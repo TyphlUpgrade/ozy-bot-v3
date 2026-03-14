@@ -1,3 +1,4 @@
+#!/usr/bin/env /home/typhlupgrade/.local/share/ozy-bot-v3/.venv/bin/python
 """
 Broker connection validation smoke test.
 
