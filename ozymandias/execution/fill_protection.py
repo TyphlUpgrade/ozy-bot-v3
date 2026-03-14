@@ -359,15 +359,18 @@ class FillProtectionManager:
         """
         Calculate buying power after deducting pending order commitments.
 
-        For limit orders: deducts quantity * limit_price.
+        For limit orders: deducts remaining_quantity * limit_price (i.e. the
+        unfilled portion only — already-filled shares are no longer committed).
         For market orders: no deduction (price unknown; broker handles margin check).
 
-        available = reported_buying_power - sum(pending_order_values)
+        available = reported_buying_power - sum(remaining_qty * limit_price)
         """
         consumed = sum(
-            o.quantity * (o.limit_price or 0.0)
+            (o.quantity - o.filled_quantity) * (o.limit_price or 0.0)
             for o in pending_orders
-            if o.status in _BLOCKING_STATUSES and o.order_type == "limit"
+            if o.status in _BLOCKING_STATUSES
+            and o.order_type == "limit"
+            and o.side == "buy"
         )
         available = reported - consumed
         log.debug("available_buying_power: reported=%.2f consumed=%.2f available=%.2f",
