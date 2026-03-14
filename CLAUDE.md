@@ -58,9 +58,9 @@ ozymandias/
 
 ## Current Build Phase
 <!-- UPDATE THIS as you complete each phase -->
-Phase: 05
-Last completed: March 13  <!--All 296 tests pass: 62 Phase 01 + 28 Phase 02 + 60 Phase 03 + 81 Phase 04 + 65 Phase 05-->
-Next up: Phase 06: Opportunity Ranker
+Phase: 06
+Last completed: March 13  <!--All 379 tests pass: 62 P01 + 28 P02 + 60 P03 + 81 P04 + 96 P05 + 52 P06-->
+Next up: Phase 07: Opportunity Ranker
 
 ## Dependencies
 ```
@@ -188,3 +188,17 @@ Deviations from `ozymandias_v3_spec_revised.md` introduced during implementation
 - **Spec:** *(implied that GFV check could block)*
 - **Impl:** `check_settlement()` returns a risk flag and logs a WARNING but does not prevent the trade
 - **Why:** The spec explicitly says "this is mostly defensive logging" and Alpaca handles settlement for margin accounts. Hard-blocking would cause unnecessary friction; the WARNING surfaces the risk for the operator to notice.
+
+---
+
+### Phase 06 — Claude AI Reasoning
+
+**Prompt template substitution uses regex, not `str.format_map()`** · spec §4.3 · `intelligence/claude_reasoning.py`
+- **Spec:** *(not specified — spec shows templates with `{placeholder}` syntax)*
+- **Impl:** `re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", ...)` — only substitutes `{plain_identifier}` tokens
+- **Why:** The prompt templates contain JSON response schema examples with `{"key": value}` blocks. `str.format_map()` interprets these as Python format strings and crashes. The regex pattern restricts substitution to bare identifiers, leaving JSON `{` `}` untouched.
+
+**`assemble_reasoning_context` `indicators` parameter accepts both formats** · spec §4.3 · `intelligence/claude_reasoning.py`
+- **Spec:** *(indicators dict format not precisely specified)*
+- **Impl:** Accepts either `{symbol: signal_summary_dict}` (output of `generate_signal_summary`) or `{symbol: signals_flat_dict}`. The assembler checks for a `"signals"` sub-key and falls back to treating the whole dict as signals.
+- **Why:** `generate_signal_summary` wraps signals under a `"signals"` key alongside `"composite_technical_score"`. Callers that pass the full summary dict and callers that pass just the signals dict both work without special-casing.
