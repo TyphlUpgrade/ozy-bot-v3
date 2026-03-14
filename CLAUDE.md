@@ -58,9 +58,9 @@ ozymandias/
 
 ## Current Build Phase
 <!-- UPDATE THIS as you complete each phase -->
-Phase: 03
-Last completed: March 13  <!--All 150 tests pass: 62 Phase 01 + 28 Phase 02 + 60 Phase 03-->
-Next up: Phase 04: Market Data Ingestion + Technical Analysis
+Phase: 04
+Last completed: March 13  <!--All 231 tests pass: 62 Phase 01 + 28 Phase 02 + 60 Phase 03 + 81 Phase 04-->
+Next up: Phase 05: Risk Manager
 
 ## Dependencies
 ```
@@ -70,59 +70,92 @@ aiohttp>=3.9, alpaca-py>=0.30, yfinance>=0.2.31, pandas>=2.1, numpy>=1.26, anthr
 ## Spec Drift Log
 Deviations from `ozymandias_v3_spec_revised.md` introduced during implementation. Read this before assuming the spec is authoritative on any listed item.
 
+### Entry format
+```
+**`identifier`** · spec §X.Y · `path/to/file.py`
+- **Spec:** what the spec says, or *(not defined)* for pure additions
+- **Impl:** what was actually implemented
+- **Why:** reason for the deviation
+```
+
+---
+
 ### Phase 02 — Broker Abstraction
 
-**`BrokerInterface` return types (section 4.8)**
+**`BrokerInterface.get_open_orders()`** · spec §4.8 · `execution/broker_interface.py`
+- **Spec:** returns `list[Order]`
+- **Impl:** returns `list[OrderStatus]`
+- **Why:** `Order` is the submission input type; returning it as query output would be a spec bug. `OrderStatus` is the correct query result type.
 
-- `get_open_orders()`: spec says `list[Order]` → implemented as `list[OrderStatus]`
-  — `Order` is the *input* type (what you submit); returning it here would be a spec bug. `OrderStatus` is correct.
-- `get_position()`: spec says `Position | None` → implemented as `Optional[BrokerPosition]`
-- `get_positions()`: spec says `list[Position]` → implemented as `list[BrokerPosition]`
-  — The name `Position` conflicts with the `Position` dataclass in `state_manager.py`. Renamed to `BrokerPosition` in `broker_interface.py` to avoid ambiguity. The two types are distinct: `BrokerPosition` is the broker's live snapshot; `Position` is the persistent state record.
+**`BrokerInterface.get_position()` / `get_positions()`** · spec §4.8 · `execution/broker_interface.py`
+- **Spec:** returns `Position | None` / `list[Position]`
+- **Impl:** returns `Optional[BrokerPosition]` / `list[BrokerPosition]`
+- **Why:** `Position` conflicts with the `Position` dataclass in `state_manager.py`. Renamed to `BrokerPosition` to avoid ambiguity. The two types are distinct: `BrokerPosition` is the broker's live snapshot; `Position` is the persistent state record.
 
-**`Order` dataclass**
+**`Order.client_order_id`** · spec §4.8 · `execution/broker_interface.py`
+- **Spec:** *(not defined)*
+- **Impl:** `client_order_id: Optional[str] = None` added to `Order` dataclass
+- **Why:** Required to correlate Alpaca orders back to local records without a second API round-trip.
 
-- Added `client_order_id: Optional[str] = None` — not in spec. Used to correlate Alpaca orders back to local records without a second API call.
+**`AlpacaBroker` async strategy** · spec §4.8 · `execution/alpaca_broker.py`
+- **Spec:** "prefer the async client (`AsyncRest`)"
+- **Impl:** synchronous `TradingClient` wrapped in `asyncio.to_thread()`
+- **Why:** `alpaca-py >= 0.30` deprecated `AsyncRest`; `TradingClient` is the current recommended client. `to_thread()` gives the same non-blocking behaviour.
 
-**`AlpacaBroker` async strategy**
+**`AlpacaBroker` constructor `environment` param** · spec §4.8 · `execution/alpaca_broker.py`
+- **Spec:** constructor takes `environment: str` (`"paper"` or `"live"`)
+- **Impl:** `paper: bool = True`
+- **Why:** Boolean is cleaner at call sites; paper mode is the only mode used in this project.
 
-- Spec (section 4.8) says "prefer the async client (`AsyncRest`)". Implemented with the synchronous `TradingClient` wrapped in `asyncio.to_thread()`.
-  — Reason: `alpaca-py >= 0.30` deprecated `AsyncRest`; `TradingClient` is the current recommended client. `to_thread()` gives the same non-blocking behavior for our use case.
-
-**`AlpacaBroker` constructor**
-
-- Spec says constructor takes `environment` string (`"paper"` or `"live"`) → implemented as `paper: bool = True`
-  — Boolean is cleaner at call sites; paper mode is the only mode used in this project.
+---
 
 ### Phase 03 — Fill Protection + PDT Guard
 
-**`StateChange` dataclass (section 7.1)**
+**`StateChange.change_type`** · spec §7.1 · `execution/fill_protection.py`
+- **Spec:** *(not defined — spec describes the concept but not the dataclass fields)*
+- **Impl:** `change_type: str` added; one of `"fill"`, `"partial_fill"`, `"cancel"`, `"partial_then_cancel"`, `"unexpected_fill"`, `"reject"`
+- **Why:** The orchestrator needs to route state changes to the correct downstream handlers.
 
-- Spec describes the concept but does not define the dataclass fields. Implementation adds:
-  - `change_type: str` — one of `"fill"`, `"partial_fill"`, `"cancel"`, `"partial_then_cancel"`, `"unexpected_fill"`, `"reject"`. Required for the orchestrator to route state changes to the right downstream handlers.
+**`FillProtectionManager.available_buying_power()`** · phases/03 §3 · `execution/fill_protection.py`
+- **Spec:** *(not in main spec §7.1/§5.4; listed as optional in `phases/03_fill_protection.md` §3)*
+- **Impl:** method implemented on `FillProtectionManager`; limit orders deduct `qty × limit_price`, market orders deduct $0
+- **Why:** Needed to prevent over-commitment of buying power across pending limit orders.
 
-**`FillProtectionManager.available_buying_power()`**
+**`PDTGuard.count_day_trades()` signature** · spec §7.2 · `execution/pdt_guard.py`
+- **Spec:** `count_day_trades(orders, portfolio) -> int`
+- **Impl:** `count_day_trades(orders, portfolio, reference_date: date | None = None) -> int`
+- **Why:** `reference_date` overrides "today" for deterministic unit testing; no effect in production.
 
-- Not in main spec sections 7.1 or 5.4. Defined in `phases/03_fill_protection.md` §3 as an optional addition. Implemented as a method on `FillProtectionManager`.
-  - Market orders deduct $0 (price unknown at submission time); limit orders deduct `qty × limit_price`.
+**`PDTGuard.can_day_trade()` signature** · spec §7.2 · `execution/pdt_guard.py`
+- **Spec:** `can_day_trade(symbol: str) -> tuple[bool, str]`
+- **Impl:** `can_day_trade(symbol, orders, portfolio, is_emergency: bool = False, reference_date: date | None = None) -> tuple[bool, str]`
+- **Why:** `orders`/`portfolio` passed explicitly to keep `PDTGuard` stateless and thread-safe. `is_emergency` subsumes the separate `is_emergency_exit()` call pattern the spec implies. `reference_date` is for testing.
 
-**`PDTGuard.count_day_trades()` (section 7.2)**
+**`PDTGuard.is_emergency_exit()`** · spec §7.2 · `execution/pdt_guard.py`
+- **Spec:** implied as a method that drives the emergency path inside `can_day_trade()`
+- **Impl:** stub returning `False`; the `is_emergency` parameter on `can_day_trade()` serves this role
+- **Why:** Phase 05 risk manager will set the emergency signal; promoting it to a caller-controlled parameter is cleaner than the guard querying itself.
 
-- Spec signature: `count_day_trades(orders, portfolio) -> int`
-- Implemented signature: `count_day_trades(orders, portfolio, reference_date: date | None = None) -> int`
-  — `reference_date` overrides "today" for deterministic unit testing. Has no effect in production (defaults to current ET date).
+**Order status string casing** · spec §7.1 · `execution/fill_protection.py`
+- **Spec:** uppercase throughout (`PENDING`, `PARTIALLY_FILLED`, `FILLED`, `CANCELLED`, `REJECTED`)
+- **Impl:** Alpaca returns lowercase (`new`, `partially_filled`, `filled`, `canceled`); `_BROKER_STATUS_MAP` in `fill_protection.py` normalises to uppercase on ingestion. `"canceled"` (Alpaca spelling) → `"CANCELLED"` (spec spelling).
+- **Why:** Broker wire format differs from spec; normalisation at the boundary keeps all internal logic spec-compliant.
 
-**`PDTGuard.can_day_trade()` (section 7.2)**
+---
 
-- Spec signature: `can_day_trade(symbol: str) -> tuple[bool, str]` (single param)
-- Implemented signature: `can_day_trade(symbol, orders, portfolio, is_emergency: bool = False, reference_date: date | None = None) -> tuple[bool, str]`
-  — `orders` and `portfolio` must be passed explicitly (no internal state caching) to keep `PDTGuard` stateless and thread-safe. `is_emergency` replaces the separate `is_emergency_exit()` call pattern implied by the spec. `reference_date` is for testing (same as `count_day_trades`).
+### Phase 04 — Market Data + Technical Analysis
 
-**`PDTGuard.is_emergency_exit()` (section 7.2)**
+**`rsi_divergence` signal output type** · spec §4.4 · `intelligence/technical_analysis.py`
+- **Spec:** `"rsi_divergence": false` (plain boolean in the example output)
+- **Impl:** `False | "bearish" | "bullish"` — `False` when no divergence detected, string otherwise
+- **Why:** A plain bool loses the direction. `compute_composite_score()` applies different adjustments for bearish (−0.2) vs bullish (+0.1); it needs to distinguish the two.
 
-- Spec implies this drives the `is_emergency` path inside `can_day_trade()`. Implemented as a stub returning `False`; Phase 05 risk manager quant overrides will set this signal. The parameter was promoted to `can_day_trade(is_emergency=...)` so callers control it directly rather than the guard querying itself.
+**RSI divergence composite score treatment** · spec §4.4 · `intelligence/technical_analysis.py`
+- **Spec:** table lists RSI divergence with weight `0.05` and values `−0.2 penalty` / `+0.1 bonus`
+- **Impl:** `−0.2` and `+0.1` are applied as direct absolute adjustments to the final score, not multiplied by `0.05`
+- **Why:** All other signals are `score × weight` where score ∈ [0, 1]. A value of `−0.2` is outside that range and cannot fit the weighted pattern. The spec's "penalty/bonus" language signals these are additive, not multiplicative.
 
-**Order status strings**
-
-- Spec uses uppercase throughout (`PENDING`, `PARTIALLY_FILLED`, `FILLED`, `CANCELLED`, `REJECTED`). Alpaca returns lowercase (`new`, `partially_filled`, `filled`, `canceled`).
-- `fill_protection.py` maps broker strings to uppercase via `_BROKER_STATUS_MAP` before storing. All internal state and comparisons use uppercase. `"canceled"` (Alpaca spelling) maps to `"CANCELLED"` (spec spelling).
+**`compute_atr()` smoothing method** · spec §4.4 · `intelligence/technical_analysis.py`
+- **Spec:** "Average True Range using EMA smoothing" (unspecified which EMA variant)
+- **Impl:** Wilder's smoothing (`ewm(com=length-1, adjust=False)`; alpha = 1/length)
+- **Why:** Wilder's ATR is the industry standard and uses the same smoothing constant as Wilder's RSI, keeping the two indicators consistent.

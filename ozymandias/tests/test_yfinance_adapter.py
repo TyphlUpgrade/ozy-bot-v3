@@ -1,0 +1,329 @@
+"""
+Tests for data/adapters/yfinance_adapter.py.
+
+yfinance calls are fully mocked — this test suite never hits the real API.
+"""
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pandas as pd
+import pytest
+
+from ozymandias.data.adapters.base import Fundamentals, Quote
+from ozymandias.data.adapters.yfinance_adapter import YFinanceAdapter
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_bar_df(uppercase: bool = True) -> pd.DataFrame:
+    """Return a minimal OHLCV DataFrame as yfinance would."""
+    if uppercase:
+        cols = {'Open': [100.0], 'High': [101.0], 'Low': [99.0],
+                'Close': [100.5], 'Volume': [1_000_000],
+                'Dividends': [0.0], 'Stock Splits': [0.0]}
+    else:
+        cols = {'open': [100.0], 'high': [101.0], 'low': [99.0],
+                'close': [100.5], 'volume': [1_000_000]}
+    return pd.DataFrame(cols, index=pd.DatetimeIndex(['2025-01-02'], tz='UTC'))
+
+
+def _make_fast_info(last_price: float = 150.0) -> MagicMock:
+    fi = MagicMock()
+    fi.last_price = last_price
+    fi.bid = last_price - 0.05
+    fi.ask = last_price + 0.05
+    fi.last_volume = 500_000
+    return fi
+
+
+def _make_ticker_info() -> dict:
+    return {
+        'marketCap': 3_000_000_000_000,
+        'trailingPE': 28.5,
+        'sector': 'Technology',
+        'industry': 'Consumer Electronics',
+        'averageVolume': 60_000_000,
+        'dividendYield': 0.005,
+        'beta': 1.2,
+        'fiftyTwoWeekHigh': 200.0,
+        'fiftyTwoWeekLow': 120.0,
+        'forwardPE': 25.0,
+        'priceToBook': 40.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# fetch_bars
+# ---------------------------------------------------------------------------
+
+class TestFetchBars:
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_columns_normalized_to_lowercase(self, mock_ticker_cls):
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.history.return_value = _make_bar_df(uppercase=True)
+
+        adapter = YFinanceAdapter()
+        df = await adapter.fetch_bars('AAPL', '1d', '5d')
+
+        assert 'close' in df.columns
+        assert 'open' in df.columns
+        assert 'high' in df.columns
+        assert 'low' in df.columns
+        assert 'volume' in df.columns
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_extra_columns_dropped(self, mock_ticker_cls):
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.history.return_value = _make_bar_df(uppercase=True)
+
+        adapter = YFinanceAdapter()
+        df = await adapter.fetch_bars('AAPL', '1d', '5d')
+
+        assert 'dividends' not in df.columns
+        assert 'stock splits' not in df.columns
+        assert set(df.columns) == {'open', 'high', 'low', 'close', 'volume'}
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_raises_on_empty_dataframe(self, mock_ticker_cls):
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.history.return_value = pd.DataFrame()
+
+        adapter = YFinanceAdapter()
+        with pytest.raises(ValueError):
+            await adapter.fetch_bars('FAKE', '1d', '5d')
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.asyncio.to_thread',
+           wraps=asyncio.to_thread)
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_uses_to_thread(self, mock_ticker_cls, mock_to_thread):
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.history.return_value = _make_bar_df()
+
+        adapter = YFinanceAdapter()
+        await adapter.fetch_bars('AAPL', '1d', '5d')
+
+        mock_to_thread.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# fetch_quote
+# ---------------------------------------------------------------------------
+
+class TestFetchQuote:
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_returns_quote_dataclass(self, mock_ticker_cls):
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.fast_info = _make_fast_info(150.0)
+
+        adapter = YFinanceAdapter()
+        quote = await adapter.fetch_quote('AAPL')
+
+        assert isinstance(quote, Quote)
+        assert quote.symbol == 'AAPL'
+        assert quote.last == pytest.approx(150.0)
+        assert quote.bid < quote.ask
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_volume_is_integer(self, mock_ticker_cls):
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.fast_info = _make_fast_info()
+
+        adapter = YFinanceAdapter()
+        quote = await adapter.fetch_quote('AAPL')
+        assert isinstance(quote.volume, int)
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_timestamp_is_utc(self, mock_ticker_cls):
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.fast_info = _make_fast_info()
+
+        adapter = YFinanceAdapter()
+        quote = await adapter.fetch_quote('AAPL')
+        assert quote.timestamp.tzinfo is not None
+
+
+# ---------------------------------------------------------------------------
+# fetch_fundamentals
+# ---------------------------------------------------------------------------
+
+class TestFetchFundamentals:
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_returns_fundamentals_dataclass(self, mock_ticker_cls):
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.info = _make_ticker_info()
+
+        adapter = YFinanceAdapter()
+        fund = await adapter.fetch_fundamentals('AAPL')
+
+        assert isinstance(fund, Fundamentals)
+        assert fund.sector == 'Technology'
+        assert fund.market_cap == 3_000_000_000_000
+        assert fund.pe_ratio == pytest.approx(28.5)
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_missing_fields_are_none(self, mock_ticker_cls):
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.info = {}  # empty — no fields
+
+        adapter = YFinanceAdapter()
+        fund = await adapter.fetch_fundamentals('AAPL')
+
+        assert fund.market_cap is None
+        assert fund.pe_ratio is None
+        assert fund.sector is None
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_na_string_treated_as_none(self, mock_ticker_cls):
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.info = {'sector': 'N/A', 'trailingPE': 'N/A'}
+
+        adapter = YFinanceAdapter()
+        fund = await adapter.fetch_fundamentals('AAPL')
+
+        assert fund.sector is None
+        assert fund.pe_ratio is None
+
+
+# ---------------------------------------------------------------------------
+# is_available
+# ---------------------------------------------------------------------------
+
+class TestIsAvailable:
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_returns_true_when_healthy(self, mock_ticker_cls):
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.fast_info.last_price = 450.0
+
+        adapter = YFinanceAdapter()
+        assert await adapter.is_available() is True
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_returns_false_on_exception(self, mock_ticker_cls):
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        type(mock_ticker.fast_info).last_price = property(
+            lambda self: (_ for _ in ()).throw(ConnectionError("timeout"))
+        )
+
+        adapter = YFinanceAdapter()
+        assert await adapter.is_available() is False
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker',
+           side_effect=Exception("no network"))
+    async def test_returns_false_on_ticker_exception(self, mock_ticker_cls):
+        adapter = YFinanceAdapter()
+        assert await adapter.is_available() is False
+
+
+# ---------------------------------------------------------------------------
+# Caching
+# ---------------------------------------------------------------------------
+
+class TestCaching:
+    @patch('ozymandias.data.adapters.yfinance_adapter.time.monotonic')
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_second_call_within_ttl_uses_cache(self, mock_ticker_cls, mock_mono):
+        mock_mono.return_value = 0.0
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.fast_info = _make_fast_info()
+
+        adapter = YFinanceAdapter(quote_ttl=60)
+        await adapter.fetch_quote('AAPL')
+        await adapter.fetch_quote('AAPL')
+
+        # yf.Ticker should only have been created once (second call hit cache)
+        assert mock_ticker_cls.call_count == 1
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.time.monotonic')
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_call_after_ttl_expiry_re_fetches(self, mock_ticker_cls, mock_mono):
+        mock_mono.return_value = 0.0
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.fast_info = _make_fast_info()
+
+        adapter = YFinanceAdapter(quote_ttl=30)
+
+        # First call at t=0
+        await adapter.fetch_quote('AAPL')
+        assert mock_ticker_cls.call_count == 1
+
+        # Advance time past TTL
+        mock_mono.return_value = 31.0
+
+        # Second call after TTL should hit the source again
+        await adapter.fetch_quote('AAPL')
+        assert mock_ticker_cls.call_count == 2
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.time.monotonic')
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_different_symbols_cached_separately(self, mock_ticker_cls, mock_mono):
+        mock_mono.return_value = 0.0
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.fast_info = _make_fast_info()
+
+        adapter = YFinanceAdapter(quote_ttl=60)
+        await adapter.fetch_quote('AAPL')
+        await adapter.fetch_quote('TSLA')
+
+        # Two distinct tickers created
+        assert mock_ticker_cls.call_count == 2
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.time.monotonic')
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_bars_cache_key_includes_interval_and_period(
+        self, mock_ticker_cls, mock_mono
+    ):
+        mock_mono.return_value = 0.0
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.history.return_value = _make_bar_df()
+
+        adapter = YFinanceAdapter(bars_ttl=300)
+        await adapter.fetch_bars('AAPL', '1d', '5d')
+        await adapter.fetch_bars('AAPL', '5m', '1d')   # different key — cache miss
+
+        # Two distinct fetch calls
+        assert mock_ticker_cls.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Error propagation
+# ---------------------------------------------------------------------------
+
+class TestErrorPropagation:
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_fetch_bars_propagates_exception(self, mock_ticker_cls):
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.history.side_effect = RuntimeError("network error")
+
+        adapter = YFinanceAdapter()
+        with pytest.raises(RuntimeError):
+            await adapter.fetch_bars('AAPL', '1d', '5d')
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_fetch_quote_propagates_exception(self, mock_ticker_cls):
+        mock_ticker_cls.side_effect = RuntimeError("no internet")
+
+        adapter = YFinanceAdapter()
+        with pytest.raises(RuntimeError):
+            await adapter.fetch_quote('AAPL')
