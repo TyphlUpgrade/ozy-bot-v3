@@ -6,7 +6,7 @@ Requires real Alpaca paper trading credentials in ozymandias/config/credentials.
 (plaintext JSON for now — encrypted storage is a later phase).
 
 Usage:
-    PYTHONPATH=. python scripts/validate_broker.py
+    PYTHONPATH=. python scripts/validate_broker.py [--debug]
 
 Expected output on success:
     [account] equity=... buying_power=...
@@ -20,14 +20,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
-import time
 from pathlib import Path
 
 # Ensure project root is on sys.path when run directly
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ozymandias.core.config import load_config
+from ozymandias.core.logger import setup_logging
 from ozymandias.execution.alpaca_broker import AlpacaBroker
 from ozymandias.execution.broker_interface import Order
 
@@ -55,7 +55,15 @@ def _load_credentials() -> tuple[str, str]:
     return api_key, secret_key
 
 
-async def main() -> None:
+async def main(debug: bool = False) -> None:
+    log = setup_logging()
+    if debug:
+        # Also send DEBUG to stdout for terminal visibility
+        for handler in logging.getLogger().handlers:
+            if isinstance(handler, logging.StreamHandler) and handler.stream is sys.stdout:
+                handler.setLevel(logging.DEBUG)
+                break
+
     api_key, secret_key = _load_credentials()
 
     broker = AlpacaBroker(api_key=api_key, secret_key=secret_key, paper=True)
@@ -118,4 +126,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main(debug="--debug" in sys.argv))
