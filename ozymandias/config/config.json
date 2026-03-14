@@ -1,0 +1,43 @@
+{
+  "broker": {
+    "name": "alpaca",
+    "environment": "paper",
+    "credentials_file": "credentials.enc",
+    "base_url_paper": "https://paper-api.alpaca.markets",
+    "base_url_live": "https://api.alpaca.markets"
+  },
+  "risk": {
+    "max_position_pct": 0.20,
+    "max_concurrent_positions": 8,
+    "max_daily_loss_pct": 0.02,
+    "per_trade_max_loss_pct": 0.03,
+    "pdt_buffer": 1,
+    "min_equity_for_trading": 25500
+  },
+  "scheduler": {
+    "fast_loop_sec": 10,
+    "medium_loop_sec": 120,
+    "slow_loop_check_sec": 300,
+    "slow_loop_max_interval_sec": 3600,
+    "slow_loop_price_move_threshold_pct": 2.0
+  },
+  "claude": {
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens_per_cycle": 4096,
+    "prompt_version": "v3.3.0",
+    "tier1_max_symbols": 12,
+    "tier2_max_symbols": 28
+  },
+  "ranker": {
+    "weight_ai": 0.35,
+    "weight_technical": 0.30,
+    "weight_risk": 0.20,
+    "weight_liquidity": 0.15
+  },
+  "strategy": {
+    "active_strategies": ["momentum", "swing"],
+    "momentum_params": {},
+    "swing_params": {}
+  },
+  "timezone": "America/New_York"
+}

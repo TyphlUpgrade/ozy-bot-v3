@@ -1,0 +1,27 @@
+You are reviewing open positions for the Ozymandias trading system. Assess each position against its original thesis.
+
+POSITION DATA:
+{position_data}
+
+CURRENT MARKET DATA:
+{market_data}
+
+For each position, evaluate:
+1. Is the original trade thesis still intact?
+2. Has the catalyst played out or changed?
+3. Should targets be adjusted based on new information?
+4. Is there any reason to exit early (thesis invalidation, better opportunity cost)?
+
+RESPONSE FORMAT (strict JSON, no markdown):
+{
+  "reviews": [
+    {
+      "symbol": "<SYMBOL>",
+      "thesis_intact": true|false,
+      "thesis_assessment": "<brief assessment>",
+      "recommended_action": "hold|exit|adjust_targets",
+      "adjusted_targets": null | {"profit_target": 0.0, "stop_loss": 0.0},
+      "notes": "<appended review note for the position record>"
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+# Async HTTP
+aiohttp>=3.9
+
+# Broker
+alpaca-py>=0.30  # Alpaca SDK with native async support
+
+# Market data
+yfinance>=0.2.31
+
+# Data & indicators (hand-rolled TA, no third-party TA libraries)
+pandas>=2.1
+numpy>=1.26
+
+# Claude API
+anthropic>=0.40
+
+# Utilities
+python-dateutil>=2.8
+
+# Testing
+pytest>=8.0
+pytest-asyncio>=0.23
