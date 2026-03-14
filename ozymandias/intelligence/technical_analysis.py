@@ -449,6 +449,8 @@ def generate_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
     # --- Bollinger position ---
     bollinger_position = 'upper_half' if last_close >= last_bb_mid else 'lower_half'
 
+    avg_daily_volume = float(df['volume'].mean())
+
     signals = {
         'vwap_position':    vwap_position,
         'rsi':              round(last_rsi, 2),
@@ -460,6 +462,8 @@ def generate_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
         'volume_ratio':     round(volume_ratio, 4),
         'atr_14':           round(last_atr, 4),
         'bollinger_position': bollinger_position,
+        'price':            round(last_close, 4),
+        'avg_daily_volume': round(avg_daily_volume, 0),
     }
 
     return {

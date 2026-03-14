@@ -348,6 +348,22 @@ class TestCheckEquityFloor:
         allowed, _ = guard.check_equity_floor(acct)
         assert allowed is False
 
+    def test_pdt_flagged_blocked_by_custom_floor(self):
+        """PDT-flagged account is blocked when equity < configured floor (regression: was hardcoded 25_000)."""
+        guard = PDTGuard(_risk_config(min_equity=30_000.0))
+        # equity > old hardcoded 25k but < configured 30k — must be BLOCKED
+        acct = _account(equity=27_000.0, pdt_flag=True)
+        allowed, reason = guard.check_equity_floor(acct)
+        assert allowed is False
+        assert "below minimum" in reason.lower()
+
+    def test_pdt_flagged_allowed_above_custom_floor(self):
+        """PDT-flagged account is allowed when equity >= configured floor."""
+        guard = PDTGuard(_risk_config(min_equity=30_000.0))
+        acct = _account(equity=31_000.0, pdt_flag=True)
+        allowed, _ = guard.check_equity_floor(acct)
+        assert allowed is True
+
 
 # ---------------------------------------------------------------------------
 # is_emergency_exit (stub)

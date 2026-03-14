@@ -184,9 +184,12 @@ class PDTGuard:
 
         Returns (trading_allowed: bool, reason: str).
         """
-        if account.pdt_flag and account.equity >= 25_000.0:
-            # PDT-flagged accounts with > $25k have unlimited day trades
-            return True, "PDT account with equity > $25,000 — unlimited day trades"
+        if account.pdt_flag and account.equity >= self._min_equity:
+            # PDT-flagged accounts above the equity floor have unlimited day trades
+            return True, (
+                f"PDT account with equity ${account.equity:,.2f} "
+                f">= floor ${self._min_equity:,.2f} — unlimited day trades"
+            )
 
         if account.equity < self._min_equity:
             reason = (

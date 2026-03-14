@@ -147,20 +147,26 @@ class OpportunityRanker:
             One entry from :attr:`ReasoningResult.new_opportunities`.
         technical_signals:
             Mapping ``symbol → signal_dict`` from ``generate_signal_summary``.
-            Keys used: ``composite_score``, ``avg_daily_volume`` (optional).
+            Keys used: ``composite_technical_score``, ``avg_daily_volume`` (optional).
+            The full output of ``generate_signal_summary()`` is expected per symbol
+            (top-level dict with ``composite_technical_score`` and nested ``signals``).
         """
         symbol = opportunity["symbol"]
-        signals = technical_signals.get(symbol, {})
+        # Full generate_signal_summary() output: top-level has composite_technical_score;
+        # per-indicator values live inside the nested "signals" sub-dict.
+        sig_summary = technical_signals.get(symbol, {})
+        nested_signals = sig_summary.get("signals", {})
 
         ai_conviction = float(opportunity.get("conviction", 0.5))
-        technical_score = float(signals.get("composite_score", 0.0))
+        # composite_technical_score is at the top level of the summary dict.
+        technical_score = float(sig_summary.get("composite_technical_score", 0.0))
 
         entry = float(opportunity.get("suggested_entry", 0.0))
         exit_ = float(opportunity.get("suggested_exit", 0.0))
         stop = float(opportunity.get("suggested_stop", 0.0))
         rar = self._risk_adjusted_return(entry, exit_, stop)
 
-        avg_vol = signals.get("avg_daily_volume")
+        avg_vol = nested_signals.get("avg_daily_volume")
         liq = self._liquidity_score(avg_vol)
 
         composite = (
@@ -251,8 +257,10 @@ class OpportunityRanker:
             return False, f"{symbol}: PDT limit — {reason}"
 
         # 5. Average daily volume
-        signals = (technical_signals or {}).get(symbol, {})
-        avg_vol = signals.get("avg_daily_volume") or opportunity.get("avg_daily_volume")
+        # avg_daily_volume lives inside the nested "signals" sub-dict of the summary output.
+        sig_summary = (technical_signals or {}).get(symbol, {})
+        nested = sig_summary.get("signals", {})
+        avg_vol = nested.get("avg_daily_volume") or opportunity.get("avg_daily_volume")
         if avg_vol is not None and avg_vol < self._min_volume:
             return (
                 False,

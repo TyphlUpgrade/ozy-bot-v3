@@ -600,8 +600,19 @@ class TestGenerateSignalSummary:
             'vwap_position', 'rsi', 'rsi_divergence', 'macd_signal',
             'trend_structure', 'roc_5', 'roc_deceleration',
             'volume_ratio', 'atr_14', 'bollinger_position',
+            'price', 'avg_daily_volume',
         }
         assert expected_keys.issubset(set(signals.keys()))
+
+    def test_price_key_matches_last_close(self):
+        df = self._df(50)
+        result = generate_signal_summary("TEST", df)
+        assert result['signals']['price'] == pytest.approx(float(df['close'].iloc[-1]), rel=1e-4)
+
+    def test_avg_daily_volume_key_is_positive(self):
+        df = self._df(50)
+        result = generate_signal_summary("TEST", df)
+        assert result['signals']['avg_daily_volume'] > 0
 
     def test_composite_score_in_range(self):
         result = generate_signal_summary("TEST", self._df())

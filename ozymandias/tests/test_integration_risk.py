@@ -199,38 +199,33 @@ class TestSignalSchemaCompatibility:
         assert isinstance(signals["atr_14"], float)
         assert signals["atr_14"] >= 0.0
 
-    def test_price_key_absent_from_ta_output(self):
+    def test_price_key_present_in_ta_output(self):
         """
-        generate_signal_summary does NOT include 'price'. Callers must add it
-        before passing signals to check_atr_trailing_stop(). This test documents
-        that known gap so it doesn't surprise future developers.
+        generate_signal_summary includes 'price' (last close) so that
+        check_atr_trailing_stop() can fire without the caller manually adding it.
         """
         df = _intraday_ohlcv(40)
         signals = generate_signal_summary("AAPL", df)["signals"]
-        assert "price" not in signals, (
-            "If 'price' is now in generate_signal_summary output, "
-            "remove check_atr_trailing_stop's None guard and update this test."
-        )
+        assert "price" in signals
+        assert isinstance(signals["price"], float)
+        assert signals["price"] > 0
 
 
 class TestSignalSummaryToOverridePipeline:
     """
     End-to-end: TA output → RiskManager override evaluation.
-    Verifies the pipeline doesn't crash and handles the missing 'price' key.
+    Verifies the pipeline doesn't crash with real TA output.
     """
 
     def test_raw_ta_output_does_not_crash_evaluate_overrides(self):
-        """Passing signals dict directly (without 'price') must not raise."""
+        """Passing signals dict from generate_signal_summary() must not raise."""
         rm = _rm()
         pos = _position()
         df = _intraday_ohlcv(40)
         signals = generate_signal_summary("AAPL", df)["signals"]
-        # ATR trailing stop will silently return False due to missing 'price'
         should_exit, triggered = rm.evaluate_overrides(pos, signals, intraday_high=120.0)
         assert isinstance(should_exit, bool)
         assert isinstance(triggered, list)
-        # ATR stop cannot fire without 'price'
-        assert "atr_trailing_stop" not in triggered
 
     def test_augmenting_price_enables_atr_trailing_stop(self):
         """

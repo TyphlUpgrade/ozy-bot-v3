@@ -102,10 +102,14 @@ def _market_open(open_: bool = True):
 
 
 def _tech(symbol: str, composite: float = 0.7, avg_vol: float | None = 1_000_000.0) -> dict:
-    sig: dict = {"composite_score": composite}
+    """
+    Build a mock technical_signals entry matching the real generate_signal_summary() schema:
+        {symbol: {"composite_technical_score": ..., "signals": {"avg_daily_volume": ...}}}
+    """
+    nested: dict = {}
     if avg_vol is not None:
-        sig["avg_daily_volume"] = avg_vol
-    return {symbol: sig}
+        nested["avg_daily_volume"] = avg_vol
+    return {symbol: {"composite_technical_score": composite, "signals": nested}}
 
 
 # ---------------------------------------------------------------------------
@@ -189,8 +193,8 @@ class TestCompositeScore:
             suggested_stop=145.0,
         )
         # rar = (165-150)/(150-145) = 3.0 → normalised = 0.60
-        # liq = 1.0 (1M vol)
-        signals = {"AAPL": {"composite_score": 0.7, "avg_daily_volume": 1_000_000}}
+        # liq = 1.0 (1M vol) — use real schema: composite_technical_score at top, avg_daily_volume nested
+        signals = {"AAPL": {"composite_technical_score": 0.7, "signals": {"avg_daily_volume": 1_000_000}}}
         result = r.score_opportunity(opp, signals, _account(), _portfolio())
 
         expected = (
@@ -219,14 +223,14 @@ class TestCompositeScore:
             suggested_exit=200.0,
             suggested_stop=80.0,
         )
-        signals = {"AAPL": {"composite_score": 1.0, "avg_daily_volume": 5_000_000}}
+        signals = {"AAPL": {"composite_technical_score": 1.0, "signals": {"avg_daily_volume": 5_000_000}}}
         result = r.score_opportunity(opp, signals, _account(), _portfolio())
         assert result.composite_score <= 1.0
 
     def test_weight_override_via_config(self):
         r = OpportunityRanker({"w_ai": 1.0, "w_tech": 0.0, "w_risk": 0.0, "w_liq": 0.0})
         opp = _opportunity(conviction=0.6)
-        signals = {"AAPL": {"composite_score": 0.9, "avg_daily_volume": 2_000_000}}
+        signals = {"AAPL": {"composite_technical_score": 0.9, "signals": {"avg_daily_volume": 2_000_000}}}
         result = r.score_opportunity(opp, signals, _account(), _portfolio())
         # Only AI conviction matters
         assert result.composite_score == pytest.approx(0.6, abs=1e-6)
@@ -286,7 +290,8 @@ class TestHardFilters:
         assert "PDT" in reason
 
     def test_low_volume_in_signals_rejects(self):
-        signals = {"AAPL": {"composite_score": 0.7, "avg_daily_volume": 50_000}}
+        # avg_daily_volume lives in the nested "signals" sub-dict of the TA output
+        signals = {"AAPL": {"composite_technical_score": 0.7, "signals": {"avg_daily_volume": 50_000}}}
         passes, reason = self._filter(signals=signals)
         assert passes is False
         assert "volume" in reason.lower()
@@ -294,19 +299,19 @@ class TestHardFilters:
     def test_low_volume_in_opportunity_rejects(self):
         opp = _opportunity(avg_daily_volume=30_000)
         # No volume in signals → falls back to opportunity dict
-        signals = {"AAPL": {"composite_score": 0.7}}
+        signals = {"AAPL": {"composite_technical_score": 0.7, "signals": {}}}
         passes, reason = self._filter(opp=opp, signals=signals)
         assert passes is False
         assert "volume" in reason.lower()
 
     def test_volume_at_100k_passes(self):
-        signals = {"AAPL": {"composite_score": 0.7, "avg_daily_volume": 100_000}}
+        signals = {"AAPL": {"composite_technical_score": 0.7, "signals": {"avg_daily_volume": 100_000}}}
         passes, _ = self._filter(signals=signals)
         assert passes is True
 
     def test_no_volume_info_passes(self):
         # Unknown volume: filter skipped (neutral)
-        signals = {"AAPL": {"composite_score": 0.7}}
+        signals = {"AAPL": {"composite_technical_score": 0.7, "signals": {}}}
         passes, _ = self._filter(signals=signals)
         assert passes is True
 
@@ -357,9 +362,10 @@ class TestRankOpportunities:
             _opportunity(symbol="TSLA"),
         ]
         # AAPL has low volume → rejected; TSLA is fine
+        # Use real TA output schema: composite_technical_score at top, avg_daily_volume nested
         signals = {
-            "AAPL": {"composite_score": 0.8, "avg_daily_volume": 10_000},
-            "TSLA": {"composite_score": 0.7, "avg_daily_volume": 2_000_000},
+            "AAPL": {"composite_technical_score": 0.8, "signals": {"avg_daily_volume": 10_000}},
+            "TSLA": {"composite_technical_score": 0.7, "signals": {"avg_daily_volume": 2_000_000}},
         }
         ranked = self._rank(opps, signals)
         assert len(ranked) == 1

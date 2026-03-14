@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -78,7 +79,7 @@ def _make_technical_summary(signals: dict) -> str:
     if vwap:
         parts.append(f"VWAP {vwap}")
     rsi = signals.get("rsi")
-    if rsi is not None:
+    if rsi is not None and not (isinstance(rsi, float) and math.isnan(rsi)):
         parts.append(f"RSI {rsi:.0f}")
     macd = signals.get("macd_signal", "")
     if macd:
