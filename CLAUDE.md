@@ -58,9 +58,9 @@ ozymandias/
 
 ## Current Build Phase
 <!-- UPDATE THIS as you complete each phase -->
-Phase: 04
-Last completed: March 13  <!--All 231 tests pass: 62 Phase 01 + 28 Phase 02 + 60 Phase 03 + 81 Phase 04-->
-Next up: Phase 05: Risk Manager
+Phase: 05
+Last completed: March 13  <!--All 296 tests pass: 62 Phase 01 + 28 Phase 02 + 60 Phase 03 + 81 Phase 04 + 65 Phase 05-->
+Next up: Phase 06: Opportunity Ranker
 
 ## Dependencies
 ```
@@ -159,3 +159,32 @@ Deviations from `ozymandias_v3_spec_revised.md` introduced during implementation
 - **Spec:** "Average True Range using EMA smoothing" (unspecified which EMA variant)
 - **Impl:** Wilder's smoothing (`ewm(com=length-1, adjust=False)`; alpha = 1/length)
 - **Why:** Wilder's ATR is the industry standard and uses the same smoothing constant as Wilder's RSI, keeping the two indicators consistent.
+
+---
+
+### Phase 05 — Risk Manager
+
+**`validate_entry()` signature** · spec §4.7 · `execution/risk_manager.py`
+- **Spec:** `validate_entry(symbol, side, quantity, price, strategy) -> tuple[bool, str]`
+- **Impl:** `validate_entry(symbol, side, quantity, price, strategy, account, portfolio, orders, avg_daily_volume=None, now=None)`
+- **Why:** The spec omits state parameters. All state (account, portfolio, orders) is passed explicitly to keep `RiskManager` stateless per call — same pattern as `PDTGuard.can_day_trade()`. `avg_daily_volume` allows skipping the min-volume check when fundamentals aren't available. `now` enables deterministic testing.
+
+**`check_daily_loss()` signature** · spec §4.7 · `execution/risk_manager.py`
+- **Spec:** `check_daily_loss(account, positions) -> tuple[bool, str]`
+- **Impl:** `check_daily_loss(account, now=None) -> tuple[bool, str]` — no `positions` parameter
+- **Why:** The spec mentions tracking "realized + unrealized P&L" but the simplest correct implementation compares current equity to start-of-day equity, which already includes unrealized P&L in the broker's equity figure. Computing it from positions separately would be redundant. `now` overrides the clock for testing.
+
+**`_pending_order_commitment()` buying power helper** · spec §7.3 · `execution/risk_manager.py`
+- **Spec:** "Calculate: `available_buying_power = reported_buying_power - sum(pending_order_values)`" — no explicit location specified
+- **Impl:** Module-level function `_pending_order_commitment(orders)` in `risk_manager.py` rather than delegating to `FillProtectionManager.available_buying_power()`
+- **Why:** `validate_entry()` needs this calculation but should not require a `FillProtectionManager` instance (which is stateful and disk-backed). The arithmetic is identical; avoiding the dependency keeps `RiskManager` testable without a full FillProtectionManager setup.
+
+**`check_vwap_crossover()` — "crossing" vs "currently below"** · spec §4.7 · `execution/risk_manager.py`
+- **Spec:** "Price *crosses* below VWAP" (implies detecting the transition event)
+- **Impl:** Detects "price is currently below VWAP with volume_ratio > 1.3" — effectively a level check, not a transition check
+- **Why:** Override checks run every fast loop (~10s). On the first cycle where price drops below VWAP, the condition becomes true — that cycle IS the cross event. Tracking a prior-state flag would add complexity with no practical benefit at 10-second resolution.
+
+**Settlement check does not hard-block** · spec §7.3 · `execution/risk_manager.py`
+- **Spec:** *(implied that GFV check could block)*
+- **Impl:** `check_settlement()` returns a risk flag and logs a WARNING but does not prevent the trade
+- **Why:** The spec explicitly says "this is mostly defensive logging" and Alpaca handles settlement for margin accounts. Hard-blocking would cause unnecessary friction; the WARNING surfaces the risk for the operator to notice.
