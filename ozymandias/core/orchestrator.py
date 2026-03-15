@@ -1396,18 +1396,28 @@ class Orchestrator:
         existing_symbols = {e.symbol for e in watchlist.entries}
 
         for item in add_list:
-            symbol = item.get("symbol", "").upper()
+            # Claude may return plain strings ("SPY") or dicts ({"symbol": "SPY", ...})
+            if isinstance(item, str):
+                symbol = item.strip().upper()
+                reason = "Added by Claude"
+                tier = 1
+                strategy = "both"
+            else:
+                symbol = item.get("symbol", "").upper()
+                reason = item.get("reason", "Added by Claude")
+                tier = item.get("priority_tier", 1)
+                strategy = item.get("strategy", "both")
             if not symbol or symbol in existing_symbols:
                 continue
             watchlist.entries.append(WatchlistEntry(
                 symbol=symbol,
                 date_added=now_iso,
-                reason=item.get("reason", "Added by Claude"),
-                priority_tier=item.get("priority_tier", 1),
-                strategy=item.get("strategy", "both"),
+                reason=reason,
+                priority_tier=tier,
+                strategy=strategy,
             ))
             existing_symbols.add(symbol)
-            log.info("Watchlist: added %s (tier=%s)", symbol, item.get("priority_tier", 1))
+            log.info("Watchlist: added %s (tier=%s)", symbol, tier)
 
         if remove_list:
             before = len(watchlist.entries)
