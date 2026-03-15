@@ -83,7 +83,7 @@ async def _run(args: argparse.Namespace) -> None:
         cfg.broker.environment, args.log_level, args.dry_run,
     )
 
-    orch = Orchestrator(config_path=args.config, log_level=args.log_level)
+    orch = Orchestrator(config_path=args.config, log_level=args.log_level, dry_run=args.dry_run)
 
     # Register SIGTERM so systemd / container stop works identically to Ctrl-C
     loop = asyncio.get_running_loop()

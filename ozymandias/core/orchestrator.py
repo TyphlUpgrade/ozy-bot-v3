@@ -105,6 +105,7 @@ class Orchestrator:
         self,
         config_path: Optional[Path] = None,
         log_level: str = "INFO",
+        dry_run: bool = False,
     ) -> None:
         """
         Prepare the orchestrator. Loads config and sets up logging.
@@ -153,6 +154,12 @@ class Orchestrator:
 
         # Shutdown flag — set by _shutdown(), checked by loops
         self._stopping = False
+
+        # Dry-run mode — if True, orders are logged but never submitted
+        self._dry_run: bool = dry_run
+
+        # Conservative startup mode — no new entries until this UTC timestamp
+        self._conservative_mode_until: Optional[datetime] = None
 
         log.debug("Orchestrator created (config loaded, modules not yet connected)")
 
@@ -251,6 +258,196 @@ class Orchestrator:
         )
 
     # -----------------------------------------------------------------------
+    # Startup reconciliation
+    # -----------------------------------------------------------------------
+
+    async def startup_reconciliation(self) -> None:
+        """
+        Compare broker state against local state on startup.
+
+        Any errors (position mismatch, phantom positions, stale orders) are
+        logged at ERROR level and trigger conservative startup mode: no new
+        entries for 10 minutes. This gives the operator time to review logs
+        before the system starts making decisions.
+        """
+        from ozymandias.core.state_manager import Position, TradeIntention
+
+        log.info("=== Startup reconciliation ===")
+        reconciliation_errors = False
+
+        # -- Step 1: Position check ------------------------------------------
+        try:
+            broker_positions = await self._broker.get_positions()
+            portfolio = await self._state_manager.load_portfolio()
+            broker_map = {p.symbol: p for p in broker_positions}
+            local_map  = {p.symbol: p for p in portfolio.positions}
+            updated = False
+
+            for symbol, broker_pos in broker_map.items():
+                if symbol in local_map:
+                    local_pos = local_map[symbol]
+                    if abs(local_pos.shares - broker_pos.qty) > 0.001:
+                        log.error(
+                            "Position mismatch: %s local=%.4f broker=%.4f — "
+                            "updating local to broker (broker is source of truth)",
+                            symbol, local_pos.shares, broker_pos.qty,
+                        )
+                        local_pos.shares = broker_pos.qty
+                        reconciliation_errors = True
+                        updated = True
+                else:
+                    log.error(
+                        "Unknown broker position: %s %.4f shares @ %.4f — "
+                        "adding to local state with reconciled=True",
+                        symbol, broker_pos.qty, broker_pos.avg_entry_price,
+                    )
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    portfolio.positions.append(Position(
+                        symbol=symbol,
+                        shares=broker_pos.qty,
+                        avg_cost=broker_pos.avg_entry_price,
+                        entry_date=now_iso,
+                        intention=TradeIntention(),
+                        reconciled=True,
+                    ))
+                    reconciliation_errors = True
+                    updated = True
+
+            for symbol in list(local_map.keys()):
+                if symbol not in broker_map:
+                    log.error(
+                        "Phantom local position: %s not found broker-side — "
+                        "removing from local state",
+                        symbol,
+                    )
+                    portfolio.positions = [
+                        p for p in portfolio.positions if p.symbol != symbol
+                    ]
+                    reconciliation_errors = True
+                    updated = True
+
+            if updated:
+                await self._state_manager.save_portfolio(portfolio)
+                log.info("Step 1: portfolio updated after reconciliation")
+            else:
+                log.info("Step 1 OK — all positions match broker")
+
+        except Exception as exc:
+            log.error("Startup reconciliation step 1 failed: %s", exc, exc_info=True)
+            reconciliation_errors = True
+
+        # -- Step 2: Order cleanup -------------------------------------------
+        try:
+            broker_open_orders = await self._broker.get_open_orders()
+            broker_order_ids = {o.order_id for o in broker_open_orders}
+            orders_state = await self._state_manager.load_orders()
+            now_iso = datetime.now(timezone.utc).isoformat()
+            stale_found = False
+
+            for order in orders_state.orders:
+                if order.status in ("PENDING", "PARTIALLY_FILLED"):
+                    if order.order_id not in broker_order_ids:
+                        log.warning(
+                            "Local order %s (%s %s) not found broker-side — "
+                            "marking CANCELLED",
+                            order.order_id, order.side, order.symbol,
+                        )
+                        order.status = "CANCELLED"
+                        order.cancelled_at = now_iso
+                        stale_found = True
+
+            local_ids = {o.order_id for o in orders_state.orders}
+            for broker_order in broker_open_orders:
+                if broker_order.order_id not in local_ids:
+                    log.warning(
+                        "Broker order %s (status=%s) not tracked locally",
+                        broker_order.order_id, broker_order.status,
+                    )
+
+            if stale_found:
+                await self._state_manager.save_orders(orders_state)
+                log.info("Step 2: stale orders marked CANCELLED")
+            else:
+                log.info("Step 2 OK — all local orders tracked broker-side")
+
+        except Exception as exc:
+            log.error("Startup reconciliation step 2 failed: %s", exc, exc_info=True)
+            reconciliation_errors = True
+
+        # -- Step 3: Account state -------------------------------------------
+        try:
+            acct = await self._broker.get_account()
+            log.info(
+                "Account snapshot — equity=$%.2f  buying_power=$%.2f  cash=$%.2f  "
+                "pdt=%s  daytrades_used=%d",
+                acct.equity, acct.buying_power, acct.cash,
+                acct.pdt_flag, acct.daytrade_count,
+            )
+            if acct.equity < 25_500.0:
+                log.warning(
+                    "Account equity $%.2f below PDT threshold $25,500 — "
+                    "new entries will be blocked by risk manager",
+                    acct.equity,
+                )
+        except Exception as exc:
+            log.error("Startup reconciliation step 3 failed: %s", exc, exc_info=True)
+            reconciliation_errors = True
+
+        # -- Step 4: Reasoning cache -----------------------------------------
+        fresh = self._reasoning_cache.load_latest_if_fresh()
+        if fresh:
+            log.info(
+                "Step 4 — fresh cache found (timestamp=%s)",
+                fresh.get("timestamp"),
+            )
+        else:
+            log.info("Step 4 — no fresh cache — Claude will be called on first trigger")
+
+        # -- Step 5: Validation gate -----------------------------------------
+        if reconciliation_errors:
+            mins = self._config.scheduler.conservative_startup_mode_min
+            conservative_until = datetime.now(timezone.utc) + timedelta(minutes=mins)
+            self._conservative_mode_until = conservative_until
+            log.warning(
+                "Reconciliation errors found — conservative startup mode active until %s "
+                "(no new entries for %d minutes)",
+                conservative_until.isoformat(), mins,
+            )
+        else:
+            log.info("Step 5 OK — startup reconciliation clean, proceeding normally")
+
+        log.info("=== Startup reconciliation complete ===")
+
+    # -----------------------------------------------------------------------
+    # Dry-run mode
+    # -----------------------------------------------------------------------
+
+    def _apply_dry_run_mode(self) -> None:
+        """
+        Replace broker.place_order with a stub that logs but never submits.
+        Called once at startup when --dry-run is active.
+        """
+        from ozymandias.execution.broker_interface import OrderResult
+
+        async def _dry_place_order(order: Order) -> OrderResult:
+            log.info(
+                "[DRY RUN] Would place order — symbol=%s  side=%s  qty=%g  "
+                "type=%s  limit=%s  tif=%s",
+                order.symbol, order.side, order.quantity,
+                order.order_type,
+                f"{order.limit_price:.4f}" if order.limit_price else "market",
+                order.time_in_force,
+            )
+            return OrderResult(
+                order_id=f"dry-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}",
+                status="pending_new",
+                submitted_at=datetime.now(timezone.utc),
+            )
+
+        self._broker.place_order = _dry_place_order
+        log.info("Dry-run mode active — orders will be logged but NOT submitted")
+
+    # -----------------------------------------------------------------------
     # Run (main entry point)
     # -----------------------------------------------------------------------
 
@@ -264,6 +461,9 @@ class Orchestrator:
         setup_logging()
 
         await self._startup()
+        await self.startup_reconciliation()
+        if self._dry_run:
+            self._apply_dry_run_mode()
 
         try:
             async with asyncio.TaskGroup() as tg:
@@ -731,6 +931,16 @@ class Orchestrator:
         """Validate and execute a single entry order for the top-ranked opportunity."""
         symbol = top.symbol
         entry_price = top.suggested_entry
+
+        # Conservative startup mode — suppress new entries until timer expires
+        if self._conservative_mode_until is not None:
+            now = datetime.now(timezone.utc)
+            if now < self._conservative_mode_until:
+                log.info(
+                    "Medium loop: conservative mode active until %s — skipping entry for %s",
+                    self._conservative_mode_until.isoformat(), symbol,
+                )
+                return
         strategy_name = top.strategy
 
         # Determine ATR for position sizing

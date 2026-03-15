@@ -60,6 +60,7 @@ class Position:
     intention: TradeIntention = field(default_factory=TradeIntention)
     order_history: list[str] = field(default_factory=list)   # broker order IDs
     position_id: str = ""
+    reconciled: bool = False           # True if detected during startup reconciliation
 
 
 @dataclass
@@ -152,6 +153,7 @@ def _from_dict_position(d: dict) -> Position:
         intention=intention,
         order_history=d.get("order_history", []),
         position_id=d.get("position_id", ""),
+        reconciled=d.get("reconciled", False),
     )
 
 

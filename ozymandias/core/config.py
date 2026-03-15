@@ -40,6 +40,7 @@ class SchedulerConfig:
     slow_loop_check_sec: int = 300
     slow_loop_max_interval_sec: int = 3600
     slow_loop_price_move_threshold_pct: float = 2.0
+    conservative_startup_mode_min: int = 10  # no new entries after reconciliation errors
 
 
 @dataclass
