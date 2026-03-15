@@ -32,7 +32,9 @@
     "weight_ai": 0.35,
     "weight_technical": 0.30,
     "weight_risk": 0.20,
-    "weight_liquidity": 0.15
+    "weight_liquidity": 0.15,
+    "min_conviction_threshold": 0.10,
+    "thesis_challenge_size_threshold": 0.15
   },
   "strategy": {
     "active_strategies": ["momentum", "swing"],

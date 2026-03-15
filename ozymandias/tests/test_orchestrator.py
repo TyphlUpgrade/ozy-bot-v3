@@ -401,6 +401,7 @@ class TestClaudeDegradation:
             watchlist_changes={"add": [], "remove": [], "rationale": ""},
             market_assessment="neutral",
             risk_flags=[],
+            rejected_opportunities=[],
             raw={},
         )
         orch._claude.run_reasoning_cycle = AsyncMock(return_value=result)
@@ -609,3 +610,134 @@ class TestSlowLoopStateApplication:
         saved = await orch._state_manager.load_portfolio()
         assert saved.positions[0].intention.exit_targets.profit_target == 230.0
         assert saved.positions[0].intention.exit_targets.stop_loss == 195.0
+
+
+# ===========================================================================
+# Thesis challenge in _medium_try_entry
+# ===========================================================================
+
+class TestThesisChallenge:
+    """Tests for the skeptical-analyst thesis challenge on large positions."""
+
+    from ozymandias.intelligence.opportunity_ranker import ScoredOpportunity
+
+    def _make_top(self, position_size_pct: float, ai_conviction: float = 0.85) -> "ScoredOpportunity":
+        from ozymandias.intelligence.opportunity_ranker import ScoredOpportunity
+        return ScoredOpportunity(
+            symbol="AAPL",
+            action="buy",
+            strategy="momentum",
+            composite_score=0.80,
+            ai_conviction=ai_conviction,
+            technical_score=0.70,
+            risk_adjusted_return=0.60,
+            liquidity_score=1.0,
+            suggested_entry=200.0,
+            suggested_exit=220.0,
+            suggested_stop=190.0,
+            position_size_pct=position_size_pct,
+            reasoning="Breakout above key resistance.",
+        )
+
+    def _stub_entry_guards(self, orch):
+        """Mock risk_manager and fill_protection to allow entry."""
+        orch._risk_manager.calculate_position_size = MagicMock(return_value=10)
+        orch._risk_manager.validate_entry = MagicMock(return_value=(True, ""))
+        orch._fill_protection.can_place_order = MagicMock(return_value=True)
+        orch._latest_indicators = {}
+        orch._latest_market_context = {}
+
+    @pytest.mark.asyncio
+    async def test_large_position_triggers_thesis_challenge(self, orch):
+        """position_size_pct >= threshold → run_thesis_challenge is called."""
+        top = self._make_top(position_size_pct=0.20)
+        self._stub_entry_guards(orch)
+        orch._claude.run_thesis_challenge = AsyncMock(
+            return_value={"proceed": True, "conviction": 0.85, "challenge_reasoning": "ok"}
+        )
+        acct = _stub_account()
+        portfolio = PortfolioState(positions=[])
+
+        await orch._medium_try_entry(top, acct, portfolio, [])
+
+        orch._claude.run_thesis_challenge.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_small_position_skips_thesis_challenge(self, orch):
+        """position_size_pct < threshold → run_thesis_challenge is NOT called."""
+        top = self._make_top(position_size_pct=0.08)
+        self._stub_entry_guards(orch)
+        orch._claude.run_thesis_challenge = AsyncMock()
+        acct = _stub_account()
+        portfolio = PortfolioState(positions=[])
+
+        await orch._medium_try_entry(top, acct, portfolio, [])
+
+        orch._claude.run_thesis_challenge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_challenge_proceed_false_skips_trade(self, orch):
+        """Challenge returning proceed=False → place_order is NOT called."""
+        top = self._make_top(position_size_pct=0.20)
+        self._stub_entry_guards(orch)
+        orch._claude.run_thesis_challenge = AsyncMock(
+            return_value={"proceed": False, "conviction": 0.15,
+                          "challenge_reasoning": "Failed breakout below $198 VWAP."}
+        )
+        acct = _stub_account()
+        portfolio = PortfolioState(positions=[])
+
+        await orch._medium_try_entry(top, acct, portfolio, [])
+
+        orch._broker.place_order.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_challenge_lower_conviction_scales_quantity(self, orch):
+        """Challenge conviction 0.5 vs original 1.0 → quantity halved."""
+        top = self._make_top(position_size_pct=0.20, ai_conviction=1.0)
+        self._stub_entry_guards(orch)
+        orch._risk_manager.calculate_position_size = MagicMock(return_value=20)
+        orch._claude.run_thesis_challenge = AsyncMock(
+            return_value={"proceed": True, "conviction": 0.5,
+                          "challenge_reasoning": "Watch $212 gap resistance."}
+        )
+        acct = _stub_account()
+        portfolio = PortfolioState(positions=[])
+
+        placed_orders = []
+        async def capture_order(order):
+            placed_orders.append(order)
+            return MagicMock(order_id="ord_001")
+        orch._broker.place_order = capture_order
+
+        # Need fill_protection.record_order to not blow up
+        from ozymandias.core.state_manager import OrderRecord
+        orch._fill_protection.record_order = AsyncMock()
+
+        await orch._medium_try_entry(top, acct, portfolio, [])
+
+        assert len(placed_orders) == 1
+        # conviction ratio = 0.5/1.0 = 0.5 → 20 * 0.5 = 10
+        assert placed_orders[0].quantity == 10
+
+    @pytest.mark.asyncio
+    async def test_challenge_returns_none_trade_proceeds(self, orch):
+        """Challenge API failure (returns None) → trade proceeds with original quantity."""
+        top = self._make_top(position_size_pct=0.20, ai_conviction=0.85)
+        self._stub_entry_guards(orch)
+        orch._risk_manager.calculate_position_size = MagicMock(return_value=10)
+        orch._claude.run_thesis_challenge = AsyncMock(return_value=None)
+        acct = _stub_account()
+        portfolio = PortfolioState(positions=[])
+
+        placed_orders = []
+        async def capture_order(order):
+            placed_orders.append(order)
+            return MagicMock(order_id="ord_001")
+        orch._broker.place_order = capture_order
+        orch._fill_protection.record_order = AsyncMock()
+
+        await orch._medium_try_entry(top, acct, portfolio, [])
+
+        assert len(placed_orders) == 1
+        assert placed_orders[0].quantity == 10

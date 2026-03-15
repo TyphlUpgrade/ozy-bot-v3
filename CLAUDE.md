@@ -32,6 +32,7 @@ External Data (yfinance) → Orchestrator (3 async loops) → Intelligence (Clau
 - Risk manager has override authority over everything — can cancel orders, force exits, block entries
 - Fill protection: never place a new order for a symbol that has a PENDING or PARTIALLY_FILLED order
 - PDT buffer: default reserve 1 of 3 allowed day trades for emergency exits
+- Never hardcode tunable parameters (thresholds, multipliers, intervals, weights, limits). Put them in config.json with a comment in the code explaining what the config value controls.
 
 ## Testing Standards
 - Every module gets unit tests. TA functions tested against hand-calculated values.
@@ -62,9 +63,9 @@ Features not described in the spec may be requested. When implementing them, fol
 
 ## Current Build Phase
 <!-- UPDATE THIS as you complete each phase -->
-Phase: 10  <!--All 519 tests pass: 62+28+60+81+96+52+42+47+37+14 (P01–P10)-->
+Phase: Post-MVP  <!--All 536 tests pass: 62+28+60+81+96+52+42+47+37+14+17 (P01–P10 + anti-bias hardening)-->
 Last completed: March 15
-Next up: Post-MVP (paper trading monitoring)
+Next up: Paper trading monitoring
 
 ## Spec Drift Log
 See `DRIFT_LOG.md`. Read the relevant phase section of DRIFT_LOG.md before modifying or debugging any module built in a previous phase.

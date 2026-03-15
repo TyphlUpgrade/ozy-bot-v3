@@ -14,6 +14,7 @@ Evaluate:
 2. Has the catalyst played out or changed materially?
 3. Should targets be adjusted based on new price action or information?
 4. Is there reason to exit early — thesis invalidation, better opportunity cost, or approaching a risk limit?
+5. What is the strongest specific argument against holding this position right now? Include it in notes.
 
 Return ONLY a JSON object. No markdown, no explanation outside the JSON.
 
@@ -26,7 +27,7 @@ RESPONSE FORMAT:
       "thesis_assessment": "<brief assessment of catalyst and position status>",
       "recommended_action": "hold|exit|adjust_targets",
       "adjusted_targets": null,
-      "notes": "<1-2 sentences to append to the position review log>"
+      "notes": "<1-2 sentences: action rationale AND the strongest current argument against this position>"
     }
   ]
 }

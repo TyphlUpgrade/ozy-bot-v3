@@ -59,6 +59,8 @@ class RankerConfig:
     weight_technical: float = 0.30
     weight_risk: float = 0.20
     weight_liquidity: float = 0.15
+    min_conviction_threshold: float = 0.10   # sanity floor: rejects degenerate zero-conviction Claude output
+    thesis_challenge_size_threshold: float = 0.15  # position_size_pct >= this triggers skeptical review
 
 
 @dataclass

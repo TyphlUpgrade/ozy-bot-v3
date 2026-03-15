@@ -583,3 +583,154 @@ class TestMakeTechnicalSummary:
         # Only some fields present — should not crash
         result = _make_technical_summary({"rsi": 45.0})
         assert "RSI 45" in result
+
+
+# ---------------------------------------------------------------------------
+# rejected_opportunities in ReasoningResult
+# ---------------------------------------------------------------------------
+
+class TestRejectedOpportunities:
+
+    @pytest.mark.asyncio
+    async def test_reasoning_result_has_rejected_opportunities(self, tmp_path):
+        engine = _engine(tmp_path)
+        response = json.dumps({
+            **json.loads(_VALID_REASONING_RESPONSE),
+            "rejected_opportunities": [
+                {
+                    "symbol": "NVDA",
+                    "considered_reason": "Strong momentum setup on daily.",
+                    "rejection_reason": "Overhead resistance at $875 from Feb gap-fill.",
+                }
+            ],
+        })
+        with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as m:
+            m.return_value = _mock_api_response(response)
+            result = await engine.run_reasoning_cycle(
+                _portfolio(), _watchlist([]), _market_data(), {}, trigger="test"
+            )
+        assert len(result.rejected_opportunities) == 1
+        assert result.rejected_opportunities[0]["symbol"] == "NVDA"
+
+    @pytest.mark.asyncio
+    async def test_rejected_opportunities_defaults_to_empty(self, tmp_path):
+        engine = _engine(tmp_path)
+        # _VALID_REASONING_RESPONSE has no rejected_opportunities key
+        with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as m:
+            m.return_value = _mock_api_response(_VALID_REASONING_RESPONSE)
+            result = await engine.run_reasoning_cycle(
+                _portfolio(), _watchlist([]), _market_data(), {}, trigger="test"
+            )
+        assert result.rejected_opportunities == []
+
+    @pytest.mark.asyncio
+    async def test_position_review_updated_reasoning_passthrough(self, tmp_path):
+        """updated_reasoning with adversarial text passes through unchanged."""
+        engine = _engine(tmp_path)
+        adversarial_text = (
+            "Holding: momentum still intact BUT overhead resistance at $312 "
+            "from March gap-fill could cap upside."
+        )
+        response = json.dumps({
+            **json.loads(_VALID_REASONING_RESPONSE),
+            "position_reviews": [
+                {
+                    "symbol": "AAPL",
+                    "action": "hold",
+                    "thesis_intact": True,
+                    "updated_reasoning": adversarial_text,
+                    "adjusted_targets": None,
+                }
+            ],
+        })
+        with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as m:
+            m.return_value = _mock_api_response(response)
+            result = await engine.run_reasoning_cycle(
+                _portfolio(), _watchlist([]), _market_data(), {}, trigger="test"
+            )
+        assert result.raw["position_reviews"][0]["updated_reasoning"] == adversarial_text
+
+
+# ---------------------------------------------------------------------------
+# run_thesis_challenge
+# ---------------------------------------------------------------------------
+
+class TestRunThesisChallenge:
+
+    def _make_opportunity(self, symbol="AAPL") -> dict:
+        return {
+            "symbol": symbol,
+            "strategy": "momentum",
+            "conviction": 0.85,
+            "suggested_entry": 200.0,
+            "suggested_exit": 220.0,
+            "suggested_stop": 190.0,
+            "position_size_pct": 0.18,
+            "reasoning": "Strong breakout above key resistance.",
+        }
+
+    @pytest.mark.asyncio
+    async def test_run_thesis_challenge_proceed_true(self, tmp_path):
+        engine = _engine(tmp_path)
+        challenge_resp = json.dumps({
+            "proceed": True,
+            "conviction": 0.80,
+            "challenge_reasoning": "Watch for rejection at $212 gap resistance.",
+        })
+        with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as m:
+            m.return_value = _mock_api_response(challenge_resp)
+            result = await engine.run_thesis_challenge(
+                self._make_opportunity(), _market_data(), _indicators(["AAPL"])
+            )
+        assert result is not None
+        assert result["proceed"] is True
+        assert result["conviction"] == pytest.approx(0.80)
+
+    @pytest.mark.asyncio
+    async def test_run_thesis_challenge_proceed_false(self, tmp_path):
+        engine = _engine(tmp_path)
+        challenge_resp = json.dumps({
+            "proceed": False,
+            "conviction": 0.20,
+            "challenge_reasoning": "Failed breakout — price closed back below $198 VWAP reclaim.",
+        })
+        with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as m:
+            m.return_value = _mock_api_response(challenge_resp)
+            result = await engine.run_thesis_challenge(
+                self._make_opportunity(), _market_data(), {}
+            )
+        assert result is not None
+        assert result["proceed"] is False
+
+    @pytest.mark.asyncio
+    async def test_run_thesis_challenge_unparseable_returns_none(self, tmp_path):
+        engine = _engine(tmp_path)
+        with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as m:
+            m.return_value = _mock_api_response("this is not json at all")
+            result = await engine.run_thesis_challenge(
+                self._make_opportunity(), _market_data(), {}
+            )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_run_thesis_challenge_loads_template(self, tmp_path):
+        engine = _engine(tmp_path)
+        with patch.object(engine, "_load_prompt", wraps=engine._load_prompt) as mock_load:
+            with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as m:
+                m.return_value = _mock_api_response('{"proceed": true, "conviction": 0.9, "challenge_reasoning": "ok"}')
+                await engine.run_thesis_challenge(
+                    self._make_opportunity(), _market_data(), {}
+                )
+        mock_load.assert_called_once_with("thesis_challenge.txt")
+
+    @pytest.mark.asyncio
+    async def test_call_claude_logs_warning_on_max_tokens_stop_reason(self, tmp_path, caplog):
+        import logging
+        engine = _engine(tmp_path)
+        resp = _mock_api_response("hello")
+        resp.stop_reason = "max_tokens"
+        with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as m:
+            m.return_value = resp
+            with caplog.at_level(logging.WARNING, logger="ozymandias.intelligence.claude_reasoning"):
+                await engine.call_claude("{x}", {"x": "test"})
+        assert any("max_tokens" in r.message for r in caplog.records)

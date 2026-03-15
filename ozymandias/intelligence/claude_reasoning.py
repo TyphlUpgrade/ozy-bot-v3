@@ -50,6 +50,7 @@ class ReasoningResult:
     watchlist_changes: dict           # {add: [...], remove: [...], rationale: "..."}
     market_assessment: str
     risk_flags: list[str]
+    rejected_opportunities: list[dict]  # [{symbol, considered_reason, rejection_reason}]
     raw: dict                         # full parsed Claude response
 
 
@@ -108,6 +109,7 @@ def _result_from_raw_reasoning(raw: dict) -> ReasoningResult:
         watchlist_changes=raw.get("watchlist_changes", {"add": [], "remove": [], "rationale": ""}),
         market_assessment=raw.get("market_assessment", ""),
         risk_flags=raw.get("risk_flags", []),
+        rejected_opportunities=raw.get("rejected_opportunities", []),
         raw=raw,
     )
 
@@ -340,7 +342,12 @@ class ClaudeReasoningEngine:
     # API call with retry
     # ------------------------------------------------------------------
 
-    async def call_claude(self, prompt_template: str, context: dict) -> str:
+    async def call_claude(
+        self,
+        prompt_template: str,
+        context: dict,
+        max_tokens_override: int | None = None,
+    ) -> str:
         """
         Fill the prompt template with context values and call the Anthropic API.
 
@@ -351,6 +358,10 @@ class ClaudeReasoningEngine:
           - TimeoutError (>120s): re-raised immediately.
 
         Logs a WARNING if a successful call takes longer than 60 seconds.
+        Logs a WARNING if stop_reason is "max_tokens" (response was truncated).
+
+        Args:
+            max_tokens_override: If provided, overrides max_tokens_per_cycle for this call.
 
         Returns the raw response text string.
         """
@@ -380,7 +391,7 @@ class ClaudeReasoningEngine:
                 response = await asyncio.wait_for(
                     self._client.messages.create(
                         model=self._claude_cfg.model,
-                        max_tokens=self._claude_cfg.max_tokens_per_cycle,
+                        max_tokens=max_tokens_override or self._claude_cfg.max_tokens_per_cycle,
                         messages=[{"role": "user", "content": prompt}],
                     ),
                     timeout=120.0,
@@ -390,6 +401,12 @@ class ClaudeReasoningEngine:
                     log.warning("Claude API call took %.1fs (>60s threshold)", elapsed)
                 else:
                     log.debug("Claude API call completed in %.1fs", elapsed)
+
+                if response.stop_reason == "max_tokens":
+                    log.warning(
+                        "Claude response truncated (stop_reason=max_tokens). "
+                        "Parsed JSON may be incomplete — defensive parser will handle."
+                    )
 
                 self._last_input_tokens = response.usage.input_tokens
                 self._last_output_tokens = response.usage.output_tokens
@@ -478,13 +495,20 @@ class ClaudeReasoningEngine:
             log.warning("Reasoning cycle: response unparseable — skipping cycle")
             return None
 
+        result = _result_from_raw_reasoning(parsed)
+        for rej in result.rejected_opportunities:
+            log.info(
+                "Rejected opportunity: %s — %s",
+                rej.get("symbol", "?"), rej.get("rejection_reason", ""),
+            )
         log.info(
-            "Reasoning cycle complete [trigger=%s]: %d reviews, %d opportunities",
+            "Reasoning cycle complete [trigger=%s]: %d reviews, %d opportunities, %d rejected",
             trigger,
             len(parsed.get("position_reviews", [])),
             len(parsed.get("new_opportunities", [])),
+            len(result.rejected_opportunities),
         )
-        return _result_from_raw_reasoning(parsed)
+        return result
 
     async def run_watchlist_build(
         self,
@@ -582,3 +606,57 @@ class ClaudeReasoningEngine:
 
         log.info("Position review complete: %s", position.symbol)
         return _result_from_raw_review(parsed)
+
+    async def run_thesis_challenge(
+        self,
+        opportunity: dict,
+        market_context: dict,
+        indicators: dict,
+    ) -> Optional[dict]:
+        """
+        Skeptical challenge of a proposed large-position entry.
+
+        Returns dict with {proceed: bool, conviction: float, challenge_reasoning: str}
+        or None if parsing fails (caller should proceed with original sizing on failure).
+        """
+        symbol = opportunity.get("symbol", "?")
+        sig_summary = indicators.get(symbol, {})
+        signals = sig_summary.get("signals", sig_summary)
+
+        template = self._load_prompt("thesis_challenge.txt")
+        # Use compact key signals only — not the full summary — to minimize input tokens.
+        key_signals = {k: signals.get(k) for k in (
+            "rsi", "macd_signal", "trend_structure", "vwap_position",
+            "roc_5", "volume_ratio", "atr_14",
+        ) if signals.get(k) is not None}
+
+        raw_text = await self.call_claude(
+            template,
+            {
+                "opportunity_json": json.dumps(opportunity, indent=2),
+                "indicators_json": json.dumps(
+                    {
+                        "symbol": symbol,
+                        "composite_score": sig_summary.get("composite_technical_score"),
+                        "signals": key_signals,
+                    },
+                    indent=2,
+                ),
+                "market_context_json": json.dumps(market_context, default=str, indent=2),
+            },
+            max_tokens_override=512,  # response is just {proceed, conviction, reasoning}
+        )
+
+        parsed = parse_claude_response(raw_text)
+        if parsed is None:
+            log.warning("Thesis challenge for %s: unparseable — proceeding with original sizing", symbol)
+            return None
+
+        log.info(
+            "Thesis challenge [%s]: proceed=%s  conviction=%.2f  reason=%s",
+            symbol,
+            parsed.get("proceed", True),
+            parsed.get("conviction", 0.0),
+            parsed.get("challenge_reasoning", ""),
+        )
+        return parsed

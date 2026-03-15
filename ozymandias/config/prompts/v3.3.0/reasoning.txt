@@ -15,10 +15,11 @@ CONTEXT:
 {context_json}
 
 INSTRUCTIONS:
-1. Review each open position: is the thesis still intact? Should targets be adjusted? Should we exit?
+1. Review each open position: is the thesis still intact? Should targets be adjusted? Should we exit? For each position, state the strongest current argument against holding it inside updated_reasoning, even if you recommend hold. This must be specific (e.g. "overhead resistance at $312 from March gap-fill") not generic ("market risk").
 2. Identify the top entry candidates from the watchlist tier 1.
 3. Flag any watchlist symbols for removal if they have lost relevance or momentum.
 4. Suggest new symbols to add if the watchlist needs replenishing (target 15-40 tickers total).
+5. List any tickers you seriously considered for entry but decided against. One sentence each. Give a SPECIFIC bear case — not generic risk statements. "Overhead resistance at $312 from March gap-fill" is acceptable; "risk of market downturn" is not.
 
 Return ONLY a JSON object. No markdown, no explanation outside the JSON.
 
@@ -30,7 +31,7 @@ RESPONSE FORMAT:
       "symbol": "<SYMBOL>",
       "action": "hold|exit|adjust",
       "thesis_intact": true|false,
-      "updated_reasoning": "<brief update on why hold/exit/adjust>",
+      "updated_reasoning": "<action rationale AND the strongest current argument against holding — even for hold decisions. Reference specific price levels, patterns, or catalysts, not generic risk statements.>",
       "adjusted_targets": null | {"profit_target": 0.0, "stop_loss": 0.0}
     }
   ],
@@ -54,5 +55,12 @@ RESPONSE FORMAT:
     "rationale": "<brief reason for changes>"
   },
   "market_assessment": "<1-2 sentence macro view and risk posture>",
-  "risk_flags": ["<any systemic risk observations that should affect sizing or timing>"]
+  "risk_flags": ["<any systemic risk observations that should affect sizing or timing>"],
+  "rejected_opportunities": [
+    {
+      "symbol": "<SYMBOL>",
+      "considered_reason": "<one sentence: why it was a candidate>",
+      "rejection_reason": "<one sentence: specific bear case — price level, pattern, catalyst failure, etc.>"
+    }
+  ]
 }

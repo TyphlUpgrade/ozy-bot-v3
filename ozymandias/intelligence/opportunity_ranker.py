@@ -97,6 +97,7 @@ class OpportunityRanker:
         self._w_liq = float(cfg.get("w_liq", _W_LIQ))
         self._max_positions = int(cfg.get("max_positions", _MAX_POSITIONS))
         self._min_volume = float(cfg.get("min_avg_daily_volume", _MIN_AVG_DAILY_VOLUME))
+        self._min_conviction = float(cfg.get("min_conviction_threshold", 0.10))  # sanity floor
 
     # ------------------------------------------------------------------
     # Sub-scores
@@ -228,6 +229,11 @@ class OpportunityRanker:
         symbol = opportunity.get("symbol", "")
         _is_open = market_hours_fn if market_hours_fn is not None else is_market_open
 
+        # 0. Minimum conviction threshold (cheapest filter runs first)
+        conviction = float(opportunity.get("conviction", 0.0))
+        if conviction < self._min_conviction:
+            return False, f"{symbol}: conviction {conviction:.2f} below threshold {self._min_conviction:.2f}"
+
         # 1. Regular-hours check
         if not _is_open():
             return False, f"{symbol}: market not in regular hours"
@@ -312,7 +318,7 @@ class OpportunityRanker:
                 technical_signals,
             )
             if not passes:
-                logger.debug("Hard filter rejected %s: %s", symbol, reason)
+                logger.info("Hard filter rejected %s: %s", symbol, reason)
                 continue
             scored.append(
                 self.score_opportunity(opp, technical_signals, account_info, portfolio)

@@ -247,3 +247,42 @@ Read the relevant phase section before modifying or debugging any module built i
 - **Spec:** *(behaviour on weekends not specified)*
 - **Impl:** `_business_days_window` never includes Saturday/Sunday. Orders with `filled_at` on a weekend will never be counted as day trades, regardless of the reference date.
 - **Why:** Correct behaviour — markets are closed on weekends. Tests that construct order records must use a weekday `filled_at` and pass a matching `reference_date` to `can_day_trade`; otherwise count will be 0 when the test suite runs on a weekend.
+
+---
+
+### Post-MVP (Anti-bias hardening)
+
+**`ReasoningResult.rejected_opportunities`** · spec *(not defined)* · `intelligence/claude_reasoning.py`
+- **Spec:** *(not defined)*
+- **Impl:** New field `rejected_opportunities: list[dict]` added to `ReasoningResult`. `_result_from_raw_reasoning()` populates it from `raw.get("rejected_opportunities", [])`. `run_reasoning_cycle()` logs each entry at INFO after a successful parse.
+- **Why:** Forces Claude to articulate specific bear cases for candidates it considered but rejected. Creates a visible audit trail of near-misses without adding to the execution pipeline.
+
+**`reasoning.txt` and `review.txt` adversarial instructions** · spec *(not defined)* · `config/prompts/v3.3.0/`
+- **Spec:** *(not defined)*
+- **Impl:** `reasoning.txt` instruction 1 strengthened to require a specific bear argument inside `updated_reasoning` for every position review (even holds). New instruction 5 added requiring `rejected_opportunities` list with specific, non-generic rejection reasons. `review.txt` `notes` description updated to require adversarial content; evaluation item 5 added.
+- **Why:** Both prompts previously incentivised only optimistic framing. The changes force Claude to surface counterarguments without changing the response schema.
+
+**`min_conviction_threshold` in ranker** · spec *(not defined)* · `intelligence/opportunity_ranker.py`, `config/config.json`
+- **Spec:** *(not defined)*
+- **Impl:** `min_conviction_threshold: float = 0.10` in `RankerConfig` and `config.json`. Hard filter runs before scoring (cheapest check first). Rejections logged at INFO.
+- **Why:** 0.10 is a sanity floor, not a quality gate — it catches degenerate zero/near-zero conviction values from malformed Claude output while leaving technically-strong, narratively-uncertain setups untouched. The existing `weight_ai=0.35` already penalises low conviction in the composite score; a high threshold would incorrectly block legitimate short-term technical momentum plays.
+
+**`call_claude()` `max_tokens_override` param** · spec §4.3 · `intelligence/claude_reasoning.py`
+- **Spec:** fixed `max_tokens_per_cycle` used for all calls
+- **Impl:** `max_tokens_override: int | None = None` added. When provided, overrides the config value for that call. All existing callers pass no override (unchanged). Truncation via `stop_reason == "max_tokens"` logged at WARNING.
+- **Why:** Thesis challenge responses are structurally tiny (`{proceed, conviction, reasoning}`); 512 tokens is sufficient and reduces cost. The override avoids adding a new config key for a single specialised call.
+
+**`run_thesis_challenge()` method** · spec *(not defined)* · `intelligence/claude_reasoning.py`
+- **Spec:** *(not defined)*
+- **Impl:** New async method on `ClaudeReasoningEngine`. Loads `thesis_challenge.txt`, sends compact key-signals subset (not full TA summary), calls Claude with `max_tokens_override=512`. Returns `{proceed, conviction, challenge_reasoning}` dict or `None` on parse failure (caller proceeds with original sizing).
+- **Why:** Adversarial second opinion specifically for large-position entries. Separate method keeps the fast path (`run_reasoning_cycle`) unchanged.
+
+**`Orchestrator._latest_market_context`** · spec *(not defined)* · `core/orchestrator.py`
+- **Spec:** *(not defined)*
+- **Impl:** `self._latest_market_context: dict = {}` stored in `__init__`; populated by the slow loop immediately before calling Claude. Consumed by `_medium_try_entry()` for thesis challenge calls.
+- **Why:** Medium and slow loops run on independent timers. The medium loop needs access to the last-known market context without triggering a new broker fetch.
+
+**Thesis challenge in `_medium_try_entry()`** · spec *(not defined)* · `core/orchestrator.py`
+- **Spec:** *(not defined)*
+- **Impl:** After fill-protection check passes, if `top.position_size_pct >= config.ranker.thesis_challenge_size_threshold` (default 0.15), `_claude.run_thesis_challenge()` is called. `proceed=False` → return immediately (no order). Lower `conviction` → quantity scaled proportionally (`max(1, int(qty * ratio))`). `None` return (parse failure) → proceed with original quantity.
+- **Why:** Large positions have the highest damage potential if wrong. Adding a synchronous adversarial check here is acceptable because the medium loop runs every 120 s — not latency-sensitive. Small positions (< 15%) skip the check entirely.

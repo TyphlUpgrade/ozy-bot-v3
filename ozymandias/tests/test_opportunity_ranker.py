@@ -86,6 +86,7 @@ def _reasoning_result(
         watchlist_changes={"add": [], "remove": [], "rationale": ""},
         market_assessment="neutral",
         risk_flags=[],
+        rejected_opportunities=[],
         raw={},
     )
 
@@ -484,3 +485,47 @@ class TestRankExitActions:
         assert actions[0].symbol == "TSLA"
         assert actions[0].urgency == pytest.approx(1.0)
         assert actions[1].urgency == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# 7. Conviction threshold (min_conviction_threshold)
+# ---------------------------------------------------------------------------
+
+class TestConvictionThreshold:
+
+    def _filter_with_threshold(self, conviction, threshold):
+        r = OpportunityRanker({"min_conviction_threshold": threshold})
+        opp = _opportunity(conviction=conviction)
+        return r.apply_hard_filters(
+            opp,
+            _account(),
+            _portfolio(),
+            _pdt_guard(True),
+            _market_open(True),
+            orders=[],
+        )
+
+    def test_conviction_below_threshold_filtered_out(self):
+        passes, reason = self._filter_with_threshold(conviction=0.05, threshold=0.10)
+        assert passes is False
+        assert "conviction" in reason.lower()
+
+    def test_conviction_at_threshold_passes(self):
+        passes, _ = self._filter_with_threshold(conviction=0.10, threshold=0.10)
+        assert passes is True
+
+    def test_conviction_above_threshold_passes(self):
+        passes, _ = self._filter_with_threshold(conviction=0.80, threshold=0.10)
+        assert passes is True
+
+    def test_conviction_filter_logged(self, caplog):
+        """rank_opportunities logs rejection at INFO when conviction is below threshold."""
+        import logging
+        r = OpportunityRanker({"min_conviction_threshold": 0.10})
+        opp = _opportunity(symbol="JUNK", conviction=0.05)
+        rr = _reasoning_result(opportunities=[opp])
+        with caplog.at_level(logging.INFO, logger="ozymandias.intelligence.opportunity_ranker"):
+            r.rank_opportunities(
+                rr, {}, _account(), _portfolio(), _pdt_guard(True), _market_open(True), []
+            )
+        assert any("JUNK" in r.message for r in caplog.records)

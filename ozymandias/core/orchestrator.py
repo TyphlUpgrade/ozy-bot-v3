@@ -146,6 +146,9 @@ class Orchestrator:
         # ATR trailing stop check.
         self._intraday_highs: dict[str, float] = {}
 
+        # Latest market context from slow loop — consumed by thesis challenge in medium loop
+        self._latest_market_context: dict = {}
+
         # Count of override exits since last Claude call (feeds trigger state)
         self._override_exit_count: int = 0
 
@@ -231,10 +234,12 @@ class Orchestrator:
 
         # -- Opportunity ranker -----------------------------------------------
         ranker_cfg = {
-            "weight_ai":        self._config.ranker.weight_ai,
-            "weight_technical": self._config.ranker.weight_technical,
-            "weight_risk":      self._config.ranker.weight_risk,
-            "weight_liquidity": self._config.ranker.weight_liquidity,
+            "weight_ai":                   self._config.ranker.weight_ai,
+            "weight_technical":            self._config.ranker.weight_technical,
+            "weight_risk":                 self._config.ranker.weight_risk,
+            "weight_liquidity":            self._config.ranker.weight_liquidity,
+            "min_conviction_threshold":    self._config.ranker.min_conviction_threshold,
+            "thesis_challenge_size_threshold": self._config.ranker.thesis_challenge_size_threshold,
         }
         self._ranker = OpportunityRanker(config=ranker_cfg)
 
@@ -894,6 +899,7 @@ class Orchestrator:
                 watchlist_changes={"add": [], "remove": [], "rationale": ""},
                 market_assessment="unknown",
                 risk_flags=[],
+                rejected_opportunities=[],
                 raw={},
             )
 
@@ -973,6 +979,41 @@ class Orchestrator:
         if not self._fill_protection.can_place_order(symbol):
             log.debug("Medium loop: fill protection blocking entry for %s", symbol)
             return
+
+        # Thesis challenge for large positions (config: ranker.thesis_challenge_size_threshold)
+        challenge_size_threshold = self._config.ranker.thesis_challenge_size_threshold
+        if top.position_size_pct >= challenge_size_threshold:
+            challenge = await self._claude.run_thesis_challenge(
+                opportunity={
+                    "symbol": symbol,
+                    "strategy": strategy_name,
+                    "conviction": top.ai_conviction,
+                    "suggested_entry": entry_price,
+                    "suggested_exit": top.suggested_exit,
+                    "suggested_stop": top.suggested_stop,
+                    "position_size_pct": top.position_size_pct,
+                    "reasoning": top.reasoning,
+                },
+                market_context=self._latest_market_context,
+                indicators=self._latest_indicators,
+            )
+            if challenge is not None:
+                if not challenge.get("proceed", True):
+                    log.info(
+                        "Thesis challenge blocked entry for %s: %s",
+                        symbol, challenge.get("challenge_reasoning", ""),
+                    )
+                    return
+                challenge_conviction = float(challenge.get("conviction", top.ai_conviction))
+                if challenge_conviction < top.ai_conviction and top.ai_conviction > 0:
+                    # Scale quantity proportionally to conviction reduction
+                    ratio = challenge_conviction / top.ai_conviction
+                    quantity = max(1, int(quantity * ratio))
+                    log.info(
+                        "Thesis challenge reduced conviction for %s: %.2f → %.2f, "
+                        "quantity scaled to %d",
+                        symbol, top.ai_conviction, challenge_conviction, quantity,
+                    )
 
         order = Order(
             symbol=symbol,
@@ -1266,6 +1307,8 @@ class Orchestrator:
             "account_equity":        acct.equity,
             "buying_power":          acct.buying_power,
         }
+
+        self._latest_market_context = market_data  # store for medium loop thesis challenge
 
         log.info(
             "Slow loop: calling Claude reasoning [trigger=%s]  "
