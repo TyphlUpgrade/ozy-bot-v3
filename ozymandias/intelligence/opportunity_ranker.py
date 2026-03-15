@@ -347,7 +347,7 @@ class OpportunityRanker:
             action = review.get("action", "hold").lower()
 
             signals = technical_signals.get(symbol, {})
-            tech_score = float(signals.get("composite_score", 0.5))
+            tech_score = float(signals.get("composite_technical_score", 0.5))
 
             if action == "exit":
                 urgency = 1.0

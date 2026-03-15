@@ -56,11 +56,32 @@ ozymandias/
 - Use pytest + pytest-asyncio for async tests
 - Mock broker and external APIs in tests — never hit real APIs in unit tests
 
+## Workflow Rules
+- **Before starting work:** Read this file. Read the current phase prompt only — not previous ones.
+  Consult the spec only to resolve a specific ambiguity; don't re-read it in full.
+- **Bug handling during implementation:**
+  - Bug in code you're currently building → fix immediately before continuing
+  - Bug in a previously built module that blocks you → fix it
+  - Bug in a previously built module that doesn't block you → add a `# BUG: description` comment and continue
+  - Never add broad `try/except` or unnecessary `None` checks to work around bugs in other modules
+- **Updating this file:** Update CLAUDE.md (especially the Spec Drift Log) when: a module's interface
+  changes from what the phase file specified, a dependency or assumption is discovered that affects
+  future phases, or a meaningful architectural decision is made. Do not modify phase files or the
+  spec file — document deviations here instead.
+
+## Adding Features Beyond the Spec
+Features not described in the spec may be requested. When implementing them, follow existing patterns:
+- New strategies → implement the `Strategy` ABC in `strategies/`
+- New Claude calls → new method in `claude_reasoning.py` + new prompt template in `config/prompts/`
+- New persistent state → extend existing JSON schemas in `state/`, don't create new files
+- New loop logic → integrate into the orchestrator's existing loop structure
+- All new code uses `async`, `get_logger()`, and `StateManager`
+
 ## Current Build Phase
 <!-- UPDATE THIS as you complete each phase -->
-Phase: 06
-Last completed: March 13  <!--All 379 tests pass: 62 P01 + 28 P02 + 60 P03 + 81 P04 + 96 P05 + 52 P06-->
-Next up: Phase 07: Opportunity Ranker
+Phase: 09  <!--All 505 tests pass: 62+28+60+81+96+52+42+47+37 (P01–P09)-->
+Last completed: March 15
+Next up: Phase 10
 
 ## Dependencies
 ```
@@ -202,3 +223,75 @@ Deviations from `ozymandias_v3_spec_revised.md` introduced during implementation
 - **Spec:** *(indicators dict format not precisely specified)*
 - **Impl:** Accepts either `{symbol: signal_summary_dict}` (output of `generate_signal_summary`) or `{symbol: signals_flat_dict}`. The assembler checks for a `"signals"` sub-key and falls back to treating the whole dict as signals.
 - **Why:** `generate_signal_summary` wraps signals under a `"signals"` key alongside `"composite_technical_score"`. Callers that pass the full summary dict and callers that pass just the signals dict both work without special-casing.
+
+---
+
+### Phase 07 — Opportunity Ranker
+
+**`apply_hard_filters()` signature** · spec §4.5 · `intelligence/opportunity_ranker.py`
+- **Spec:** `apply_hard_filters(opportunity, account_info, portfolio, pdt_guard, market_hours)`
+- **Impl:** adds three optional params: `market_hours_fn=None` (injectable callable, defaults to `is_market_open()`), `orders: list | None = None` (forwarded to PDT guard), `technical_signals: dict | None = None` (used for volume filter)
+- **Why:** `PDTGuard.can_day_trade()` requires `orders` explicitly (Phase 03 pattern). `market_hours_fn` enables off-hours testing without patching globals.
+
+**`rank_opportunities()` signature** · spec §4.5 · `intelligence/opportunity_ranker.py`
+- **Spec:** `rank_opportunities(..., market_hours)`
+- **Impl:** `market_hours` → `market_hours_fn` (optional, defaults to `is_market_open()`); `orders` parameter added and forwarded to `apply_hard_filters()`
+- **Why:** Consistent with Phase 03/05 pattern of passing state explicitly.
+
+**`rank_exit_actions()` — signal key name** · spec §4.5 · `intelligence/opportunity_ranker.py`
+- **Spec:** signal dict key is `"composite_technical_score"` (from `generate_signal_summary()`)
+- **Impl:** fixed to read `signals.get("composite_technical_score", 0.5)`; tests updated to use nested format `{"composite_technical_score": X}` matching the real TA output schema
+- **Why:** Was reading wrong key `"composite_score"`, silently defaulting to 0.5 — fixed 2026-03-15.
+
+---
+
+### Phase 08 — Strategy Modules
+
+**`Strategy._DEFAULT_PARAMS` + `_p()` helper** · spec §4.6 · `strategies/base_strategy.py`
+- **Spec:** *(not defined)*
+- **Impl:** `_DEFAULT_PARAMS: dict[str, Any] = {}` class attribute (subclasses override); `_p(key)` shorthand for `self._params[key]`
+- **Why:** Pure additions for convenience. Reduces boilerplate in strategy subclasses.
+
+**`MomentumStrategy` end-of-day exit** · spec §4.6 · `strategies/momentum_strategy.py`
+- **Spec:** "exit before 3:55 PM ET if no swing hold thesis"
+- **Impl:** Unconditional forced exit at end of day via `is_last_five_minutes()` — no swing-hold thesis check
+- **Why:** Stricter than spec; simplifies implementation. All momentum positions are exited EOD.
+
+**`get_strategy()` registry** · spec §4.6 · `strategies/base_strategy.py`
+- **Spec:** "load active strategies from config (`strategy.active_strategies`)"
+- **Impl:** Hardcoded dict `{"momentum": MomentumStrategy, "swing": SwingStrategy}`; new strategies require code changes
+- **Why:** Adequate for v3 scope; deferred config-driven loading to future phase if new strategies are added.
+
+**`SwingStrategy` trend double-check** · spec §4.6 · `strategies/swing_strategy.py`
+- **Spec:** trend-not-broken is a hard requirement
+- **Impl:** Checked twice: hard reject if `trend == "bearish_aligned"` (line 76) AND counted as soft signal condition (line 129)
+- **Why:** Redundant but not incorrect. Hard filter ensures no false positives; soft condition boosts score when trend is healthy.
+
+---
+
+### Phase 09 — Orchestrator
+
+**`DegradationState`** · spec §N/A · `core/orchestrator.py`
+- **Spec:** *(not defined)*
+- **Impl:** `DegradationState` dataclass tracks `broker_available`, `claude_available`, `market_data_available`, `safe_mode`, `claude_backoff_until_utc`. All degradation logic flows through this.
+- **Why:** Needed to coordinate backoff and safe-mode behaviour across the three loops.
+
+**`SlowLoopTriggerState`** · spec §N/A · `core/orchestrator.py`
+- **Spec:** *(not defined)*
+- **Impl:** `SlowLoopTriggerState` dataclass holds `last_claude_call_utc`, `last_trigger_prices`, `last_session`, `last_override_exit_count`, `claude_call_in_flight`.
+- **Why:** Encapsulates all mutable trigger-evaluation state to make `_check_triggers()` testable without side effects.
+
+**`_result_from_raw_reasoning()` call contract** · spec §4.3 · `intelligence/claude_reasoning.py`
+- **Spec:** *(internal helper not specified)*
+- **Impl:** Accepts the `parsed_response` sub-dict (i.e. the Claude JSON itself), NOT the full cache record. Callers must extract: `parsed = (cached or {}).get("parsed_response") or {}` before calling.
+- **Why:** `ReasoningCache.load_latest_if_fresh()` returns an envelope `{"timestamp": …, "parsed_response": {…}}`. Passing the envelope directly causes all fields to resolve to empty lists/dicts.
+
+**Claude failure backoff timing** · spec §4.3 · `core/orchestrator.py`
+- **Spec:** "exponential backoff" — values unspecified
+- **Impl:** base 30 s, doubles each failure (`30 × 2^(n-1)`), capped at 600 s. Tracked via `_claude_failure_count: int` on `Orchestrator`.
+- **Why:** Values chosen to be responsive for transient errors while not hammering the API.
+
+**`is_market_open()` in orchestrator medium loop** · spec §N/A · `core/orchestrator.py`
+- **Spec:** *(not specified for test environments)*
+- **Impl:** `is_market_open()` uses the real clock. Tests run outside NYSE hours MUST patch `ozymandias.core.orchestrator.is_market_open` to `True`, otherwise the ranker's `apply_hard_filters()` rejects all candidates.
+- **Why:** Hard filter is correct in production; patching is necessary for deterministic off-hours testing.

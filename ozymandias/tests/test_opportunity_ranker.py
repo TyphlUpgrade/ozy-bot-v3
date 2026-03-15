@@ -348,7 +348,7 @@ class TestRankOpportunities:
                          suggested_entry=100.0, suggested_exit=120.0, suggested_stop=90.0)
             for i in range(1, 6)  # convictions: 0.2, 0.4, 0.6, 0.8, 1.0
         ]
-        signals = {f"S{i}": {"composite_score": 0.5, "avg_daily_volume": 500_000}
+        signals = {f"S{i}": {"composite_technical_score": 0.5, "signals": {"avg_daily_volume": 500_000}}
                    for i in range(1, 6)}
         ranked = self._rank(opps, signals)
         assert len(ranked) == 5
@@ -410,32 +410,32 @@ class TestRankExitActions:
 
     def test_exit_has_maximum_urgency(self):
         reviews = [{"symbol": "AAPL", "action": "exit", "updated_reasoning": "thesis broken"}]
-        actions = self._rank_exits(reviews, {"AAPL": {"composite_score": 0.9}})
+        actions = self._rank_exits(reviews, {"AAPL": {"composite_technical_score": 0.9}})
         assert actions[0].urgency == pytest.approx(1.0)
         assert actions[0].action == "exit"
 
     def test_hold_has_lower_urgency_when_tech_strong(self):
         reviews = [{"symbol": "AAPL", "action": "hold", "updated_reasoning": "all good"}]
         # tech score = 0.9 → urgency = max(0, 1 - 0.9) = 0.1
-        actions = self._rank_exits(reviews, {"AAPL": {"composite_score": 0.9}})
+        actions = self._rank_exits(reviews, {"AAPL": {"composite_technical_score": 0.9}})
         assert actions[0].urgency == pytest.approx(0.1)
 
     def test_hold_has_higher_urgency_when_tech_weak(self):
         reviews = [{"symbol": "AAPL", "action": "hold", "updated_reasoning": "uncertain"}]
         # tech score = 0.2 → urgency = 0.8
-        actions = self._rank_exits(reviews, {"AAPL": {"composite_score": 0.2}})
+        actions = self._rank_exits(reviews, {"AAPL": {"composite_technical_score": 0.2}})
         assert actions[0].urgency == pytest.approx(0.8)
 
     def test_adjust_urgency_higher_when_tech_weak(self):
         reviews = [{"symbol": "AAPL", "action": "adjust", "updated_reasoning": "tighten stop"}]
         # tech score = 0.2 → urgency = 0.5 + 0.5*(1-0.2) = 0.9
-        actions = self._rank_exits(reviews, {"AAPL": {"composite_score": 0.2}})
+        actions = self._rank_exits(reviews, {"AAPL": {"composite_technical_score": 0.2}})
         assert actions[0].urgency == pytest.approx(0.9)
 
     def test_adjust_urgency_lower_when_tech_strong(self):
         reviews = [{"symbol": "AAPL", "action": "adjust", "updated_reasoning": "tweak"}]
         # tech score = 0.9 → urgency = 0.5 + 0.5*0.1 = 0.55
-        actions = self._rank_exits(reviews, {"AAPL": {"composite_score": 0.9}})
+        actions = self._rank_exits(reviews, {"AAPL": {"composite_technical_score": 0.9}})
         assert actions[0].urgency == pytest.approx(0.55)
 
     def test_mixed_hold_exit_adjust_sorted_by_urgency(self):
@@ -445,9 +445,9 @@ class TestRankExitActions:
             {"symbol": "C", "action": "adjust", "updated_reasoning": "tweak"},
         ]
         signals = {
-            "A": {"composite_score": 0.8},
-            "B": {"composite_score": 0.5},
-            "C": {"composite_score": 0.5},
+            "A": {"composite_technical_score": 0.8},
+            "B": {"composite_technical_score": 0.5},
+            "C": {"composite_technical_score": 0.5},
         }
         actions = self._rank_exits(reviews, signals)
         # exit (1.0) > adjust (0.75) > hold (0.2)
