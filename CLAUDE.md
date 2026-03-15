@@ -61,11 +61,22 @@ Features not described in the spec may be requested. When implementing them, fol
 - New loop logic → integrate into the orchestrator's existing loop structure
 - All new code uses `async`, `get_logger()`, and `StateManager`
 
-## Current Build Phase
-<!-- UPDATE THIS as you complete each phase -->
-Phase: Post-MVP  <!--All 536 tests pass: 62+28+60+81+96+52+42+47+37+14+17 (P01–P10 + anti-bias hardening)-->
-Last completed: March 15
-Next up: Paper trading monitoring
+## Post-MVP Status
+All 10 spec phases complete. The bot is feature-complete per `ozymandias_v3_spec_revised.md`.
+Current focus is post-MVP hardening and paper trading validation.
+
+<!--All 536 tests pass: 62+28+60+81+96+52+42+47+37+14+17 (P01–P10 + anti-bias hardening)-->
+Last spec phase completed: Phase 10 (March 15)
+
+### Completed post-MVP work
+- **Anti-bias hardening** (March 15): conviction sanity floor, `rejected_opportunities` logging,
+  adversarial `updated_reasoning` prompts, thesis challenge for large positions
+
+### Known gaps / next candidates
+- Paper trading monitoring (observability, dashboards, log review tooling)
+- Short selling support (requires `account_type` check from broker; `sell_short` is in the
+  opportunity schema but the orchestrator only places `buy` orders)
+- Settlement warning suppression for margin accounts (minor log hygiene; not urgent)
 
 ## Spec Drift Log
 See `DRIFT_LOG.md`. Read the relevant phase section of DRIFT_LOG.md before modifying or debugging any module built in a previous phase.
