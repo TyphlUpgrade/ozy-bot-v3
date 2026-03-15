@@ -49,6 +49,7 @@ class ClaudeConfig:
     prompt_version: str = "v3.3.0"
     tier1_max_symbols: int = 12
     tier2_max_symbols: int = 28
+    max_reasoning_interval_min: int = 60   # time-ceiling trigger threshold
 
 
 @dataclass

@@ -14,14 +14,14 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 from ozymandias.core.config import Config, load_config
 from ozymandias.core.logger import setup_logging
-from ozymandias.core.market_hours import is_market_open
+from ozymandias.core.market_hours import Session, get_current_session, is_market_open
 from ozymandias.core.reasoning_cache import ReasoningCache
 from ozymandias.core.state_manager import (
     OrderRecord,
@@ -147,6 +147,9 @@ class Orchestrator:
 
         # Count of override exits since last Claude call (feeds trigger state)
         self._override_exit_count: int = 0
+
+        # Consecutive Claude failure count — used for exponential backoff
+        self._claude_failure_count: int = 0
 
         # Shutdown flag — set by _shutdown(), checked by loops
         self._stopping = False
@@ -324,20 +327,36 @@ class Orchestrator:
         # run local checks.
         if not self._degradation.broker_available:
             log.warning("Fast loop: broker unavailable — skipping order operations")
-            await self._fast_step_pdt_check()
+            try:
+                await self._fast_step_pdt_check()
+            except Exception as exc:
+                log.error("Fast loop PDT check error: %s", exc, exc_info=True)
             return
 
+        # Each step is isolated: an exception in one must not prevent the others.
         # Step 1 & 2: poll + reconcile + handle stale orders
-        await self._fast_step_poll_and_reconcile()
+        try:
+            await self._fast_step_poll_and_reconcile()
+        except Exception as exc:
+            log.error("Fast loop poll/reconcile error: %s", exc, exc_info=True)
 
         # Step 3: quant overrides
-        await self._fast_step_quant_overrides()
+        try:
+            await self._fast_step_quant_overrides()
+        except Exception as exc:
+            log.error("Fast loop quant overrides error: %s", exc, exc_info=True)
 
         # Step 4: PDT guard check
-        await self._fast_step_pdt_check()
+        try:
+            await self._fast_step_pdt_check()
+        except Exception as exc:
+            log.error("Fast loop PDT check error: %s", exc, exc_info=True)
 
         # Step 5: position sync
-        await self._fast_step_position_sync()
+        try:
+            await self._fast_step_position_sync()
+        except Exception as exc:
+            log.error("Fast loop position sync error: %s", exc, exc_info=True)
 
     # -- Fast loop steps ----------------------------------------------------
 
@@ -866,16 +885,315 @@ class Orchestrator:
                 break  # one exit order per position per cycle
 
     # -----------------------------------------------------------------------
-    # Slow loop (stub — implemented in next phase increment)
+    # Slow loop
     # -----------------------------------------------------------------------
 
     async def _slow_loop(self) -> None:
         while not self._stopping:
             try:
-                pass  # TODO: implement slow loop
+                await self._slow_loop_cycle()
             except Exception as exc:
                 log.error("Slow loop error: %s", exc, exc_info=True)
             await asyncio.sleep(self._config.scheduler.slow_loop_check_sec)
+
+    async def _slow_loop_cycle(self) -> None:
+        """
+        One slow loop tick (runs every slow_loop_check_sec, default 5 min).
+
+        Evaluates all trigger conditions. If none fire, updates trigger state
+        and returns. If one or more fire and no Claude call is already in-flight,
+        starts a Claude reasoning cycle. The cycle is async — fast and medium
+        loops continue uninterrupted while waiting for Claude's response.
+        """
+        # Guard: never fire two concurrent Claude calls
+        if self._trigger_state.claude_call_in_flight:
+            log.debug("Slow loop: Claude call already in-flight — skipping check")
+            return
+
+        # Guard: Claude API is in backoff
+        if self._degradation.claude_backoff_until_utc is not None:
+            now = datetime.now(timezone.utc)
+            if now < self._degradation.claude_backoff_until_utc:
+                log.debug(
+                    "Slow loop: Claude in backoff until %s — skipping",
+                    self._degradation.claude_backoff_until_utc.isoformat(),
+                )
+                return
+            # Backoff expired — try again
+            self._degradation.claude_backoff_until_utc = None
+
+        triggers = await self._check_triggers()
+
+        if not triggers:
+            log.debug("Slow loop: no triggers fired — no-op")
+            await self._update_trigger_prices()
+            return
+
+        log.info("Slow loop: triggers fired — %s", triggers)
+
+        # Mark in-flight before the await so concurrent checks skip
+        self._trigger_state.claude_call_in_flight = True
+        try:
+            await self._run_claude_cycle(trigger_name="|".join(triggers))
+        finally:
+            self._trigger_state.claude_call_in_flight = False
+
+    async def _check_triggers(self) -> list[str]:
+        """
+        Evaluate all slow-loop trigger conditions.
+        Returns a list of trigger name strings (empty = no trigger).
+        """
+        triggers: list[str] = []
+        now = datetime.now(timezone.utc)
+        ts = self._trigger_state
+
+        # 1. Time ceiling: 60+ minutes since last Claude call
+        if ts.last_claude_call_utc is None:
+            triggers.append("no_previous_call")
+        else:
+            elapsed_min = (now - ts.last_claude_call_utc).total_seconds() / 60
+            if elapsed_min >= self._config.claude.max_reasoning_interval_min:
+                triggers.append("time_ceiling")
+
+        # 2. Price move: any Tier 1 symbol or position moved >2% since last eval
+        watchlist = await self._state_manager.load_watchlist()
+        portfolio = await self._state_manager.load_portfolio()
+        tracked = {e.symbol for e in watchlist.entries if e.priority_tier == 1}
+        tracked |= {p.symbol for p in portfolio.positions}
+        indicators = getattr(self, "_latest_indicators", {})
+        for symbol in tracked:
+            current_price = indicators.get(symbol, {}).get("price")
+            if current_price is None:
+                continue
+            last_price = ts.last_prices.get(symbol)
+            if last_price and abs(current_price - last_price) / last_price > 0.02:
+                triggers.append(f"price_move:{symbol}")
+
+        # 3. Position approaching target (within 1% of profit target or stop loss)
+        for pos in portfolio.positions:
+            targets = pos.intention.exit_targets
+            current = indicators.get(pos.symbol, {}).get("price")
+            if current is None:
+                continue
+            if targets.profit_target > 0:
+                pct_to_target = abs(current - targets.profit_target) / targets.profit_target
+                if pct_to_target <= 0.01:
+                    triggers.append(f"near_target:{pos.symbol}")
+            if targets.stop_loss > 0:
+                pct_to_stop = abs(current - targets.stop_loss) / targets.stop_loss
+                if pct_to_stop <= 0.01:
+                    triggers.append(f"near_stop:{pos.symbol}")
+
+        # 4. Override exit occurred since last Claude call
+        if self._override_exit_count > ts.last_override_exit_count:
+            triggers.append("override_exit")
+
+        # 5. Market session transition (open at 9:30 ET, approaching close at 3:30 ET)
+        current_session = get_current_session()
+        last_session = ts.last_session
+        if last_session != current_session.value:
+            if current_session == Session.REGULAR_HOURS:
+                triggers.append("session_open")
+            elif current_session == Session.POST_MARKET and last_session == Session.REGULAR_HOURS:
+                triggers.append("session_close")
+            # Always update last_session regardless of whether we fire
+            ts.last_session = current_session.value
+
+        # Also fire ~30 min before close (3:30 PM ET) while still in regular hours
+        if current_session == Session.REGULAR_HOURS:
+            from datetime import time as _time
+            from zoneinfo import ZoneInfo as _ZI
+            et = datetime.now(_ZI("America/New_York"))
+            if _time(15, 28) <= et.time() <= _time(15, 32):
+                # Only fire once in the ~5-min window; use time_ceiling or a flag
+                if "session_open" not in triggers and "time_ceiling" not in triggers:
+                    triggers.append("approaching_close")
+
+        # 6. Watchlist critically small
+        if len(watchlist.entries) < 10:
+            triggers.append("watchlist_small")
+
+        return triggers
+
+    async def _update_trigger_prices(self) -> None:
+        """Snapshot current prices into last_prices for next trigger comparison."""
+        indicators = getattr(self, "_latest_indicators", {})
+        for symbol, ind in indicators.items():
+            price = ind.get("price")
+            if price is not None:
+                self._trigger_state.last_prices[symbol] = price
+
+    async def _run_claude_cycle(self, trigger_name: str) -> None:
+        """
+        Assembles context, calls Claude, processes the response, and
+        updates state accordingly. On API failure, enters quantitative-only
+        mode with exponential backoff.
+        """
+        portfolio = await self._state_manager.load_portfolio()
+        watchlist = await self._state_manager.load_watchlist()
+        orders_state = await self._state_manager.load_orders()
+        indicators = getattr(self, "_latest_indicators", {})
+
+        # Build market_data context block
+        try:
+            acct = await self._broker.get_account()
+        except Exception as exc:
+            self._mark_broker_failure(exc)
+            log.warning("Slow loop: cannot fetch account for Claude context — skipping cycle")
+            return
+        self._mark_broker_available()
+
+        pdt_remaining = 3 - self._config.risk.pdt_buffer - \
+            self._pdt_guard.count_day_trades(orders_state.orders, portfolio)
+
+        market_data = {
+            "spy_trend":             "unknown",   # populated if data adapter provides it
+            "vix":                   None,
+            "sector_rotation":       "unknown",
+            "macro_events_today":    [],
+            "trading_session":       get_current_session().value,
+            "pdt_trades_remaining":  max(0, pdt_remaining),
+            "account_equity":        acct.equity,
+            "buying_power":          acct.buying_power,
+        }
+
+        log.info(
+            "Slow loop: calling Claude reasoning [trigger=%s]  "
+            "positions=%d  watchlist=%d  session=%s",
+            trigger_name,
+            len(portfolio.positions),
+            len(watchlist.entries),
+            market_data["trading_session"],
+        )
+
+        try:
+            result = await self._claude.run_reasoning_cycle(
+                portfolio=portfolio,
+                watchlist=watchlist,
+                market_data=market_data,
+                indicators=indicators,
+                trigger=trigger_name,
+                skip_cache=True,   # slow loop always wants a fresh call
+            )
+        except Exception as exc:
+            self._handle_claude_failure(exc)
+            return
+
+        if result is None:
+            log.warning("Slow loop: Claude returned unparseable response — skipping state update")
+            return
+
+        # Claude call succeeded — clear any backoff state
+        self._degradation.claude_available = True
+        self._degradation.claude_backoff_until_utc = None
+        self._trigger_state.last_claude_call_utc = datetime.now(timezone.utc)
+        self._trigger_state.last_override_exit_count = self._override_exit_count
+
+        # Snapshot current prices after a successful cycle
+        await self._update_trigger_prices()
+
+        # -- Apply watchlist changes ------------------------------------------
+        changes = result.watchlist_changes
+        add_list    = changes.get("add", [])
+        remove_list = changes.get("remove", [])
+        if add_list or remove_list:
+            await self._apply_watchlist_changes(watchlist, add_list, remove_list)
+
+        # -- Apply position review notes -------------------------------------
+        if result.position_reviews:
+            await self._apply_position_reviews(portfolio, result.position_reviews)
+
+        log.info(
+            "Slow loop: Claude cycle complete — %d new opportunities  "
+            "%d watchlist adds  %d removes  %d position reviews",
+            len(result.new_opportunities),
+            len(add_list),
+            len(remove_list),
+            len(result.position_reviews),
+        )
+
+    def _handle_claude_failure(self, exc: Exception) -> None:
+        """Enter quantitative-only mode; schedule exponential backoff retry."""
+        now = datetime.now(timezone.utc)
+        # Exponential backoff: base 30s, doubles each failure, cap 10 min
+        if self._degradation.claude_available:
+            self._degradation.claude_available = False
+            self._claude_failure_count = 1
+        else:
+            self._claude_failure_count = getattr(self, "_claude_failure_count", 1) + 1
+
+        backoff_sec = min(30 * (2 ** (self._claude_failure_count - 1)), 600)
+        self._degradation.claude_backoff_until_utc = now + timedelta(seconds=backoff_sec)
+        log.error(
+            "Claude API failure (attempt %d): %s — quantitative-only mode, "
+            "retry in %ds",
+            self._claude_failure_count, exc, backoff_sec,
+        )
+
+    async def _apply_watchlist_changes(
+        self,
+        watchlist: "WatchlistState",
+        add_list: list[dict],
+        remove_list: list[str],
+    ) -> None:
+        """Apply Claude-suggested watchlist additions and removals."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        from ozymandias.core.state_manager import WatchlistEntry
+
+        existing_symbols = {e.symbol for e in watchlist.entries}
+
+        for item in add_list:
+            symbol = item.get("symbol", "").upper()
+            if not symbol or symbol in existing_symbols:
+                continue
+            watchlist.entries.append(WatchlistEntry(
+                symbol=symbol,
+                date_added=now_iso,
+                reason=item.get("reason", "Added by Claude"),
+                priority_tier=item.get("priority_tier", 1),
+                strategy=item.get("strategy", "both"),
+            ))
+            existing_symbols.add(symbol)
+            log.info("Watchlist: added %s (tier=%s)", symbol, item.get("priority_tier", 1))
+
+        if remove_list:
+            before = len(watchlist.entries)
+            watchlist.entries = [
+                e for e in watchlist.entries if e.symbol not in remove_list
+            ]
+            removed = before - len(watchlist.entries)
+            if removed:
+                log.info("Watchlist: removed %d symbol(s): %s", removed, remove_list)
+
+        await self._state_manager.save_watchlist(watchlist)
+
+    async def _apply_position_reviews(
+        self,
+        portfolio: "PortfolioState",
+        reviews: list[dict],
+    ) -> None:
+        """Append Claude's review notes to each position's intention."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        changed = False
+        for review in reviews:
+            symbol = review.get("symbol", "")
+            for pos in portfolio.positions:
+                if pos.symbol != symbol:
+                    continue
+                note = review.get("updated_reasoning") or review.get("notes", "")
+                if note:
+                    pos.intention.review_notes.append(f"[{now_iso}] {note}")
+                    changed = True
+                # Apply adjusted targets if provided
+                adj = review.get("adjusted_targets") or {}
+                if adj.get("profit_target"):
+                    pos.intention.exit_targets.profit_target = float(adj["profit_target"])
+                    changed = True
+                if adj.get("stop_loss"):
+                    pos.intention.exit_targets.stop_loss = float(adj["stop_loss"])
+                    changed = True
+        if changed:
+            await self._state_manager.save_portfolio(portfolio)
 
     # -----------------------------------------------------------------------
     # Degradation helpers
