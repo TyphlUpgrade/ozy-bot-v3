@@ -665,7 +665,8 @@ class Orchestrator:
         # still score the technically-detected signals.
         cached_raw = self._reasoning_cache.load_latest_if_fresh()
         if cached_raw:
-            reasoning_result = _result_from_raw_reasoning(cached_raw)
+            parsed = cached_raw.get("parsed_response") or {}
+            reasoning_result = _result_from_raw_reasoning(parsed)
         else:
             reasoning_result = ReasoningResult(
                 timestamp=datetime.now(timezone.utc).isoformat(),
