@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 from ozymandias.core.config import Config, load_config
 from ozymandias.core.logger import setup_logging
+from ozymandias.core.market_hours import is_market_open
 from ozymandias.core.reasoning_cache import ReasoningCache
 from ozymandias.core.state_manager import (
     OrderRecord,
@@ -34,7 +35,11 @@ from ozymandias.execution.broker_interface import BrokerInterface, Order
 from ozymandias.execution.fill_protection import FillProtectionManager
 from ozymandias.execution.pdt_guard import PDTGuard
 from ozymandias.execution.risk_manager import RiskManager
-from ozymandias.intelligence.claude_reasoning import ClaudeReasoningEngine
+from ozymandias.intelligence.claude_reasoning import (
+    ClaudeReasoningEngine,
+    ReasoningResult,
+    _result_from_raw_reasoning,
+)
 from ozymandias.intelligence.opportunity_ranker import OpportunityRanker
 from ozymandias.intelligence.technical_analysis import generate_signal_summary
 from ozymandias.strategies.base_strategy import Strategy
@@ -569,16 +574,295 @@ class Orchestrator:
                 )
 
     # -----------------------------------------------------------------------
-    # Medium loop (stub — implemented in next phase increment)
+    # Medium loop
     # -----------------------------------------------------------------------
 
     async def _medium_loop(self) -> None:
         while not self._stopping:
             try:
-                pass  # TODO: implement medium loop
+                await self._medium_loop_cycle()
             except Exception as exc:
                 log.error("Medium loop error: %s", exc, exc_info=True)
             await asyncio.sleep(self._config.scheduler.medium_loop_sec)
+
+    async def _medium_loop_cycle(self) -> None:
+        """
+        One medium loop tick. Steps:
+        1. Fetch latest bars for Tier 1 watchlist symbols + open positions.
+        2. Run TA on all fetched data; cache indicators for fast loop.
+        3. Detect entry signals via active strategies.
+        4. Re-rank opportunity queue using cached Claude reasoning + fresh TA.
+        5. Execute top opportunity (one per cycle) if risk-validated.
+        6. Re-evaluate open positions; exit if strategy recommends it.
+        """
+        if self._degradation.market_data_available is False:
+            log.warning("Medium loop: market data unavailable — skipping cycle")
+            return
+
+        # -- Step 1: gather symbols to scan ----------------------------------
+        watchlist = await self._state_manager.load_watchlist()
+        portfolio = await self._state_manager.load_portfolio()
+        orders_state = await self._state_manager.load_orders()
+
+        tier1_symbols = [e.symbol for e in watchlist.entries if e.priority_tier == 1]
+        position_symbols = [p.symbol for p in portfolio.positions]
+        scan_symbols = list(dict.fromkeys(tier1_symbols + position_symbols))  # dedup, order-preserving
+
+        if not scan_symbols:
+            log.debug("Medium loop: no symbols to scan")
+            return
+
+        # -- Step 2: fetch bars + run TA -------------------------------------
+        indicators: dict[str, dict] = {}  # symbol → full generate_signal_summary() output
+        bars: dict[str, object] = {}      # symbol → DataFrame
+
+        for symbol in scan_symbols:
+            try:
+                df = await self._data_adapter.fetch_bars(symbol, interval="5m", period="1d")
+                if df is None or df.empty:
+                    log.warning("Medium loop: no bars returned for %s", symbol)
+                    continue
+                summary = generate_signal_summary(symbol, df)
+                indicators[symbol] = summary
+                bars[symbol] = df
+            except Exception as exc:
+                log.warning("Medium loop: TA failed for %s: %s", symbol, exc)
+
+        if not indicators:
+            log.warning("Medium loop: TA produced no results — all fetches failed")
+            self._degradation.market_data_available = False
+            return
+
+        self._degradation.market_data_available = True
+
+        # Cache indicators for the fast loop (quant overrides)
+        self._latest_indicators = {sym: v["signals"] for sym, v in indicators.items()}
+
+        log.debug("Medium loop: scanned %d symbol(s)", len(indicators))
+
+        # -- Step 3: detect entry signals ------------------------------------
+        # {symbol: [Signal, ...]}
+        entry_signals: dict[str, list] = {}
+        for symbol, summary in indicators.items():
+            df = bars.get(symbol)
+            if df is None:
+                continue
+            sigs_flat = summary["signals"]
+            for strategy in self._strategies:
+                try:
+                    sigs = await strategy.generate_signals(symbol, df, sigs_flat)
+                    if sigs:
+                        entry_signals.setdefault(symbol, []).extend(sigs)
+                except Exception as exc:
+                    log.warning(
+                        "Medium loop: generate_signals failed for %s/%s: %s",
+                        symbol, type(strategy).__name__, exc,
+                    )
+
+        # -- Step 4: re-rank opportunity queue --------------------------------
+        # Load the most recent Claude reasoning result from cache.
+        # If no cache hit, build an empty ReasoningResult so the ranker can
+        # still score the technically-detected signals.
+        cached_raw = self._reasoning_cache.load_latest_if_fresh()
+        if cached_raw:
+            reasoning_result = _result_from_raw_reasoning(cached_raw)
+        else:
+            reasoning_result = ReasoningResult(
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                position_reviews=[],
+                new_opportunities=[],
+                watchlist_changes={"add": [], "remove": [], "rationale": ""},
+                market_assessment="unknown",
+                risk_flags=[],
+                raw={},
+            )
+
+        try:
+            acct = await self._broker.get_account()
+        except Exception as exc:
+            self._mark_broker_failure(exc)
+            return
+        self._mark_broker_available()
+
+        ranked = self._ranker.rank_opportunities(
+            reasoning_result,
+            indicators,
+            acct,
+            portfolio,
+            self._pdt_guard,
+            is_market_open,
+            orders=orders_state.orders,
+        )
+
+        log.debug(
+            "Medium loop: ranker returned %d opportunity/ies (from %d Claude candidates)",
+            len(ranked), len(reasoning_result.new_opportunities),
+        )
+
+        # -- Step 5: execute top opportunity (one per cycle) -----------------
+        if not self._degradation.safe_mode and ranked:
+            top = ranked[0]
+            await self._medium_try_entry(top, acct, portfolio, orders_state.orders)
+
+        # -- Step 6: re-evaluate open positions ------------------------------
+        await self._medium_evaluate_positions(portfolio, bars, indicators, acct, orders_state.orders)
+
+    async def _medium_try_entry(self, top, acct, portfolio, orders) -> None:
+        """Validate and execute a single entry order for the top-ranked opportunity."""
+        symbol = top.symbol
+        entry_price = top.suggested_entry
+        strategy_name = top.strategy
+
+        # Determine ATR for position sizing
+        ind = self._latest_indicators.get(symbol, {})
+        atr = ind.get("atr_14", 0.0)
+        avg_vol = ind.get("avg_daily_volume")
+
+        quantity = self._risk_manager.calculate_position_size(
+            symbol, entry_price, atr, acct.equity
+        )
+        if quantity <= 0:
+            log.debug("Medium loop: position size = 0 for %s — skipping", symbol)
+            return
+
+        allowed, reason = self._risk_manager.validate_entry(
+            symbol=symbol,
+            side="buy",
+            quantity=quantity,
+            price=entry_price,
+            strategy=strategy_name,
+            account=acct,
+            portfolio=portfolio,
+            orders=orders,
+            avg_daily_volume=avg_vol,
+        )
+        if not allowed:
+            log.debug("Medium loop: entry blocked for %s — %s", symbol, reason)
+            return
+
+        if not self._fill_protection.can_place_order(symbol):
+            log.debug("Medium loop: fill protection blocking entry for %s", symbol)
+            return
+
+        order = Order(
+            symbol=symbol,
+            side="buy",
+            quantity=quantity,
+            order_type="limit",
+            limit_price=entry_price,
+            time_in_force="day",
+        )
+        try:
+            result = await self._broker.place_order(order)
+        except Exception as exc:
+            self._mark_broker_failure(exc)
+            return
+        self._mark_broker_available()
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        record = OrderRecord(
+            order_id=result.order_id,
+            symbol=symbol,
+            side="buy",
+            quantity=quantity,
+            order_type="limit",
+            limit_price=entry_price,
+            status="PENDING",
+            created_at=now_iso,
+            last_checked_at=now_iso,
+        )
+        await self._fill_protection.record_order(record)
+        log.info(
+            "Entry order placed — %s  qty=%d  limit=%.2f  strategy=%s  score=%.3f",
+            symbol, quantity, entry_price, strategy_name, top.composite_score,
+        )
+
+    async def _medium_evaluate_positions(self, portfolio, bars, indicators, acct, orders) -> None:
+        """Run evaluate_position() on each open position; exit if recommended."""
+        for position in portfolio.positions:
+            symbol = position.symbol
+            df = bars.get(symbol)
+            ind_summary = indicators.get(symbol)
+            if df is None or ind_summary is None:
+                log.debug("Medium loop: no data for position %s — skipping eval", symbol)
+                continue
+
+            sigs_flat = ind_summary["signals"]
+
+            for strategy in self._strategies:
+                try:
+                    eval_result = await strategy.evaluate_position(position, df, sigs_flat)
+                except Exception as exc:
+                    log.warning(
+                        "Medium loop: evaluate_position failed %s/%s: %s",
+                        symbol, type(strategy).__name__, exc,
+                    )
+                    continue
+
+                if eval_result.action != "exit":
+                    continue
+
+                log.info(
+                    "Medium loop: strategy exit signal — %s  action=%s  confidence=%.2f  reason=%s",
+                    symbol, eval_result.action, eval_result.confidence, eval_result.reasoning,
+                )
+
+                if not self._fill_protection.can_place_order(symbol):
+                    log.warning(
+                        "Medium loop: exit blocked for %s — pending order exists", symbol
+                    )
+                    break
+
+                # Get suggested exit parameters
+                try:
+                    exit_sug = await strategy.suggest_exit(position, df, sigs_flat)
+                except Exception as exc:
+                    log.warning("Medium loop: suggest_exit failed %s: %s", symbol, exc)
+                    exit_sug = None
+
+                if exit_sug and exit_sug.order_type == "limit" and exit_sug.exit_price > 0:
+                    exit_order = Order(
+                        symbol=symbol,
+                        side="sell",
+                        quantity=position.shares,
+                        order_type="limit",
+                        limit_price=exit_sug.exit_price,
+                        time_in_force="day",
+                    )
+                else:
+                    exit_order = Order(
+                        symbol=symbol,
+                        side="sell",
+                        quantity=position.shares,
+                        order_type="market",
+                        time_in_force="day",
+                    )
+
+                try:
+                    result = await self._broker.place_order(exit_order)
+                except Exception as exc:
+                    self._mark_broker_failure(exc)
+                    break
+                self._mark_broker_available()
+
+                now_iso = datetime.now(timezone.utc).isoformat()
+                record = OrderRecord(
+                    order_id=result.order_id,
+                    symbol=symbol,
+                    side="sell",
+                    quantity=position.shares,
+                    order_type=exit_order.order_type,
+                    limit_price=exit_order.limit_price,
+                    status="PENDING",
+                    created_at=now_iso,
+                    last_checked_at=now_iso,
+                )
+                await self._fill_protection.record_order(record)
+                log.info(
+                    "Exit order placed — %s  qty=%d  type=%s  strategy=%s",
+                    symbol, position.shares, exit_order.order_type, type(strategy).__name__,
+                )
+                break  # one exit order per position per cycle
 
     # -----------------------------------------------------------------------
     # Slow loop (stub — implemented in next phase increment)
