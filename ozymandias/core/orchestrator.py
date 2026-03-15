@@ -1484,10 +1484,57 @@ class Orchestrator:
     # -----------------------------------------------------------------------
 
     def _load_credentials(self) -> tuple[str, str]:
-        """Read Alpaca API credentials from the configured credentials file."""
+        """
+        Read all API credentials from the configured credentials file and
+        inject them into the process environment.
+
+        Supports two file formats:
+        - Encrypted: Fernet token (detected by b'gAAAAA' prefix). Decrypted
+          using the key at config.broker.credentials_key_file.
+        - Plaintext: plain JSON. Accepted without decryption for recovery /
+          initial setup.
+
+        After parsing, sets ANTHROPIC_API_KEY in os.environ (if present in
+        the file and not already set externally) so the Anthropic SDK picks
+        it up automatically when ClaudeReasoningEngine initialises its client.
+
+        Returns (alpaca_api_key, alpaca_secret_key).
+        """
+        import os
+        from cryptography.fernet import Fernet, InvalidToken
+
         creds_path = self._config.credentials_path
-        with open(creds_path, "r", encoding="utf-8") as fh:
-            creds = json.load(fh)
+        raw = creds_path.read_bytes()
+
+        if raw.lstrip().startswith(b"gAAAAA"):
+            # Encrypted — load key from keyfile
+            key_path = Path(self._config.broker.credentials_key_file).expanduser()
+            if not key_path.exists():
+                raise RuntimeError(
+                    f"credentials file is encrypted but key file not found: {key_path}\n"
+                    f"Generate a key with:  python scripts/encrypt_credentials.py --keygen"
+                )
+            key = key_path.read_bytes().strip()
+            try:
+                raw = Fernet(key).decrypt(raw.strip())
+            except InvalidToken as exc:
+                raise RuntimeError(
+                    f"Failed to decrypt credentials — wrong key or corrupted file: {exc}"
+                ) from exc
+            log.debug("Credentials decrypted from %s using key at %s", creds_path, key_path)
+        else:
+            log.debug("Credentials loaded as plaintext from %s", creds_path)
+
+        creds = json.loads(raw)
+
+        # Inject Anthropic key into env if present and not already set externally
+        anthropic_key = creds.get("anthropic_api_key")
+        if anthropic_key and not os.environ.get("ANTHROPIC_API_KEY"):
+            os.environ["ANTHROPIC_API_KEY"] = anthropic_key
+            log.debug("ANTHROPIC_API_KEY set from credentials file")
+        elif os.environ.get("ANTHROPIC_API_KEY"):
+            log.debug("ANTHROPIC_API_KEY already set in environment — credentials file value ignored")
+
         api_key = creds.get("api_key") or creds.get("APCA_API_KEY_ID")
         secret_key = creds.get("secret_key") or creds.get("APCA_API_SECRET_KEY")
         if not api_key or not secret_key:

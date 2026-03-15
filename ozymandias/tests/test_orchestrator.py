@@ -741,3 +741,110 @@ class TestThesisChallenge:
 
         assert len(placed_orders) == 1
         assert placed_orders[0].quantity == 10
+
+
+# ===========================================================================
+# Credentials loading — plaintext and encrypted paths
+# ===========================================================================
+
+class TestLoadCredentials:
+
+    def _make_orch(self, tmp_path):
+        """Return an Orchestrator with _config._config_dir pointed at tmp_path."""
+        with (
+            patch("ozymandias.execution.alpaca_broker.AlpacaBroker.__init__", MagicMock(return_value=None)),
+            patch("ozymandias.execution.alpaca_broker.AlpacaBroker.get_account", AsyncMock(return_value=_stub_account())),
+            patch("ozymandias.execution.alpaca_broker.AlpacaBroker.get_market_hours", AsyncMock(return_value=_stub_hours())),
+            patch("anthropic.AsyncAnthropic", MagicMock),
+            patch("ozymandias.core.orchestrator.Orchestrator._load_credentials", MagicMock(return_value=("k", "s"))),
+        ):
+            o = Orchestrator()
+            o._state_manager._dir = tmp_path
+            o._reasoning_cache._dir = tmp_path / "cache"
+            o._reasoning_cache._dir.mkdir()
+        o._config._config_dir = tmp_path
+        return o
+
+    def test_plaintext_credentials_loaded(self, tmp_path):
+        import json, os
+        creds = {"api_key": "KEY123", "secret_key": "SECRET456", "anthropic_api_key": "ANT123"}
+        (tmp_path / "credentials.enc").write_text(json.dumps(creds))
+        o = self._make_orch(tmp_path)
+        env_before = os.environ.pop("ANTHROPIC_API_KEY", None)
+        try:
+            api_key, secret_key = o._load_credentials()
+            assert api_key == "KEY123"
+            assert secret_key == "SECRET456"
+            assert os.environ.get("ANTHROPIC_API_KEY") == "ANT123"
+        finally:
+            if env_before is not None:
+                os.environ["ANTHROPIC_API_KEY"] = env_before
+            else:
+                os.environ.pop("ANTHROPIC_API_KEY", None)
+
+    def test_anthropic_key_not_overwritten_if_env_set(self, tmp_path):
+        import json, os
+        creds = {"api_key": "K", "secret_key": "S", "anthropic_api_key": "FROM_FILE"}
+        (tmp_path / "credentials.enc").write_text(json.dumps(creds))
+        o = self._make_orch(tmp_path)
+        os.environ["ANTHROPIC_API_KEY"] = "FROM_ENV"
+        try:
+            o._load_credentials()
+            assert os.environ["ANTHROPIC_API_KEY"] == "FROM_ENV"
+        finally:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+
+    def test_encrypted_credentials_loaded(self, tmp_path):
+        import json
+        from cryptography.fernet import Fernet
+        key = Fernet.generate_key()
+        key_file = tmp_path / ".ozy_key"
+        key_file.write_bytes(key)
+
+        creds = {"api_key": "ENC_KEY", "secret_key": "ENC_SECRET"}
+        encrypted = Fernet(key).encrypt(json.dumps(creds).encode())
+        (tmp_path / "credentials.enc").write_bytes(encrypted)
+
+        o = self._make_orch(tmp_path)
+        o._config.broker.credentials_key_file = str(key_file)
+        api_key, secret_key = o._load_credentials()
+        assert api_key == "ENC_KEY"
+        assert secret_key == "ENC_SECRET"
+
+    def test_encrypted_missing_key_file_raises(self, tmp_path):
+        from cryptography.fernet import Fernet
+        import json
+        key = Fernet.generate_key()
+        creds = {"api_key": "K", "secret_key": "S"}
+        encrypted = Fernet(key).encrypt(json.dumps(creds).encode())
+        (tmp_path / "credentials.enc").write_bytes(encrypted)
+
+        o = self._make_orch(tmp_path)
+        o._config.broker.credentials_key_file = str(tmp_path / "nonexistent.key")
+        with pytest.raises(RuntimeError, match="key file not found"):
+            o._load_credentials()
+
+    def test_encrypted_wrong_key_raises(self, tmp_path):
+        from cryptography.fernet import Fernet
+        import json
+        key_correct = Fernet.generate_key()
+        key_wrong = Fernet.generate_key()
+        key_file = tmp_path / ".ozy_key"
+        key_file.write_bytes(key_wrong)
+
+        creds = {"api_key": "K", "secret_key": "S"}
+        encrypted = Fernet(key_correct).encrypt(json.dumps(creds).encode())
+        (tmp_path / "credentials.enc").write_bytes(encrypted)
+
+        o = self._make_orch(tmp_path)
+        o._config.broker.credentials_key_file = str(key_file)
+        with pytest.raises(RuntimeError, match="decrypt"):
+            o._load_credentials()
+
+    def test_missing_api_key_field_raises(self, tmp_path):
+        import json
+        creds = {"wrong_field": "x"}
+        (tmp_path / "credentials.enc").write_text(json.dumps(creds))
+        o = self._make_orch(tmp_path)
+        with pytest.raises(RuntimeError, match="api_key"):
+            o._load_credentials()

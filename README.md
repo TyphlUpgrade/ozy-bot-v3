@@ -13,21 +13,62 @@ An automated stock trading bot that combines Claude AI strategic reasoning with 
 ### 1. Install dependencies
 
 ```bash
-pip install aiohttp>=3.9 alpaca-py>=0.30 yfinance>=0.2.31 \
-            pandas>=2.1 numpy>=1.26 anthropic>=0.40 python-dateutil>=2.8
+pip install -r requirements.txt
 ```
 
 ### 2. Configure credentials
 
-Create `ozymandias/config/credentials.enc` (plain JSON — the `.enc` extension is a naming convention, not actual encryption in v3):
+`ozymandias/config/credentials.enc` holds all API keys. The bot supports both plaintext (for initial setup) and Fernet-encrypted formats.
+
+#### Plaintext format (exact — field names are case-sensitive)
 
 ```json
 {
-  "api_key": "YOUR_ALPACA_API_KEY",
+  "api_key": "YOUR_ALPACA_API_KEY_ID",
   "secret_key": "YOUR_ALPACA_SECRET_KEY",
   "anthropic_api_key": "YOUR_ANTHROPIC_API_KEY"
 }
 ```
+
+- `api_key` — Alpaca API Key ID (found under Paper Trading → API Keys at alpaca.markets)
+- `secret_key` — Alpaca Secret Key (shown once at creation time)
+- `anthropic_api_key` — Anthropic API key (console.anthropic.com → API Keys)
+
+**Do not rename these fields.** The loader checks exact key names. The file must be valid JSON with no trailing commas.
+
+#### Encrypting credentials (recommended)
+
+Once the plaintext file is working, encrypt it:
+
+```bash
+# Generate a key (written to ~/.ozy_key, mode 600)
+python scripts/encrypt_credentials.py --keygen
+
+# Encrypt credentials.enc in place
+python scripts/encrypt_credentials.py --encrypt
+```
+
+The key file (`~/.ozy_key`) must be present at startup. **Back it up somewhere secure** — without it the encrypted credentials file is unreadable and unrecoverable.
+
+#### Credentials management reference
+
+| Command | Effect |
+|---|---|
+| `--keygen` | Generate a new key at `~/.ozy_key` |
+| `--encrypt` | Encrypt plaintext `credentials.enc` in place |
+| `--decrypt` | Decrypt back to plaintext (for editing or recovery) |
+| `--rekey` | Rotate to a new key; re-encrypts atomically |
+| `--key-file PATH` | Override key file location |
+| `--creds-file PATH` | Override credentials file location |
+
+#### Recovery if the key is lost
+
+The encrypted file cannot be recovered without the key. Steps to recover:
+
+1. Delete `credentials.enc`
+2. Create a fresh plaintext file using the exact format above
+3. Validate it works: `PYTHONPATH=. python scripts/validate_config.py`
+4. Re-encrypt: `python scripts/encrypt_credentials.py --keygen --encrypt`
 
 ### 3. Review config
 

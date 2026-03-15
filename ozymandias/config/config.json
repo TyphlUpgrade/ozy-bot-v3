@@ -3,6 +3,7 @@
     "name": "alpaca",
     "environment": "paper",
     "credentials_file": "credentials.enc",
+    "credentials_key_file": "~/.ozy_key",
     "base_url_paper": "https://paper-api.alpaca.markets",
     "base_url_live": "https://api.alpaca.markets"
   },

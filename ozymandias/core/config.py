@@ -19,6 +19,7 @@ class BrokerConfig:
     name: str = "alpaca"
     environment: str = "paper"
     credentials_file: str = "credentials.enc"
+    credentials_key_file: str = "~/.ozy_key"  # path to Fernet key for credentials decryption
     base_url_paper: str = "https://paper-api.alpaca.markets"
     base_url_live: str = "https://api.alpaca.markets"
 
