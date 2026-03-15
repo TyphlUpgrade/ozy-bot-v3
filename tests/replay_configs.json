@@ -1,0 +1,118 @@
+{
+  "_comment": "Historical replay configuration. Edit this file to adjust what the script tests.",
+
+  "globals": {
+    "symbols":           ["TSLA", "NVDA", "AMD", "META", "AAPL", "GOOGL", "AMZN", "NFLX", "COIN", "PLTR"],
+    "period":            "14d",
+    "interval":          "5m",
+    "warmup_bars":       60,
+
+    "periods":           ["14d", "30d", "60d"],
+    "_comment_periods":  "Used by --multi-period. Runs the full config grid across each period independently. 'period' (below) is still used for --grid and single-config runs.",
+
+    "exclude_open_close_mins": 30,
+    "_comment_open_close": "Skip the first and last N minutes of each trading session. 5-min bars during open/close are disproportionately noisy. Set to 0 to disable.",
+
+    "reentry_cooldown_bars": 12,
+    "_comment_cooldown": "After a stop-out, ignore new entry signals for this many bars on the same symbol+strategy. At 5-min intervals, 12 bars = 1 hour. Set to 0 to disable."
+  },
+
+  "configs": [
+    {
+      "name":     "baseline",
+      "label":    "baseline (strategy defaults)",
+      "interval": "1h",
+      "momentum": {},
+      "swing":    {}
+    },
+    {
+      "name":    "momentum_tight",
+      "label":   "momentum-only, tight (5/6, vol 1.5, RSI 45-65)",
+      "momentum": {
+        "min_signals_for_entry":   5,
+        "min_volume_ratio":        1.5,
+        "rsi_entry_min":           45,
+        "rsi_entry_max":           65,
+        "exclude_open_close_mins": 0,
+        "reentry_cooldown_bars":   6
+      },
+      "swing": null
+    },
+    {
+      "name":    "momentum_strict",
+      "label":   "momentum-only, strict (5/6, vol 1.8, RSI 50-65)",
+      "momentum": {
+        "min_signals_for_entry":   5,
+        "min_volume_ratio":        1.8,
+        "rsi_entry_min":           50,
+        "rsi_entry_max":           65,
+        "exclude_open_close_mins": 0,
+        "reentry_cooldown_bars":   6
+      },
+      "swing": null
+    },
+    {
+      "name":     "swing_only",
+      "label":    "swing-only (strategy defaults, 1h bars)",
+      "interval": "1h",
+      "momentum": null,
+      "swing":    {}
+    },
+    {
+      "name":     "swing_only_filtered",
+      "label":    "swing-only, filtered (excl=30, cool=12, min_sig=4)",
+      "interval": "1h",
+      "momentum": null,
+      "swing": {
+        "min_signals_for_entry":   4,
+        "exclude_open_close_mins": 30,
+        "reentry_cooldown_bars":   12
+      }
+    },
+    {
+      "name":     "momentum_tight_plus_swing_full",
+      "label":    "momentum tight + swing 5/5",
+      "interval": "1h",
+      "momentum": {
+        "min_signals_for_entry": 5,
+        "min_volume_ratio":      1.5,
+        "rsi_entry_min":         45,
+        "rsi_entry_max":         65
+      },
+      "swing": {
+        "min_signals_for_entry": 5
+      }
+    },
+    {
+      "name":     "best_of_each",
+      "label":    "best-of: momentum defaults+open window, swing defaults+filter",
+      "interval": "1h",
+      "momentum": {
+        "exclude_open_close_mins": 0,
+        "reentry_cooldown_bars":   12
+      },
+      "swing": {
+        "exclude_open_close_mins": 30,
+        "reentry_cooldown_bars":   12
+      }
+    },
+    {
+      "name":     "split_filters",
+      "label":    "momentum open (excl=0, cool=6) + swing filtered (excl=30, cool=24)",
+      "interval": "1h",
+      "momentum": {
+        "min_signals_for_entry":   5,
+        "min_volume_ratio":        1.5,
+        "rsi_entry_min":           45,
+        "rsi_entry_max":           65,
+        "exclude_open_close_mins": 0,
+        "reentry_cooldown_bars":   6
+      },
+      "swing": {
+        "min_signals_for_entry":   4,
+        "exclude_open_close_mins": 30,
+        "reentry_cooldown_bars":   24
+      }
+    }
+  ]
+}

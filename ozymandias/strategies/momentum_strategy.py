@@ -60,6 +60,9 @@ class MomentumStrategy(Strategy):
         "min_signals_for_entry": 4,
         "partial_profit_pct": 0.5,      # fraction to exit at profit target
         "profit_target_proximity_pct": 2.0,  # % from target to trigger scale-out
+        # Volatility regime gate: block entries when short-term vol / long-term vol
+        # falls below this ratio (choppy / low-energy market with no directional thrust).
+        "min_vol_regime_ratio": 0.75,
     }
 
     # ------------------------------------------------------------------
@@ -76,6 +79,13 @@ class MomentumStrategy(Strategy):
         Return a momentum :class:`Signal` when ≥ ``min_signals_for_entry``
         conditions are met, otherwise return an empty list.
         """
+        # Hard gate: require a trending/directional regime before counting conditions.
+        # When short-term vol is well below long-term vol the market is choppy —
+        # momentum entries in that regime get stopped out by noise.
+        vol_regime = float(indicators.get("vol_regime_ratio", 1.0))
+        if vol_regime < self._p("min_vol_regime_ratio"):
+            return []
+
         conditions, weights = self._evaluate_entry_conditions(indicators)
         n_met = sum(1 for v in conditions.values() if v)
 

@@ -157,6 +157,27 @@ def compute_volume_sma(df: pd.DataFrame, length: int = 20) -> pd.Series:
     return df['volume'].rolling(length).mean().rename('volume_sma')
 
 
+def compute_volatility_regime(
+    df: pd.DataFrame,
+    short: int = 20,
+    long: int = 100,
+) -> pd.Series:
+    """
+    Volatility regime ratio: rolling_std(log_returns, short) / rolling_std(log_returns, long).
+
+    > 1.0 → short-term vol exceeds long-term → trending / directional regime
+    < 1.0 → short-term vol below long-term  → choppy / mean-reverting regime
+
+    Uses log returns so the ratio is scale-independent.
+    Returns NaN where either window hasn't warmed up.
+    """
+    log_returns = np.log(df['close'] / df['close'].shift(1))
+    short_std = log_returns.rolling(short).std()
+    long_std  = log_returns.rolling(long).std()
+    ratio = short_std / long_std.replace(0.0, np.nan)
+    return ratio.rename('vol_regime_ratio')
+
+
 # ---------------------------------------------------------------------------
 # Signal detection
 # ---------------------------------------------------------------------------
@@ -381,20 +402,22 @@ def generate_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
     ema_50  = compute_ema(df['close'], 50)
     ema_200 = compute_ema(df['close'], 200)
 
-    vwap    = compute_vwap(df)
-    rsi     = compute_rsi(df)
-    macd_df = compute_macd(df)
-    roc     = compute_roc(df)
-    atr     = compute_atr(df)
-    bb      = compute_bollinger_bands(df)
-    vol_sma = compute_volume_sma(df)
+    vwap       = compute_vwap(df)
+    rsi        = compute_rsi(df)
+    macd_df    = compute_macd(df)
+    roc        = compute_roc(df)
+    atr        = compute_atr(df)
+    bb         = compute_bollinger_bands(df)
+    vol_sma    = compute_volume_sma(df)
+    vol_regime = compute_volatility_regime(df)
 
     # --- Extract latest values with NaN-safe defaults ---
     last_close   = float(df['close'].iloc[-1])
     last_vwap    = float(vwap.iloc[-1])   if not pd.isna(vwap.iloc[-1])   else last_close
     last_rsi     = float(rsi.iloc[-1])    if not pd.isna(rsi.iloc[-1])    else 50.0
-    last_roc     = float(roc.iloc[-1])    if not pd.isna(roc.iloc[-1])    else 0.0
-    last_atr     = float(atr.iloc[-1])    if not pd.isna(atr.iloc[-1])    else 0.0
+    last_roc        = float(roc.iloc[-1])        if not pd.isna(roc.iloc[-1])        else 0.0
+    last_atr        = float(atr.iloc[-1])        if not pd.isna(atr.iloc[-1])        else 0.0
+    last_vol_regime = float(vol_regime.iloc[-1]) if not pd.isna(vol_regime.iloc[-1]) else 1.0
     last_vol     = float(df['volume'].iloc[-1])
     # If the 20-bar vol SMA hasn't warmed up yet, use the mean of all available
     # bars as a proxy rather than last_vol (which would always produce ratio=1.0
@@ -464,6 +487,7 @@ def generate_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
         'bollinger_position': bollinger_position,
         'price':            round(last_close, 4),
         'avg_daily_volume': round(avg_daily_volume, 0),
+        'vol_regime_ratio': round(last_vol_regime, 4),
     }
 
     return {

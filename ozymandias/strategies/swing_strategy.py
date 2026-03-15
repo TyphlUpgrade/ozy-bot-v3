@@ -55,6 +55,9 @@ class SwingStrategy(Strategy):
         "panic_volume_ratio": 1.5,      # above this → panic selling, skip
         "min_signals_for_entry": 4,     # out of 5; longterm_trend_ok is also a hard filter
         "profit_target_proximity_pct": 2.0,
+        # Volatility regime gate: swing trades tolerate quieter regimes than momentum
+        # but still need some directional energy to avoid pure chop stop-outs.
+        "min_vol_regime_ratio": 0.70,
     }
 
     # ------------------------------------------------------------------
@@ -74,6 +77,11 @@ class SwingStrategy(Strategy):
         # Hard requirement: long-term trend must not be broken.
         # Swing trading is "buying the dip in an uptrend" — no uptrend means no entry.
         if indicators.get("trend_structure") == "bearish_aligned":
+            return []
+
+        # Hard gate: require minimum volatility regime energy.
+        vol_regime = float(indicators.get("vol_regime_ratio", 1.0))
+        if vol_regime < self._p("min_vol_regime_ratio"):
             return []
 
         conditions, weights = self._evaluate_entry_conditions(indicators)
