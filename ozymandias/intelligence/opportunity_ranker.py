@@ -60,6 +60,7 @@ class ScoredOpportunity:
     suggested_stop: float
     position_size_pct: float    # fraction of portfolio (e.g. 0.10 = 10%)
     reasoning: str
+    require_strong_entry: bool = False  # if True, raise min_signals_for_entry by 1 for this trade
 
 
 @dataclass
@@ -192,6 +193,7 @@ class OpportunityRanker:
             suggested_stop=stop,
             position_size_pct=float(opportunity.get("position_size_pct", 0.05)),
             reasoning=opportunity.get("reasoning", ""),
+            require_strong_entry=bool(opportunity.get("require_strong_entry", False)),
         )
 
     # ------------------------------------------------------------------

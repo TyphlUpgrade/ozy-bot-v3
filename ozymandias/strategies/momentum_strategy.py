@@ -45,7 +45,7 @@ class MomentumStrategy(Strategy):
     Entry requires ≥ ``min_signals_for_entry`` of 6 technical conditions:
 
     1. Price above VWAP
-    2. RSI 40–70 (not overbought, room to run)
+    2. RSI 45–65 (mid-range with room to run; not weak trend or late chase)
     3. MACD bullish or bullish crossover
     4. Volume ratio ≥ ``min_volume_ratio``
     5. Trend structure bullishly aligned (9 + 20 EMAs at minimum)
@@ -54,15 +54,19 @@ class MomentumStrategy(Strategy):
 
     _DEFAULT_PARAMS = {
         "min_volume_ratio": 1.2,
-        "rsi_entry_min": 40,
-        "rsi_entry_max": 70,
+        "rsi_entry_min": 45,   # tightened from 40: RSI 40–45 = weakening trend, not momentum
+        "rsi_entry_max": 65,   # tightened from 70: RSI >65 approaches overbought late-chase territory
         "rsi_overbought": 80,
         "min_signals_for_entry": 4,
         "partial_profit_pct": 0.5,      # fraction to exit at profit target
         "profit_target_proximity_pct": 2.0,  # % from target to trigger scale-out
         # Volatility regime gate: block entries when short-term vol / long-term vol
         # falls below this ratio (choppy / low-energy market with no directional thrust).
-        "min_vol_regime_ratio": 0.75,
+        "min_vol_regime_ratio": 0.85,  # raised from 0.75: 0.76 is still borderline choppy
+        # When true, bearish EMA alignment (9/20/50/200 all downtrending) is an absolute
+        # entry block. When false, bearish_aligned is a heavy negative signal but not a veto —
+        # allows Claude high-conviction catalyst-driven breakout entries.
+        "block_bearish_aligned": True,
     }
 
     # ------------------------------------------------------------------
@@ -86,6 +90,12 @@ class MomentumStrategy(Strategy):
         if vol_regime < self._p("min_vol_regime_ratio"):
             return []
 
+        # Configurable hard gate: block entries when all EMAs are in full downtrend.
+        # Off by default allows Claude high-conviction catalyst entries in lagging trends.
+        if self._p("block_bearish_aligned"):
+            if indicators.get("trend_structure") == "bearish_aligned":
+                return []
+
         conditions, weights = self._evaluate_entry_conditions(indicators)
         n_met = sum(1 for v in conditions.values() if v)
 
@@ -96,7 +106,11 @@ class MomentumStrategy(Strategy):
         price = float(indicators.get("price") or market_data["close"].iloc[-1])
         atr = float(indicators.get("atr_14") or 0.0)
 
-        stop = price - (2 * atr) if atr > 0 else price * (1 - _FALLBACK_STOP_PCT)
+        # Tighter stop for marginal entries (exactly min_signals met): 1.5×ATR.
+        # Full stop (2×ATR) only when conviction is high (all 6 signals fired).
+        # Scales stop to trade quality — less room given to weaker setups.
+        multiplier = 1.5 if n_met == self._p("min_signals_for_entry") else 2.0
+        stop = price - (multiplier * atr) if atr > 0 else price * (1 - _FALLBACK_STOP_PCT)
         target = price + (3 * atr) if atr > 0 else price * (1 + _FALLBACK_TARGET_PCT)
 
         reasons = [cond for cond, met in conditions.items() if met]

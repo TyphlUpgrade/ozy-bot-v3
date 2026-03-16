@@ -19,7 +19,7 @@ import logging
 import math
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -51,7 +51,8 @@ class ReasoningResult:
     market_assessment: str
     risk_flags: list[str]
     rejected_opportunities: list[dict]  # [{symbol, considered_reason, rejection_reason}]
-    raw: dict                         # full parsed Claude response
+    session_veto: list[str] = field(default_factory=list)  # strategy names to suppress for this session
+    raw: dict = field(default_factory=dict)                # full parsed Claude response
 
 
 @dataclass
@@ -102,6 +103,9 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _result_from_raw_reasoning(raw: dict) -> ReasoningResult:
+    # session_veto must be a list of strings; guard against Claude returning wrong type
+    raw_veto = raw.get("session_veto", [])
+    session_veto = [str(v) for v in raw_veto] if isinstance(raw_veto, list) else []
     return ReasoningResult(
         timestamp=raw.get("timestamp", datetime.now(timezone.utc).isoformat()),
         position_reviews=raw.get("position_reviews", []),
@@ -110,6 +114,7 @@ def _result_from_raw_reasoning(raw: dict) -> ReasoningResult:
         market_assessment=raw.get("market_assessment", ""),
         risk_flags=raw.get("risk_flags", []),
         rejected_opportunities=raw.get("rejected_opportunities", []),
+        session_veto=session_veto,
         raw=raw,
     )
 

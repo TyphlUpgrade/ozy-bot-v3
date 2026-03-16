@@ -455,13 +455,13 @@ class TestSwingEntry:
 
     @pytest.mark.asyncio
     async def test_signal_atr_based_targets(self):
-        """Stop = price - 2×ATR, target = price + 4×ATR."""
+        """Stop = price - 2×ATR, target = price + 5×ATR (target_atr_multiplier default 5.0)."""
         s = SwingStrategy()
         inds = _swing_indicators(price=100.0, atr_14=3.0)
         signals = await s.generate_signals("TSLA", _df(price=100.0), inds)
         assert len(signals) == 1
         assert signals[0].stop_price == pytest.approx(94.0)   # 100 - 2*3
-        assert signals[0].target_price == pytest.approx(112.0) # 100 + 4*3
+        assert signals[0].target_price == pytest.approx(115.0) # 100 + 5*3
 
 
 # ---------------------------------------------------------------------------

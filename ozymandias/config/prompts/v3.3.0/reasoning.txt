@@ -21,6 +21,12 @@ INSTRUCTIONS:
 4. Suggest new symbols to add if the watchlist needs replenishing (target 15-40 tickers total).
 5. List any tickers you seriously considered for entry but decided against. One sentence each. Give a SPECIFIC bear case — not generic risk statements. "Overhead resistance at $312 from March gap-fill" is acceptable; "risk of market downturn" is not.
 
+FIELD INSTRUCTIONS:
+- "suggested_stop" / "suggested_exit": if you have a specific support/resistance level in mind (e.g. "stop below the 200-EMA at $387"), populate these. Use 0.0 if you have no strong view — the system will fall back to ATR-based levels.
+- "require_strong_entry": set true if macro/fundamental context suggests the technical setup must be especially clean for this entry (e.g. uncertain macro, recent sector weakness). Raises the quant signal bar by 1 for this trade only. Never set false explicitly — omit or use false as the default.
+- "catalyst_type": for swing strategy opportunities only — classify as "catalyst_driven" (news event, earnings setup, volume-confirmed reversal pattern) or "technical_only" (purely TA-based, no identifiable catalyst). Conviction for "technical_only" swing entries must not exceed 0.50.
+- "session_veto": list of strategy names to suppress entry for the remainder of this session (e.g. ["swing"]). Use ONLY when market regime clearly invalidates a strategy type — e.g. pure distribution phase with no reversal setups for swing, or low-vol choppy tape for momentum. Empty list is the default and correct choice in most sessions.
+
 Return ONLY a JSON object. No markdown, no explanation outside the JSON.
 
 RESPONSE FORMAT:
@@ -46,7 +52,9 @@ RESPONSE FORMAT:
       "suggested_entry": 0.0,
       "suggested_exit": 0.0,
       "suggested_stop": 0.0,
-      "position_size_pct": 0.10
+      "position_size_pct": 0.10,
+      "require_strong_entry": false,
+      "catalyst_type": "catalyst_driven|technical_only"
     }
   ],
   "watchlist_changes": {
@@ -56,6 +64,7 @@ RESPONSE FORMAT:
   },
   "market_assessment": "<1-2 sentence macro view and risk posture>",
   "risk_flags": ["<any systemic risk observations that should affect sizing or timing>"],
+  "session_veto": [],
   "rejected_opportunities": [
     {
       "symbol": "<SYMBOL>",

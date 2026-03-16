@@ -17,6 +17,7 @@ import logging
 import pandas as pd
 
 from ozymandias.core.state_manager import Position
+from ozymandias.intelligence.technical_analysis import compute_rsi
 from ozymandias.strategies.base_strategy import (
     ExitSuggestion,
     PositionEval,
@@ -34,7 +35,7 @@ class SwingStrategy(Strategy):
     """
     Swing strategy — medium-term (days to weeks) dip-buying in uptrends.
 
-    Entry requires ≥ ``min_signals_for_entry`` of 5 technical conditions:
+    Entry requires ≥ ``min_signals_for_entry`` of 6 technical conditions:
 
     1. Price near support (lower Bollinger half or within ``support_proximity_pct``
        of a key EMA)
@@ -43,6 +44,7 @@ class SwingStrategy(Strategy):
     4. Long-term trend intact: 50 and 200 EMAs bullishly aligned (or at
        minimum not bearishly aligned)
     5. Volume not indicating panic selling (``volume_ratio < panic_volume_ratio``)
+    6. RSI is turning up: rsi[i] > rsi[i-2] (distinguishes bottoming from still-falling)
     """
 
     _DEFAULT_PARAMS = {
@@ -53,8 +55,10 @@ class SwingStrategy(Strategy):
         "max_scale_in_count": 2,
         "scale_in_dip_pct": 3.0,       # only scale in if price drops ≥ 3% more
         "panic_volume_ratio": 1.5,      # above this → panic selling, skip
-        "min_signals_for_entry": 4,     # out of 5; longterm_trend_ok is also a hard filter
+        "min_signals_for_entry": 5,     # raised from 4: 5/6 required for high-quality entries
         "profit_target_proximity_pct": 2.0,
+        # Swing targets aim for multi-day moves — 5×ATR gives ~2.5:1 R:R, breakeven at ~30% WR.
+        "target_atr_multiplier": 5.0,  # raised from 4.0: overnight gap risk warrants wider target
         # Volatility regime gate: swing trades tolerate quieter regimes than momentum
         # but still need some directional energy to avoid pure chop stop-outs.
         "min_vol_regime_ratio": 0.70,
@@ -84,7 +88,22 @@ class SwingStrategy(Strategy):
         if vol_regime < self._p("min_vol_regime_ratio"):
             return []
 
-        conditions, weights = self._evaluate_entry_conditions(indicators)
+        # RSI turning up: distinguishes a genuine bottom from a still-falling RSI.
+        # Computed from raw bars (single O(n) pass), kept internal — not added to
+        # indicators cache so _precompute_indicators doesn't need changes.
+        rsi_series = compute_rsi(market_data)
+        rsi_turning = (
+            len(rsi_series) >= 3
+            and not pd.isna(rsi_series.iloc[-1])
+            and not pd.isna(rsi_series.iloc[-3])
+            and float(rsi_series.iloc[-1]) > float(rsi_series.iloc[-3])
+        )
+        # Inject into a local dict copy so _evaluate_entry_conditions can read it
+        # without modifying the shared indicators cache.
+        indicators_with_rsi_turn = dict(indicators)
+        indicators_with_rsi_turn["rsi_turning"] = rsi_turning
+
+        conditions, weights = self._evaluate_entry_conditions(indicators_with_rsi_turn)
         n_met = sum(1 for v in conditions.values() if v)
 
         if n_met < self._p("min_signals_for_entry"):
@@ -96,8 +115,12 @@ class SwingStrategy(Strategy):
 
         # Swing stops are wider — 2× ATR or fallback percentage
         stop = price - (2 * atr) if atr > 0 else price * (1 - _FALLBACK_STOP_PCT)
-        # Swing targets aim for more reward — 4× ATR or fallback
-        target = price + (4 * atr) if atr > 0 else price * (1 + _FALLBACK_TARGET_PCT)
+        # Swing targets aim for multi-day reward — configurable ATR multiplier or fallback
+        target = (
+            price + (self._p("target_atr_multiplier") * atr)
+            if atr > 0
+            else price * (1 + _FALLBACK_TARGET_PCT)
+        )
 
         reasons = [cond for cond, met in conditions.items() if met]
         signal = Signal(
@@ -108,10 +131,10 @@ class SwingStrategy(Strategy):
             stop_price=round(stop, 4),
             target_price=round(target, 4),
             timeframe="medium",
-            reasoning=f"Swing conditions met ({n_met}/5): {', '.join(reasons)}",
+            reasoning=f"Swing conditions met ({n_met}/6): {', '.join(reasons)}",
         )
         log.debug(
-            "Swing signal for %s: strength=%.2f, %d/5 conditions",
+            "Swing signal for %s: strength=%.2f, %d/6 conditions",
             symbol, signal.strength, n_met,
         )
         return [signal]
@@ -120,15 +143,17 @@ class SwingStrategy(Strategy):
         self, indicators: dict
     ) -> tuple[dict[str, bool], dict[str, float]]:
         """
-        Check each of the 5 swing entry conditions.
+        Check each of the 6 swing entry conditions.
 
-        Returns (conditions_met: dict, weights: dict) where weights sum to 1.0.
+        Returns (conditions_met: dict, weights: dict).
+        Weights do not sum to 1.0 — strength is capped at min(sum, 1.0).
         """
         rsi = float(indicators.get("rsi") or 50.0)
         bb_pos = indicators.get("bollinger_position", "middle")
         macd = indicators.get("macd_signal", "bearish_cross")
         trend = indicators.get("trend_structure", "mixed")
         vol_ratio = float(indicators.get("volume_ratio") or 1.0)
+        rsi_turning = bool(indicators.get("rsi_turning", False))
 
         conditions = {
             "near_support":       bb_pos == "lower_half",
@@ -136,13 +161,17 @@ class SwingStrategy(Strategy):
             "macd_not_collapsing": macd != "bearish_cross",
             "longterm_trend_ok":  trend != "bearish_aligned",
             "no_panic_selling":   vol_ratio < self._p("panic_volume_ratio"),
+            # RSI rising: rsi[i] > rsi[i-2]. Highest single weight — a still-falling RSI
+            # is the core false-bottom failure mode for swing trades.
+            "rsi_turning":        rsi_turning,
         }
         weights = {
-            "near_support":       0.25,
-            "rsi_oversold_range": 0.25,
+            "near_support":       0.20,
+            "rsi_oversold_range": 0.20,
             "macd_not_collapsing": 0.15,
-            "longterm_trend_ok":  0.25,
+            "longterm_trend_ok":  0.20,
             "no_panic_selling":   0.10,
+            "rsi_turning":        0.20,
         }
         return conditions, weights
 

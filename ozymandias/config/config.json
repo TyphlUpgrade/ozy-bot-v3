@@ -39,8 +39,16 @@
   },
   "strategy": {
     "active_strategies": ["momentum", "swing"],
-    "momentum_params": {},
-    "swing_params": {}
+    "momentum_params": {
+      "min_vol_regime_ratio": 0.85,
+      "rsi_entry_min": 45,
+      "rsi_entry_max": 65,
+      "block_bearish_aligned": true
+    },
+    "swing_params": {
+      "target_atr_multiplier": 5.0,
+      "min_signals_for_entry": 5
+    }
   },
   "timezone": "America/New_York"
 }

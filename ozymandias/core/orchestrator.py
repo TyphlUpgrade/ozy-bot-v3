@@ -155,6 +155,11 @@ class Orchestrator:
         # Consecutive Claude failure count — used for exponential backoff
         self._claude_failure_count: int = 0
 
+        # Pending entry intentions: symbol → {stop, target, strategy, reasoning}.
+        # Written by _medium_try_entry when an order is placed; consumed by
+        # _fast_step_position_sync when a new broker position is discovered.
+        self._pending_intentions: dict[str, dict] = {}
+
         # Shutdown flag — set by _shutdown(), checked by loops
         self._stopping = False
 
@@ -766,6 +771,8 @@ class Orchestrator:
             log.error("Failed to load portfolio for sync: %s", exc, exc_info=True)
             return
 
+        from ozymandias.core.state_manager import ExitTargets, Position, TradeIntention
+
         broker_symbols = {p.symbol for p in broker_positions}
         local_symbols = {p.symbol for p in portfolio.positions}
 
@@ -777,13 +784,41 @@ class Orchestrator:
                 ghost_local,
             )
 
-        # Positions broker has that we don't track locally
+        # Positions broker has that we don't track locally — create them now so that
+        # stop/target checks and Claude position reviews work correctly during the session.
         unknown_broker = broker_symbols - local_symbols
-        if unknown_broker:
-            log.warning(
-                "Position sync discrepancy — broker has positions not tracked locally: %s",
-                unknown_broker,
-            )
+        portfolio_updated = False
+        for bp in broker_positions:
+            if bp.symbol not in local_symbols:
+                # Pull pending intention stored when the entry order was placed.
+                # Falls back to empty intention if the position arrived unexpectedly.
+                pending = self._pending_intentions.pop(bp.symbol, {})
+                now_iso = datetime.now(timezone.utc).isoformat()
+                intention = TradeIntention(
+                    strategy=pending.get("strategy", "unknown"),
+                    reasoning=pending.get("reasoning", ""),
+                    exit_targets=ExitTargets(
+                        stop_loss=pending.get("stop", 0.0),
+                        profit_target=pending.get("target", 0.0),
+                    ),
+                )
+                portfolio.positions.append(Position(
+                    symbol=bp.symbol,
+                    shares=bp.qty,
+                    avg_cost=bp.avg_entry_price,
+                    entry_date=now_iso,
+                    intention=intention,
+                ))
+                portfolio_updated = True
+                log.info(
+                    "New position created from fill: %s  qty=%.2f  avg_cost=%.4f  "
+                    "stop=%.4f  target=%.4f",
+                    bp.symbol, bp.qty, bp.avg_entry_price,
+                    pending.get("stop", 0.0), pending.get("target", 0.0),
+                )
+
+        if portfolio_updated:
+            await self._state_manager.save_portfolio(portfolio)
 
         # Quantity mismatches for shared symbols
         local_map = {p.symbol: p for p in portfolio.positions}
@@ -865,28 +900,8 @@ class Orchestrator:
         log.debug("Medium loop: scanned %d symbol(s)", len(indicators))
 
         # -- Step 3: detect entry signals ------------------------------------
-        # {symbol: [Signal, ...]}
-        entry_signals: dict[str, list] = {}
-        for symbol, summary in indicators.items():
-            df = bars.get(symbol)
-            if df is None:
-                continue
-            sigs_flat = summary["signals"]
-            for strategy in self._strategies:
-                try:
-                    sigs = await strategy.generate_signals(symbol, df, sigs_flat)
-                    if sigs:
-                        entry_signals.setdefault(symbol, []).extend(sigs)
-                except Exception as exc:
-                    log.warning(
-                        "Medium loop: generate_signals failed for %s/%s: %s",
-                        symbol, type(strategy).__name__, exc,
-                    )
-
-        # -- Step 4: re-rank opportunity queue --------------------------------
-        # Load the most recent Claude reasoning result from cache.
-        # If no cache hit, build an empty ReasoningResult so the ranker can
-        # still score the technically-detected signals.
+        # Load the most recent Claude reasoning result early so session_veto and
+        # require_strong_entry can gate signal generation before ranking.
         cached_raw = self._reasoning_cache.load_latest_if_fresh()
         if cached_raw:
             parsed = cached_raw.get("parsed_response") or {}
@@ -900,8 +915,56 @@ class Orchestrator:
                 market_assessment="unknown",
                 risk_flags=[],
                 rejected_opportunities=[],
+                session_veto=[],
                 raw={},
             )
+
+        # Build per-(symbol, strategy) require_strong_entry lookup from Claude opportunities.
+        _require_strong: dict[tuple[str, str], bool] = {
+            (opp["symbol"], opp.get("strategy", "")): bool(opp.get("require_strong_entry", False))
+            for opp in reasoning_result.new_opportunities
+            if "symbol" in opp
+        }
+
+        # {symbol: [Signal, ...]}
+        entry_signals: dict[str, list] = {}
+        for symbol, summary in indicators.items():
+            df = bars.get(symbol)
+            if df is None:
+                continue
+            sigs_flat = summary["signals"]
+            for strategy in self._strategies:
+                strategy_name = type(strategy).__name__.replace("Strategy", "").lower()
+
+                # Session veto: Claude has assessed this strategy as invalid for today's regime.
+                if strategy_name in reasoning_result.session_veto:
+                    log.info(
+                        "[veto] skipping %s entry for %s — session veto active",
+                        strategy_name, symbol,
+                    )
+                    continue
+
+                # require_strong_entry: temporarily raise min_signals_for_entry by 1
+                # for this symbol. Safe because asyncio is single-threaded (no races).
+                strong = _require_strong.get((symbol, strategy_name), False)
+                if strong:
+                    orig_min = strategy._params["min_signals_for_entry"]
+                    strategy._params["min_signals_for_entry"] = orig_min + 1
+                try:
+                    sigs = await strategy.generate_signals(symbol, df, sigs_flat)
+                    if sigs:
+                        entry_signals.setdefault(symbol, []).extend(sigs)
+                except Exception as exc:
+                    log.warning(
+                        "Medium loop: generate_signals failed for %s/%s: %s",
+                        symbol, type(strategy).__name__, exc,
+                    )
+                finally:
+                    if strong:
+                        strategy._params["min_signals_for_entry"] = orig_min
+
+        # -- Step 4: re-rank opportunity queue --------------------------------
+        # reasoning_result already loaded above (before step 3).
 
         try:
             acct = await self._broker.get_account()
@@ -1015,6 +1078,21 @@ class Orchestrator:
                         symbol, top.ai_conviction, challenge_conviction, quantity,
                     )
 
+        # Determine stop and target for position intention.
+        # Prefer Claude's suggested levels (specific support/resistance) when provided;
+        # fall back to ATR-based calculation if Claude returned 0.
+        atr_for_intention = ind.get("atr_14", 0.0)
+        use_stop = (
+            top.suggested_stop
+            if top.suggested_stop > 0
+            else (entry_price - 2 * atr_for_intention if atr_for_intention > 0 else entry_price * 0.95)
+        )
+        use_target = (
+            top.suggested_exit
+            if top.suggested_exit > 0
+            else (entry_price + 3 * atr_for_intention if atr_for_intention > 0 else entry_price * 1.10)
+        )
+
         order = Order(
             symbol=symbol,
             side="buy",
@@ -1030,6 +1108,14 @@ class Orchestrator:
             return
         self._mark_broker_available()
 
+        # Store intention so _fast_step_position_sync can attach it to the position on fill.
+        self._pending_intentions[symbol] = {
+            "stop": round(use_stop, 4),
+            "target": round(use_target, 4),
+            "strategy": strategy_name,
+            "reasoning": top.reasoning,
+        }
+
         now_iso = datetime.now(timezone.utc).isoformat()
         record = OrderRecord(
             order_id=result.order_id,
@@ -1044,8 +1130,12 @@ class Orchestrator:
         )
         await self._fill_protection.record_order(record)
         log.info(
-            "Entry order placed — %s  qty=%d  limit=%.2f  strategy=%s  score=%.3f",
+            "Entry order placed — %s  qty=%d  limit=%.2f  strategy=%s  score=%.3f  "
+            "stop=%.4f  target=%.4f  (stop_src=%s  target_src=%s)",
             symbol, quantity, entry_price, strategy_name, top.composite_score,
+            use_stop, use_target,
+            "claude" if top.suggested_stop > 0 else "atr",
+            "claude" if top.suggested_exit > 0 else "atr",
         )
 
     async def _medium_evaluate_positions(self, portfolio, bars, indicators, acct, orders) -> None:
