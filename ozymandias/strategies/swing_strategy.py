@@ -62,6 +62,9 @@ class SwingStrategy(Strategy):
         # Volatility regime gate: swing trades tolerate quieter regimes than momentum
         # but still need some directional energy to avoid pure chop stop-outs.
         "min_vol_regime_ratio": 0.70,
+        # Hard RVOL gate: current bar volume / 20-bar SMA must meet this floor.
+        # Softer than momentum (0.8 vs 1.0) — swing entries tolerate quieter tape.
+        "min_rvol_for_entry": 0.8,
     }
 
     # ------------------------------------------------------------------
@@ -86,6 +89,13 @@ class SwingStrategy(Strategy):
         # Hard gate: require minimum volatility regime energy.
         vol_regime = float(indicators.get("vol_regime_ratio", 1.0))
         if vol_regime < self._p("min_vol_regime_ratio"):
+            return []
+
+        # Hard RVOL gate: require minimum relative volume (current bar / 20-bar SMA).
+        # Softer than momentum — swing entries tolerate quieter tape but still need
+        # some participation to avoid getting trapped in illiquid dips.
+        rvol = float(indicators.get("volume_ratio", 1.0))
+        if rvol < self._p("min_rvol_for_entry"):
             return []
 
         # RSI turning up: distinguishes a genuine bottom from a still-falling RSI.

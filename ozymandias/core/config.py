@@ -42,6 +42,22 @@ class SchedulerConfig:
     slow_loop_max_interval_sec: int = 3600
     slow_loop_price_move_threshold_pct: float = 2.0
     conservative_startup_mode_min: int = 10  # no new entries after reconciliation errors
+    # Dead zone: block new entries during midday low-volume window (ET times, "HH:MM" format)
+    dead_zone_start_et: str = "11:30"
+    dead_zone_end_et: str = "14:30"
+
+
+@dataclass
+class AIFallbackConfig:
+    enabled: bool = True
+    fallback_model: str = "gemini-2.0-flash"   # Google Gemini Flash — fast, high-availability fallback
+    overload_retries: int = 3                   # 529 retry attempts before switching to fallback (3s→6s→12s)
+    overload_base_sec: float = 3.0              # initial delay for 529 retries
+    overload_max_sec: float = 12.0              # max delay for 529 retries
+    server_error_base_sec: float = 30.0         # initial delay for non-overload 5xx
+    server_error_max_sec: float = 600.0         # max delay for non-overload 5xx
+    circuit_breaker_threshold: int = 3          # consecutive overload fallbacks → skip Claude entirely
+    circuit_breaker_probe_min: int = 10         # minutes between Claude probe attempts when circuit is open
 
 
 @dataclass
@@ -77,6 +93,7 @@ class Config:
     risk: RiskConfig = field(default_factory=RiskConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     claude: ClaudeConfig = field(default_factory=ClaudeConfig)
+    ai_fallback: AIFallbackConfig = field(default_factory=AIFallbackConfig)
     ranker: RankerConfig = field(default_factory=RankerConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     timezone: str = "America/New_York"

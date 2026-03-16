@@ -52,6 +52,14 @@ def _fail(label: str, detail: str = "") -> None:
     _results.append((label, False, detail))
 
 
+def _warn(label: str, detail: str = "") -> None:
+    msg = f"  [WARN] {label}"
+    if detail:
+        msg += f"\n         {detail}"
+    print(msg)
+    # Warnings don't count as failures
+
+
 def _section(title: str) -> None:
     print(f"\n{title}")
     print("  " + "─" * (len(title) + 2))
@@ -103,12 +111,27 @@ def check_credentials(cfg) -> dict | None:
             return None
         _pass("Credentials file exists", str(creds_path))
 
-        with open(creds_path, "r", encoding="utf-8") as fh:
-            creds = json.load(fh)
+        raw = creds_path.read_bytes()
+        if raw.lstrip().startswith(b"gAAAAA"):
+            # Fernet-encrypted — decrypt before parsing
+            try:
+                from cryptography.fernet import Fernet, InvalidToken
+                key_path = Path(cfg.broker.credentials_key_file).expanduser()
+                if not key_path.exists():
+                    _fail("Credentials encrypted but key file not found", str(key_path))
+                    return None
+                fernet_key = key_path.read_bytes().strip()
+                raw = Fernet(fernet_key).decrypt(raw.strip())
+                _pass("Credentials decrypted successfully")
+            except InvalidToken:
+                _fail("Credentials decryption failed", "wrong key or corrupted file")
+                return None
+        creds = json.loads(raw)
 
         api_key    = creds.get("api_key") or creds.get("APCA_API_KEY_ID")
         secret_key = creds.get("secret_key") or creds.get("APCA_API_SECRET_KEY")
         claude_key = creds.get("anthropic_api_key") or creds.get("ANTHROPIC_API_KEY")
+        gemini_key = creds.get("gemini_api_key") or creds.get("GEMINI_API_KEY")
 
         if api_key:
             _pass("Alpaca API key present", f"{api_key[:8]}...")
@@ -124,6 +147,11 @@ def check_credentials(cfg) -> dict | None:
             _pass("Anthropic API key present", f"{claude_key[:8]}...")
         else:
             _fail("Anthropic API key missing", "expected 'anthropic_api_key'")
+
+        if gemini_key:
+            _pass("Gemini API key present (AI fallback)", f"{gemini_key[:8]}...")
+        else:
+            _warn("Gemini API key missing", "expected 'gemini_api_key' — fallback provider unavailable if Claude is overloaded")
 
         return creds
     except Exception as exc:

@@ -65,7 +65,8 @@ import argparse
 import asyncio
 import json
 import sys
-from dataclasses import dataclass, asdict
+import uuid
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -99,6 +100,7 @@ RESULTS_FILE     = _HERE / "replay_results.jsonl"
 
 CACHE_DIR = _HERE / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
+TRADES_FILE = _HERE / "trade_journal_backtest.jsonl"
 
 # Canonical set of indicator names the current _precompute_indicators produces.
 # Update this set whenever a new key is added to the signals dict.
@@ -212,7 +214,8 @@ class Trade:
     target_price: float
     exit_price: float = 0.0
     exit_bar: int = -1
-    exit_reason: str = ""     # "stop" | "target" | "end_of_data"
+    exit_reason: str = ""             # "stop" | "target" | "end_of_data"
+    signals_at_entry: dict = field(default_factory=dict)
 
     @property
     def pnl_pct(self) -> float:
@@ -484,9 +487,9 @@ async def _replay_symbol(
         strategies.append(("swing", swing))
 
     completed: list[Trade] = []
-    active:    dict[str, Trade] = {}       # strat_name → open Trade
-    pending:   dict[str, tuple[float, float]] = {}  # strat_name → (stop, target)
-    cooldown:  dict[str, int] = {}         # strat_name → bar index after which re-entry allowed
+    active:    dict[str, Trade] = {}                        # strat_name → open Trade
+    pending:   dict[str, tuple[float, float, dict]] = {}    # strat_name → (stop, target, signals)
+    cooldown:  dict[str, int] = {}                          # strat_name → bar index after which re-entry allowed
 
     n = len(df)
 
@@ -499,7 +502,7 @@ async def _replay_symbol(
         # ----------------------------------------------------------------
         # 1. Fill pending entries at this bar's open
         # ----------------------------------------------------------------
-        for strat_name, (stop_px, target_px) in list(pending.items()):
+        for strat_name, (stop_px, target_px, entry_signals) in list(pending.items()):
             if strat_name in active:
                 continue
             if bar_open <= 0:
@@ -511,6 +514,7 @@ async def _replay_symbol(
                 entry_price=bar_open,
                 stop_price=stop_px,
                 target_price=target_px,
+                signals_at_entry=entry_signals,
             )
         pending.clear()
 
@@ -588,7 +592,7 @@ async def _replay_symbol(
             if sig.stop_price <= 0 or sig.target_price <= 0:
                 continue
 
-            pending[strat_name] = (sig.stop_price, sig.target_price)
+            pending[strat_name] = (sig.stop_price, sig.target_price, dict(indicators) if indicators else {})
 
     # ----------------------------------------------------------------
     # 4. Close anything still open at end of data
@@ -841,6 +845,36 @@ def _save_result(
     }
     with RESULTS_FILE.open("a") as f:
         f.write(json.dumps(record) + "\n")
+
+
+def _save_trades(trades: list[Trade], cfg: dict, df_map: dict | None = None) -> int:
+    """Append per-trade rows to TRADES_FILE.  Returns number of rows written."""
+    if not trades:
+        return 0
+    config_name = cfg.get("name", "unnamed")
+    now = datetime.now(timezone.utc).isoformat()
+    count = 0
+    with TRADES_FILE.open("a") as f:
+        for t in trades:
+            record = {
+                "trade_id":        str(uuid.uuid4()),
+                "source":          "backtest",
+                "config_name":     config_name,
+                "symbol":          t.symbol,
+                "strategy":        t.strategy,
+                "direction":       "long",
+                "entry_price":     t.entry_price,
+                "exit_price":      t.exit_price,
+                "stop_price":      t.stop_price,
+                "target_price":    t.target_price,
+                "exit_reason":     t.exit_reason,
+                "pnl_pct":         round(t.pnl_pct, 4),
+                "signals_at_entry": t.signals_at_entry,
+                "recorded_at":     now,
+            }
+            f.write(json.dumps(record) + "\n")
+            count += 1
+    return count
 
 
 def show_results(sort_by: str = "net_pnl") -> None:
@@ -1103,8 +1137,10 @@ def main() -> None:
                         help="Sort column for --results (default: net_pnl)")
     parser.add_argument("--period",   metavar="PERIOD",   help="Override globals.period (e.g. 30d)")
     parser.add_argument("--interval", metavar="INTERVAL", help="Override globals.interval (e.g. 15m)")
-    parser.add_argument("--no-save",  action="store_true",
+    parser.add_argument("--no-save",     action="store_true",
                         help="Do not write results to replay_results.jsonl")
+    parser.add_argument("--save-trades", action="store_true",
+                        help="Append per-trade rows (with signals) to trade_journal_backtest.jsonl")
     args = parser.parse_args()
 
     if args.results:
@@ -1120,7 +1156,8 @@ def main() -> None:
     if args.interval:
         globals_["interval"] = args.interval
 
-    save = not args.no_save
+    save        = not args.no_save
+    save_trades = args.save_trades
 
     if args.grid:
         asyncio.run(run_grid(cfg_file, globals_, save=save))
@@ -1140,6 +1177,9 @@ def main() -> None:
         if save and stats:
             _save_result(cfg, globals_, stats)
             print(f"\nResult saved to {RESULTS_FILE.name}")
+        if save_trades:
+            n = _save_trades(trades, cfg)
+            print(f"{n} trade rows appended to {TRADES_FILE.name}")
 
     else:
         # Default: run first config (baseline) with pretty output
@@ -1154,6 +1194,9 @@ def main() -> None:
         if save and _compute_stats(trades):
             _save_result(cfg, globals_, _compute_stats(trades))
             print(f"\nResult saved to {RESULTS_FILE.name}")
+        if save_trades:
+            n = _save_trades(trades, cfg)
+            print(f"{n} trade rows appended to {TRADES_FILE.name}")
 
 
 if __name__ == "__main__":

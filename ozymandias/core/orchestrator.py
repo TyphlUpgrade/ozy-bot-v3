@@ -1830,6 +1830,14 @@ class Orchestrator:
         elif os.environ.get("ANTHROPIC_API_KEY"):
             log.debug("ANTHROPIC_API_KEY already set in environment — credentials file value ignored")
 
+        # Inject Gemini key into env if present and not already set externally
+        gemini_key = creds.get("gemini_api_key")
+        if gemini_key and not os.environ.get("GEMINI_API_KEY"):
+            os.environ["GEMINI_API_KEY"] = gemini_key
+            log.debug("GEMINI_API_KEY set from credentials file")
+        elif os.environ.get("GEMINI_API_KEY"):
+            log.debug("GEMINI_API_KEY already set in environment — credentials file value ignored")
+
         api_key = creds.get("api_key") or creds.get("APCA_API_KEY_ID")
         secret_key = creds.get("secret_key") or creds.get("APCA_API_SECRET_KEY")
         if not api_key or not secret_key:

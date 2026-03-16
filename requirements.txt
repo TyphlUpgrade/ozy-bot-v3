@@ -11,6 +11,9 @@ numpy>=1.26
 # Claude API
 anthropic>=0.40
 
+# AI fallback provider (Gemini Flash — used when Anthropic is overloaded)
+google-generativeai>=0.8
+
 # Credentials encryption
 cryptography>=42.0
 

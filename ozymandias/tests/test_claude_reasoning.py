@@ -9,10 +9,12 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import anthropic
 import pytest
 
 from ozymandias.core.config import ClaudeConfig, Config, RiskConfig
@@ -734,3 +736,160 @@ class TestRunThesisChallenge:
             with caplog.at_level(logging.WARNING, logger="ozymandias.intelligence.claude_reasoning"):
                 await engine.call_claude("{x}", {"x": "test"})
         assert any("max_tokens" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# AI Fallback (Gemini)
+# ---------------------------------------------------------------------------
+
+class TestAIFallback:
+    """Tests for the multi-provider fallback: 529 fast retries → Gemini Flash."""
+
+    def _engine_with_fallback(self, tmp_path: Path) -> ClaudeReasoningEngine:
+        cfg = _config()
+        cfg.ai_fallback.enabled = True
+        cfg.ai_fallback.overload_retries = 3
+        cfg.ai_fallback.overload_base_sec = 0.0   # no sleeping in tests
+        cfg.ai_fallback.overload_max_sec = 0.0
+        cfg.ai_fallback.circuit_breaker_threshold = 3
+        cfg.ai_fallback.circuit_breaker_probe_min = 10
+        return ClaudeReasoningEngine(cfg, cache=_cache(tmp_path), prompts_dir=_prompts_dir())
+
+    def _overload_error(self):
+        return anthropic.APIStatusError(
+            message="overloaded",
+            response=MagicMock(status_code=529, headers={}),
+            body={},
+        )
+
+    def _mock_gemini_response(self, text: str):
+        resp = MagicMock()
+        resp.text = text
+        return resp
+
+    @pytest.mark.asyncio
+    async def test_sdk_max_retries_is_zero(self, tmp_path):
+        engine = self._engine_with_fallback(tmp_path)
+        assert engine._client.max_retries == 0
+
+    @pytest.mark.asyncio
+    async def test_529_retries_then_falls_back_to_gemini(self, tmp_path):
+        """3 fast 529 retries → 4th attempt triggers Gemini fallback."""
+        engine = self._engine_with_fallback(tmp_path)
+        gemini_text = '{"fallback": true}'
+
+        overload = self._overload_error()
+        mock_gemini_resp = self._mock_gemini_response(gemini_text)
+
+        with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as mock_claude:
+            mock_claude.side_effect = [overload, overload, overload, overload]
+            with patch.object(engine, "_call_gemini_fallback", new_callable=AsyncMock) as mock_gemini:
+                mock_gemini.return_value = gemini_text
+                result = await engine.call_claude("{x}", {"x": "val"})
+
+        assert result == gemini_text
+        assert mock_claude.call_count == 4  # 3 retries + 1 that triggers fallback
+        mock_gemini.assert_called_once()
+        assert engine._overload_fallback_count == 1
+
+    @pytest.mark.asyncio
+    async def test_529_recovers_on_second_retry(self, tmp_path):
+        """Claude recovers on retry 2 → no fallback, circuit breaker stays at 0."""
+        engine = self._engine_with_fallback(tmp_path)
+        overload = self._overload_error()
+        success_resp = _mock_api_response('{"ok": true}')
+
+        with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as mock_claude:
+            mock_claude.side_effect = [overload, overload, success_resp]
+            with patch.object(engine, "_call_gemini_fallback", new_callable=AsyncMock) as mock_gemini:
+                result = await engine.call_claude("{x}", {"x": "val"})
+
+        assert result == '{"ok": true}'
+        mock_gemini.assert_not_called()
+        assert engine._overload_fallback_count == 0
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_skips_claude_when_threshold_reached(self, tmp_path):
+        """After 3 consecutive fallbacks, next call goes straight to Gemini without trying Claude."""
+        engine = self._engine_with_fallback(tmp_path)
+        engine._overload_fallback_count = 3
+        engine._circuit_broken_since = time.monotonic()
+
+        gemini_text = '{"from_gemini": true}'
+        with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as mock_claude:
+            with patch.object(engine, "_call_gemini_fallback", new_callable=AsyncMock) as mock_gemini:
+                mock_gemini.return_value = gemini_text
+                result = await engine.call_claude("{x}", {"x": "val"})
+
+        mock_claude.assert_not_called()
+        mock_gemini.assert_called_once()
+        assert result == gemini_text
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_probes_claude_after_interval(self, tmp_path):
+        """After probe interval, Claude is tried once; if it succeeds circuit resets."""
+        engine = self._engine_with_fallback(tmp_path)
+        engine._overload_fallback_count = 3
+        # Set broken_since far enough in the past to trigger a probe
+        engine._circuit_broken_since = time.monotonic() - (engine._cfg.ai_fallback.circuit_breaker_probe_min * 60 + 1)
+
+        success_resp = _mock_api_response('{"probe_ok": true}')
+        with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as mock_claude:
+            mock_claude.return_value = success_resp
+            with patch.object(engine, "_call_gemini_fallback", new_callable=AsyncMock) as mock_gemini:
+                result = await engine.call_claude("{x}", {"x": "val"})
+
+        mock_claude.assert_called_once()
+        mock_gemini.assert_not_called()
+        assert result == '{"probe_ok": true}'
+        assert engine._overload_fallback_count == 0  # reset on success
+
+    @pytest.mark.asyncio
+    async def test_fallback_disabled_raises_on_exhausted_529(self, tmp_path):
+        """When fallback is disabled, exhausting overload retries re-raises the error."""
+        engine = self._engine_with_fallback(tmp_path)
+        engine._cfg.ai_fallback.enabled = False
+
+        overload = self._overload_error()
+        with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as mock_claude:
+            mock_claude.side_effect = [overload, overload, overload, overload]
+            with pytest.raises(Exception):
+                await engine.call_claude("{x}", {"x": "val"})
+
+    @pytest.mark.asyncio
+    async def test_gemini_key_missing_raises_runtime_error(self, tmp_path, monkeypatch):
+        """_call_gemini_fallback raises RuntimeError when GEMINI_API_KEY is absent."""
+        engine = self._engine_with_fallback(tmp_path)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+        # Mock genai import to avoid requiring the package to test key-missing path
+        import sys
+        mock_genai = MagicMock()
+        mock_genai.configure = MagicMock()
+        mock_genai.GenerativeModel = MagicMock(side_effect=RuntimeError("should not reach model init"))
+        with patch.dict(sys.modules, {"google.generativeai": mock_genai}):
+            with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
+                await engine._call_gemini_fallback("test prompt", 1024)
+
+    @pytest.mark.asyncio
+    async def test_other_5xx_uses_slow_retry_not_gemini(self, tmp_path):
+        """Non-529 server errors (500) use slow backoff and never trigger Gemini fallback."""
+        engine = self._engine_with_fallback(tmp_path)
+        cfg = engine._cfg.ai_fallback
+        cfg.server_error_base_sec = 0.0  # no sleeping
+        cfg.server_error_max_sec = 0.0
+
+        server_err = anthropic.APIStatusError(
+            message="internal server error",
+            response=MagicMock(status_code=500, headers={}),
+            body={},
+        )
+        success_resp = _mock_api_response('{"ok": true}')
+
+        with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as mock_claude:
+            mock_claude.side_effect = [server_err, server_err, success_resp]
+            with patch.object(engine, "_call_gemini_fallback", new_callable=AsyncMock) as mock_gemini:
+                result = await engine.call_claude("{x}", {"x": "val"})
+
+        mock_gemini.assert_not_called()
+        assert result == '{"ok": true}'

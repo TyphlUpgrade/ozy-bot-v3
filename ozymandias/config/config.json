@@ -20,7 +20,9 @@
     "medium_loop_sec": 120,
     "slow_loop_check_sec": 300,
     "slow_loop_max_interval_sec": 3600,
-    "slow_loop_price_move_threshold_pct": 2.0
+    "slow_loop_price_move_threshold_pct": 2.0,
+    "dead_zone_start_et": "11:30",
+    "dead_zone_end_et": "14:30"
   },
   "claude": {
     "model": "claude-sonnet-4-20250514",
@@ -28,6 +30,17 @@
     "prompt_version": "v3.3.0",
     "tier1_max_symbols": 12,
     "tier2_max_symbols": 28
+  },
+  "ai_fallback": {
+    "enabled": true,
+    "fallback_model": "gemini-2.0-flash",
+    "overload_retries": 3,
+    "overload_base_sec": 3.0,
+    "overload_max_sec": 12.0,
+    "server_error_base_sec": 30.0,
+    "server_error_max_sec": 600.0,
+    "circuit_breaker_threshold": 3,
+    "circuit_breaker_probe_min": 10
   },
   "ranker": {
     "weight_ai": 0.35,
@@ -38,16 +51,18 @@
     "thesis_challenge_size_threshold": 0.15
   },
   "strategy": {
-    "active_strategies": ["momentum", "swing"],
+    "active_strategies": ["momentum"],
     "momentum_params": {
       "min_vol_regime_ratio": 0.85,
       "rsi_entry_min": 45,
       "rsi_entry_max": 65,
-      "block_bearish_aligned": true
+      "block_bearish_aligned": true,
+      "min_rvol_for_entry": 1.0
     },
     "swing_params": {
       "target_atr_multiplier": 5.0,
-      "min_signals_for_entry": 5
+      "min_signals_for_entry": 5,
+      "min_rvol_for_entry": 0.8
     }
   },
   "timezone": "America/New_York"

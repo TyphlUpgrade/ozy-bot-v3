@@ -577,3 +577,94 @@ class TestSwingExit:
         assert suggestion.order_type == "limit"
         assert suggestion.urgency == pytest.approx(0.3)
         assert suggestion.exit_price == pytest.approx(115.0)
+
+
+# ---------------------------------------------------------------------------
+# 8. RVOL hard gate — momentum
+# ---------------------------------------------------------------------------
+
+class TestMomentumRvolGate:
+
+    @pytest.mark.asyncio
+    async def test_rvol_below_threshold_blocks_entry(self):
+        """volume_ratio=0.9 < min_rvol_for_entry=1.0 → no signal."""
+        s = MomentumStrategy()
+        inds = _momentum_indicators(volume_ratio=0.9)
+        signals = await s.generate_signals("AAPL", _df(), inds)
+        assert len(signals) == 0
+
+    @pytest.mark.asyncio
+    async def test_rvol_exactly_at_threshold_allows_entry(self):
+        """volume_ratio exactly == min_rvol_for_entry → allowed (not strictly less)."""
+        s = MomentumStrategy()
+        inds = _momentum_indicators(volume_ratio=1.0)
+        signals = await s.generate_signals("AAPL", _df(), inds)
+        assert len(signals) == 1
+
+    @pytest.mark.asyncio
+    async def test_rvol_above_threshold_allows_entry(self):
+        """volume_ratio=1.5 > min_rvol_for_entry=1.0 → signal generated."""
+        s = MomentumStrategy()
+        inds = _momentum_indicators(volume_ratio=1.5)
+        signals = await s.generate_signals("AAPL", _df(), inds)
+        assert len(signals) == 1
+
+    @pytest.mark.asyncio
+    async def test_rvol_gate_uses_configured_threshold(self):
+        """Custom min_rvol_for_entry=1.3: volume_ratio=1.2 → blocked."""
+        s = MomentumStrategy({"min_rvol_for_entry": 1.3})
+        inds = _momentum_indicators(volume_ratio=1.2)
+        signals = await s.generate_signals("AAPL", _df(), inds)
+        assert len(signals) == 0
+
+    @pytest.mark.asyncio
+    async def test_missing_volume_ratio_defaults_to_1_0(self):
+        """Missing volume_ratio defaults to 1.0 — at threshold, entry allowed."""
+        s = MomentumStrategy()
+        inds = _momentum_indicators()
+        del inds["volume_ratio"]
+        signals = await s.generate_signals("AAPL", _df(), inds)
+        assert len(signals) == 1
+
+
+# ---------------------------------------------------------------------------
+# 9. RVOL hard gate — swing
+# ---------------------------------------------------------------------------
+
+class TestSwingRvolGate:
+
+    @pytest.mark.asyncio
+    async def test_rvol_below_threshold_blocks_entry(self):
+        """volume_ratio=0.7 < min_rvol_for_entry=0.8 → no signal."""
+        s = SwingStrategy()
+        inds = _swing_indicators(volume_ratio=0.7)
+        signals = await s.generate_signals("TSLA", _df(), inds)
+        assert len(signals) == 0
+
+    @pytest.mark.asyncio
+    async def test_rvol_exactly_at_threshold_allows_entry(self):
+        """volume_ratio exactly == 0.8 → allowed."""
+        s = SwingStrategy()
+        inds = _swing_indicators(volume_ratio=0.8)
+        signals = await s.generate_signals("TSLA", _df(), inds)
+        assert len(signals) == 1
+
+    @pytest.mark.asyncio
+    async def test_rvol_above_threshold_allows_entry(self):
+        """volume_ratio=1.1 > 0.8 → signal generated."""
+        s = SwingStrategy()
+        inds = _swing_indicators(volume_ratio=1.1)
+        signals = await s.generate_signals("TSLA", _df(), inds)
+        assert len(signals) == 1
+
+    @pytest.mark.asyncio
+    async def test_swing_rvol_threshold_softer_than_momentum(self):
+        """volume_ratio=0.9 passes swing (0.8) but would block momentum (1.0)."""
+        swing = SwingStrategy()
+        momentum = MomentumStrategy()
+        inds_s = _swing_indicators(volume_ratio=0.9)
+        inds_m = _momentum_indicators(volume_ratio=0.9)
+        swing_signals = await swing.generate_signals("TSLA", _df(), inds_s)
+        momentum_signals = await momentum.generate_signals("AAPL", _df(), inds_m)
+        assert len(swing_signals) == 1
+        assert len(momentum_signals) == 0

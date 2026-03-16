@@ -67,6 +67,10 @@ class MomentumStrategy(Strategy):
         # entry block. When false, bearish_aligned is a heavy negative signal but not a veto —
         # allows Claude high-conviction catalyst-driven breakout entries.
         "block_bearish_aligned": True,
+        # Hard RVOL gate: current bar volume / 20-bar SMA must meet this floor before
+        # any entry is considered. Prevents momentum entries when nobody is trading.
+        # Distinct from the soft high_volume condition (rewarded at 1.2+, weight 0.15).
+        "min_rvol_for_entry": 1.0,
     }
 
     # ------------------------------------------------------------------
@@ -95,6 +99,13 @@ class MomentumStrategy(Strategy):
         if self._p("block_bearish_aligned"):
             if indicators.get("trend_structure") == "bearish_aligned":
                 return []
+
+        # Hard RVOL gate: require minimum relative volume (current bar / 20-bar SMA).
+        # Blocks momentum entries when volume is absent — signal quality collapses in
+        # low-participation moves. Separate from the soft high_volume condition (1.2+).
+        rvol = float(indicators.get("volume_ratio", 1.0))
+        if rvol < self._p("min_rvol_for_entry"):
+            return []
 
         conditions, weights = self._evaluate_entry_conditions(indicators)
         n_met = sum(1 for v in conditions.values() if v)

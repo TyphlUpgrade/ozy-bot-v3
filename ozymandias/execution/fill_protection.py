@@ -66,6 +66,8 @@ class StateChange:
     old_status: str
     new_status: str
     fill_qty: float = 0.0
+    fill_price: float = 0.0   # avg fill price from broker (0.0 if not applicable)
+    side: str = ""             # "buy" | "sell" copied from the local OrderRecord
     change_type: str = ""  # "fill" | "partial_fill" | "cancel" | "unexpected_fill" | "reject"
 
 
@@ -224,7 +226,10 @@ class FillProtectionManager:
                 changes.append(StateChange(
                     order_id=order_id, symbol=local.symbol,
                     old_status=old_status, new_status=new_local,
-                    fill_qty=broker.filled_qty, change_type=change_type,
+                    fill_qty=broker.filled_qty,
+                    fill_price=float(broker.filled_avg_price or 0.0),
+                    side=local.side,
+                    change_type=change_type,
                 ))
 
             # Check for unexpected fills — broker reports filled orders we don't track
@@ -334,7 +339,9 @@ class FillProtectionManager:
         return StateChange(
             order_id=order_id, symbol=order.symbol,
             old_status=old_status, new_status=order.status,
-            fill_qty=order.filled_quantity, change_type=change_type,
+            fill_qty=order.filled_quantity,
+            side=order.side,
+            change_type=change_type,
         )
 
     # ------------------------------------------------------------------

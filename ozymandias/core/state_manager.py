@@ -23,9 +23,9 @@ from typing import Any, Optional
 # ---------------------------------------------------------------------------
 
 STATE_DIR = Path(__file__).resolve().parent.parent / "state"
-PORTFOLIO_FILE = STATE_DIR / "portfolio.json"
-WATCHLIST_FILE = STATE_DIR / "watchlist.json"
-ORDERS_FILE    = STATE_DIR / "orders.json"
+PORTFOLIO_FILE    = STATE_DIR / "portfolio.json"
+WATCHLIST_FILE    = STATE_DIR / "watchlist.json"
+ORDERS_FILE       = STATE_DIR / "orders.json"
 
 
 # ---------------------------------------------------------------------------
@@ -391,3 +391,5 @@ class StateManager:
         state.last_updated = datetime.now(timezone.utc).isoformat()
         async with self._orders_lock:
             _atomic_write(self.orders_path, _to_dict(state))
+
+
