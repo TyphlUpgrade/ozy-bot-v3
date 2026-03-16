@@ -85,6 +85,8 @@ class SlowLoopTriggerState:
     claude_call_in_flight: bool = False
     # Track session transitions so we only fire once per transition
     last_session: Optional[str] = None
+    # Fired once after the first medium loop cycle populates indicators
+    indicators_seeded: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -1528,6 +1530,12 @@ class Orchestrator:
         # 6. Watchlist critically small
         if len(watchlist.entries) < 10:
             triggers.append("watchlist_small")
+
+        # 7. Indicators seeded for the first time — fire once after the first medium
+        #    loop cycle so Claude always has real TA data on its first call.
+        if not ts.indicators_seeded and getattr(self, "_latest_indicators", {}):
+            triggers.append("indicators_ready")
+            ts.indicators_seeded = True
 
         return triggers
 
