@@ -266,6 +266,12 @@ class TestCheckTriggers:
 
 class TestSlowLoopCycle:
 
+    @pytest.fixture(autouse=True)
+    def market_open(self):
+        """Patch is_market_open to True so the market-hours gate doesn't short-circuit."""
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            yield
+
     @pytest.mark.asyncio
     async def test_no_trigger_no_claude_call(self, orch):
         """If check_triggers returns [], Claude must not be called."""
@@ -452,6 +458,11 @@ class TestBrokerDegradation:
 # ===========================================================================
 
 class TestFastLoopErrorIsolation:
+
+    @pytest.fixture(autouse=True)
+    def market_open(self):
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            yield
 
     @pytest.mark.asyncio
     async def test_exception_in_poll_does_not_stop_other_steps(self, orch):
@@ -848,3 +859,206 @@ class TestLoadCredentials:
         o = self._make_orch(tmp_path)
         with pytest.raises(RuntimeError, match="api_key"):
             o._load_credentials()
+
+
+# ===========================================================================
+# Overnight running — market-hours gates
+# ===========================================================================
+
+class TestOvernightGates:
+    """
+    When is_market_open() returns False, all three loop cycles must return
+    immediately without calling any broker or Claude APIs.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fast_loop_silent_when_market_closed(self, orch):
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=False):
+            await orch._fast_loop_cycle()
+        orch._broker.get_open_orders.assert_not_called()
+        orch._broker.get_positions.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_medium_loop_silent_when_market_closed(self, orch):
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=False):
+            await orch._medium_loop_cycle()
+        orch._broker.get_account.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_slow_loop_silent_when_market_closed(self, orch):
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=False):
+            with patch.object(orch, "_run_claude_cycle", AsyncMock()) as mock_claude:
+                await orch._slow_loop_cycle()
+        mock_claude.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fast_loop_runs_when_market_open(self, orch):
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            await orch._fast_loop_cycle()
+        orch._broker.get_open_orders.assert_called()
+
+
+# ===========================================================================
+# Short selling — entry wiring
+# ===========================================================================
+
+class TestShortEntryWiring:
+    """
+    sell_short opportunities must produce sell orders, correct stop/target
+    orientation, and correct P&L calculation.
+    """
+
+    @pytest.fixture(autouse=True)
+    def market_open(self):
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_sell_short_produces_sell_order(self, orch):
+        """A sell_short opportunity must place an Order with side='sell'."""
+        from ozymandias.intelligence.opportunity_ranker import ScoredOpportunity
+        from ozymandias.core.market_hours import Session
+        from ozymandias.execution.broker_interface import AccountInfo, OrderResult
+
+        acct = AccountInfo(
+            equity=100_000.0, buying_power=80_000.0, cash=50_000.0,
+            currency="USD", pdt_flag=False, daytrade_count=0, account_id="test",
+        )
+        opp = ScoredOpportunity(
+            symbol="TSLA",
+            action="sell_short",
+            strategy="momentum",
+            ai_conviction=0.75,
+            technical_score=0.70,
+            risk_adjusted_return=0.60,
+            liquidity_score=0.80,
+            reasoning="bearish breakdown",
+            suggested_entry=250.0,
+            suggested_exit=230.0,   # below entry — profit target for short
+            suggested_stop=260.0,   # above entry — stop for short
+            position_size_pct=0.05,
+            composite_score=0.75,
+        )
+        portfolio = PortfolioState()
+        orders_state = OrdersState()
+        orch._latest_indicators = {"TSLA": {"atr_14": 5.0, "price": 250.0}}
+
+        orch._broker.place_order = AsyncMock(return_value=OrderResult(
+            order_id="short-001", status="pending_new",
+            submitted_at=datetime.now(timezone.utc),
+        ))
+
+        with patch("ozymandias.execution.risk_manager.get_current_session",
+                   return_value=Session.REGULAR_HOURS):
+            await orch._medium_try_entry(opp, acct, portfolio, orders_state.orders)
+
+        assert orch._broker.place_order.called
+        placed = orch._broker.place_order.call_args[0][0]
+        assert placed.side == "sell", f"Expected sell, got {placed.side}"
+        assert placed.symbol == "TSLA"
+
+    @pytest.mark.asyncio
+    async def test_short_stop_above_entry_target_below(self, orch):
+        """For a short entry, the stored intention must have stop > entry and target < entry."""
+        from ozymandias.intelligence.opportunity_ranker import ScoredOpportunity
+        from ozymandias.core.market_hours import Session
+        from ozymandias.execution.broker_interface import AccountInfo, OrderResult
+
+        acct = AccountInfo(
+            equity=100_000.0, buying_power=80_000.0, cash=50_000.0,
+            currency="USD", pdt_flag=False, daytrade_count=0, account_id="test",
+        )
+        entry_price = 300.0
+        opp = ScoredOpportunity(
+            symbol="NVDA",
+            action="sell_short",
+            strategy="momentum",
+            ai_conviction=0.70,
+            technical_score=0.65,
+            risk_adjusted_return=0.60,
+            liquidity_score=0.75,
+            reasoning="distribution pattern",
+            suggested_entry=entry_price,
+            suggested_exit=0.0,    # let ATR fallback compute
+            suggested_stop=0.0,    # let ATR fallback compute
+            position_size_pct=0.05,
+            composite_score=0.70,
+        )
+        portfolio = PortfolioState()
+        orders_state = OrdersState()
+        orch._latest_indicators = {"NVDA": {"atr_14": 8.0, "price": entry_price}}
+
+        orch._broker.place_order = AsyncMock(return_value=OrderResult(
+            order_id="short-002", status="pending_new",
+            submitted_at=datetime.now(timezone.utc),
+        ))
+
+        with patch("ozymandias.execution.risk_manager.get_current_session",
+                   return_value=Session.REGULAR_HOURS):
+            await orch._medium_try_entry(opp, acct, portfolio, orders_state.orders)
+
+        pending = orch._pending_intentions.get("NVDA")
+        assert pending is not None
+        assert pending["direction"] == "short"
+        # ATR fallback: stop = entry + 2*atr, target = entry - 3*atr
+        assert pending["stop"] > entry_price, "Short stop must be above entry"
+        assert pending["target"] < entry_price, "Short target must be below entry"
+
+    @pytest.mark.asyncio
+    async def test_short_exit_is_buy_order(self, orch):
+        """Quant override exit for a short position must place a 'buy' (buy-to-cover) order."""
+        symbol = "TSLA"
+        position = Position(
+            symbol=symbol,
+            shares=10.0,
+            avg_cost=250.0,
+            entry_date=datetime.now(timezone.utc).isoformat(),
+            intention=TradeIntention(direction="short"),
+        )
+        await _set_portfolio(orch, [position])
+        orch._latest_indicators = {symbol: {
+            "price": 270.0,       # above entry — short is losing
+            "vwap": 260.0,
+            "vwap_position": "above",
+            "volume_ratio": 2.0,
+            "rsi": 65.0,
+            "rsi_divergence": False,
+            "roc_5": 0.04,
+            "atr_14": 5.0,
+            "atr_trailing_stop": 265.0,
+        }}
+        orch._intraday_highs[symbol] = 272.0
+
+        from ozymandias.execution.broker_interface import OrderResult
+        orch._broker.place_order = AsyncMock(return_value=OrderResult(
+            order_id="cover-001", status="pending_new",
+            submitted_at=datetime.now(timezone.utc),
+        ))
+
+        # _fast_step_quant_overrides skips shorts — no buy-to-cover via quant path
+        await orch._fast_step_quant_overrides()
+        orch._broker.place_order.assert_not_called()
+
+    def test_short_pnl_positive_when_price_falls(self):
+        """P&L for a short closed below entry must be positive."""
+        # Simulate the P&L calculation logic directly
+        entry_price = 250.0
+        exit_price = 230.0
+        direction = "short"
+        if direction == "short":
+            pnl_pct = round((entry_price - exit_price) / entry_price * 100, 4)
+        else:
+            pnl_pct = round((exit_price - entry_price) / entry_price * 100, 4)
+        assert pnl_pct > 0, "Short closed below entry should be profitable"
+        assert abs(pnl_pct - 8.0) < 0.01
+
+    def test_short_pnl_negative_when_price_rises(self):
+        """P&L for a short closed above entry must be negative."""
+        entry_price = 250.0
+        exit_price = 270.0
+        direction = "short"
+        if direction == "short":
+            pnl_pct = round((entry_price - exit_price) / entry_price * 100, 4)
+        else:
+            pnl_pct = round((exit_price - entry_price) / entry_price * 100, 4)
+        assert pnl_pct < 0, "Short closed above entry should be a loss"

@@ -222,6 +222,12 @@ class TestFullCycle:
     Run one cycle of fast → medium → slow and verify cross-loop integration.
     """
 
+    @pytest.fixture(autouse=True)
+    def market_open(self):
+        """Patch is_market_open to True so the market-hours gate doesn't short-circuit."""
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            yield
+
     @pytest.mark.asyncio
     async def test_full_cycle_places_order(self, orch, tmp_path):
         """

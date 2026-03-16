@@ -142,6 +142,7 @@ def _map_position(alpaca_pos) -> BrokerPosition:
         current_price=float(alpaca_pos.current_price or 0),
         market_value=float(alpaca_pos.market_value or 0),
         unrealized_pl=float(alpaca_pos.unrealized_pl or 0),
+        side=str(alpaca_pos.side.value).lower() if hasattr(alpaca_pos, "side") and alpaca_pos.side is not None else "long",
     )
 
 

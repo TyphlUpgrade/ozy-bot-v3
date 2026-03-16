@@ -10,7 +10,7 @@ from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 import pytest
 
-from ozymandias.core.config import RiskConfig
+from ozymandias.core.config import RiskConfig, SchedulerConfig
 from ozymandias.core.state_manager import (
     OrderRecord,
     PortfolioState,
@@ -704,3 +704,133 @@ class TestPendingOrderCommitment:
         # 10 shares ordered, 4 filled, 6 remaining @ $100 → $600
         orders = [_order(qty=10.0, limit_price=100.0, status="PARTIALLY_FILLED", filled_qty=4.0)]
         assert _pending_order_commitment(orders) == 600.0
+
+
+# ---------------------------------------------------------------------------
+# Dead zone filtering
+# ---------------------------------------------------------------------------
+
+def _rm_with_dead_zone(start: str = "11:30", end: str = "14:30") -> RiskManager:
+    """Build a RiskManager with custom dead zone times."""
+    sched = SchedulerConfig(dead_zone_start_et=start, dead_zone_end_et=end)
+    cfg = _cfg()
+    return RiskManager(cfg, _pdt(cfg), sched)
+
+
+class TestDeadZone:
+    """Dead zone blocks new entries during 11:30–14:30 ET; exits unaffected."""
+
+    def _call_hours(self, rm: RiskManager, now: datetime, strategy: str = "momentum") -> tuple[bool, str]:
+        return rm._check_market_hours(strategy, now)
+
+    def test_dead_zone_blocks_entry_at_noon(self):
+        rm = _rm_with_dead_zone()
+        # 12:00 PM ET — inside dead zone
+        now = datetime(2026, 3, 11, 12, 0, tzinfo=ET)
+        ok, msg = self._call_hours(rm, now)
+        assert not ok
+        assert "dead zone" in msg.lower()
+
+    def test_dead_zone_allows_entry_before(self):
+        rm = _rm_with_dead_zone()
+        # 11:00 AM ET — before dead zone
+        now = datetime(2026, 3, 11, 11, 0, tzinfo=ET)
+        ok, _ = self._call_hours(rm, now)
+        assert ok
+
+    def test_dead_zone_allows_entry_after(self):
+        rm = _rm_with_dead_zone()
+        # 3:00 PM ET — after dead zone
+        now = datetime(2026, 3, 11, 15, 0, tzinfo=ET)
+        ok, _ = self._call_hours(rm, now)
+        assert ok
+
+    def test_dead_zone_boundary_start_is_blocked(self):
+        rm = _rm_with_dead_zone()
+        # Exactly 11:30 ET → inclusive start → blocked
+        now = datetime(2026, 3, 11, 11, 30, tzinfo=ET)
+        ok, msg = self._call_hours(rm, now)
+        assert not ok
+        assert "dead zone" in msg.lower()
+
+    def test_dead_zone_boundary_end_is_allowed(self):
+        rm = _rm_with_dead_zone()
+        # Exactly 14:30 ET → exclusive end → allowed
+        now = datetime(2026, 3, 11, 14, 30, tzinfo=ET)
+        ok, _ = self._call_hours(rm, now)
+        assert ok
+
+    def test_dead_zone_applies_to_swing_strategy(self):
+        rm = _rm_with_dead_zone()
+        now = datetime(2026, 3, 11, 13, 0, tzinfo=ET)
+        ok, msg = self._call_hours(rm, now, strategy="swing")
+        assert not ok
+        assert "dead zone" in msg.lower()
+
+    def test_validate_entry_blocks_during_dead_zone(self):
+        """Dead zone propagates through the full validate_entry path."""
+        rm = _rm_with_dead_zone()
+        now = datetime(2026, 3, 11, 12, 0, tzinfo=ET)
+        rm._reset_daily_if_needed(_account(), now.date())
+        ok, msg = rm.validate_entry(
+            "AAPL", "buy", 10, 100.0, "momentum",
+            _account(), _portfolio(), [], now=now,
+        )
+        assert not ok
+        assert "dead zone" in msg.lower()
+
+    def test_default_rm_has_dead_zone_configured(self):
+        """RiskManager without explicit scheduler uses SchedulerConfig defaults."""
+        rm = _rm()  # no scheduler passed — uses defaults
+        # Default dead zone is 11:30–14:30; verify noon is blocked
+        now = datetime(2026, 3, 11, 12, 0, tzinfo=ET)
+        ok, msg = rm._check_market_hours("momentum", now)
+        assert not ok
+        assert "dead zone" in msg.lower()
+
+
+# ===========================================================================
+# Short selling — validate_entry skips buying-power check
+# ===========================================================================
+
+class TestShortEntryValidation:
+    """short entry (side="sell") must pass all risk checks but skip buying-power."""
+
+    def _now_regular(self):
+        """A timestamp during regular hours: Tuesday 10:00 ET."""
+        return datetime(2026, 3, 10, 10, 0, tzinfo=ET)
+
+    def test_short_entry_passes_when_buying_power_insufficient(self):
+        """sell_short entries must not be blocked by the buying-power check."""
+        rm = _rm()
+        # Give tiny buying power — would block a long entry
+        acct = _account(buying_power=1.0)
+        ok, msg = rm.validate_entry(
+            "TSLA", "sell", 10, 200.0, "momentum",
+            acct, _portfolio(), [], now=self._now_regular(),
+        )
+        assert ok, f"Short entry should pass with low buying power; got: {msg}"
+
+    def test_long_entry_blocked_when_buying_power_insufficient(self):
+        """Confirm the buying-power check still fires for long (buy) entries."""
+        rm = _rm()
+        acct = _account(buying_power=1.0)
+        ok, msg = rm.validate_entry(
+            "TSLA", "buy", 10, 200.0, "momentum",
+            acct, _portfolio(), [], now=self._now_regular(),
+        )
+        assert not ok
+        assert "buying power" in msg.lower()
+
+    def test_short_entry_still_blocked_by_position_limit(self):
+        """Other risk checks (max concurrent positions) still apply to shorts."""
+        cfg = _cfg(max_concurrent_positions=1)
+        rm = _rm(cfg)
+        # One position already open — at the limit
+        portfolio = _portfolio(["AAPL"])
+        ok, msg = rm.validate_entry(
+            "TSLA", "sell", 5, 200.0, "momentum",
+            _account(), portfolio, [], now=self._now_regular(),
+        )
+        assert not ok
+        assert "concurrent" in msg.lower()

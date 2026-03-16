@@ -29,6 +29,7 @@ from ozymandias.core.state_manager import (
     StateManager,
     WatchlistState,
 )
+from ozymandias.core.trade_journal import TradeJournal
 from ozymandias.data.adapters.yfinance_adapter import YFinanceAdapter
 from ozymandias.execution.alpaca_broker import AlpacaBroker
 from ozymandias.execution.broker_interface import BrokerInterface, Order
@@ -120,6 +121,7 @@ class Orchestrator:
 
         # -- Core infrastructure (initialized immediately from config) --------
         self._state_manager = StateManager()
+        self._trade_journal = TradeJournal()
         self._reasoning_cache = ReasoningCache()
 
         # -- External connectors (instantiated in _startup after credentials) -
@@ -155,10 +157,15 @@ class Orchestrator:
         # Consecutive Claude failure count — used for exponential backoff
         self._claude_failure_count: int = 0
 
-        # Pending entry intentions: symbol → {stop, target, strategy, reasoning}.
+        # Pending entry intentions: symbol → {stop, target, strategy, reasoning, ...}.
         # Written by _medium_try_entry when an order is placed; consumed by
         # _fast_step_position_sync when a new broker position is discovered.
         self._pending_intentions: dict[str, dict] = {}
+
+        # Entry contexts: symbol → {signals, claude_conviction, composite_score}.
+        # Populated from _pending_intentions when a buy fill is detected; consumed
+        # by _journal_closed_trade when the position is later closed.
+        self._entry_contexts: dict[str, dict] = {}
 
         # Shutdown flag — set by _shutdown(), checked by loops
         self._stopping = False
@@ -226,7 +233,9 @@ class Orchestrator:
 
         # -- PDT guard & risk manager -----------------------------------------
         self._pdt_guard = PDTGuard(self._config.risk)
-        self._risk_manager = RiskManager(self._config.risk, self._pdt_guard)
+        self._risk_manager = RiskManager(
+            self._config.risk, self._pdt_guard, self._config.scheduler
+        )
 
         # -- Market data adapter ----------------------------------------------
         self._data_adapter = YFinanceAdapter()
@@ -533,6 +542,9 @@ class Orchestrator:
         4. PDT guard check.
         5. Position sync (broker vs local).
         """
+        if not is_market_open():
+            return  # no action outside regular hours — resumes cleanly at 9:30
+
         # Guard — if broker is unavailable, skip order operations but still
         # run local checks.
         if not self._degradation.broker_available:
@@ -588,10 +600,12 @@ class Orchestrator:
         changes = await self._fill_protection.reconcile(broker_statuses)
         for change in changes:
             log.info(
-                "Order state change: %s %s → %s (type=%s fill_qty=%.2f)",
+                "Order state change: %s %s → %s (type=%s fill_qty=%.2f fill_price=%.4f)",
                 change.symbol, change.old_status, change.new_status,
-                change.change_type, change.fill_qty,
+                change.change_type, change.fill_qty, change.fill_price,
             )
+            if change.change_type == "fill" and change.side == "sell":
+                await self._journal_closed_trade(change)
 
         # Also poll any locally-tracked orders not in broker's open list
         orders_state = await self._state_manager.load_orders()
@@ -640,6 +654,81 @@ class Orchestrator:
                     stale_order.order_id, exc,
                 )
 
+    async def _journal_closed_trade(self, change) -> None:
+        """Write a trade journal entry and remove the position from the portfolio.
+
+        Called whenever a sell order fill is detected in the reconcile loop.
+        Captures: entry data from portfolio, exit price from broker fill, signal
+        context from _entry_contexts (populated when the buy filled).
+        """
+        symbol = change.symbol
+        try:
+            portfolio = await self._state_manager.load_portfolio()
+            position = next((p for p in portfolio.positions if p.symbol == symbol), None)
+            if position is None:
+                log.debug("_journal_closed_trade: no local position for %s — skipping", symbol)
+                return
+
+            entry_price = position.avg_cost
+            exit_price = change.fill_price
+            is_short = position.intention.direction == "short"
+            if entry_price > 0 and exit_price > 0:
+                if is_short:
+                    pnl_pct = round((entry_price - exit_price) / entry_price * 100, 4)
+                else:
+                    pnl_pct = round((exit_price - entry_price) / entry_price * 100, 4)
+            else:
+                pnl_pct = 0.0
+
+            # Infer exit reason from fill price vs stop/target levels.
+            # For shorts: target is below entry (profit when price falls),
+            # stop is above entry (loss when price rises).
+            stop = position.intention.exit_targets.stop_loss
+            target = position.intention.exit_targets.profit_target
+            if is_short:
+                if exit_price > 0 and target > 0 and exit_price <= target * 1.001:
+                    exit_reason = "target"
+                elif exit_price > 0 and stop > 0 and exit_price >= stop * 0.999:
+                    exit_reason = "stop"
+                else:
+                    exit_reason = "strategy"
+            else:
+                if exit_price > 0 and target > 0 and exit_price >= target * 0.999:
+                    exit_reason = "target"
+                elif exit_price > 0 and stop > 0 and exit_price <= stop * 1.001:
+                    exit_reason = "stop"
+                else:
+                    exit_reason = "strategy"
+
+            ctx = self._entry_contexts.pop(symbol, {})
+            await self._trade_journal.append({
+                "symbol": symbol,
+                "strategy": position.intention.strategy,
+                "direction": position.intention.direction,
+                "entry_time": position.entry_date,
+                "exit_time": datetime.now(timezone.utc).isoformat(),
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "shares": change.fill_qty,
+                "pnl_pct": pnl_pct,
+                "stop_price": stop,
+                "target_price": target,
+                "exit_reason": exit_reason,
+                "signals_at_entry": ctx.get("signals", {}),
+                "claude_conviction": ctx.get("claude_conviction", 0.0),
+                "composite_score": ctx.get("composite_score", 0.0),
+                "source": "live",
+            })
+
+            portfolio.positions = [p for p in portfolio.positions if p.symbol != symbol]
+            await self._state_manager.save_portfolio(portfolio)
+            log.info(
+                "Trade closed and journaled: %s  pnl=%.2f%%  exit_reason=%s",
+                symbol, pnl_pct, exit_reason,
+            )
+        except Exception as exc:
+            log.error("_journal_closed_trade failed for %s: %s", symbol, exc, exc_info=True)
+
     async def _fast_step_quant_overrides(self) -> None:
         """
         Step 3: For each open position, evaluate quantitative override signals.
@@ -653,6 +742,11 @@ class Orchestrator:
 
         for position in portfolio.positions:
             symbol = position.symbol
+
+            # Override signals (VWAP crossover, ATR trailing stop) are long-biased.
+            # Skip quant overrides for short positions — they rely on stop/target instead.
+            if position.intention.direction == "short":
+                continue
 
             # We need current indicators — use cached TA data if available.
             # In the fast loop we reuse the most recent indicator data computed
@@ -693,10 +787,11 @@ class Orchestrator:
                 )
                 continue
 
-            # Place market sell order
+            # Place market exit order (buy to close short, sell to close long)
+            exit_side = "buy" if position.intention.direction == "short" else "sell"
             exit_order = Order(
                 symbol=symbol,
-                side="sell",
+                side=exit_side,
                 quantity=position.shares,
                 order_type="market",
                 time_in_force="day",
@@ -707,7 +802,7 @@ class Orchestrator:
                 order_record = OrderRecord(
                     order_id=result.order_id,
                     symbol=symbol,
-                    side="sell",
+                    side=exit_side,
                     quantity=position.shares,
                     order_type="market",
                     limit_price=None,
@@ -775,27 +870,70 @@ class Orchestrator:
 
         broker_symbols = {p.symbol for p in broker_positions}
         local_symbols = {p.symbol for p in portfolio.positions}
+        local_map = {p.symbol: p for p in portfolio.positions}
+        portfolio_updated = False
 
-        # Positions we have locally but broker doesn't know about
+        # Positions we have locally but broker no longer holds — these were closed
+        # outside the normal fill-detection path (e.g. manual broker close).
         ghost_local = local_symbols - broker_symbols
         if ghost_local:
             log.warning(
-                "Position sync discrepancy — local has positions not in broker: %s",
+                "Position sync: local positions not found at broker (likely closed externally): %s",
                 ghost_local,
             )
+            for symbol in ghost_local:
+                pos = local_map.get(symbol)
+                if pos is None:
+                    continue
+                ctx = self._entry_contexts.pop(symbol, {})
+                current_price = getattr(self, "_latest_indicators", {}).get(symbol, {}).get("price", 0.0)
+                await self._trade_journal.append({
+                    "symbol": symbol,
+                    "strategy": pos.intention.strategy,
+                    "direction": pos.intention.direction,
+                    "entry_time": pos.entry_date,
+                    "exit_time": datetime.now(timezone.utc).isoformat(),
+                    "entry_price": pos.avg_cost,
+                    "exit_price": current_price,
+                    "shares": pos.shares,
+                    "pnl_pct": round(
+                        (
+                            (pos.avg_cost - current_price) / pos.avg_cost * 100
+                            if pos.intention.direction == "short"
+                            else (current_price - pos.avg_cost) / pos.avg_cost * 100
+                        )
+                        if pos.avg_cost > 0 and current_price > 0 else 0.0, 4
+                    ),
+                    "stop_price": pos.intention.exit_targets.stop_loss,
+                    "target_price": pos.intention.exit_targets.profit_target,
+                    "exit_reason": "external_close",
+                    "signals_at_entry": ctx.get("signals", {}),
+                    "claude_conviction": ctx.get("claude_conviction", 0.0),
+                    "composite_score": ctx.get("composite_score", 0.0),
+                    "source": "live",
+                })
+            portfolio.positions = [p for p in portfolio.positions if p.symbol not in ghost_local]
+            portfolio_updated = True
 
         # Positions broker has that we don't track locally — create them now so that
         # stop/target checks and Claude position reviews work correctly during the session.
         unknown_broker = broker_symbols - local_symbols
-        portfolio_updated = False
         for bp in broker_positions:
             if bp.symbol not in local_symbols:
                 # Pull pending intention stored when the entry order was placed.
                 # Falls back to empty intention if the position arrived unexpectedly.
                 pending = self._pending_intentions.pop(bp.symbol, {})
+                # Move signal context into entry_contexts for use when this position closes.
+                if pending:
+                    self._entry_contexts[bp.symbol] = {
+                        "signals": pending.pop("_signals", {}),
+                        "claude_conviction": pending.pop("_claude_conviction", 0.0),
+                        "composite_score": pending.pop("_composite_score", 0.0),
+                    }
                 now_iso = datetime.now(timezone.utc).isoformat()
                 intention = TradeIntention(
                     strategy=pending.get("strategy", "unknown"),
+                    direction=pending.get("direction", bp.side),
                     reasoning=pending.get("reasoning", ""),
                     exit_targets=ExitTargets(
                         stop_loss=pending.get("stop", 0.0),
@@ -854,6 +992,9 @@ class Orchestrator:
         5. Execute top opportunity (one per cycle) if risk-validated.
         6. Re-evaluate open positions; exit if strategy recommends it.
         """
+        if not is_market_open():
+            return  # no data fetches or analysis outside regular hours
+
         if self._degradation.market_data_available is False:
             log.warning("Medium loop: market data unavailable — skipping cycle")
             return
@@ -1010,6 +1151,8 @@ class Orchestrator:
                     self._conservative_mode_until.isoformat(), symbol,
                 )
                 return
+        is_short = top.action == "sell_short"
+        order_side = "sell" if is_short else "buy"
         strategy_name = top.strategy
 
         # Determine ATR for position sizing
@@ -1026,7 +1169,7 @@ class Orchestrator:
 
         allowed, reason = self._risk_manager.validate_entry(
             symbol=symbol,
-            side="buy",
+            side=order_side,
             quantity=quantity,
             price=entry_price,
             strategy=strategy_name,
@@ -1081,21 +1224,31 @@ class Orchestrator:
         # Determine stop and target for position intention.
         # Prefer Claude's suggested levels (specific support/resistance) when provided;
         # fall back to ATR-based calculation if Claude returned 0.
+        # For shorts, stop is above entry (loss if price rises) and target is below entry.
         atr_for_intention = ind.get("atr_14", 0.0)
-        use_stop = (
-            top.suggested_stop
-            if top.suggested_stop > 0
-            else (entry_price - 2 * atr_for_intention if atr_for_intention > 0 else entry_price * 0.95)
-        )
-        use_target = (
-            top.suggested_exit
-            if top.suggested_exit > 0
-            else (entry_price + 3 * atr_for_intention if atr_for_intention > 0 else entry_price * 1.10)
-        )
+        atr_or_pct = atr_for_intention if atr_for_intention > 0 else entry_price * 0.02
+        if is_short:
+            use_stop = (
+                top.suggested_stop if top.suggested_stop > 0
+                else entry_price + 2 * atr_or_pct
+            )
+            use_target = (
+                top.suggested_exit if top.suggested_exit > 0
+                else entry_price - 3 * atr_or_pct
+            )
+        else:
+            use_stop = (
+                top.suggested_stop if top.suggested_stop > 0
+                else entry_price - 2 * atr_or_pct
+            )
+            use_target = (
+                top.suggested_exit if top.suggested_exit > 0
+                else entry_price + 3 * atr_or_pct
+            )
 
         order = Order(
             symbol=symbol,
-            side="buy",
+            side=order_side,
             quantity=quantity,
             order_type="limit",
             limit_price=entry_price,
@@ -1109,18 +1262,23 @@ class Orchestrator:
         self._mark_broker_available()
 
         # Store intention so _fast_step_position_sync can attach it to the position on fill.
+        # Also stash signal context for the trade journal (consumed when the position closes).
         self._pending_intentions[symbol] = {
             "stop": round(use_stop, 4),
             "target": round(use_target, 4),
             "strategy": strategy_name,
             "reasoning": top.reasoning,
+            "direction": "short" if is_short else "long",
+            "_signals": dict(self._latest_indicators.get(symbol, {})),
+            "_claude_conviction": float(top.ai_conviction),
+            "_composite_score": float(top.composite_score),
         }
 
         now_iso = datetime.now(timezone.utc).isoformat()
         record = OrderRecord(
             order_id=result.order_id,
             symbol=symbol,
-            side="buy",
+            side=order_side,
             quantity=quantity,
             order_type="limit",
             limit_price=entry_price,
@@ -1181,10 +1339,12 @@ class Orchestrator:
                     log.warning("Medium loop: suggest_exit failed %s: %s", symbol, exc)
                     exit_sug = None
 
+                # buy to close short, sell to close long
+                exit_side = "buy" if position.intention.direction == "short" else "sell"
                 if exit_sug and exit_sug.order_type == "limit" and exit_sug.exit_price > 0:
                     exit_order = Order(
                         symbol=symbol,
-                        side="sell",
+                        side=exit_side,
                         quantity=position.shares,
                         order_type="limit",
                         limit_price=exit_sug.exit_price,
@@ -1193,7 +1353,7 @@ class Orchestrator:
                 else:
                     exit_order = Order(
                         symbol=symbol,
-                        side="sell",
+                        side=exit_side,
                         quantity=position.shares,
                         order_type="market",
                         time_in_force="day",
@@ -1210,7 +1370,7 @@ class Orchestrator:
                 record = OrderRecord(
                     order_id=result.order_id,
                     symbol=symbol,
-                    side="sell",
+                    side=exit_side,
                     quantity=position.shares,
                     order_type=exit_order.order_type,
                     limit_price=exit_order.limit_price,
@@ -1246,6 +1406,9 @@ class Orchestrator:
         starts a Claude reasoning cycle. The cycle is async — fast and medium
         loops continue uninterrupted while waiting for Claude's response.
         """
+        if not is_market_open():
+            return  # no Claude calls outside regular hours
+
         # Guard: never fire two concurrent Claude calls
         if self._trigger_state.claude_call_in_flight:
             log.debug("Slow loop: Claude call already in-flight — skipping check")

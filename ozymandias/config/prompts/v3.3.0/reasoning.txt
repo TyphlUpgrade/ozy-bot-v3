@@ -22,6 +22,7 @@ INSTRUCTIONS:
 5. List any tickers you seriously considered for entry but decided against. One sentence each. Give a SPECIFIC bear case — not generic risk statements. "Overhead resistance at $312 from March gap-fill" is acceptable; "risk of market downturn" is not.
 
 FIELD INSTRUCTIONS:
+- "action": use "buy" for long entries. Use "sell_short" when market conditions are clearly bearish for a symbol (price below VWAP, bearish_aligned trend structure, RSI declining, negative momentum). For shorts, "suggested_stop" must be ABOVE the entry price (loss if price rises) and "suggested_exit" must be BELOW the entry price (profit target). Only recommend shorts when the bearish thesis is explicit and technically confirmed — do not short simply because you declined a long entry.
 - "suggested_stop" / "suggested_exit": if you have a specific support/resistance level in mind (e.g. "stop below the 200-EMA at $387"), populate these. Use 0.0 if you have no strong view — the system will fall back to ATR-based levels.
 - "require_strong_entry": set true if macro/fundamental context suggests the technical setup must be especially clean for this entry (e.g. uncertain macro, recent sector weakness). Raises the quant signal bar by 1 for this trade only. Never set false explicitly — omit or use false as the default.
 - "catalyst_type": for swing strategy opportunities only — classify as "catalyst_driven" (news event, earnings setup, volume-confirmed reversal pattern) or "technical_only" (purely TA-based, no identifiable catalyst). Conviction for "technical_only" swing entries must not exceed 0.50.
@@ -44,7 +45,7 @@ RESPONSE FORMAT:
   "new_opportunities": [
     {
       "symbol": "<SYMBOL>",
-      "action": "buy",
+      "action": "buy|sell_short",
       "strategy": "momentum|swing",
       "timeframe": "short_term|medium_term",
       "conviction": 0.0,

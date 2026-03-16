@@ -12,7 +12,9 @@ import logging
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from ozymandias.core.config import RiskConfig
+from datetime import time as dtime
+
+from ozymandias.core.config import RiskConfig, SchedulerConfig
 from ozymandias.core.market_hours import Session, get_current_session, is_last_five_minutes
 from ozymandias.core.state_manager import OrderRecord, PortfolioState, Position
 from ozymandias.execution.broker_interface import AccountInfo
@@ -63,9 +65,18 @@ class RiskManager:
         shares = rm.calculate_position_size("AAPL", 175.0, 3.5, 50_000.0)
     """
 
-    def __init__(self, config: RiskConfig, pdt_guard: PDTGuard) -> None:
+    def __init__(
+        self,
+        config: RiskConfig,
+        pdt_guard: PDTGuard,
+        scheduler: SchedulerConfig | None = None,
+    ) -> None:
         self._cfg = config
         self._pdt = pdt_guard
+        # Dead zone: parse HH:MM strings from scheduler config
+        sched = scheduler or SchedulerConfig()
+        self._dead_zone_start: dtime = dtime.fromisoformat(sched.dead_zone_start_et)
+        self._dead_zone_end: dtime = dtime.fromisoformat(sched.dead_zone_end_et)
         # Previous momentum scores per symbol (for flip detection)
         self._prev_momentum_scores: dict[str, float] = {}
         # Daily loss state
@@ -171,12 +182,22 @@ class RiskManager:
         return True, "All risk checks passed"
 
     def _check_market_hours(self, strategy: str, now: datetime) -> tuple[bool, str]:
-        """Block entries in non-regular sessions; block momentum in last 5 minutes."""
+        """Block entries in non-regular sessions; block all entries in dead zone;
+        block momentum in last 5 minutes."""
         session = get_current_session(now)
         if session != Session.REGULAR_HOURS:
             return False, (
                 f"Market not in regular hours (session={session.value}) — "
                 f"new entries blocked"
+            )
+        # Dead zone: no new entries during midday low-volume window
+        et = now.astimezone(ET)
+        t = et.time()
+        if self._dead_zone_start <= t < self._dead_zone_end:
+            return False, (
+                f"Dead zone active ({self._dead_zone_start.strftime('%H:%M')}–"
+                f"{self._dead_zone_end.strftime('%H:%M')} ET) "
+                "— new entries suspended"
             )
         if strategy == "momentum" and is_last_five_minutes(now):
             return False, (

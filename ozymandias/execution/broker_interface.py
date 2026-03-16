@@ -87,6 +87,7 @@ class BrokerPosition:
     current_price: float
     market_value: float
     unrealized_pl: float
+    side: str = "long"      # "long" | "short"
 
 
 @dataclass
