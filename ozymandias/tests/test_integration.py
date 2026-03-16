@@ -223,8 +223,9 @@ class TestFullCycle:
     """
 
     @pytest.fixture(autouse=True)
-    def market_open(self):
-        """Patch is_market_open to True so the market-hours gate doesn't short-circuit."""
+    def market_open(self, orch):
+        """Patch is_market_open to True and seed indicators so guards don't short-circuit."""
+        orch._latest_indicators = {"NVDA": {"price": 875.0}}
         with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
             yield
 
@@ -457,6 +458,11 @@ class TestDegradation:
     - claude_backoff_until_utc is set
     - Slow loop skips Claude calls until backoff expires
     """
+
+    @pytest.fixture(autouse=True)
+    def seed_indicators(self, orch):
+        """Seed _latest_indicators so the slow loop's indicator guard doesn't short-circuit."""
+        orch._latest_indicators = {"TEST": {"price": 100.0}}
 
     @pytest.mark.asyncio
     async def test_claude_failure_sets_degradation_flag(self, orch):

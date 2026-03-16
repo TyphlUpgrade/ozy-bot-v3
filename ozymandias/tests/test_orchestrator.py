@@ -247,6 +247,7 @@ class TestCheckTriggers:
     @pytest.mark.asyncio
     async def test_no_trigger_when_quiet(self, orch):
         """All conditions calm — trigger list should be empty."""
+        from ozymandias.core.market_hours import get_current_session
         symbols = [f"SYM{i}" for i in range(12)]
         await _set_watchlist(orch, tier1=symbols)
         orch._trigger_state.last_claude_call_utc = (
@@ -256,6 +257,8 @@ class TestCheckTriggers:
         orch._trigger_state.last_override_exit_count = 0
         orch._override_exit_count = 0
         orch._latest_indicators = {}
+        # Sync last_session to actual current session so the transition trigger doesn't fire.
+        orch._trigger_state.last_session = get_current_session().value
         triggers = await orch._check_triggers()
         assert triggers == []
 
@@ -267,8 +270,9 @@ class TestCheckTriggers:
 class TestSlowLoopCycle:
 
     @pytest.fixture(autouse=True)
-    def market_open(self):
-        """Patch is_market_open to True so the market-hours gate doesn't short-circuit."""
+    def market_open(self, orch):
+        """Patch is_market_open to True and seed indicators so guards don't short-circuit."""
+        orch._latest_indicators = {"TEST": {"price": 100.0}}
         with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
             yield
 

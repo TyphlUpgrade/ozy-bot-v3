@@ -1,6 +1,3 @@
-# Async HTTP
-aiohttp>=3.9
-
 # Broker
 alpaca-py>=0.30  # Alpaca SDK with native async support
 

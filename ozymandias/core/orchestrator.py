@@ -419,6 +419,12 @@ class Orchestrator:
                 "Step 4 — fresh cache found (timestamp=%s)",
                 fresh.get("timestamp"),
             )
+            # Suppress no_previous_call trigger — we already have recent reasoning.
+            try:
+                ts = datetime.fromisoformat(fresh["timestamp"])
+                self._trigger_state.last_claude_call_utc = ts
+            except Exception:
+                pass  # malformed timestamp — let trigger fire naturally
         else:
             log.info("Step 4 — no fresh cache — Claude will be called on first trigger")
 
@@ -1408,6 +1414,12 @@ class Orchestrator:
         """
         if not is_market_open():
             return  # no Claude calls outside regular hours
+
+        # Guard: don't call Claude until the medium loop has computed indicators at
+        # least once. Without TA data the context is empty and Claude rejects everything.
+        if not getattr(self, "_latest_indicators", {}):
+            log.debug("Slow loop: no indicator data yet — waiting for first medium loop cycle")
+            return
 
         # Guard: never fire two concurrent Claude calls
         if self._trigger_state.claude_call_in_flight:
