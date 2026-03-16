@@ -505,14 +505,8 @@ class TestFastLoopErrorIsolation:
 
 class TestMediumLoopOneEntryPerCycle:
 
-    @pytest.mark.asyncio
-    async def test_only_one_entry_per_cycle(self, orch):
-        """
-        Even if the ranker returns 3 scored opportunities, only the top-ranked
-        one should be attempted per cycle.
-        """
+    def _make_ranked(self):
         from ozymandias.intelligence.opportunity_ranker import ScoredOpportunity
-
         opp = lambda sym, score: ScoredOpportunity(
             symbol=sym, action="buy", strategy="momentum",
             composite_score=score, ai_conviction=0.7, technical_score=0.6,
@@ -520,12 +514,49 @@ class TestMediumLoopOneEntryPerCycle:
             suggested_entry=200.0, suggested_exit=220.0, suggested_stop=190.0,
             position_size_pct=0.08, reasoning="test",
         )
-        ranked = [opp("AAPL", 0.8), opp("TSLA", 0.7), opp("NVDA", 0.6)]
+        return [opp("AAPL", 0.8), opp("TSLA", 0.7), opp("NVDA", 0.6)]
 
+    def _run_medium_cycle(self, orch, ranked, fake_try_entry):
+        """Helper: run one _medium_loop_cycle with patched deps."""
+        import pandas as pd
+        from datetime import timezone as _tz
+
+        df = pd.DataFrame({
+            "open": [200.0], "high": [201.0], "low": [199.0],
+            "close": [200.5], "volume": [100_000.0],
+        }, index=pd.DatetimeIndex(
+            [datetime.now(_tz.utc)], tz=_tz.utc
+        ))
+
+        return (
+            patch.object(orch, "_data_adapter"),
+            patch.object(orch, "_ranker"),
+            patch.object(orch, "_medium_evaluate_positions", AsyncMock()),
+            patch.object(orch, "_medium_try_entry", fake_try_entry),
+            patch("ozymandias.core.orchestrator.generate_signal_summary",
+                  return_value={"signals": {}, "composite_technical_score": 0.5,
+                                "symbol": "X", "timestamp": ""}),
+        ), df
+
+    @pytest.mark.asyncio
+    async def test_stops_after_first_success(self, orch):
+        """
+        When the first candidate succeeds (returns True), no further candidates
+        are attempted even if more are ranked.
+        """
+        ranked = self._make_ranked()
         entry_calls = []
 
         async def fake_try_entry(top, acct, portfolio, orders):
             entry_calls.append(top.symbol)
+            return True  # first attempt succeeds
+
+        import pandas as pd
+        from datetime import timezone as _tz
+        df = pd.DataFrame({
+            "open": [200.0], "high": [201.0], "low": [199.0],
+            "close": [200.5], "volume": [100_000.0],
+        }, index=pd.DatetimeIndex([datetime.now(_tz.utc)], tz=_tz.utc))
 
         with (
             patch.object(orch, "_data_adapter") as mock_adapter,
@@ -536,15 +567,6 @@ class TestMediumLoopOneEntryPerCycle:
                   return_value={"signals": {}, "composite_technical_score": 0.5,
                                 "symbol": "X", "timestamp": ""}),
         ):
-            import pandas as pd
-            import numpy as np
-            from datetime import timezone
-            df = pd.DataFrame({
-                "open": [200.0], "high": [201.0], "low": [199.0],
-                "close": [200.5], "volume": [100_000.0],
-            }, index=pd.DatetimeIndex(
-                [datetime.now(timezone.utc)], tz=timezone.utc
-            ))
             mock_adapter.fetch_bars = AsyncMock(return_value=df)
             mock_ranker.rank_opportunities = MagicMock(return_value=ranked)
             orch._broker.get_account = AsyncMock(return_value=_stub_account())
@@ -553,10 +575,93 @@ class TestMediumLoopOneEntryPerCycle:
             with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
                 await orch._medium_loop_cycle()
 
-        assert len(entry_calls) == 1, (
-            f"Expected exactly 1 entry attempt, got {len(entry_calls)}: {entry_calls}"
+        assert entry_calls == ["AAPL"], (
+            f"Expected only AAPL attempted, got {entry_calls}"
         )
-        assert entry_calls[0] == "AAPL", f"Expected top-ranked AAPL, got {entry_calls[0]}"
+
+    @pytest.mark.asyncio
+    async def test_tries_next_candidate_when_first_skipped(self, orch):
+        """
+        When first candidate returns False (blocked), the loop tries the next
+        candidate. Stops after first True.
+        """
+        ranked = self._make_ranked()
+        entry_calls = []
+
+        async def fake_try_entry(top, acct, portfolio, orders):
+            entry_calls.append(top.symbol)
+            # AAPL blocked, TSLA succeeds
+            return top.symbol != "AAPL"
+
+        import pandas as pd
+        from datetime import timezone as _tz
+        df = pd.DataFrame({
+            "open": [200.0], "high": [201.0], "low": [199.0],
+            "close": [200.5], "volume": [100_000.0],
+        }, index=pd.DatetimeIndex([datetime.now(_tz.utc)], tz=_tz.utc))
+
+        with (
+            patch.object(orch, "_data_adapter") as mock_adapter,
+            patch.object(orch, "_ranker") as mock_ranker,
+            patch.object(orch, "_medium_evaluate_positions", AsyncMock()),
+            patch.object(orch, "_medium_try_entry", fake_try_entry),
+            patch("ozymandias.core.orchestrator.generate_signal_summary",
+                  return_value={"signals": {}, "composite_technical_score": 0.5,
+                                "symbol": "X", "timestamp": ""}),
+        ):
+            mock_adapter.fetch_bars = AsyncMock(return_value=df)
+            mock_ranker.rank_opportunities = MagicMock(return_value=ranked)
+            orch._broker.get_account = AsyncMock(return_value=_stub_account())
+
+            await _set_watchlist(orch, tier1=["AAPL"])
+            with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+                await orch._medium_loop_cycle()
+
+        assert entry_calls == ["AAPL", "TSLA"], (
+            f"Expected AAPL (blocked) then TSLA (success), got {entry_calls}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_respects_entry_attempts_per_cycle_limit(self, orch):
+        """
+        entry_attempts_per_cycle caps how many candidates are tried even if all fail.
+        Default is 3, so with 3 candidates all blocked, exactly 3 attempts are made.
+        """
+        ranked = self._make_ranked()
+        entry_calls = []
+
+        async def fake_try_entry(top, acct, portfolio, orders):
+            entry_calls.append(top.symbol)
+            return False  # all blocked
+
+        import pandas as pd
+        from datetime import timezone as _tz
+        df = pd.DataFrame({
+            "open": [200.0], "high": [201.0], "low": [199.0],
+            "close": [200.5], "volume": [100_000.0],
+        }, index=pd.DatetimeIndex([datetime.now(_tz.utc)], tz=_tz.utc))
+
+        with (
+            patch.object(orch, "_data_adapter") as mock_adapter,
+            patch.object(orch, "_ranker") as mock_ranker,
+            patch.object(orch, "_medium_evaluate_positions", AsyncMock()),
+            patch.object(orch, "_medium_try_entry", fake_try_entry),
+            patch("ozymandias.core.orchestrator.generate_signal_summary",
+                  return_value={"signals": {}, "composite_technical_score": 0.5,
+                                "symbol": "X", "timestamp": ""}),
+        ):
+            mock_adapter.fetch_bars = AsyncMock(return_value=df)
+            mock_ranker.rank_opportunities = MagicMock(return_value=ranked)
+            orch._broker.get_account = AsyncMock(return_value=_stub_account())
+
+            await _set_watchlist(orch, tier1=["AAPL"])
+            with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+                await orch._medium_loop_cycle()
+
+        # Default entry_attempts_per_cycle = 3, we have exactly 3 ranked → all tried
+        assert len(entry_calls) == 3, (
+            f"Expected 3 attempts (capped by entry_attempts_per_cycle), got {entry_calls}"
+        )
 
 
 # ===========================================================================
@@ -759,6 +864,452 @@ class TestThesisChallenge:
 
 
 # ===========================================================================
+# Thesis challenge cache
+# ===========================================================================
+
+class TestThesisChallengeCache:
+    """Tests for the per-symbol thesis challenge result cache."""
+
+    def _make_top(self, symbol: str = "AAPL", position_size_pct: float = 0.20):
+        from ozymandias.intelligence.opportunity_ranker import ScoredOpportunity
+        return ScoredOpportunity(
+            symbol=symbol, action="buy", strategy="momentum",
+            composite_score=0.80, ai_conviction=0.85, technical_score=0.70,
+            risk_adjusted_return=0.60, liquidity_score=1.0,
+            suggested_entry=200.0, suggested_exit=220.0, suggested_stop=190.0,
+            position_size_pct=position_size_pct, reasoning="Breakout.",
+        )
+
+    def _stub_entry_guards(self, orch):
+        orch._risk_manager.calculate_position_size = MagicMock(return_value=10)
+        orch._risk_manager.validate_entry = MagicMock(return_value=(True, ""))
+        orch._fill_protection.can_place_order = MagicMock(return_value=True)
+        orch._latest_indicators = {}
+        orch._latest_market_context = {}
+
+    @pytest.mark.asyncio
+    async def test_cached_block_skips_claude_call(self, orch):
+        """When a symbol is cached as blocked (within TTL), run_thesis_challenge is NOT called."""
+        import time as _time
+        top = self._make_top()
+        self._stub_entry_guards(orch)
+        orch._claude.run_thesis_challenge = AsyncMock(
+            return_value={"proceed": False, "conviction": 0.1, "challenge_reasoning": "blocked"}
+        )
+        acct = _stub_account()
+        portfolio = PortfolioState(positions=[])
+
+        # Pre-populate cache: AAPL was blocked 30 seconds ago (well within 10-min TTL)
+        orch._thesis_challenge_cache["AAPL"] = (True, _time.monotonic() - 30)
+
+        result = await orch._medium_try_entry(top, acct, portfolio, [])
+
+        assert result is False
+        orch._claude.run_thesis_challenge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_expired_cache_re_evaluates(self, orch):
+        """When the cached result is older than TTL, Claude is called again."""
+        import time as _time
+        top = self._make_top()
+        self._stub_entry_guards(orch)
+        orch._claude.run_thesis_challenge = AsyncMock(
+            return_value={"proceed": True, "conviction": 0.85, "challenge_reasoning": "ok"}
+        )
+        orch._broker.place_order = AsyncMock(return_value=MagicMock(order_id="ord_x"))
+        orch._fill_protection.record_order = AsyncMock()
+        acct = _stub_account()
+        portfolio = PortfolioState(positions=[])
+
+        # Pre-populate cache: AAPL was blocked 20 minutes ago (beyond default 10-min TTL)
+        ttl_sec = orch._config.ranker.thesis_challenge_ttl_min * 60
+        orch._thesis_challenge_cache["AAPL"] = (True, _time.monotonic() - ttl_sec - 1)
+
+        await orch._medium_try_entry(top, acct, portfolio, [])
+
+        orch._claude.run_thesis_challenge.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_challenge_result_stored_in_cache(self, orch):
+        """After a thesis challenge runs, the result is stored in the cache."""
+        import time as _time
+        top = self._make_top()
+        self._stub_entry_guards(orch)
+        orch._claude.run_thesis_challenge = AsyncMock(
+            return_value={"proceed": False, "conviction": 0.1, "challenge_reasoning": "nope"}
+        )
+        acct = _stub_account()
+        portfolio = PortfolioState(positions=[])
+
+        assert "AAPL" not in orch._thesis_challenge_cache
+
+        await orch._medium_try_entry(top, acct, portfolio, [])
+
+        assert "AAPL" in orch._thesis_challenge_cache
+        was_blocked, ts = orch._thesis_challenge_cache["AAPL"]
+        assert was_blocked is True
+        assert _time.monotonic() - ts < 5  # stored within last 5 seconds
+
+    @pytest.mark.asyncio
+    async def test_not_blocked_cache_entry_falls_through(self, orch):
+        """When cached as not-blocked, re-evaluation runs (conditions may have changed)."""
+        import time as _time
+        top = self._make_top()
+        self._stub_entry_guards(orch)
+        orch._claude.run_thesis_challenge = AsyncMock(
+            return_value={"proceed": True, "conviction": 0.85, "challenge_reasoning": "ok"}
+        )
+        orch._broker.place_order = AsyncMock(return_value=MagicMock(order_id="ord_y"))
+        orch._fill_protection.record_order = AsyncMock()
+        acct = _stub_account()
+        portfolio = PortfolioState(positions=[])
+
+        # Cached as NOT blocked (within TTL) — should still re-evaluate
+        orch._thesis_challenge_cache["AAPL"] = (False, _time.monotonic() - 30)
+
+        await orch._medium_try_entry(top, acct, portfolio, [])
+
+        orch._claude.run_thesis_challenge.assert_called_once()
+
+
+# ===========================================================================
+# Opening fill registration and dispatch
+# ===========================================================================
+
+class TestRegisterOpeningFill:
+    """_register_opening_fill creates the portfolio position from confirmed fill data."""
+
+    def _make_change(self, symbol="AMD", fill_qty=30.0, fill_price=198.07, side="buy"):
+        from ozymandias.execution.fill_protection import StateChange
+        return StateChange(
+            order_id="ord_001", symbol=symbol,
+            old_status="PENDING", new_status="FILLED",
+            fill_qty=fill_qty, fill_price=fill_price,
+            side=side, change_type="fill",
+        )
+
+    @pytest.mark.asyncio
+    async def test_creates_long_position_from_buy_fill(self, orch):
+        """Long position created with correct qty, price, and intention from pending."""
+        orch._pending_intentions["AMD"] = {
+            "stop": 194.0, "target": 205.0, "strategy": "swing",
+            "direction": "long", "reasoning": "breakout",
+            "_signals": {}, "_claude_conviction": 0.8, "_composite_score": 0.7,
+        }
+        change = self._make_change(fill_qty=30.0, fill_price=198.07)
+
+        await orch._register_opening_fill(change)
+
+        portfolio = await orch._state_manager.load_portfolio()
+        assert len(portfolio.positions) == 1
+        pos = portfolio.positions[0]
+        assert pos.symbol == "AMD"
+        assert pos.shares == 30.0
+        assert abs(pos.avg_cost - 198.07) < 0.001
+        assert pos.intention.strategy == "swing"
+        assert pos.intention.direction == "long"
+        assert pos.intention.exit_targets.stop_loss == 194.0
+        assert pos.intention.exit_targets.profit_target == 205.0
+
+    @pytest.mark.asyncio
+    async def test_creates_short_position_from_sell_fill(self, orch):
+        """Short position created from a sell fill — shares stored positive, direction=short."""
+        orch._pending_intentions["META"] = {
+            "stop": 635.0, "target": 615.0, "strategy": "swing",
+            "direction": "short", "reasoning": "breakdown",
+            "_signals": {}, "_claude_conviction": 0.75, "_composite_score": 0.65,
+        }
+        change = self._make_change(symbol="META", fill_qty=9.0, fill_price=628.23, side="sell")
+
+        await orch._register_opening_fill(change)
+
+        portfolio = await orch._state_manager.load_portfolio()
+        pos = portfolio.positions[0]
+        assert pos.symbol == "META"
+        assert pos.shares == 9.0          # positive — not -9
+        assert pos.intention.direction == "short"
+        assert pos.intention.exit_targets.stop_loss == 635.0
+        assert pos.intention.exit_targets.profit_target == 615.0
+
+    @pytest.mark.asyncio
+    async def test_intention_defaults_when_no_pending(self, orch):
+        """If _pending_intentions is missing, defaults apply."""
+        change = self._make_change()
+
+        await orch._register_opening_fill(change)
+
+        portfolio = await orch._state_manager.load_portfolio()
+        pos = portfolio.positions[0]
+        assert pos.intention.strategy == "unknown"
+        assert pos.intention.exit_targets.stop_loss == 0.0
+
+    @pytest.mark.asyncio
+    async def test_pops_pending_intentions(self, orch):
+        """_pending_intentions entry is consumed."""
+        orch._pending_intentions["AMD"] = {
+            "stop": 194.0, "target": 205.0, "strategy": "swing",
+            "direction": "long", "reasoning": "r",
+            "_signals": {"rsi": 60}, "_claude_conviction": 0.8, "_composite_score": 0.7,
+        }
+        await orch._register_opening_fill(self._make_change())
+        assert "AMD" not in orch._pending_intentions
+
+    @pytest.mark.asyncio
+    async def test_moves_signals_to_entry_contexts(self, orch):
+        """Signal context is moved to _entry_contexts for later use when position closes."""
+        orch._pending_intentions["AMD"] = {
+            "stop": 194.0, "target": 205.0, "strategy": "swing",
+            "direction": "long", "reasoning": "r",
+            "_signals": {"rsi": 62.0}, "_claude_conviction": 0.82, "_composite_score": 0.73,
+        }
+        await orch._register_opening_fill(self._make_change())
+        ctx = orch._entry_contexts.get("AMD", {})
+        assert ctx.get("signals") == {"rsi": 62.0}
+        assert abs(ctx.get("claude_conviction", 0) - 0.82) < 0.001
+
+    @pytest.mark.asyncio
+    async def test_no_duplicate_if_position_already_exists(self, orch):
+        """Duplicate fill event: guard prevents second position."""
+        from ozymandias.core.state_manager import ExitTargets, TradeIntention
+        existing = Position(
+            symbol="AMD", shares=30.0, avg_cost=198.07,
+            entry_date=datetime.now(timezone.utc).isoformat(),
+            intention=TradeIntention(
+                strategy="swing", direction="long", reasoning="",
+                exit_targets=ExitTargets(stop_loss=194.0, profit_target=205.0),
+            ),
+        )
+        await orch._state_manager.save_portfolio(PortfolioState(positions=[existing]))
+        await orch._register_opening_fill(self._make_change())
+        portfolio = await orch._state_manager.load_portfolio()
+        assert len(portfolio.positions) == 1  # no duplicate
+
+
+class TestDispatchConfirmedFill:
+    """_dispatch_confirmed_fill routes to open or close based on portfolio state."""
+
+    def _make_change(self, symbol="META", side="sell"):
+        from ozymandias.execution.fill_protection import StateChange
+        return StateChange(
+            order_id="ord_001", symbol=symbol,
+            old_status="PENDING", new_status="FILLED",
+            fill_qty=9.0, fill_price=628.23,
+            side=side, change_type="fill",
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_position_routes_to_opening_fill(self, orch):
+        """sell fill with no local position → opening short, not journal."""
+        orch._pending_intentions["META"] = {
+            "stop": 635.0, "target": 615.0, "strategy": "swing",
+            "direction": "short", "reasoning": "r",
+            "_signals": {}, "_claude_conviction": 0.7, "_composite_score": 0.6,
+        }
+        change = self._make_change(side="sell")
+
+        await orch._dispatch_confirmed_fill(change)
+
+        portfolio = await orch._state_manager.load_portfolio()
+        assert len(portfolio.positions) == 1
+        pos = portfolio.positions[0]
+        assert pos.symbol == "META"
+        assert pos.intention.direction == "short"
+        assert pos.shares == 9.0
+
+    @pytest.mark.asyncio
+    async def test_existing_position_routes_to_journal(self, orch):
+        """buy fill with existing short position → journal/close, not duplicate open."""
+        from ozymandias.core.state_manager import ExitTargets, TradeIntention
+        existing = Position(
+            symbol="META", shares=9.0, avg_cost=628.23,
+            entry_date=datetime.now(timezone.utc).isoformat(),
+            intention=TradeIntention(
+                strategy="swing", direction="short", reasoning="",
+                exit_targets=ExitTargets(stop_loss=635.0, profit_target=615.0),
+            ),
+        )
+        await orch._state_manager.save_portfolio(PortfolioState(positions=[existing]))
+
+        # Simulate a buy-to-close fill
+        from ozymandias.execution.fill_protection import StateChange
+        change = StateChange(
+            order_id="ord_002", symbol="META",
+            old_status="PENDING", new_status="FILLED",
+            fill_qty=9.0, fill_price=620.0,
+            side="buy", change_type="fill",
+        )
+
+        await orch._dispatch_confirmed_fill(change)
+
+        # Position removed (journaled/closed)
+        portfolio = await orch._state_manager.load_portfolio()
+        assert len(portfolio.positions) == 0
+
+    @pytest.mark.asyncio
+    async def test_long_buy_fill_no_position_creates_long(self, orch):
+        """buy fill with no local position → long open."""
+        orch._pending_intentions["AMD"] = {
+            "stop": 194.0, "target": 205.0, "strategy": "momentum",
+            "direction": "long", "reasoning": "r",
+            "_signals": {}, "_claude_conviction": 0.8, "_composite_score": 0.7,
+        }
+        from ozymandias.execution.fill_protection import StateChange
+        change = StateChange(
+            order_id="ord_003", symbol="AMD",
+            old_status="PENDING", new_status="FILLED",
+            fill_qty=30.0, fill_price=198.07,
+            side="buy", change_type="fill",
+        )
+
+        await orch._dispatch_confirmed_fill(change)
+
+        portfolio = await orch._state_manager.load_portfolio()
+        assert len(portfolio.positions) == 1
+        assert portfolio.positions[0].intention.direction == "long"
+
+
+class TestPositionSyncQtyCorrection:
+    """position_sync corrects local qty to match broker truth."""
+
+    @pytest.mark.asyncio
+    async def test_corrects_qty_discrepancy(self, orch):
+        """When local qty != broker qty, local is updated to broker value."""
+        from ozymandias.core.state_manager import ExitTargets, TradeIntention
+        from ozymandias.execution.broker_interface import BrokerPosition
+
+        # Local state has stale qty from partial fill
+        pos = Position(
+            symbol="AMD", shares=2.0, avg_cost=198.07,
+            entry_date=datetime.now(timezone.utc).isoformat(),
+            intention=TradeIntention(
+                strategy="swing", direction="long", reasoning="",
+                exit_targets=ExitTargets(stop_loss=194.0, profit_target=205.0),
+            ),
+        )
+        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
+
+        orch._broker.get_positions = AsyncMock(return_value=[
+            BrokerPosition(
+                symbol="AMD", qty=30.0, avg_entry_price=198.07,
+                current_price=200.0, market_value=6000.0, unrealized_pl=57.9,
+            )
+        ])
+
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            await orch._fast_step_position_sync()
+
+        portfolio = await orch._state_manager.load_portfolio()
+        assert portfolio.positions[0].shares == 30.0
+
+    @pytest.mark.asyncio
+    async def test_no_save_when_no_changes(self, orch):
+        """When local and broker qty match, portfolio is not written."""
+        from ozymandias.core.state_manager import ExitTargets, TradeIntention
+        from ozymandias.execution.broker_interface import BrokerPosition
+
+        pos = Position(
+            symbol="AMD", shares=30.0, avg_cost=198.07,
+            entry_date=datetime.now(timezone.utc).isoformat(),
+            intention=TradeIntention(
+                strategy="swing", direction="long", reasoning="",
+                exit_targets=ExitTargets(stop_loss=194.0, profit_target=205.0),
+            ),
+        )
+        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
+        save_spy = AsyncMock(wraps=orch._state_manager.save_portfolio)
+        orch._state_manager.save_portfolio = save_spy
+
+        orch._broker.get_positions = AsyncMock(return_value=[
+            BrokerPosition(
+                symbol="AMD", qty=30.0, avg_entry_price=198.07,
+                current_price=200.0, market_value=6000.0, unrealized_pl=57.9,
+            )
+        ])
+
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            await orch._fast_step_position_sync()
+
+        save_spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_short_position_broker_negative_qty_stored_positive(self, orch):
+        """Broker reports shorts as negative qty; local shares stay positive."""
+        from ozymandias.core.state_manager import ExitTargets, TradeIntention
+        from ozymandias.execution.broker_interface import BrokerPosition
+
+        pos = Position(
+            symbol="META", shares=9.0, avg_cost=628.23,
+            entry_date=datetime.now(timezone.utc).isoformat(),
+            intention=TradeIntention(
+                strategy="swing", direction="short", reasoning="",
+                exit_targets=ExitTargets(stop_loss=635.0, profit_target=615.0),
+            ),
+        )
+        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
+
+        # Broker returns qty=-9 for a short position
+        orch._broker.get_positions = AsyncMock(return_value=[
+            BrokerPosition(
+                symbol="META", qty=-9.0, avg_entry_price=628.23,
+                current_price=625.0, market_value=-5653.5, unrealized_pl=29.07,
+                side="short",
+            )
+        ])
+
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            await orch._fast_step_position_sync()
+
+        portfolio = await orch._state_manager.load_portfolio()
+        # Shares must remain positive so exit order quantity= works correctly
+        assert portfolio.positions[0].shares == 9.0
+
+    @pytest.mark.asyncio
+    async def test_defers_ghost_cleanup_when_exit_order_pending(self, orch):
+        """
+        If an exit order is in-flight for a symbol absent from broker positions,
+        position_sync must NOT remove it as ghost — the fill dispatch will close
+        it correctly on the next cycle.
+
+        This prevents the hallucination loop: sell fills → phantom open → double sell.
+        """
+        from ozymandias.core.state_manager import ExitTargets, TradeIntention
+        from ozymandias.execution.broker_interface import BrokerPosition
+
+        # Local position exists
+        pos = Position(
+            symbol="SPY", shares=8.0, avg_cost=670.09,
+            entry_date=datetime.now(timezone.utc).isoformat(),
+            intention=TradeIntention(
+                strategy="momentum", direction="long", reasoning="",
+                exit_targets=ExitTargets(stop_loss=660.0, profit_target=680.0),
+            ),
+        )
+        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
+
+        # Pending exit order exists for SPY (market sell, not yet detected as filled)
+        exit_record = OrderRecord(
+            order_id="sell_001", symbol="SPY", side="sell",
+            quantity=8, order_type="market", limit_price=None,
+            status="PENDING",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            last_checked_at=datetime.now(timezone.utc).isoformat(),
+        )
+        await orch._fill_protection.record_order(exit_record)
+
+        # Broker no longer shows SPY (market order already settled on broker side)
+        orch._broker.get_positions = AsyncMock(return_value=[])
+
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            await orch._fast_step_position_sync()
+
+        # SPY must NOT have been removed — fill dispatch will handle it
+        portfolio = await orch._state_manager.load_portfolio()
+        assert any(p.symbol == "SPY" for p in portfolio.positions), (
+            "SPY was ghost-cleaned despite having a pending exit order"
+        )
+
+
+# ===========================================================================
 # Credentials loading — plaintext and encrypted paths
 # ===========================================================================
 
@@ -946,15 +1497,18 @@ class TestShortEntryWiring:
         portfolio = PortfolioState()
         orders_state = OrdersState()
         orch._latest_indicators = {"TSLA": {"atr_14": 5.0, "price": 250.0}}
+        orch._latest_market_context = {}
+        orch._risk_manager.calculate_position_size = MagicMock(return_value=10)
+        orch._risk_manager.validate_entry = MagicMock(return_value=(True, ""))
+        orch._fill_protection.can_place_order = MagicMock(return_value=True)
+        orch._fill_protection.record_order = AsyncMock()
 
         orch._broker.place_order = AsyncMock(return_value=OrderResult(
             order_id="short-001", status="pending_new",
             submitted_at=datetime.now(timezone.utc),
         ))
 
-        with patch("ozymandias.execution.risk_manager.get_current_session",
-                   return_value=Session.REGULAR_HOURS):
-            await orch._medium_try_entry(opp, acct, portfolio, orders_state.orders)
+        await orch._medium_try_entry(opp, acct, portfolio, orders_state.orders)
 
         assert orch._broker.place_order.called
         placed = orch._broker.place_order.call_args[0][0]
@@ -991,15 +1545,18 @@ class TestShortEntryWiring:
         portfolio = PortfolioState()
         orders_state = OrdersState()
         orch._latest_indicators = {"NVDA": {"atr_14": 8.0, "price": entry_price}}
+        orch._latest_market_context = {}
+        orch._risk_manager.calculate_position_size = MagicMock(return_value=10)
+        orch._risk_manager.validate_entry = MagicMock(return_value=(True, ""))
+        orch._fill_protection.can_place_order = MagicMock(return_value=True)
+        orch._fill_protection.record_order = AsyncMock()
 
         orch._broker.place_order = AsyncMock(return_value=OrderResult(
             order_id="short-002", status="pending_new",
             submitted_at=datetime.now(timezone.utc),
         ))
 
-        with patch("ozymandias.execution.risk_manager.get_current_session",
-                   return_value=Session.REGULAR_HOURS):
-            await orch._medium_try_entry(opp, acct, portfolio, orders_state.orders)
+        await orch._medium_try_entry(opp, acct, portfolio, orders_state.orders)
 
         pending = orch._pending_intentions.get("NVDA")
         assert pending is not None

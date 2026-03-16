@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -178,6 +179,15 @@ class Orchestrator:
         # Conservative startup mode — no new entries until this UTC timestamp
         self._conservative_mode_until: Optional[datetime] = None
 
+        # Thesis challenge result cache: symbol → (was_blocked, monotonic_timestamp).
+        # Prevents hammering Claude with repeated challenges on the same symbol every cycle.
+        self._thesis_challenge_cache: dict[str, tuple[bool, float]] = {}
+
+        # Recently-closed symbols: symbol → monotonic timestamp of closure.
+        # Prevents _fast_step_position_sync from re-adopting a position the bot just
+        # closed (which would cause a runaway loop of repeated exit orders).
+        self._recently_closed: dict[str, float] = {}
+
         log.debug("Orchestrator created (config loaded, modules not yet connected)")
 
     # -----------------------------------------------------------------------
@@ -305,30 +315,36 @@ class Orchestrator:
             updated = False
 
             for symbol, broker_pos in broker_map.items():
+                # Broker reports negative qty for shorts; shares always stored positive.
+                broker_abs_qty = abs(broker_pos.qty)
                 if symbol in local_map:
                     local_pos = local_map[symbol]
-                    if abs(local_pos.shares - broker_pos.qty) > 0.001:
+                    if abs(local_pos.shares - broker_abs_qty) > 0.001:
                         log.error(
                             "Position mismatch: %s local=%.4f broker=%.4f — "
                             "updating local to broker (broker is source of truth)",
-                            symbol, local_pos.shares, broker_pos.qty,
+                            symbol, local_pos.shares, broker_abs_qty,
                         )
-                        local_pos.shares = broker_pos.qty
+                        local_pos.shares = broker_abs_qty
                         reconciliation_errors = True
                         updated = True
                 else:
                     log.error(
                         "Unknown broker position: %s %.4f shares @ %.4f — "
                         "adding to local state with reconciled=True",
-                        symbol, broker_pos.qty, broker_pos.avg_entry_price,
+                        symbol, broker_abs_qty, broker_pos.avg_entry_price,
                     )
                     now_iso = datetime.now(timezone.utc).isoformat()
+                    # Infer direction from broker side; defaults to "long" for buys.
+                    reconciled_direction = (
+                        "short" if broker_pos.side in ("short", "sell") else "long"
+                    )
                     portfolio.positions.append(Position(
                         symbol=symbol,
-                        shares=broker_pos.qty,
+                        shares=broker_abs_qty,
                         avg_cost=broker_pos.avg_entry_price,
                         entry_date=now_iso,
-                        intention=TradeIntention(),
+                        intention=TradeIntention(direction=reconciled_direction),
                         reconciled=True,
                     ))
                     reconciliation_errors = True
@@ -612,8 +628,8 @@ class Orchestrator:
                 change.symbol, change.old_status, change.new_status,
                 change.change_type, change.fill_qty, change.fill_price,
             )
-            if change.change_type == "fill" and change.side == "sell":
-                await self._journal_closed_trade(change)
+            if change.change_type == "fill":
+                await self._dispatch_confirmed_fill(change)
 
         # Also poll any locally-tracked orders not in broker's open list
         orders_state = await self._state_manager.load_orders()
@@ -633,6 +649,8 @@ class Orchestrator:
                             "Explicit poll — order state change: %s %s → %s",
                             change.symbol, change.old_status, change.new_status,
                         )
+                        if change.change_type == "fill":
+                            await self._dispatch_confirmed_fill(change)
                 except Exception as exc:
                     log.warning("Failed to poll order %s: %s", order.order_id, exc)
 
@@ -661,6 +679,88 @@ class Orchestrator:
                     "Failed to cancel stale order %s: %s",
                     stale_order.order_id, exc,
                 )
+
+    async def _dispatch_confirmed_fill(self, change) -> None:
+        """Route a confirmed fill to the correct handler.
+
+        Uses portfolio state to determine intent:
+        - Symbol already has a local position → this is a closing fill → journal it
+        - No local position → this is an opening fill → register the new position
+
+        This is correct for all four cases: long open (buy), long close (sell),
+        short open (sell), short close (buy). Using change.side alone is wrong
+        because sell can mean either short-open or long-close.
+        """
+        try:
+            portfolio = await self._state_manager.load_portfolio()
+        except Exception as exc:
+            log.error("_dispatch_confirmed_fill: failed to load portfolio for %s: %s", change.symbol, exc, exc_info=True)
+            return
+        has_position = any(p.symbol == change.symbol for p in portfolio.positions)
+        if has_position:
+            await self._journal_closed_trade(change)
+        else:
+            await self._register_opening_fill(change)
+
+    async def _register_opening_fill(self, change) -> None:
+        """Create a local portfolio position when an opening fill is confirmed.
+
+        Called from _dispatch_confirmed_fill for both long opens (buy fill) and
+        short opens (sell fill). Positions are created at the moment of confirmed
+        fill — with the correct quantity, avg fill price, and intention — rather
+        than speculatively from get_positions() which can race against partial fills.
+
+        Shares are always stored as a positive number; direction="short" conveys
+        the sign. This matches how exit order quantity= fields are used throughout.
+        """
+        from ozymandias.core.state_manager import ExitTargets, Position, TradeIntention
+
+        symbol = change.symbol
+        pending = self._pending_intentions.pop(symbol, {})
+
+        # Move signal context into entry_contexts for use when the position closes.
+        if pending:
+            self._entry_contexts[symbol] = {
+                "signals": pending.pop("_signals", {}),
+                "claude_conviction": pending.pop("_claude_conviction", 0.0),
+                "composite_score": pending.pop("_composite_score", 0.0),
+            }
+
+        try:
+            portfolio = await self._state_manager.load_portfolio()
+        except Exception as exc:
+            log.error("_register_opening_fill: failed to load portfolio for %s: %s", symbol, exc, exc_info=True)
+            return
+
+        # Guard: if position already exists (e.g. duplicate fill event), skip
+        if any(p.symbol == symbol for p in portfolio.positions):
+            log.debug("_register_opening_fill: position for %s already exists — skipping duplicate", symbol)
+            return
+
+        intention = TradeIntention(
+            strategy=pending.get("strategy", "unknown"),
+            direction=pending.get("direction", "long"),
+            reasoning=pending.get("reasoning", ""),
+            exit_targets=ExitTargets(
+                stop_loss=pending.get("stop", 0.0),
+                profit_target=pending.get("target", 0.0),
+            ),
+        )
+        portfolio.positions.append(Position(
+            symbol=symbol,
+            shares=change.fill_qty,  # always positive; direction field carries the sign
+            avg_cost=change.fill_price if change.fill_price > 0 else 0.0,
+            entry_date=datetime.now(timezone.utc).isoformat(),
+            intention=intention,
+        ))
+        await self._state_manager.save_portfolio(portfolio)
+        log.info(
+            "Position registered from opening fill: %s  qty=%.2f  avg_cost=%.4f  "
+            "stop=%.4f  target=%.4f  strategy=%s  direction=%s",
+            symbol, change.fill_qty, change.fill_price,
+            pending.get("stop", 0.0), pending.get("target", 0.0),
+            pending.get("strategy", "unknown"), pending.get("direction", "long"),
+        )
 
     async def _journal_closed_trade(self, change) -> None:
         """Write a trade journal entry and remove the position from the portfolio.
@@ -730,6 +830,7 @@ class Orchestrator:
 
             portfolio.positions = [p for p in portfolio.positions if p.symbol != symbol]
             await self._state_manager.save_portfolio(portfolio)
+            self._recently_closed[symbol] = time.monotonic()
             log.info(
                 "Trade closed and journaled: %s  pnl=%.2f%%  exit_reason=%s",
                 symbol, pnl_pct, exit_reason,
@@ -883,7 +984,20 @@ class Orchestrator:
 
         # Positions we have locally but broker no longer holds — these were closed
         # outside the normal fill-detection path (e.g. manual broker close).
+        # Exception: if there's a pending/partially-filled exit order for the symbol,
+        # the position was closed by our own order but the fill hasn't been processed
+        # yet (common with fast-settling paper market orders). Skip ghost cleanup and
+        # let _dispatch_confirmed_fill handle it on the next cycle.
         ghost_local = local_symbols - broker_symbols
+        if ghost_local:
+            deferred = {s for s in ghost_local if not self._fill_protection.can_place_order(s)}
+            if deferred:
+                log.debug(
+                    "Position sync: deferring ghost cleanup for %s — active exit order in flight",
+                    deferred,
+                )
+            ghost_local -= deferred
+
         if ghost_local:
             log.warning(
                 "Position sync: local positions not found at broker (likely closed externally): %s",
@@ -895,6 +1009,10 @@ class Orchestrator:
                     continue
                 ctx = self._entry_contexts.pop(symbol, {})
                 current_price = getattr(self, "_latest_indicators", {}).get(symbol, {}).get("price", 0.0)
+                # Fall back to avg_cost when no market price is available — records
+                # pnl=0% rather than a misleading 0-price exit.
+                if current_price == 0.0:
+                    current_price = pos.avg_cost
                 await self._trade_journal.append({
                     "symbol": symbol,
                     "strategy": pos.intention.strategy,
@@ -921,24 +1039,34 @@ class Orchestrator:
                     "source": "live",
                 })
             portfolio.positions = [p for p in portfolio.positions if p.symbol not in ghost_local]
+            for symbol in ghost_local:
+                self._recently_closed[symbol] = time.monotonic()
             portfolio_updated = True
 
-        # Positions broker has that we don't track locally — create them now so that
-        # stop/target checks and Claude position reviews work correctly during the session.
-        unknown_broker = broker_symbols - local_symbols
+        # Positions broker has that we don't track locally.
+        # Normal bot fills are created by _register_buy_fill in the reconcile loop.
+        # This path is a fallback for positions opened externally (manual trades, etc.).
+        _readopt_ttl = 60.0  # seconds to block re-adoption after a position is closed
         for bp in broker_positions:
             if bp.symbol not in local_symbols:
-                # Pull pending intention stored when the entry order was placed.
-                # Falls back to empty intention if the position arrived unexpectedly.
+                # Guard: if we just closed this symbol, don't immediately re-adopt.
+                # This prevents the runaway loop where every close triggers a re-adopt
+                # which triggers another override exit (e.g. 16 AMD sell orders).
+                closed_at = self._recently_closed.get(bp.symbol, 0.0)
+                if time.monotonic() - closed_at < _readopt_ttl:
+                    log.debug(
+                        "Position sync: skipping re-adoption of %s — closed %.0fs ago "
+                        "(fill detection pending or position settling)",
+                        bp.symbol, time.monotonic() - closed_at,
+                    )
+                    continue
                 pending = self._pending_intentions.pop(bp.symbol, {})
-                # Move signal context into entry_contexts for use when this position closes.
                 if pending:
                     self._entry_contexts[bp.symbol] = {
                         "signals": pending.pop("_signals", {}),
                         "claude_conviction": pending.pop("_claude_conviction", 0.0),
                         "composite_score": pending.pop("_composite_score", 0.0),
                     }
-                now_iso = datetime.now(timezone.utc).isoformat()
                 intention = TradeIntention(
                     strategy=pending.get("strategy", "unknown"),
                     direction=pending.get("direction", bp.side),
@@ -948,35 +1076,41 @@ class Orchestrator:
                         profit_target=pending.get("target", 0.0),
                     ),
                 )
+                # Broker reports negative qty for short positions; shares are
+                # always stored as positive — direction field carries the sign.
+                adopted_qty = abs(bp.qty)
                 portfolio.positions.append(Position(
                     symbol=bp.symbol,
-                    shares=bp.qty,
+                    shares=adopted_qty,
                     avg_cost=bp.avg_entry_price,
-                    entry_date=now_iso,
+                    entry_date=datetime.now(timezone.utc).isoformat(),
                     intention=intention,
                 ))
                 portfolio_updated = True
-                log.info(
-                    "New position created from fill: %s  qty=%.2f  avg_cost=%.4f  "
-                    "stop=%.4f  target=%.4f",
-                    bp.symbol, bp.qty, bp.avg_entry_price,
-                    pending.get("stop", 0.0), pending.get("target", 0.0),
+                log.warning(
+                    "Position sync: untracked broker position adopted: %s  qty=%.2f  avg_cost=%.4f  side=%s",
+                    bp.symbol, adopted_qty, bp.avg_entry_price, bp.side,
                 )
 
-        if portfolio_updated:
-            await self._state_manager.save_portfolio(portfolio)
-
-        # Quantity mismatches for shared symbols
+        # Quantity mismatches — broker is authoritative; correct local state.
+        # Broker reports negative qty for shorts; compare using abs() since
+        # local shares are always stored as a positive number.
         local_map = {p.symbol: p for p in portfolio.positions}
         for bp in broker_positions:
             lp = local_map.get(bp.symbol)
             if lp is None:
                 continue
-            if abs(bp.qty - lp.shares) > 0.001:
+            broker_abs_qty = abs(bp.qty)
+            if abs(broker_abs_qty - lp.shares) > 0.001:
                 log.warning(
-                    "Position sync discrepancy — %s: local=%.4f broker=%.4f",
-                    bp.symbol, lp.shares, bp.qty,
+                    "Position sync: correcting %s qty local=%.4f → broker=%.4f",
+                    bp.symbol, lp.shares, broker_abs_qty,
                 )
+                lp.shares = broker_abs_qty
+                portfolio_updated = True
+
+        if portfolio_updated:
+            await self._state_manager.save_portfolio(portfolio)
 
     # -----------------------------------------------------------------------
     # Medium loop
@@ -1134,6 +1268,13 @@ class Orchestrator:
             return
         self._mark_broker_available()
 
+        # Keep portfolio cash/buying_power in sync with broker so downstream
+        # logic (ranker, Claude context) always sees current capital figures.
+        if portfolio.cash != acct.cash or portfolio.buying_power != acct.buying_power:
+            portfolio.cash = acct.cash
+            portfolio.buying_power = acct.buying_power
+            await self._state_manager.save_portfolio(portfolio)
+
         ranked = self._ranker.rank_opportunities(
             reasoning_result,
             indicators,
@@ -1149,16 +1290,22 @@ class Orchestrator:
             len(ranked), len(reasoning_result.new_opportunities),
         )
 
-        # -- Step 5: execute top opportunity (one per cycle) -----------------
+        # -- Step 5: try ranked opportunities in order (one entry per cycle) --------
         if not self._degradation.safe_mode and ranked:
-            top = ranked[0]
-            await self._medium_try_entry(top, acct, portfolio, orders_state.orders)
+            for candidate in ranked[:self._config.scheduler.entry_attempts_per_cycle]:
+                entered = await self._medium_try_entry(candidate, acct, portfolio, orders_state.orders)
+                if entered:
+                    break  # one entry per cycle; stop after first successful placement
 
         # -- Step 6: re-evaluate open positions ------------------------------
         await self._medium_evaluate_positions(portfolio, bars, indicators, acct, orders_state.orders)
 
-    async def _medium_try_entry(self, top, acct, portfolio, orders) -> None:
-        """Validate and execute a single entry order for the top-ranked opportunity."""
+    async def _medium_try_entry(self, top, acct, portfolio, orders) -> bool:
+        """Validate and execute a single entry order for the top-ranked opportunity.
+
+        Returns True if an order was placed, False if this candidate was skipped
+        (so the caller can try the next ranked candidate).
+        """
         symbol = top.symbol
         entry_price = top.suggested_entry
 
@@ -1170,7 +1317,7 @@ class Orchestrator:
                     "Medium loop: conservative mode active until %s — skipping entry for %s",
                     self._conservative_mode_until.isoformat(), symbol,
                 )
-                return
+                return False
         is_short = top.action == "sell_short"
         order_side = "sell" if is_short else "buy"
         strategy_name = top.strategy
@@ -1185,7 +1332,7 @@ class Orchestrator:
         )
         if quantity <= 0:
             log.debug("Medium loop: position size = 0 for %s — skipping", symbol)
-            return
+            return False
 
         allowed, reason = self._risk_manager.validate_entry(
             symbol=symbol,
@@ -1200,15 +1347,30 @@ class Orchestrator:
         )
         if not allowed:
             log.debug("Medium loop: entry blocked for %s — %s", symbol, reason)
-            return
+            return False
 
         if not self._fill_protection.can_place_order(symbol):
             log.debug("Medium loop: fill protection blocking entry for %s", symbol)
-            return
+            return False
 
         # Thesis challenge for large positions (config: ranker.thesis_challenge_size_threshold)
         challenge_size_threshold = self._config.ranker.thesis_challenge_size_threshold
         if top.position_size_pct >= challenge_size_threshold:
+            ttl = self._config.ranker.thesis_challenge_ttl_min * 60
+            cached = self._thesis_challenge_cache.get(symbol)
+            if cached:
+                was_blocked, ts = cached
+                age = time.monotonic() - ts
+                if age < ttl:
+                    if was_blocked:
+                        log.debug(
+                            "Thesis challenge cache: %s still blocked (cached %.0fmin ago)"
+                            " — trying next candidate",
+                            symbol, age / 60,
+                        )
+                        return False
+                    # was not blocked last time — fall through and re-evaluate
+
             challenge = await self._claude.run_thesis_challenge(
                 opportunity={
                     "symbol": symbol,
@@ -1224,12 +1386,14 @@ class Orchestrator:
                 indicators=self._latest_indicators,
             )
             if challenge is not None:
-                if not challenge.get("proceed", True):
+                blocked = not challenge.get("proceed", True)
+                self._thesis_challenge_cache[symbol] = (blocked, time.monotonic())
+                if blocked:
                     log.info(
                         "Thesis challenge blocked entry for %s: %s",
                         symbol, challenge.get("challenge_reasoning", ""),
                     )
-                    return
+                    return False
                 challenge_conviction = float(challenge.get("conviction", top.ai_conviction))
                 if challenge_conviction < top.ai_conviction and top.ai_conviction > 0:
                     # Scale quantity proportionally to conviction reduction
@@ -1278,7 +1442,7 @@ class Orchestrator:
             result = await self._broker.place_order(order)
         except Exception as exc:
             self._mark_broker_failure(exc)
-            return
+            return False
         self._mark_broker_available()
 
         # Store intention so _fast_step_position_sync can attach it to the position on fill.
@@ -1315,6 +1479,7 @@ class Orchestrator:
             "claude" if top.suggested_stop > 0 else "atr",
             "claude" if top.suggested_exit > 0 else "atr",
         )
+        return True
 
     async def _medium_evaluate_positions(self, portfolio, bars, indicators, acct, orders) -> None:
         """Run evaluate_position() on each open position; exit if recommended."""
@@ -1720,11 +1885,12 @@ class Orchestrator:
         portfolio: "PortfolioState",
         reviews: list[dict],
     ) -> None:
-        """Append Claude's review notes to each position's intention."""
+        """Append Claude's review notes and act on exit recommendations."""
         now_iso = datetime.now(timezone.utc).isoformat()
         changed = False
         for review in reviews:
             symbol = review.get("symbol", "")
+            action = review.get("action", "hold")
             for pos in portfolio.positions:
                 if pos.symbol != symbol:
                     continue
@@ -1740,6 +1906,49 @@ class Orchestrator:
                 if adj.get("stop_loss"):
                     pos.intention.exit_targets.stop_loss = float(adj["stop_loss"])
                     changed = True
+                # Claude recommends exiting — place a market exit order immediately.
+                # thesis_intact=False is a hard signal; action="exit" is sufficient.
+                if action == "exit":
+                    if not self._fill_protection.can_place_order(symbol):
+                        log.warning(
+                            "Claude position review: exit for %s blocked — pending order exists",
+                            symbol,
+                        )
+                        break
+                    exit_side = "buy" if pos.intention.direction == "short" else "sell"
+                    exit_order = Order(
+                        symbol=symbol,
+                        side=exit_side,
+                        quantity=pos.shares,
+                        order_type="market",
+                        time_in_force="day",
+                    )
+                    try:
+                        result = await self._broker.place_order(exit_order)
+                        order_record = OrderRecord(
+                            order_id=result.order_id,
+                            symbol=symbol,
+                            side=exit_side,
+                            quantity=pos.shares,
+                            order_type="market",
+                            limit_price=None,
+                            status="PENDING",
+                            created_at=now_iso,
+                            last_checked_at=now_iso,
+                        )
+                        await self._fill_protection.record_order(order_record)
+                        log.info(
+                            "Claude position review exit: %s  order_id=%s  "
+                            "reason=%s",
+                            symbol, result.order_id,
+                            review.get("updated_reasoning", "")[:120],
+                        )
+                    except Exception as exc:
+                        log.error(
+                            "Failed to place Claude review exit for %s: %s",
+                            symbol, exc,
+                        )
+                    break  # done with this position
         if changed:
             await self._state_manager.save_portfolio(portfolio)
 

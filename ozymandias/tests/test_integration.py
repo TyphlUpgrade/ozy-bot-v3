@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, time as dtime, timezone, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -253,6 +253,10 @@ class TestFullCycle:
         # Patch is_market_open in orchestrator (used by ranker) AND get_current_session
         # in risk_manager (used by validate_entry._check_market_hours).
         # Tests run outside NYSE hours so both real-clock calls would block entries.
+        # Dead zone uses datetime.now() directly — override the parsed bounds so no
+        # real clock time falls in the dead zone window.
+        orch._risk_manager._dead_zone_start = dtime(0, 0)
+        orch._risk_manager._dead_zone_end   = dtime(0, 1)
         from ozymandias.core.market_hours import Session
         with (
             patch("ozymandias.core.orchestrator.is_market_open", return_value=True),

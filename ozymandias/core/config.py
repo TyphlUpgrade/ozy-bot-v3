@@ -45,6 +45,7 @@ class SchedulerConfig:
     # Dead zone: block new entries during midday low-volume window (ET times, "HH:MM" format)
     dead_zone_start_et: str = "11:30"
     dead_zone_end_et: str = "14:30"
+    entry_attempts_per_cycle: int = 3  # max ranked candidates to attempt per medium cycle before giving up
 
 
 @dataclass
@@ -78,6 +79,7 @@ class RankerConfig:
     weight_liquidity: float = 0.15
     min_conviction_threshold: float = 0.10   # sanity floor: rejects degenerate zero-conviction Claude output
     thesis_challenge_size_threshold: float = 0.15  # position_size_pct >= this triggers skeptical review
+    thesis_challenge_ttl_min: int = 10  # minutes to cache a thesis challenge result before re-evaluating
 
 
 @dataclass
