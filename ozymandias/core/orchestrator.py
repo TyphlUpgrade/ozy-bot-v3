@@ -1043,10 +1043,22 @@ class Orchestrator:
 
         self._degradation.market_data_available = True
 
-        # Cache indicators for the fast loop (quant overrides)
+        # Cache indicators for the fast loop (quant overrides).
+        # Track whether this is the first population so we can fire Claude immediately.
+        indicators_were_empty = not getattr(self, "_latest_indicators", {})
         self._latest_indicators = {sym: v["signals"] for sym, v in indicators.items()}
 
         log.debug("Medium loop: scanned %d symbol(s)", len(indicators))
+
+        # Fire the slow loop immediately the first time indicators are populated.
+        # This gets Claude's assessment within seconds of startup rather than waiting
+        # up to slow_loop_check_sec (default 5 min) for the next scheduled tick.
+        if indicators_were_empty and self._latest_indicators:
+            log.info("Medium loop: indicators seeded — triggering immediate slow loop cycle")
+            try:
+                await self._slow_loop_cycle()
+            except Exception as exc:
+                log.error("Immediate slow loop cycle after indicator seed failed: %s", exc, exc_info=True)
 
         # -- Step 3: detect entry signals ------------------------------------
         # Load the most recent Claude reasoning result early so session_veto and
