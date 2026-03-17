@@ -124,7 +124,13 @@ class Orchestrator:
 
         # -- Core infrastructure (initialized immediately from config) --------
         self._state_manager = StateManager()
-        self._trade_journal = TradeJournal()
+        # Derive journal path from state manager so both always point at the same
+        # directory. This matters in tests: redirecting _state_manager._dir must be
+        # accompanied by an equivalent redirect of _trade_journal._path, and having
+        # the path derived here makes the relationship explicit.
+        self._trade_journal = TradeJournal(
+            path=self._state_manager._dir / "trade_journal.jsonl"
+        )
         self._reasoning_cache = ReasoningCache()
 
         # -- External connectors (instantiated in _startup after credentials) -
@@ -245,6 +251,9 @@ class Orchestrator:
 
         # -- PDT guard & risk manager -----------------------------------------
         self._pdt_guard = PDTGuard(self._config.risk)
+        # Seed broker_floor from startup account fetch so the bot never starts
+        # a session thinking it has more day trades remaining than the broker knows.
+        self._pdt_guard.broker_floor = acct.daytrade_count
         self._risk_manager = RiskManager(
             self._config.risk, self._pdt_guard, self._config.scheduler
         )
@@ -1267,6 +1276,9 @@ class Orchestrator:
             self._mark_broker_failure(exc)
             return
         self._mark_broker_available()
+
+        # Keep broker_floor in sync so PDT guard never undercounts day trades.
+        self._pdt_guard.broker_floor = acct.daytrade_count
 
         # Keep portfolio cash/buying_power in sync with broker so downstream
         # logic (ranker, Claude context) always sees current capital figures.

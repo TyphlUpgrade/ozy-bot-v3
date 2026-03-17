@@ -152,6 +152,7 @@ async def orch(tmp_path):
     ):
         o = Orchestrator()
         o._state_manager._dir = tmp_path
+        o._trade_journal._path = tmp_path / "trade_journal.jsonl"
         o._reasoning_cache._dir = tmp_path / "cache"
         o._reasoning_cache._dir.mkdir()
         await o._startup()

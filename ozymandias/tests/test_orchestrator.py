@@ -75,6 +75,7 @@ async def orch(tmp_path):
     ):
         o = Orchestrator()
         o._state_manager._dir = tmp_path
+        o._trade_journal._path = tmp_path / "trade_journal.jsonl"
         o._reasoning_cache._dir = tmp_path / "cache"
         o._reasoning_cache._dir.mkdir()
         await o._startup()
@@ -1085,6 +1086,84 @@ class TestRegisterOpeningFill:
         assert len(portfolio.positions) == 1  # no duplicate
 
 
+# ===========================================================================
+# Trade journal path isolation
+# ===========================================================================
+
+class TestTradeJournalIsolation:
+    """
+    Verify that the TradeJournal path is always derived from the state manager
+    directory, so test runs never pollute the real state/trade_journal.jsonl.
+
+    Regression test for Bug #6 (2026-03-16): phantom META trades appeared in
+    the live trade journal because TradeJournal() used a hardcoded path and
+    test fixtures only redirected _state_manager._dir, not _trade_journal._path.
+    """
+
+    def test_journal_path_co_located_with_state_manager(self, orch, tmp_path):
+        """Journal file lives in the same directory as all other state files."""
+        assert orch._trade_journal._path.parent == orch._state_manager._dir
+        assert orch._trade_journal._path.parent == tmp_path
+
+    def test_journal_path_redirected_to_tmp_path(self, orch, tmp_path):
+        """The orch fixture must point the journal at tmp_path, not the real state dir."""
+        from ozymandias.core.trade_journal import TRADE_JOURNAL_FILE
+        assert orch._trade_journal._path != TRADE_JOURNAL_FILE
+
+    @pytest.mark.asyncio
+    async def test_journal_writes_go_to_tmp_path_not_real_file(self, orch, tmp_path):
+        """_journal_closed_trade writes to tmp_path, never the real state file."""
+        from ozymandias.core.trade_journal import TRADE_JOURNAL_FILE
+        from ozymandias.core.state_manager import (
+            ExitTargets, PortfolioState, Position, TradeIntention,
+        )
+        from ozymandias.execution.fill_protection import StateChange
+
+        real_journal = TRADE_JOURNAL_FILE
+        real_content_before = real_journal.read_text() if real_journal.exists() else ""
+
+        # Seed a position so _journal_closed_trade has something to close
+        pos = Position(
+            symbol="JOURNALTEST",
+            shares=5.0,
+            avg_cost=100.0,
+            entry_date="2026-01-01T00:00:00+00:00",
+            intention=TradeIntention(
+                strategy="momentum",
+                direction="long",
+                exit_targets=ExitTargets(stop_loss=90.0, profit_target=110.0),
+            ),
+        )
+        await orch._state_manager.save_portfolio(
+            PortfolioState(cash=0.0, buying_power=0.0, positions=[pos])
+        )
+
+        change = StateChange(
+            order_id="test-ord-001",
+            symbol="JOURNALTEST",
+            old_status="PENDING",
+            new_status="FILLED",
+            fill_qty=5.0,
+            fill_price=105.0,
+            side="sell",
+            change_type="fill",
+        )
+        await orch._journal_closed_trade(change)
+
+        # Real file must be untouched
+        real_content_after = real_journal.read_text() if real_journal.exists() else ""
+        assert real_content_before == real_content_after, (
+            "Test wrote to the real trade_journal.jsonl — journal path isolation is broken"
+        )
+
+        # tmp_path journal must have the entry
+        tmp_journal = tmp_path / "trade_journal.jsonl"
+        assert tmp_journal.exists(), "Expected journal entry in tmp_path but file not created"
+        import json
+        entries = [json.loads(line) for line in tmp_journal.read_text().splitlines()]
+        assert any(e["symbol"] == "JOURNALTEST" for e in entries)
+
+
 class TestDispatchConfirmedFill:
     """_dispatch_confirmed_fill routes to open or close based on portfolio state."""
 
@@ -1326,6 +1405,7 @@ class TestLoadCredentials:
         ):
             o = Orchestrator()
             o._state_manager._dir = tmp_path
+            o._trade_journal._path = tmp_path / "trade_journal.jsonl"
             o._reasoning_cache._dir = tmp_path / "cache"
             o._reasoning_cache._dir.mkdir()
         o._config._config_dir = tmp_path

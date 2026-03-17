@@ -73,6 +73,10 @@ class PDTGuard:
     def __init__(self, config: RiskConfig) -> None:
         self._pdt_buffer = config.pdt_buffer          # default 1 reserved for emergency exits
         self._min_equity = config.min_equity_for_trading  # default 25_500.0
+        # Broker-reported day-trade count. Updated by orchestrator after each
+        # account fetch. Used as a floor so the bot never undercounts day trades
+        # relative to what the broker tracks (e.g. from phantom/adoption trades).
+        self.broker_floor: int = 0
 
     # ------------------------------------------------------------------
     # Day trade counting
@@ -122,8 +126,15 @@ class PDTGuard:
                 sells[key] = True
 
         # A day trade = same (symbol, date) has both buy and sell fills
-        day_trades = sum(1 for key in buys if key in sells)
-        log.debug("count_day_trades: %d in rolling 5-day window (today=%s)", day_trades, today)
+        local_count = sum(1 for key in buys if key in sells)
+        # Take the higher of the local count and the broker's reported count.
+        # The broker may have tracked day trades from phantom/adoption activity
+        # that never produced matching buy+sell pairs in orders.json.
+        day_trades = max(local_count, self.broker_floor)
+        log.debug(
+            "count_day_trades: local=%d  broker_floor=%d  effective=%d (today=%s)",
+            local_count, self.broker_floor, day_trades, today,
+        )
         return day_trades
 
     # ------------------------------------------------------------------
