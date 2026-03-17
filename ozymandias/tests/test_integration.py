@@ -249,6 +249,7 @@ class TestFullCycle:
         bars = _make_bars(60, base_price=875.0)
         orch._data_adapter = MagicMock()
         orch._data_adapter.fetch_bars = AsyncMock(return_value=bars)
+        orch._data_adapter.fetch_news = AsyncMock(return_value=[])
 
         # Phase 11 drift check: Claude's suggested_entry must be close to the current
         # market price (bars ~875). Override the fixture's default price=200 response.
@@ -336,6 +337,7 @@ class TestOverrideExit:
         bars = _make_bars(60, base_price=180.0)  # low price = below VWAP
         orch._data_adapter = MagicMock()
         orch._data_adapter.fetch_bars = AsyncMock(return_value=bars)
+        orch._data_adapter.fetch_news = AsyncMock(return_value=[])
 
         # Inject indicators with price below VWAP and elevated volume ratio
         orch._latest_indicators = {
@@ -360,6 +362,10 @@ class TestOverrideExit:
                 },
             }
         }
+
+        # Simulate position entered well beyond the hold window so overrides can fire.
+        import time as _time
+        orch._position_entry_times[symbol] = _time.monotonic() - (orch._config.scheduler.min_hold_before_override_min * 60 + 10)
 
         sell_result = OrderResult(
             order_id="sell-001",
@@ -522,6 +528,7 @@ class TestDegradation:
         bars = _make_bars(60, base_price=875.0)
         orch._data_adapter = MagicMock()
         orch._data_adapter.fetch_bars = AsyncMock(return_value=bars)
+        orch._data_adapter.fetch_news = AsyncMock(return_value=[])
 
         with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
             await orch._fast_loop_cycle()

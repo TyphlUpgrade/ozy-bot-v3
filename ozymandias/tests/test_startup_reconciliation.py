@@ -196,7 +196,10 @@ class TestStartupReconciliation:
         assert nvda.shares == pytest.approx(8.0)
         assert nvda.avg_cost == pytest.approx(870.0)
         assert nvda.reconciled is True
-        assert orch._conservative_mode_until is not None
+        # Unknown broker positions are adopted cleanly — they do NOT trigger
+        # conservative mode. The hold-time guard handles override protection.
+        assert orch._conservative_mode_until is None
+        assert "NVDA" in orch._position_entry_times
 
     @pytest.mark.asyncio
     async def test_stale_local_orders_marked_cancelled(self, orch):

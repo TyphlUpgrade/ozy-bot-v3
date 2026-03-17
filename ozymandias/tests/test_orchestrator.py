@@ -775,7 +775,7 @@ class TestThesisChallenge:
         top = self._make_top(position_size_pct=0.20)
         self._stub_entry_guards(orch)
         orch._claude.run_thesis_challenge = AsyncMock(
-            return_value={"proceed": True, "conviction": 0.85, "challenge_reasoning": "ok"}
+            return_value={"concern_level": 0.0, "reasoning": "no material concerns"}
         )
         acct = _stub_account()
         portfolio = PortfolioState(positions=[])
@@ -798,30 +798,13 @@ class TestThesisChallenge:
         orch._claude.run_thesis_challenge.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_challenge_proceed_false_skips_trade(self, orch):
-        """Challenge returning proceed=False → place_order is NOT called."""
+    async def test_challenge_high_concern_reduces_quantity_but_trade_proceeds(self, orch):
+        """High concern_level → quantity reduced by penalty, but trade is NOT blocked."""
         top = self._make_top(position_size_pct=0.20)
-        self._stub_entry_guards(orch)
-        orch._claude.run_thesis_challenge = AsyncMock(
-            return_value={"proceed": False, "conviction": 0.15,
-                          "challenge_reasoning": "Failed breakout below $198 VWAP."}
-        )
-        acct = _stub_account()
-        portfolio = PortfolioState(positions=[])
-
-        await orch._medium_try_entry(top, acct, portfolio, [])
-
-        orch._broker.place_order.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_challenge_lower_conviction_scales_quantity(self, orch):
-        """Challenge conviction 0.5 vs original 1.0 → quantity halved."""
-        top = self._make_top(position_size_pct=0.20, ai_conviction=1.0)
         self._stub_entry_guards(orch)
         orch._risk_manager.calculate_position_size = MagicMock(return_value=20)
         orch._claude.run_thesis_challenge = AsyncMock(
-            return_value={"proceed": True, "conviction": 0.5,
-                          "challenge_reasoning": "Watch $212 gap resistance."}
+            return_value={"concern_level": 1.0, "reasoning": "Multiple serious concerns."}
         )
         acct = _stub_account()
         portfolio = PortfolioState(positions=[])
@@ -831,16 +814,43 @@ class TestThesisChallenge:
             placed_orders.append(order)
             return MagicMock(order_id="ord_001")
         orch._broker.place_order = capture_order
+        orch._fill_protection.record_order = AsyncMock()
 
-        # Need fill_protection.record_order to not blow up
-        from ozymandias.core.state_manager import OrderRecord
+        await orch._medium_try_entry(top, acct, portfolio, [])
+
+        # Trade MUST proceed (not blocked), just with reduced quantity.
+        assert len(placed_orders) == 1
+        # concern=1.0 × max_penalty=0.35 → size_factor=0.65 → int(20 × 0.65) = 13
+        max_penalty = orch._config.ranker.thesis_challenge_max_penalty
+        expected_qty = max(1, int(20 * (1.0 - 1.0 * max_penalty)))
+        assert placed_orders[0].quantity == expected_qty
+
+    @pytest.mark.asyncio
+    async def test_challenge_concern_level_scales_quantity(self, orch):
+        """Moderate concern_level applies proportional penalty to quantity."""
+        top = self._make_top(position_size_pct=0.20, ai_conviction=0.85)
+        self._stub_entry_guards(orch)
+        orch._risk_manager.calculate_position_size = MagicMock(return_value=20)
+        orch._claude.run_thesis_challenge = AsyncMock(
+            return_value={"concern_level": 0.5, "reasoning": "Earnings in 2 days."}
+        )
+        acct = _stub_account()
+        portfolio = PortfolioState(positions=[])
+
+        placed_orders = []
+        async def capture_order(order):
+            placed_orders.append(order)
+            return MagicMock(order_id="ord_001")
+        orch._broker.place_order = capture_order
         orch._fill_protection.record_order = AsyncMock()
 
         await orch._medium_try_entry(top, acct, portfolio, [])
 
         assert len(placed_orders) == 1
-        # conviction ratio = 0.5/1.0 = 0.5 → 20 * 0.5 = 10
-        assert placed_orders[0].quantity == 10
+        # concern=0.5 × max_penalty=0.35 → size_factor=0.825 → int(20 × 0.825) = 16
+        max_penalty = orch._config.ranker.thesis_challenge_max_penalty
+        expected_qty = max(1, int(20 * (1.0 - 0.5 * max_penalty)))
+        assert placed_orders[0].quantity == expected_qty
 
     @pytest.mark.asyncio
     async def test_challenge_returns_none_trade_proceeds(self, orch):
@@ -891,24 +901,27 @@ class TestThesisChallengeCache:
         orch._latest_market_context = {}
 
     @pytest.mark.asyncio
-    async def test_cached_block_skips_claude_call(self, orch):
-        """When a symbol is cached as blocked (within TTL), run_thesis_challenge is NOT called."""
+    async def test_cached_concern_skips_claude_call(self, orch):
+        """When a symbol is cached with concern_level within TTL, run_thesis_challenge is NOT called."""
         import time as _time
         top = self._make_top()
         self._stub_entry_guards(orch)
-        orch._claude.run_thesis_challenge = AsyncMock(
-            return_value={"proceed": False, "conviction": 0.1, "challenge_reasoning": "blocked"}
-        )
+        orch._risk_manager.calculate_position_size = MagicMock(return_value=10)
+        orch._claude.run_thesis_challenge = AsyncMock()
+        orch._broker.place_order = AsyncMock(return_value=MagicMock(order_id="ord_x"))
+        orch._fill_protection.record_order = AsyncMock()
         acct = _stub_account()
         portfolio = PortfolioState(positions=[])
 
-        # Pre-populate cache: AAPL was blocked 30 seconds ago (well within 10-min TTL)
-        orch._thesis_challenge_cache["AAPL"] = (True, _time.monotonic() - 30)
+        # Pre-populate cache: AAPL has concern_level=0.5 from 30 seconds ago (within TTL)
+        orch._thesis_challenge_cache["AAPL"] = (0.5, _time.monotonic() - 30)
 
-        result = await orch._medium_try_entry(top, acct, portfolio, [])
+        await orch._medium_try_entry(top, acct, portfolio, [])
 
-        assert result is False
+        # Claude must NOT be called — cached value is used
         orch._claude.run_thesis_challenge.assert_not_called()
+        # Trade still proceeds (penalty applied, not blocked)
+        orch._broker.place_order.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_expired_cache_re_evaluates(self, orch):
@@ -917,16 +930,16 @@ class TestThesisChallengeCache:
         top = self._make_top()
         self._stub_entry_guards(orch)
         orch._claude.run_thesis_challenge = AsyncMock(
-            return_value={"proceed": True, "conviction": 0.85, "challenge_reasoning": "ok"}
+            return_value={"concern_level": 0.0, "reasoning": "no concerns"}
         )
         orch._broker.place_order = AsyncMock(return_value=MagicMock(order_id="ord_x"))
         orch._fill_protection.record_order = AsyncMock()
         acct = _stub_account()
         portfolio = PortfolioState(positions=[])
 
-        # Pre-populate cache: AAPL was blocked 20 minutes ago (beyond default 10-min TTL)
+        # Pre-populate cache: expired entry (beyond default 10-min TTL)
         ttl_sec = orch._config.ranker.thesis_challenge_ttl_min * 60
-        orch._thesis_challenge_cache["AAPL"] = (True, _time.monotonic() - ttl_sec - 1)
+        orch._thesis_challenge_cache["AAPL"] = (0.3, _time.monotonic() - ttl_sec - 1)
 
         await orch._medium_try_entry(top, acct, portfolio, [])
 
@@ -934,12 +947,12 @@ class TestThesisChallengeCache:
 
     @pytest.mark.asyncio
     async def test_challenge_result_stored_in_cache(self, orch):
-        """After a thesis challenge runs, the result is stored in the cache."""
+        """After a thesis challenge runs, the concern_level is stored in the cache."""
         import time as _time
         top = self._make_top()
         self._stub_entry_guards(orch)
         orch._claude.run_thesis_challenge = AsyncMock(
-            return_value={"proceed": False, "conviction": 0.1, "challenge_reasoning": "nope"}
+            return_value={"concern_level": 0.6, "reasoning": "Earnings risk present."}
         )
         acct = _stub_account()
         portfolio = PortfolioState(positions=[])
@@ -949,30 +962,30 @@ class TestThesisChallengeCache:
         await orch._medium_try_entry(top, acct, portfolio, [])
 
         assert "AAPL" in orch._thesis_challenge_cache
-        was_blocked, ts = orch._thesis_challenge_cache["AAPL"]
-        assert was_blocked is True
+        concern_level, ts = orch._thesis_challenge_cache["AAPL"]
+        assert concern_level == pytest.approx(0.6)
         assert _time.monotonic() - ts < 5  # stored within last 5 seconds
 
     @pytest.mark.asyncio
-    async def test_not_blocked_cache_entry_falls_through(self, orch):
-        """When cached as not-blocked, re-evaluation runs (conditions may have changed)."""
+    async def test_cached_zero_concern_skips_claude_no_penalty(self, orch):
+        """Cached concern_level=0.0 within TTL → Claude not called, quantity unchanged."""
         import time as _time
         top = self._make_top()
         self._stub_entry_guards(orch)
-        orch._claude.run_thesis_challenge = AsyncMock(
-            return_value={"proceed": True, "conviction": 0.85, "challenge_reasoning": "ok"}
-        )
+        orch._risk_manager.calculate_position_size = MagicMock(return_value=10)
+        orch._claude.run_thesis_challenge = AsyncMock()
         orch._broker.place_order = AsyncMock(return_value=MagicMock(order_id="ord_y"))
         orch._fill_protection.record_order = AsyncMock()
         acct = _stub_account()
         portfolio = PortfolioState(positions=[])
 
-        # Cached as NOT blocked (within TTL) — should still re-evaluate
-        orch._thesis_challenge_cache["AAPL"] = (False, _time.monotonic() - 30)
+        # Cached with no concern (within TTL) — Claude skipped, no penalty applied
+        orch._thesis_challenge_cache["AAPL"] = (0.0, _time.monotonic() - 30)
 
         await orch._medium_try_entry(top, acct, portfolio, [])
 
-        orch._claude.run_thesis_challenge.assert_called_once()
+        orch._claude.run_thesis_challenge.assert_not_called()
+        assert orch._broker.place_order.call_args[0][0].quantity == 10
 
 
 # ===========================================================================
@@ -1086,6 +1099,95 @@ class TestRegisterOpeningFill:
         await orch._register_opening_fill(self._make_change())
         portfolio = await orch._state_manager.load_portfolio()
         assert len(portfolio.positions) == 1  # no duplicate
+
+
+# ===========================================================================
+# Quant override minimum hold time
+# ===========================================================================
+
+class TestQuantOverrideHoldTime:
+    """Quant overrides must not fire within min_hold_before_override_min of entry."""
+
+    def _make_position(self, symbol="XLE"):
+        from ozymandias.core.state_manager import ExitTargets, Position, TradeIntention
+        return Position(
+            symbol=symbol, shares=84.0, avg_cost=58.73, entry_date="2026-03-17T14:11:54Z",
+            intention=TradeIntention(
+                strategy="momentum", direction="long",
+                reasoning="breakout", catalyst=None,
+                expected_move="+4%", max_expected_loss=-100.0,
+                entry_date="2026-03-17",
+                exit_targets=ExitTargets(profit_target=61.0, stop_loss=57.2),
+            ),
+        )
+
+    def _stub_indicators(self, orch, symbol, roc_deceleration=True):
+        orch._latest_indicators = {symbol: {
+            "price": 58.73,
+            "roc_deceleration": roc_deceleration,
+            "vwap_position": "above",
+            "volume_ratio": 0.8,
+        }}
+
+    @pytest.mark.asyncio
+    async def test_override_suppressed_within_hold_window(self, orch):
+        """Override with roc_deceleration=True must NOT fire if position was just entered."""
+        import time as _time
+        symbol = "XLE"
+        portfolio = PortfolioState(positions=[self._make_position(symbol)])
+        orch._state_manager.save_portfolio = AsyncMock()
+        orch._state_manager.load_portfolio = AsyncMock(return_value=portfolio)
+        orch._state_manager.load_orders = AsyncMock(return_value=MagicMock(orders=[]))
+        self._stub_indicators(orch, symbol, roc_deceleration=True)
+        # Simulate fill registered just now (well within 5-min cooldown)
+        orch._position_entry_times[symbol] = _time.monotonic()
+        orch._config.scheduler.min_hold_before_override_min = 5
+
+        await orch._fast_step_quant_overrides()
+
+        orch._broker.place_order.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_override_fires_after_hold_window(self, orch):
+        """Override must fire once the hold window has elapsed."""
+        import time as _time
+        symbol = "XLE"
+        portfolio = PortfolioState(positions=[self._make_position(symbol)])
+        orch._state_manager.save_portfolio = AsyncMock()
+        orch._state_manager.load_portfolio = AsyncMock(return_value=portfolio)
+        orch._state_manager.load_orders = AsyncMock(return_value=MagicMock(orders=[]))
+        self._stub_indicators(orch, symbol, roc_deceleration=True)
+        orch._fill_protection.can_place_order = MagicMock(return_value=True)
+        # Simulate fill registered 6 minutes ago (beyond 5-min cooldown)
+        orch._position_entry_times[symbol] = _time.monotonic() - 360
+        orch._config.scheduler.min_hold_before_override_min = 5
+        orch._broker.place_order = AsyncMock(return_value=MagicMock(order_id="ord_override"))
+        orch._fill_protection.record_order = AsyncMock()
+
+        await orch._fast_step_quant_overrides()
+
+        orch._broker.place_order.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_entry_time_cleared_on_close(self, orch):
+        """_position_entry_times entry is removed when the trade journals (position closes)."""
+        from ozymandias.execution.fill_protection import StateChange
+        symbol = "XLE"
+        orch._position_entry_times[symbol] = 12345.0
+
+        pos = self._make_position(symbol)
+        portfolio = PortfolioState(positions=[pos])
+        orch._state_manager.load_portfolio = AsyncMock(return_value=portfolio)
+        orch._state_manager.save_portfolio = AsyncMock()
+        orch._trade_journal.append = AsyncMock()
+
+        change = StateChange(
+            order_id="ord_x", symbol=symbol, old_status="PENDING", new_status="FILLED",
+            fill_qty=84.0, fill_price=58.50, side="sell", change_type="fill",
+        )
+        await orch._journal_closed_trade(change)
+
+        assert symbol not in orch._position_entry_times
 
 
 # ===========================================================================

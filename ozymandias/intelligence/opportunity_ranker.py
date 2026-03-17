@@ -100,6 +100,13 @@ class OpportunityRanker:
         self._min_volume = float(cfg.get("min_avg_daily_volume", _MIN_AVG_DAILY_VOLUME))
         self._min_conviction = float(cfg.get("min_conviction_threshold", 0.10))  # sanity floor
         self._min_technical_score = float(cfg.get("min_technical_score", 0.30))  # TA quality floor
+        # Symbols that may appear on the watchlist for market context but must never be entered.
+        no_entry_raw = cfg.get("no_entry_symbols", [
+            "SPY", "QQQ", "IWM", "DIA",
+            "VXX", "UVXY", "SVXY", "VIXY",
+            "TLT", "GLD", "SLV", "USO",
+        ])
+        self._no_entry_symbols: frozenset[str] = frozenset(s.upper() for s in no_entry_raw)
 
     # ------------------------------------------------------------------
     # Sub-scores
@@ -220,8 +227,7 @@ class OpportunityRanker:
             Callable that returns True when the market is in regular hours.
             Defaults to :func:`ozymandias.core.market_hours.is_market_open`.
         orders:
-            Full order list forwarded to :meth:`PDTGuard.can_day_trade`.
-            When omitted, an empty list is used (best-effort PDT check).
+            Reserved for future use; not currently used inside this method.
         technical_signals:
             Optional signal map; used only for the volume filter.
 
@@ -232,12 +238,16 @@ class OpportunityRanker:
         symbol = opportunity.get("symbol", "")
         _is_open = market_hours_fn if market_hours_fn is not None else is_market_open
 
-        # 0. Minimum conviction threshold (cheapest filter runs first)
+        # 0. No-entry symbol guard — broad-market/volatility ETFs used for context only
+        if symbol.upper() in self._no_entry_symbols:
+            return False, f"{symbol}: in no_entry_symbols list (market-context instrument, not tradeable)"
+
+        # 1. Minimum conviction threshold
         conviction = float(opportunity.get("conviction", 0.0))
         if conviction < self._min_conviction:
             return False, f"{symbol}: conviction {conviction:.2f} below threshold {self._min_conviction:.2f}"
 
-        # 0.5. Minimum composite technical score floor
+        # 2. Minimum composite technical score floor
         if technical_signals is not None:
             sig_summary = technical_signals.get(symbol, {})
             tech_score = float(sig_summary.get("composite_technical_score", 0.0))
@@ -248,11 +258,11 @@ class OpportunityRanker:
                     f"{self._min_technical_score:.2f}",
                 )
 
-        # 1. Regular-hours check
+        # 3. Regular-hours check
         if not _is_open():
             return False, f"{symbol}: market not in regular hours"
 
-        # 2. Buying power
+        # 4. Buying power
         position_size_pct = float(opportunity.get("position_size_pct", 0.05))
         required = account_info.equity * position_size_pct
         if account_info.buying_power < required:
@@ -262,21 +272,22 @@ class OpportunityRanker:
                 f"({account_info.buying_power:.2f} < {required:.2f} required)",
             )
 
-        # 3. Max concurrent positions
+        # 5. Max concurrent positions
         if len(portfolio.positions) >= self._max_positions:
             return (
                 False,
                 f"{symbol}: max concurrent positions ({self._max_positions}) reached",
             )
 
-        # 4. PDT check
-        allowed, reason = pdt_guard.can_day_trade(
-            symbol, orders or [], portfolio
-        )
-        if not allowed:
-            return False, f"{symbol}: PDT limit — {reason}"
+        # 5a. Per-symbol duplicate guard — never enter a symbol already in portfolio
+        if any(p.symbol == symbol for p in portfolio.positions):
+            return False, f"{symbol}: position already open in portfolio"
 
-        # 5. Average daily volume
+        # 6. (PDT check removed — a new entry is never a day trade by itself.
+        #     The day trade occurs only when the position is closed same-day.
+        #     PDT gating happens in validate_entry at close time.)
+
+        # 7. Average daily volume
         # avg_daily_volume lives inside the nested "signals" sub-dict of the summary output.
         sig_summary = (technical_signals or {}).get(symbol, {})
         nested = sig_summary.get("signals", {})

@@ -8,6 +8,7 @@ Response caching with configurable TTL (simple dict + timestamp expiry):
   - Quotes:        30 seconds (default)
   - Bars:           5 minutes (default)
   - Fundamentals:  60 minutes (default)
+  - News:          15 minutes (default)
 """
 from __future__ import annotations
 
@@ -55,10 +56,12 @@ class YFinanceAdapter(DataAdapter):
         quote_ttl: int = 30,
         bars_ttl: int = 300,
         fundamentals_ttl: int = 3600,
+        news_ttl: int = 900,
     ) -> None:
         self._quote_ttl = quote_ttl
         self._bars_ttl = bars_ttl
         self._fundamentals_ttl = fundamentals_ttl
+        self._news_ttl = news_ttl  # 15 min default — news freshness degrades slowly
         self._cache: dict[str, _CacheEntry] = {}
 
     # ------------------------------------------------------------------
@@ -118,6 +121,43 @@ class YFinanceAdapter(DataAdapter):
 
         self._set_cache(key, fundamentals, self._fundamentals_ttl)
         return fundamentals
+
+    async def fetch_news(self, symbol: str, max_items: int = 5) -> list[dict]:
+        """
+        Fetch recent news headlines for a symbol (best-effort).
+
+        Returns a list of {title, publisher, age_hours} dicts for items
+        published within the last 24 hours, capped at max_items.
+        Returns [] on any exception.
+        """
+        key = f"news:{symbol}"
+        cached = self._get_cache(key)
+        if cached is not None:
+            log.debug("Cache hit: news %s", symbol)
+            return cached
+
+        try:
+            raw_items = await asyncio.to_thread(self._download_news, symbol)
+        except Exception as exc:
+            log.debug("fetch_news failed for %s: %s", symbol, exc)
+            return []
+
+        now_ts = time.time()
+        result = []
+        for item in raw_items:
+            pub_ts = item.get("providerPublishTime", 0)
+            age_hours = (now_ts - pub_ts) / 3600.0
+            if age_hours <= 24.0:
+                result.append({
+                    "title":     item.get("title", ""),
+                    "publisher": item.get("publisher", ""),
+                    "age_hours": round(age_hours, 1),
+                })
+            if len(result) >= max_items:
+                break
+
+        self._set_cache(key, result, self._news_ttl)
+        return result
 
     async def is_available(self) -> bool:
         """Lightweight health check — tries to fetch SPY fast_info."""
@@ -207,6 +247,11 @@ class YFinanceAdapter(DataAdapter):
             forward_pe=_get('forwardPE'),
             price_to_book=_get('priceToBook'),
         )
+
+    @staticmethod
+    def _download_news(symbol: str) -> list[dict]:
+        """Return raw news items from yfinance (list of dicts)."""
+        return yf.Ticker(symbol).news or []
 
     @staticmethod
     def _health_check() -> None:

@@ -371,11 +371,13 @@ class TestCheckEquityFloor:
 
 class TestBrokerFloor:
     """
-    broker_floor ensures count_day_trades never undercounts vs broker.
+    broker_floor is stored for informational/logging purposes but is NOT used
+    to inflate the local count for blocking decisions.
 
-    Regression test for Bug #9: bot counted 1 day trade (NVDA), broker
-    reported 5. Phantom/adoption trades executed at broker level (AMD 16 sells,
-    SPY buys) were invisible to the local order-based counter.
+    Context: broker_floor was originally used as max(local, broker) to catch
+    phantom trades. This caused Bug #9b (2026-03-17): broker_floor=5 from a
+    buggy paper session permanently blocked all entries for the rest of the
+    5-day rolling window. Local order tracking is now authoritative.
     """
 
     def test_default_floor_zero_has_no_effect(self):
@@ -385,22 +387,21 @@ class TestBrokerFloor:
             _filled_order("o1", "AAPL", "buy", TUE),
             _filled_order("o2", "AAPL", "sell", TUE),
         ]
-        # local=1, broker_floor=0 → max(1, 0)=1
         assert guard.count_day_trades(orders, _portfolio(), reference_date=WED) == 1
 
-    def test_broker_floor_higher_than_local_returns_floor(self):
-        """When broker_floor exceeds local count, broker floor is used."""
+    def test_broker_floor_higher_than_local_does_not_inflate_count(self):
+        """broker_floor > local count: local count is still returned (broker is informational)."""
         guard = _guard()
         guard.broker_floor = 5
         orders = [
             _filled_order("o1", "AAPL", "buy", TUE),
             _filled_order("o2", "AAPL", "sell", TUE),
         ]
-        # local=1, broker_floor=5 → max(1, 5)=5
-        assert guard.count_day_trades(orders, _portfolio(), reference_date=WED) == 5
+        # local=1, broker_floor=5 → local count wins: 1
+        assert guard.count_day_trades(orders, _portfolio(), reference_date=WED) == 1
 
-    def test_local_count_beats_lower_broker_floor(self):
-        """Local count beats broker_floor when local is higher."""
+    def test_local_count_returned_regardless_of_broker_floor(self):
+        """Local count is always the return value."""
         guard = _guard()
         guard.broker_floor = 1
         orders = [
@@ -411,35 +412,39 @@ class TestBrokerFloor:
             _filled_order("o5", "NVDA", "buy", WED),
             _filled_order("o6", "NVDA", "sell", WED),
         ]
-        # local=3, broker_floor=1 → max(3, 1)=3
+        # local=3, broker_floor=1 → local 3
         assert guard.count_day_trades(orders, _portfolio(), reference_date=WED) == 3
 
-    def test_can_day_trade_blocked_by_broker_floor(self):
-        """can_day_trade is blocked when broker_floor brings count to the limit."""
+    def test_high_broker_floor_does_not_block_can_day_trade(self):
+        """Even with broker_floor above limit, can_day_trade uses local count."""
         guard = _guard(pdt_buffer=1)  # effective limit = 3-1 = 2
-        guard.broker_floor = 2        # broker already at limit; local has 0
-        orders = []
-        # max(0, 2)=2 >= effective_limit 2 → blocked
-        allowed, reason = guard.can_day_trade("AAPL", orders, _portfolio(), reference_date=WED)
-        assert allowed is False
-        assert "limit" in reason.lower()
-
-    def test_can_day_trade_allowed_when_broker_floor_below_limit(self):
-        """can_day_trade is allowed when broker_floor is below the effective limit."""
-        guard = _guard(pdt_buffer=1)  # effective limit = 2
-        guard.broker_floor = 1        # 1 below limit; local also 0
-        orders = []
+        guard.broker_floor = 5        # would have blocked under old logic
+        orders = []                   # local=0
+        # local=0 < effective_limit=2 → allowed
         allowed, _ = guard.can_day_trade("AAPL", orders, _portfolio(), reference_date=WED)
         assert allowed is True
 
-    def test_broker_floor_persists_across_calls(self):
-        """broker_floor stays set between calls — simulates orchestrator refresh pattern."""
+    def test_can_day_trade_blocked_by_local_count(self):
+        """can_day_trade is blocked when local count reaches the effective limit."""
+        guard = _guard(pdt_buffer=1)  # effective limit = 2
+        orders = [
+            _filled_order("o1", "AAPL", "buy", TUE),
+            _filled_order("o2", "AAPL", "sell", TUE),
+            _filled_order("o3", "TSLA", "buy", TUE),
+            _filled_order("o4", "TSLA", "sell", TUE),
+        ]
+        # local=2 >= effective_limit=2 → blocked
+        allowed, reason = guard.can_day_trade("NVDA", orders, _portfolio(), reference_date=WED)
+        assert allowed is False
+        assert "limit" in reason.lower()
+
+    def test_broker_floor_stored_for_logging(self):
+        """broker_floor attribute is settable and readable (used for warning logs)."""
         guard = _guard()
         guard.broker_floor = 3
-        # First call
-        assert guard.count_day_trades([], _portfolio(), reference_date=WED) == 3
-        # Second call without resetting — floor must still apply
-        assert guard.count_day_trades([], _portfolio(), reference_date=WED) == 3
+        assert guard.broker_floor == 3
+        # count_day_trades still returns local count, not broker_floor
+        assert guard.count_day_trades([], _portfolio(), reference_date=WED) == 0
 
 
 # ---------------------------------------------------------------------------

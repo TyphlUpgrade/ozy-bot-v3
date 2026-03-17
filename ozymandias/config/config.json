@@ -22,14 +22,19 @@
     "slow_loop_max_interval_sec": 3600,
     "slow_loop_price_move_threshold_pct": 2.0,
     "dead_zone_start_et": "11:30",
-    "dead_zone_end_et": "14:30"
+    "dead_zone_end_et": "14:30",
+    "limit_order_timeout_sec": 300,
+    "market_order_conviction_threshold": 0.80,
+    "min_hold_before_override_min": 5
   },
   "claude": {
     "model": "claude-sonnet-4-20250514",
     "max_tokens_per_cycle": 4096,
     "prompt_version": "v3.3.0",
     "tier1_max_symbols": 12,
-    "tier2_max_symbols": 28
+    "tier2_max_symbols": 28,
+    "news_max_age_hours": 168,
+    "news_max_items_per_symbol": 3
   },
   "ai_fallback": {
     "enabled": true,
@@ -48,11 +53,17 @@
     "weight_risk": 0.20,
     "weight_liquidity": 0.15,
     "min_conviction_threshold": 0.10,
-    "thesis_challenge_size_threshold": 0.15,
+    "thesis_challenge_size_threshold": 0.20,
+    "thesis_challenge_max_penalty": 0.35,
     "max_entry_drift_pct": 0.015,
     "max_adverse_drift_pct": 0.020,
     "min_technical_score": 0.30,
-    "ta_size_factor_min": 0.60
+    "ta_size_factor_min": 0.60,
+    "no_entry_symbols": [
+      "SPY", "QQQ", "IWM", "DIA",
+      "VXX", "UVXY", "SVXY", "VIXY",
+      "TLT", "GLD", "SLV", "USO"
+    ]
   },
   "strategy": {
     "active_strategies": ["momentum"],

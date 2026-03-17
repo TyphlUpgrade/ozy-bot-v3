@@ -31,6 +31,23 @@ _ATR_TRAILING_STOP_MULTIPLIER: float = 2.0
 _MIN_AVG_DAILY_VOLUME: int = 100_000
 
 
+def _et_date_str(date_str: str) -> date | None:
+    """Parse an ISO date/datetime string and return the ET calendar date, or None."""
+    if not date_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(date_str)
+        if dt.tzinfo is None:
+            return dt.date()
+        return dt.astimezone(ET).date()
+    except (ValueError, AttributeError):
+        # Plain date string like "2026-03-17"
+        try:
+            return date.fromisoformat(date_str)
+        except ValueError:
+            return None
+
+
 def _pending_order_commitment(orders: list[OrderRecord]) -> float:
     """
     Sum of capital committed by pending limit orders.
@@ -77,6 +94,7 @@ class RiskManager:
         sched = scheduler or SchedulerConfig()
         self._dead_zone_start: dtime = dtime.fromisoformat(sched.dead_zone_start_et)
         self._dead_zone_end: dtime = dtime.fromisoformat(sched.dead_zone_end_et)
+        self._bypass_market_hours: bool = sched.bypass_market_hours  # skip all session/dead-zone checks when True
         # Previous momentum scores per symbol (for flip detection)
         self._prev_momentum_scores: dict[str, float] = {}
         # Daily loss state
@@ -154,11 +172,19 @@ class RiskManager:
         if not hours_ok:
             return False, hours_msg
 
-        # 6. PDT day-trade check (only applies if selling a symbol already held)
-        if side == "sell" and any(p.symbol == symbol for p in portfolio.positions):
-            pdt_ok, pdt_msg = self._pdt.can_day_trade(symbol, orders, portfolio)
-            if not pdt_ok:
-                return False, pdt_msg
+        # 6. PDT day-trade check — only when closing a position opened today AND
+        # equity is below the PDT threshold. Above $25,500 the broker permits
+        # unlimited day trades regardless of PDT designation.
+        if account.equity < self._cfg.min_equity_for_trading:
+            today_et = now.astimezone(ET).date()
+            opened_today = any(
+                p.symbol == symbol and _et_date_str(p.entry_date) == today_et
+                for p in portfolio.positions
+            )
+            if side == "sell" and opened_today:
+                pdt_ok, pdt_msg = self._pdt.can_day_trade(symbol, orders, portfolio)
+                if not pdt_ok:
+                    return False, pdt_msg
 
         # 7. Buying power
         if side == "buy":
@@ -184,6 +210,8 @@ class RiskManager:
     def _check_market_hours(self, strategy: str, now: datetime) -> tuple[bool, str]:
         """Block entries in non-regular sessions; block all entries in dead zone;
         block momentum in last 5 minutes."""
+        if self._bypass_market_hours:
+            return True, "Market hours bypass active"
         session = get_current_session(now)
         if session != Session.REGULAR_HOURS:
             return False, (

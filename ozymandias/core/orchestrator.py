@@ -52,6 +52,14 @@ log = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
 
+# Market context instruments fetched every medium cycle for Claude macro context.
+# Results go into _market_context_indicators only — never into _latest_indicators
+# (no entry pipeline contamination).
+_CONTEXT_SYMBOLS = [
+    "SPY", "QQQ", "IWM",                           # broad market
+    "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLC",  # sectors
+]
+
 
 # ---------------------------------------------------------------------------
 # Degradation state
@@ -157,8 +165,17 @@ class Orchestrator:
         # ATR trailing stop check.
         self._intraday_highs: dict[str, float] = {}
 
+        # Monotonic timestamp of each position's opening fill — used to enforce
+        # a minimum hold time before quant overrides can fire (prevents the override
+        # from triggering on stale indicators the moment a position is registered).
+        self._position_entry_times: dict[str, float] = {}
+
         # Latest market context from slow loop — consumed by thesis challenge in medium loop
         self._latest_market_context: dict = {}
+
+        # TA results for context instruments (SPY, QQQ, sector ETFs).
+        # Updated each medium cycle; consumed by _build_market_context for Claude calls.
+        self._market_context_indicators: dict = {}
 
         # Count of override exits since last Claude call (feeds trigger state)
         self._override_exit_count: int = 0
@@ -185,9 +202,17 @@ class Orchestrator:
         # Conservative startup mode — no new entries until this UTC timestamp
         self._conservative_mode_until: Optional[datetime] = None
 
-        # Thesis challenge result cache: symbol → (was_blocked, monotonic_timestamp).
+        # Thesis challenge result cache: symbol → (concern_level, monotonic_timestamp).
         # Prevents hammering Claude with repeated challenges on the same symbol every cycle.
-        self._thesis_challenge_cache: dict[str, tuple[bool, float]] = {}
+        self._thesis_challenge_cache: dict[str, tuple[float, float]] = {}
+
+        # Monotonic timestamp of the last PDT warning log — suppresses repeated warnings
+        # that would otherwise fire every fast loop tick (every 10s) when near the limit.
+        self._last_pdt_warning_ts: float = 0.0
+
+        # Last-known account equity, updated after every broker account fetch.
+        # Used by _fast_step_pdt_check to skip PDT limits when above the $25k threshold.
+        self._last_known_equity: float = 0.0
 
         # Recently-closed symbols: symbol → monotonic timestamp of closure.
         # Prevents _fast_step_position_sync from re-adopting a position the bot just
@@ -230,6 +255,7 @@ class Orchestrator:
         self._broker = AlpacaBroker(api_key=api_key, secret_key=secret_key, paper=paper)
 
         acct = await self._broker.get_account()
+        self._last_known_equity = acct.equity
         log.info(
             "Broker connected [%s] — equity=$%.2f  buying_power=$%.2f  "
             "cash=$%.2f  pdt=%s  daytrades_used=%d",
@@ -340,13 +366,17 @@ class Orchestrator:
                         reconciliation_errors = True
                         updated = True
                 else:
-                    log.error(
+                    # Broker has a position we don't know about (e.g. carried over
+                    # from a prior session). Adopt it — this is fully handled: hold-time
+                    # is set, overrides are gated, and the medium loop will manage it.
+                    # Does NOT trigger conservative mode; there is no uncertainty here.
+                    log.warning(
                         "Unknown broker position: %s %.4f shares @ %.4f — "
-                        "adding to local state with reconciled=True",
+                        "adopting into local state (direction=%s)",
                         symbol, broker_abs_qty, broker_pos.avg_entry_price,
+                        "short" if broker_pos.side in ("short", "sell") else "long",
                     )
                     now_iso = datetime.now(timezone.utc).isoformat()
-                    # Infer direction from broker side; defaults to "long" for buys.
                     reconciled_direction = (
                         "short" if broker_pos.side in ("short", "sell") else "long"
                     )
@@ -358,7 +388,9 @@ class Orchestrator:
                         intention=TradeIntention(direction=reconciled_direction),
                         reconciled=True,
                     ))
-                    reconciliation_errors = True
+                    # Give reconciled positions the hold-time window so overrides
+                    # cannot fire on stale indicators immediately after adoption.
+                    self._position_entry_times[symbol] = time.monotonic()
                     updated = True
 
             for symbol in list(local_map.keys()):
@@ -425,6 +457,7 @@ class Orchestrator:
         # -- Step 3: Account state -------------------------------------------
         try:
             acct = await self._broker.get_account()
+            self._last_known_equity = acct.equity
             log.info(
                 "Account snapshot — equity=$%.2f  buying_power=$%.2f  cash=$%.2f  "
                 "pdt=%s  daytrades_used=%d",
@@ -577,7 +610,7 @@ class Orchestrator:
         4. PDT guard check.
         5. Position sync (broker vs local).
         """
-        if not is_market_open():
+        if not self._is_market_open():
             return  # no action outside regular hours — resumes cleanly at 9:30
 
         # Guard — if broker is unavailable, skip order operations but still
@@ -665,15 +698,18 @@ class Orchestrator:
                 except Exception as exc:
                     log.warning("Failed to poll order %s: %s", order.order_id, exc)
 
-        # Handle stale orders
-        stale = self._fill_protection.get_stale_orders(
-            timeout_sec=self._config.scheduler.fast_loop_sec * 6  # default 60s
-        )
+        # Handle stale orders — configurable timeout (default 5 min)
+        stale_timeout = self._config.scheduler.limit_order_timeout_sec
+        stale = self._fill_protection.get_stale_orders(timeout_sec=stale_timeout)
         for stale_order in stale:
+            try:
+                age_sec = int((datetime.now(timezone.utc) - datetime.fromisoformat(stale_order.created_at)).total_seconds())
+            except Exception:
+                age_sec = -1
             log.warning(
-                "Cancelling stale order %s for %s (type=%s age=%ds)",
+                "Cancelling stale order %s for %s (type=%s age=%ds timeout=%ds)",
                 stale_order.order_id, stale_order.symbol,
-                stale_order.order_type, stale_order.timeout_seconds,
+                stale_order.order_type, age_sec, stale_timeout,
             )
             try:
                 cancel_result = await self._broker.cancel_order(stale_order.order_id)
@@ -765,6 +801,7 @@ class Orchestrator:
             intention=intention,
         ))
         await self._state_manager.save_portfolio(portfolio)
+        self._position_entry_times[symbol] = time.monotonic()
         log.info(
             "Position registered from opening fill: %s  qty=%.2f  avg_cost=%.4f  "
             "stop=%.4f  target=%.4f  strategy=%s  direction=%s",
@@ -842,6 +879,7 @@ class Orchestrator:
             portfolio.positions = [p for p in portfolio.positions if p.symbol != symbol]
             await self._state_manager.save_portfolio(portfolio)
             self._recently_closed[symbol] = time.monotonic()
+            self._position_entry_times.pop(symbol, None)
             log.info(
                 "Trade closed and journaled: %s  pnl=%.2f%%  exit_reason=%s",
                 symbol, pnl_pct, exit_reason,
@@ -866,6 +904,22 @@ class Orchestrator:
             # Override signals (VWAP crossover, ATR trailing stop) are long-biased.
             # Skip quant overrides for short positions — they rely on stop/target instead.
             if position.intention.direction == "short":
+                continue
+
+            # Enforce minimum hold time before overrides can fire.
+            # This prevents stale indicators (computed before entry) from triggering
+            # an immediate exit on the same fast loop tick that registered the fill.
+            min_hold_sec = self._config.scheduler.min_hold_before_override_min * 60
+            entry_ts = self._position_entry_times.get(symbol)
+            held_sec = (time.monotonic() - entry_ts) if entry_ts is not None else 0.0
+            if held_sec < min_hold_sec:
+                log.debug(
+                    "Override check skipped for %s — %s",
+                    symbol,
+                    f"held {held_sec:.0f}s < min {min_hold_sec:.0f}s"
+                    if entry_ts is not None
+                    else "no entry time recorded (reconciled/adopted position)",
+                )
                 continue
 
             # We need current indicators — use cached TA data if available.
@@ -947,8 +1001,23 @@ class Orchestrator:
         """
         Step 4: Check that the PDT day-trade count hasn't been exceeded.
         Log a WARNING if approaching the limit.
+
+        PDT limits only apply when equity is below the configured minimum ($25,500).
+        Above that threshold the broker permits unlimited day trades regardless of
+        PDT designation, so this check is skipped entirely.
         """
         try:
+            # Skip the entire PDT limit check when equity is above the threshold.
+            # The $25k rule only restricts trading when an account is BOTH PDT-flagged
+            # AND under-capitalised. Above the threshold, day trade count is irrelevant.
+            min_equity = self._config.risk.min_equity_for_trading
+            if self._last_known_equity >= min_equity:
+                log.debug(
+                    "PDT check skipped — equity $%.2f >= PDT threshold $%.2f",
+                    self._last_known_equity, min_equity,
+                )
+                return
+
             orders_state = await self._state_manager.load_orders()
             portfolio = await self._state_manager.load_portfolio()
 
@@ -959,11 +1028,15 @@ class Orchestrator:
             log.debug("PDT check: %d day trades used (safe limit=%d)", day_trades, allowed)
 
             if day_trades >= allowed:
-                log.warning(
-                    "PDT WARNING: %d of %d day trades used (buffer=%d). "
-                    "No more entries without emergency flag.",
-                    day_trades, 3, self._config.risk.pdt_buffer,
-                )
+                # Rate-limit to once per 5 minutes — this fires every fast loop tick otherwise.
+                now_mono = time.monotonic()
+                if now_mono - self._last_pdt_warning_ts >= 300:
+                    log.warning(
+                        "PDT WARNING: %d of %d day trades used (buffer=%d). "
+                        "Same-day closes will be blocked; new entries are unaffected.",
+                        day_trades, 3, self._config.risk.pdt_buffer,
+                    )
+                    self._last_pdt_warning_ts = now_mono
         except Exception as exc:
             log.error("PDT check error: %s", exc, exc_info=True)
 
@@ -1097,6 +1170,9 @@ class Orchestrator:
                     entry_date=datetime.now(timezone.utc).isoformat(),
                     intention=intention,
                 ))
+                # Give adopted positions the hold-time window so override signals
+                # based on stale indicators don't fire immediately after adoption.
+                self._position_entry_times[bp.symbol] = time.monotonic()
                 portfolio_updated = True
                 log.warning(
                     "Position sync: untracked broker position adopted: %s  qty=%.2f  avg_cost=%.4f  side=%s",
@@ -1106,6 +1182,14 @@ class Orchestrator:
         # Quantity mismatches — broker is authoritative; correct local state.
         # Broker reports negative qty for shorts; compare using abs() since
         # local shares are always stored as a positive number.
+        #
+        # IMPORTANT: Skip upward corrections when there is an active (PENDING or
+        # PARTIALLY_FILLED) order for the symbol. The broker qty already reflects
+        # shares from that in-flight order, which haven't been dispatched as a fill
+        # event yet. Correcting upward here would cause _dispatch_confirmed_fill to
+        # see "position already exists" and route the fill as a close instead of an
+        # additional open. Downward corrections are always safe (they mean shares
+        # were removed, e.g. an external close).
         local_map = {p.symbol: p for p in portfolio.positions}
         for bp in broker_positions:
             lp = local_map.get(bp.symbol)
@@ -1113,6 +1197,13 @@ class Orchestrator:
                 continue
             broker_abs_qty = abs(bp.qty)
             if abs(broker_abs_qty - lp.shares) > 0.001:
+                if broker_abs_qty > lp.shares and not self._fill_protection.can_place_order(bp.symbol):
+                    log.debug(
+                        "Position sync: skipping upward qty correction for %s "
+                        "(local=%.4f broker=%.4f) — active order in flight",
+                        bp.symbol, lp.shares, broker_abs_qty,
+                    )
+                    continue
                 log.warning(
                     "Position sync: correcting %s qty local=%.4f → broker=%.4f",
                     bp.symbol, lp.shares, broker_abs_qty,
@@ -1145,7 +1236,7 @@ class Orchestrator:
         5. Execute top opportunity (one per cycle) if risk-validated.
         6. Re-evaluate open positions; exit if strategy recommends it.
         """
-        if not is_market_open():
+        if not self._is_market_open():
             return  # no data fetches or analysis outside regular hours
 
         if self._degradation.market_data_available is False:
@@ -1197,6 +1288,21 @@ class Orchestrator:
         }
 
         log.debug("Medium loop: scanned %d symbol(s)", len(indicators))
+
+        # -- Context instruments: best-effort macro data for Claude -----------
+        # Fetch TA for SPY, QQQ, sector ETFs not already in the main scan.
+        # Failures are silently skipped — this data is informational only.
+        for ctx_sym in _CONTEXT_SYMBOLS:
+            if ctx_sym in indicators:
+                # Already fetched as a watchlist/position symbol — reuse the result.
+                self._market_context_indicators[ctx_sym] = indicators[ctx_sym]
+                continue
+            try:
+                df = await self._data_adapter.fetch_bars(ctx_sym, interval="5m", period="1d")
+                if df is not None and not df.empty:
+                    self._market_context_indicators[ctx_sym] = generate_signal_summary(ctx_sym, df)
+            except Exception as exc:
+                log.debug("Medium loop: context fetch skipped for %s: %s", ctx_sym, exc)
 
         # Fire the slow loop immediately the first time indicators are populated.
         # This gets Claude's assessment within seconds of startup rather than waiting
@@ -1277,13 +1383,11 @@ class Orchestrator:
 
         try:
             acct = await self._broker.get_account()
+            self._last_known_equity = acct.equity
         except Exception as exc:
             self._mark_broker_failure(exc)
             return
         self._mark_broker_available()
-
-        # Keep broker_floor in sync so PDT guard never undercounts day trades.
-        self._pdt_guard.broker_floor = acct.daytrade_count
 
         # Keep portfolio cash/buying_power in sync with broker so downstream
         # logic (ranker, Claude context) always sees current capital figures.
@@ -1298,7 +1402,7 @@ class Orchestrator:
             acct,
             portfolio,
             self._pdt_guard,
-            is_market_open,
+            self._is_market_open,
             orders=orders_state.orders,
         )
 
@@ -1428,57 +1532,63 @@ class Orchestrator:
             log.debug("Medium loop: fill protection blocking entry for %s", symbol)
             return False
 
-        # Thesis challenge for large positions (config: ranker.thesis_challenge_size_threshold)
+        # Thesis challenge for large positions — returns a concern_level (0–1) that applies
+        # a bounded size penalty. Never blocks the trade; worst case shrinks it by
+        # thesis_challenge_max_penalty (default 35%).
         challenge_size_threshold = self._config.ranker.thesis_challenge_size_threshold
         if top.position_size_pct >= challenge_size_threshold:
             ttl = self._config.ranker.thesis_challenge_ttl_min * 60
             cached = self._thesis_challenge_cache.get(symbol)
+            cached_concern: float | None = None
             if cached:
-                was_blocked, ts = cached
-                age = time.monotonic() - ts
-                if age < ttl:
-                    if was_blocked:
-                        log.debug(
-                            "Thesis challenge cache: %s still blocked (cached %.0fmin ago)"
-                            " — trying next candidate",
-                            symbol, age / 60,
-                        )
-                        return False
-                    # was not blocked last time — fall through and re-evaluate
+                cached_concern_val, ts = cached
+                if time.monotonic() - ts < ttl:
+                    cached_concern = cached_concern_val
+                    log.debug(
+                        "Thesis challenge cache hit for %s: concern_level=%.2f (cached %.0fmin ago)",
+                        symbol, cached_concern, (time.monotonic() - ts) / 60,
+                    )
 
-            challenge = await self._claude.run_thesis_challenge(
-                opportunity={
-                    "symbol": symbol,
-                    "strategy": strategy_name,
-                    "conviction": top.ai_conviction,
-                    "suggested_entry": entry_price,
-                    "suggested_exit": top.suggested_exit,
-                    "suggested_stop": top.suggested_stop,
-                    "position_size_pct": top.position_size_pct,
-                    "reasoning": top.reasoning,
-                },
-                market_context=self._latest_market_context,
-                indicators=self._latest_indicators,
-            )
-            if challenge is not None:
-                blocked = not challenge.get("proceed", True)
-                self._thesis_challenge_cache[symbol] = (blocked, time.monotonic())
-                if blocked:
-                    log.info(
-                        "Thesis challenge blocked entry for %s: %s",
-                        symbol, challenge.get("challenge_reasoning", ""),
-                    )
-                    return False
-                challenge_conviction = float(challenge.get("conviction", top.ai_conviction))
-                if challenge_conviction < top.ai_conviction and top.ai_conviction > 0:
-                    # Scale quantity proportionally to conviction reduction
-                    ratio = challenge_conviction / top.ai_conviction
-                    quantity = max(1, int(quantity * ratio))
-                    log.info(
-                        "Thesis challenge reduced conviction for %s: %.2f → %.2f, "
-                        "quantity scaled to %d",
-                        symbol, top.ai_conviction, challenge_conviction, quantity,
-                    )
+            if cached_concern is None:
+                # Build a compact portfolio summary for concentration assessment.
+                portfolio_summary = {
+                    "open_positions": [
+                        {"symbol": p.symbol, "direction": getattr(p, "direction", "long")}
+                        for p in portfolio.positions
+                    ],
+                    "position_count": len(portfolio.positions),
+                }
+                challenge = await self._claude.run_thesis_challenge(
+                    opportunity={
+                        "symbol": symbol,
+                        "strategy": strategy_name,
+                        "conviction": top.ai_conviction,
+                        "suggested_entry": entry_price,
+                        "suggested_exit": top.suggested_exit,
+                        "suggested_stop": top.suggested_stop,
+                        "atr": ind.get("atr_14", 0.0),
+                        "position_size_pct": top.position_size_pct,
+                        "reasoning": top.reasoning,
+                    },
+                    market_context=self._latest_market_context,
+                    portfolio=portfolio_summary,
+                )
+                if challenge is not None:
+                    try:
+                        cached_concern = max(0.0, min(1.0, float(challenge.get("concern_level", 0.0))))
+                    except (TypeError, ValueError):
+                        log.warning("Thesis challenge for %s: non-numeric concern_level — ignoring", symbol)
+                        cached_concern = 0.0
+                    self._thesis_challenge_cache[symbol] = (cached_concern, time.monotonic())
+
+            if cached_concern is not None and cached_concern > 0.0:
+                max_penalty = self._config.ranker.thesis_challenge_max_penalty
+                size_factor = 1.0 - (cached_concern * max_penalty)
+                quantity = max(1, int(quantity * size_factor))
+                log.info(
+                    "Thesis challenge penalty for %s: concern=%.2f → size_factor=%.2f → qty=%d",
+                    symbol, cached_concern, size_factor, quantity,
+                )
 
         # Determine stop and target for position intention.
         # Prefer Claude's suggested levels (specific support/resistance) when provided;
@@ -1505,12 +1615,19 @@ class Orchestrator:
                 else entry_price + 3 * atr_or_pct
             )
 
+        # High-conviction momentum entries use market orders for immediate fills.
+        # Below the threshold, or for non-momentum strategies, use a limit order.
+        mkt_threshold = self._config.scheduler.market_order_conviction_threshold
+        use_market = (
+            strategy_name == "momentum"
+            and top.ai_conviction >= mkt_threshold
+        )
         order = Order(
             symbol=symbol,
             side=order_side,
             quantity=quantity,
-            order_type="limit",
-            limit_price=entry_price,
+            order_type="market" if use_market else "limit",
+            limit_price=None if use_market else entry_price,
             time_in_force="day",
         )
         try:
@@ -1534,26 +1651,35 @@ class Orchestrator:
         }
 
         now_iso = datetime.now(timezone.utc).isoformat()
+        actual_order_type = "market" if use_market else "limit"
         record = OrderRecord(
             order_id=result.order_id,
             symbol=symbol,
             side=order_side,
             quantity=quantity,
-            order_type="limit",
-            limit_price=entry_price,
+            order_type=actual_order_type,
+            limit_price=None if use_market else entry_price,
             status="PENDING",
             created_at=now_iso,
             last_checked_at=now_iso,
         )
         await self._fill_protection.record_order(record)
-        log.info(
-            "Entry order placed — %s  qty=%d  limit=%.2f  strategy=%s  score=%.3f  "
-            "stop=%.4f  target=%.4f  (stop_src=%s  target_src=%s)",
-            symbol, quantity, entry_price, strategy_name, top.composite_score,
-            use_stop, use_target,
-            "claude" if top.suggested_stop > 0 else "atr",
-            "claude" if top.suggested_exit > 0 else "atr",
-        )
+        if use_market:
+            log.info(
+                "Entry order placed (MARKET) — %s  qty=%d  conviction=%.2f>=%.2f  strategy=%s  "
+                "score=%.3f  stop=%.4f  target=%.4f",
+                symbol, quantity, top.ai_conviction, mkt_threshold,
+                strategy_name, top.composite_score, use_stop, use_target,
+            )
+        else:
+            log.info(
+                "Entry order placed — %s  qty=%d  limit=%.2f  strategy=%s  score=%.3f  "
+                "stop=%.4f  target=%.4f  (stop_src=%s  target_src=%s)",
+                symbol, quantity, entry_price, strategy_name, top.composite_score,
+                use_stop, use_target,
+                "claude" if top.suggested_stop > 0 else "atr",
+                "claude" if top.suggested_exit > 0 else "atr",
+            )
         return True
 
     async def _medium_evaluate_positions(self, portfolio, bars, indicators, acct, orders) -> None:
@@ -1666,7 +1792,7 @@ class Orchestrator:
         starts a Claude reasoning cycle. The cycle is async — fast and medium
         loops continue uninterrupted while waiting for Claude's response.
         """
-        if not is_market_open():
+        if not self._is_market_open():
             return  # no Claude calls outside regular hours
 
         # Guard: don't call Claude until the medium loop has computed indicators at
@@ -1799,6 +1925,88 @@ class Orchestrator:
             if price is not None:
                 self._trigger_state.last_prices[symbol] = price
 
+    async def _build_market_context(self, acct, pdt_remaining: int) -> dict:
+        """
+        Build the market_data context dict for Claude reasoning calls.
+
+        Derives macro trend summary from _market_context_indicators (populated
+        each medium cycle) and fetches tier-1 watchlist news concurrently.
+        """
+        ctx = self._market_context_indicators
+
+        def _classify_trend(sym: str) -> str:
+            """Map a context symbol's TA signals to a simple trend label."""
+            signals = ctx.get(sym, {}).get("signals", {})
+            ts   = signals.get("trend_structure", "")
+            vwap = signals.get("vwap_position", "")
+            if ts == "bullish_aligned" and vwap in ("above", "at"):
+                return "bullish"
+            if ts == "bearish_aligned" and vwap in ("below", "at"):
+                return "bearish"
+            if ts or vwap:
+                return "mixed"
+            return "unknown"
+
+        spy_rsi = ctx.get("SPY", {}).get("signals", {}).get("rsi")
+
+        bullish_count = sum(
+            1 for sym in _CONTEXT_SYMBOLS
+            if ctx.get(sym, {}).get("signals", {}).get("trend_structure") == "bullish_aligned"
+        )
+        market_breadth = f"{bullish_count}/{len(_CONTEXT_SYMBOLS)} context instruments bullish-aligned"
+
+        _SECTOR_ETFS = {
+            "XLK": "Technology",
+            "XLF": "Financials",
+            "XLE": "Energy",
+            "XLV": "Healthcare",
+            "XLI": "Industrials",
+            "XLY": "Consumer Discretionary",
+            "XLC": "Communication Services",
+        }
+        sector_performance = []
+        for etf, sector in _SECTOR_ETFS.items():
+            ind = ctx.get(etf)
+            if not ind:
+                continue
+            sector_performance.append({
+                "sector":          sector,
+                "etf":             etf,
+                "trend":           ind.get("signals", {}).get("trend_structure", "unknown"),
+                "composite_score": ind.get("composite_technical_score", 0.0),
+            })
+        sector_performance.sort(key=lambda x: x["composite_score"], reverse=True)
+
+        # Fetch news for tier-1 watchlist symbols concurrently (best-effort).
+        watchlist = await self._state_manager.load_watchlist()
+        tier1 = [e.symbol for e in watchlist.entries if e.priority_tier == 1]
+        max_items = self._config.claude.news_max_items_per_symbol
+        news_results = await asyncio.gather(
+            *[self._data_adapter.fetch_news(s, max_items=max_items) for s in tier1],
+            return_exceptions=True,
+        )
+        max_age = self._config.claude.news_max_age_hours
+        watchlist_news: dict[str, list] = {}
+        for sym, result in zip(tier1, news_results):
+            if isinstance(result, Exception):
+                continue
+            filtered = [item for item in result if item.get("age_hours", 9999) < max_age]
+            if filtered:
+                watchlist_news[sym] = filtered
+
+        return {
+            "spy_trend":         _classify_trend("SPY"),
+            "spy_rsi":           spy_rsi,
+            "qqq_trend":         _classify_trend("QQQ"),
+            "market_breadth":    market_breadth,
+            "sector_performance": sector_performance,
+            "watchlist_news":    watchlist_news,
+            "trading_session":   get_current_session().value,
+            "pdt_trades_remaining": max(0, pdt_remaining),
+            "account_equity":    acct.equity,
+            "buying_power":      acct.buying_power,
+        }
+
     async def _run_claude_cycle(self, trigger_name: str) -> None:
         """
         Assembles context, calls Claude, processes the response, and
@@ -1813,6 +2021,7 @@ class Orchestrator:
         # Build market_data context block
         try:
             acct = await self._broker.get_account()
+            self._last_known_equity = acct.equity
         except Exception as exc:
             self._mark_broker_failure(exc)
             log.warning("Slow loop: cannot fetch account for Claude context — skipping cycle")
@@ -1822,16 +2031,7 @@ class Orchestrator:
         pdt_remaining = 3 - self._config.risk.pdt_buffer - \
             self._pdt_guard.count_day_trades(orders_state.orders, portfolio)
 
-        market_data = {
-            "spy_trend":             "unknown",   # populated if data adapter provides it
-            "vix":                   None,
-            "sector_rotation":       "unknown",
-            "macro_events_today":    [],
-            "trading_session":       get_current_session().value,
-            "pdt_trades_remaining":  max(0, pdt_remaining),
-            "account_equity":        acct.equity,
-            "buying_power":          acct.buying_power,
-        }
+        market_data = await self._build_market_context(acct, pdt_remaining)
 
         self._latest_market_context = market_data  # store for medium loop thesis challenge
 
@@ -1994,6 +2194,17 @@ class Orchestrator:
                 # Claude recommends exiting — place a market exit order immediately.
                 # thesis_intact=False is a hard signal; action="exit" is sufficient.
                 if action == "exit":
+                    # Guard against the override-vs-Claude race: if this symbol was
+                    # closed by the fast loop (override/stop) while Claude's API call
+                    # was in flight, the position no longer exists — skip the exit.
+                    if symbol in self._recently_closed:
+                        log.info(
+                            "Claude position review: exit for %s skipped — "
+                            "position already closed by fast loop (%.0fs ago)",
+                            symbol,
+                            time.monotonic() - self._recently_closed[symbol],
+                        )
+                        break
                     if not self._fill_protection.can_place_order(symbol):
                         log.warning(
                             "Claude position review: exit for %s blocked — pending order exists",
@@ -2060,6 +2271,12 @@ class Orchestrator:
                     "No new orders will be placed.",
                     elapsed,
                 )
+
+    def _is_market_open(self) -> bool:
+        """Return True if market is open, or if the market-hours bypass is active."""
+        if self._config.scheduler.bypass_market_hours:
+            return True
+        return is_market_open()
 
     def _mark_broker_available(self) -> None:
         if not self._degradation.broker_available:

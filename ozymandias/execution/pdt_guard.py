@@ -127,15 +127,24 @@ class PDTGuard:
 
         # A day trade = same (symbol, date) has both buy and sell fills
         local_count = sum(1 for key in buys if key in sells)
-        # Take the higher of the local count and the broker's reported count.
-        # The broker may have tracked day trades from phantom/adoption activity
-        # that never produced matching buy+sell pairs in orders.json.
-        day_trades = max(local_count, self.broker_floor)
-        log.debug(
-            "count_day_trades: local=%d  broker_floor=%d  effective=%d (today=%s)",
-            local_count, self.broker_floor, day_trades, today,
-        )
-        return day_trades
+        # Use local count as the authoritative figure for blocking decisions.
+        # broker_floor is informational only — it is intentionally NOT used here
+        # because the broker's rolling count can be inflated by past buggy sessions,
+        # permanently blocking new entries for days. Local order tracking is
+        # reliable after the re-adoption / phantom-trade bugs were fixed.
+        if self.broker_floor > local_count:
+            log.warning(
+                "count_day_trades: broker reports %d day trades but local tracking "
+                "shows only %d — broker count may reflect a prior buggy session; "
+                "using local count for compliance gating (today=%s)",
+                self.broker_floor, local_count, today,
+            )
+        else:
+            log.debug(
+                "count_day_trades: local=%d  broker_floor=%d (today=%s)",
+                local_count, self.broker_floor, today,
+            )
+        return local_count
 
     # ------------------------------------------------------------------
     # Day trade permission check

@@ -671,38 +671,44 @@ class TestRunThesisChallenge:
             "reasoning": "Strong breakout above key resistance.",
         }
 
-    @pytest.mark.asyncio
-    async def test_run_thesis_challenge_proceed_true(self, tmp_path):
-        engine = _engine(tmp_path)
-        challenge_resp = json.dumps({
-            "proceed": True,
-            "conviction": 0.80,
-            "challenge_reasoning": "Watch for rejection at $212 gap resistance.",
-        })
-        with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as m:
-            m.return_value = _mock_api_response(challenge_resp)
-            result = await engine.run_thesis_challenge(
-                self._make_opportunity(), _market_data(), _indicators(["AAPL"])
-            )
-        assert result is not None
-        assert result["proceed"] is True
-        assert result["conviction"] == pytest.approx(0.80)
+    def _portfolio_summary(self, n: int = 0) -> dict:
+        return {
+            "open_positions": [{"symbol": f"SYM{i}", "direction": "long"} for i in range(n)],
+            "position_count": n,
+        }
 
     @pytest.mark.asyncio
-    async def test_run_thesis_challenge_proceed_false(self, tmp_path):
+    async def test_run_thesis_challenge_no_concerns(self, tmp_path):
+        """concern_level=0.0 → no penalty, trade proceeds at full size."""
         engine = _engine(tmp_path)
         challenge_resp = json.dumps({
-            "proceed": False,
-            "conviction": 0.20,
-            "challenge_reasoning": "Failed breakout — price closed back below $198 VWAP reclaim.",
+            "concern_level": 0.0,
+            "reasoning": "no material concerns",
         })
         with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as m:
             m.return_value = _mock_api_response(challenge_resp)
             result = await engine.run_thesis_challenge(
-                self._make_opportunity(), _market_data(), {}
+                self._make_opportunity(), _market_data(), self._portfolio_summary()
             )
         assert result is not None
-        assert result["proceed"] is False
+        assert result["concern_level"] == pytest.approx(0.0)
+        assert "reasoning" in result
+
+    @pytest.mark.asyncio
+    async def test_run_thesis_challenge_moderate_concern(self, tmp_path):
+        """concern_level between 0 and 1 is returned verbatim."""
+        engine = _engine(tmp_path)
+        challenge_resp = json.dumps({
+            "concern_level": 0.45,
+            "reasoning": "Earnings in 2 days creates binary risk for this momentum trade.",
+        })
+        with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as m:
+            m.return_value = _mock_api_response(challenge_resp)
+            result = await engine.run_thesis_challenge(
+                self._make_opportunity(), _market_data(), self._portfolio_summary(2)
+            )
+        assert result is not None
+        assert result["concern_level"] == pytest.approx(0.45)
 
     @pytest.mark.asyncio
     async def test_run_thesis_challenge_unparseable_returns_none(self, tmp_path):
@@ -710,18 +716,31 @@ class TestRunThesisChallenge:
         with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as m:
             m.return_value = _mock_api_response("this is not json at all")
             result = await engine.run_thesis_challenge(
-                self._make_opportunity(), _market_data(), {}
+                self._make_opportunity(), _market_data(), self._portfolio_summary()
             )
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_run_thesis_challenge_empty_portfolio_calls_claude(self, tmp_path):
+        """Empty portfolio dict is valid — Claude is still called (no indicators guard removed)."""
+        engine = _engine(tmp_path)
+        challenge_resp = json.dumps({"concern_level": 0.0, "reasoning": "no concerns"})
+        with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as m:
+            m.return_value = _mock_api_response(challenge_resp)
+            result = await engine.run_thesis_challenge(
+                self._make_opportunity(), _market_data(), {}
+            )
+        assert result is not None
+        m.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_run_thesis_challenge_loads_template(self, tmp_path):
         engine = _engine(tmp_path)
         with patch.object(engine, "_load_prompt", wraps=engine._load_prompt) as mock_load:
             with patch.object(engine._client.messages, "create", new_callable=AsyncMock) as m:
-                m.return_value = _mock_api_response('{"proceed": true, "conviction": 0.9, "challenge_reasoning": "ok"}')
+                m.return_value = _mock_api_response('{"concern_level": 0.1, "reasoning": "minor drift risk"}')
                 await engine.run_thesis_challenge(
-                    self._make_opportunity(), _market_data(), {}
+                    self._make_opportunity(), _market_data(), self._portfolio_summary()
                 )
         mock_load.assert_called_once_with("thesis_challenge.txt")
 

@@ -10,6 +10,7 @@ Tests for Phase 11: Execution Fidelity
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,7 +60,7 @@ def _make_opportunity(
         action=action,
         strategy="momentum",
         composite_score=0.75,
-        ai_conviction=0.80,
+        ai_conviction=0.70,   # below market_order_conviction_threshold (0.80) — tests limit order path
         technical_score=0.70,
         risk_adjusted_return=0.60,
         liquidity_score=0.80,
@@ -436,3 +437,60 @@ class TestTASizeModifier:
 
         assert len(orders) == 1
         assert orders[0].quantity >= 1
+
+
+# ===========================================================================
+# 5. Market order for high-conviction momentum entries
+# ===========================================================================
+
+class TestMarketOrderPath:
+    """High-conviction momentum entries use market orders; others use limit orders."""
+
+    @pytest.mark.asyncio
+    async def test_high_conviction_momentum_uses_market_order(self, orch):
+        """conviction >= threshold AND strategy=momentum → market order, no limit_price."""
+        top = _make_opportunity(suggested_entry=200.0)
+        top = dataclasses.replace(top, ai_conviction=0.85)
+        _stub_entry_guards(orch, indicators={"NVDA": {"price": 200.5, "composite_technical_score": 1.0}})
+        placed_orders = []
+        async def capture(order):
+            placed_orders.append(order)
+            return OrderResult(order_id="o1", status="pending_new",
+                               submitted_at=datetime.now(timezone.utc))
+        orch._broker.place_order = capture
+        await orch._medium_try_entry(top, _stub_account(), PortfolioState(positions=[]), [])
+        assert len(placed_orders) == 1
+        assert placed_orders[0].order_type == "market"
+        assert placed_orders[0].limit_price is None
+
+    @pytest.mark.asyncio
+    async def test_below_threshold_uses_limit_order(self, orch):
+        """conviction < threshold → limit order with limit_price set."""
+        top = _make_opportunity(suggested_entry=200.0)  # ai_conviction=0.70 by default
+        _stub_entry_guards(orch, indicators={"NVDA": {"price": 200.5, "composite_technical_score": 1.0}})
+        placed_orders = []
+        async def capture(order):
+            placed_orders.append(order)
+            return OrderResult(order_id="o1", status="pending_new",
+                               submitted_at=datetime.now(timezone.utc))
+        orch._broker.place_order = capture
+        await orch._medium_try_entry(top, _stub_account(), PortfolioState(positions=[]), [])
+        assert len(placed_orders) == 1
+        assert placed_orders[0].order_type == "limit"
+        assert placed_orders[0].limit_price is not None
+
+    @pytest.mark.asyncio
+    async def test_high_conviction_swing_uses_limit_order(self, orch):
+        """conviction >= threshold but strategy=swing → limit order (market only for momentum)."""
+        top = _make_opportunity(suggested_entry=200.0)
+        top = dataclasses.replace(top, ai_conviction=0.85, strategy="swing")
+        _stub_entry_guards(orch, indicators={"NVDA": {"price": 200.5, "composite_technical_score": 1.0}})
+        placed_orders = []
+        async def capture(order):
+            placed_orders.append(order)
+            return OrderResult(order_id="o1", status="pending_new",
+                               submitted_at=datetime.now(timezone.utc))
+        orch._broker.place_order = capture
+        await orch._medium_try_entry(top, _stub_account(), PortfolioState(positions=[]), [])
+        assert len(placed_orders) == 1
+        assert placed_orders[0].order_type == "limit"

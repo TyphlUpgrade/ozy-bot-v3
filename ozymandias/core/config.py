@@ -16,41 +16,45 @@ from typing import Optional
 
 @dataclass
 class BrokerConfig:
-    name: str = "alpaca"
-    environment: str = "paper"
-    credentials_file: str = "credentials.enc"
-    credentials_key_file: str = "~/.ozy_key"  # path to Fernet key for credentials decryption
+    name: str = "alpaca"                               # broker backend; only "alpaca" is supported
+    environment: str = "paper"                         # "paper" or "live"; selects which base_url is used
+    credentials_file: str = "credentials.enc"          # Fernet-encrypted credentials file in config dir
+    credentials_key_file: str = "~/.ozy_key"           # path to Fernet key file for credentials decryption
     base_url_paper: str = "https://paper-api.alpaca.markets"
     base_url_live: str = "https://api.alpaca.markets"
 
 
 @dataclass
 class RiskConfig:
-    max_position_pct: float = 0.20
-    max_concurrent_positions: int = 8
-    max_daily_loss_pct: float = 0.02
-    per_trade_max_loss_pct: float = 0.03
-    pdt_buffer: int = 1
-    min_equity_for_trading: float = 25500.0
+    max_position_pct: float = 0.20          # max fraction of portfolio equity per single position
+    max_concurrent_positions: int = 8       # hard cap on open positions; blocks new entries above this
+    max_daily_loss_pct: float = 0.02        # halt trading for the day when loss exceeds this fraction of equity
+    per_trade_max_loss_pct: float = 0.03    # max stop-loss distance as fraction of equity; used by position sizer
+    pdt_buffer: int = 1                     # PDT day-trades to hold in reserve as emergency exits (of 3 allowed)
+    min_equity_for_trading: float = 25500.0 # block all new entries below this equity; FINRA PDT floor is $25k
 
 
 @dataclass
 class SchedulerConfig:
-    fast_loop_sec: int = 10
-    medium_loop_sec: int = 120
-    slow_loop_check_sec: int = 300
-    slow_loop_max_interval_sec: int = 3600
-    slow_loop_price_move_threshold_pct: float = 2.0
-    conservative_startup_mode_min: int = 10  # no new entries after reconciliation errors
+    fast_loop_sec: int = 10                          # interval for fill polling, quant overrides, position sync
+    medium_loop_sec: int = 120                       # interval for TA scans, ranking, and order execution
+    slow_loop_check_sec: int = 300                   # how often to evaluate slow-loop triggers (not how often Claude runs)
+    slow_loop_max_interval_sec: int = 3600           # time-ceiling trigger: Claude runs at least this often during market hours
+    slow_loop_price_move_threshold_pct: float = 2.0  # price-move trigger: fires Claude if any tier-1 symbol moves this much since last call
+    conservative_startup_mode_min: int = 10          # no new entries for this many minutes after reconciliation errors on startup
     # Dead zone: block new entries during midday low-volume window (ET times, "HH:MM" format)
     dead_zone_start_et: str = "11:30"
     dead_zone_end_et: str = "14:30"
-    entry_attempts_per_cycle: int = 3  # max ranked candidates to attempt per medium cycle before giving up
+    entry_attempts_per_cycle: int = 3                # max ranked candidates to attempt per medium cycle before giving up
+    limit_order_timeout_sec: int = 300               # cancel unfilled limit orders after this many seconds (default 5 min)
+    market_order_conviction_threshold: float = 0.80  # use market order (immediate fill) for momentum entries at or above this conviction
+    min_hold_before_override_min: int = 5            # quant overrides cannot fire within this many minutes of position entry
+    bypass_market_hours: bool = False                # when True, skip all market-hours gates (loop guards, dead zone, session check); for off-hours testing only
 
 
 @dataclass
 class AIFallbackConfig:
-    enabled: bool = True
+    enabled: bool = True                        # whether to fall back to Gemini when Claude is unavailable
     fallback_model: str = "gemini-2.0-flash"   # Google Gemini Flash — fast, high-availability fallback
     overload_retries: int = 3                   # 529 retry attempts before switching to fallback (3s→6s→12s)
     overload_base_sec: float = 3.0              # initial delay for 529 retries
@@ -63,34 +67,45 @@ class AIFallbackConfig:
 
 @dataclass
 class ClaudeConfig:
-    model: str = "claude-sonnet-4-20250514"
-    max_tokens_per_cycle: int = 4096
-    prompt_version: str = "v3.3.0"
-    tier1_max_symbols: int = 12
-    tier2_max_symbols: int = 28
-    max_reasoning_interval_min: int = 60   # time-ceiling trigger threshold
+    model: str = "claude-sonnet-4-20250514"    # Anthropic model ID for all reasoning calls
+    max_tokens_per_cycle: int = 4096           # token budget per reasoning call; thesis challenge uses 512 via override
+    prompt_version: str = "v3.3.0"            # versioned subdirectory under config/prompts/ loaded for all templates
+    tier1_max_symbols: int = 12               # max tier-1 watchlist symbols passed to Claude with full indicator detail
+    tier2_max_symbols: int = 28               # max tier-2 symbols passed as watchlist replenishment candidates
+    max_reasoning_interval_min: int = 60      # time-ceiling trigger: Claude runs at least this often during market hours
+    news_max_age_hours: int = 168             # secondary age gate for watchlist_news in Claude context (7 days); adapter pre-filters to 24h
+    news_max_items_per_symbol: int = 3        # headline cap per symbol sent to Claude; controls token budget
 
 
 @dataclass
 class RankerConfig:
-    weight_ai: float = 0.35
-    weight_technical: float = 0.30
-    weight_risk: float = 0.20
-    weight_liquidity: float = 0.15
+    # Opportunity composite score weights — must sum to 1.0
+    weight_ai: float = 0.35           # Claude conviction component of composite opportunity score
+    weight_technical: float = 0.30    # composite TA score component
+    weight_risk: float = 0.20         # risk-adjusted expected value component
+    weight_liquidity: float = 0.15    # volume/liquidity quality component
     min_conviction_threshold: float = 0.10   # sanity floor: rejects degenerate zero-conviction Claude output
-    thesis_challenge_size_threshold: float = 0.15  # position_size_pct >= this triggers skeptical review
-    thesis_challenge_ttl_min: int = 10  # minutes to cache a thesis challenge result before re-evaluating
-    max_entry_drift_pct: float = 0.015   # skip long buy if current price > suggested_entry × (1 + this)
-    max_adverse_drift_pct: float = 0.020  # skip long buy if current price < suggested_entry × (1 - this)
-    min_technical_score: float = 0.30    # hard filter floor: composite_technical_score below this rejects
-    ta_size_factor_min: float = 0.60     # at composite_technical_score=0, enter at this fraction of risk-sized qty
+    thesis_challenge_size_threshold: float = 0.20  # position_size_pct >= this triggers adversarial Claude review before entry
+    thesis_challenge_ttl_min: int = 10  # minutes to cache a thesis challenge result before re-evaluating the same symbol
+    thesis_challenge_max_penalty: float = 0.35  # max fractional size reduction from thesis challenge (0.35 = up to 35% smaller)
+    max_entry_drift_pct: float = 0.015   # skip long buy if current price > suggested_entry × (1 + this); avoids chasing
+    max_adverse_drift_pct: float = 0.020  # skip long buy if current price < suggested_entry × (1 - this); entry level broken
+    min_technical_score: float = 0.30    # hard filter floor: composite_technical_score below this rejects entry regardless of conviction
+    ta_size_factor_min: float = 0.60     # at composite_technical_score=0, enter at this fraction of risk-sized qty; scales linearly to 1.0
+    no_entry_symbols: list = field(default_factory=lambda: [
+        # Broad-market and volatility ETFs used as market-context monitors only.
+        # These may appear on the watchlist (tier 2) but must never be entered as trades.
+        "SPY", "QQQ", "IWM", "DIA",        # major broad-market ETFs
+        "VXX", "UVXY", "SVXY", "VIXY",    # volatility products (too mean-reverting / decay-prone)
+        "TLT", "GLD", "SLV", "USO",        # macro/commodity context instruments
+    ])
 
 
 @dataclass
 class StrategyConfig:
-    active_strategies: list[str] = field(default_factory=lambda: ["momentum", "swing"])
-    momentum_params: dict = field(default_factory=dict)
-    swing_params: dict = field(default_factory=dict)
+    active_strategies: list[str] = field(default_factory=lambda: ["momentum", "swing"])  # must match keys in get_strategy() registry
+    momentum_params: dict = field(default_factory=dict)   # overrides for MomentumStrategy._DEFAULT_PARAMS
+    swing_params: dict = field(default_factory=dict)      # overrides for SwingStrategy._DEFAULT_PARAMS
 
 
 @dataclass
@@ -102,7 +117,7 @@ class Config:
     ai_fallback: AIFallbackConfig = field(default_factory=AIFallbackConfig)
     ranker: RankerConfig = field(default_factory=RankerConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
-    timezone: str = "America/New_York"
+    timezone: str = "America/New_York"  # used by market hours logic; all internal timestamps remain UTC
 
     # Path to the config directory (set by loader)
     _config_dir: Optional[Path] = field(default=None, repr=False, compare=False)

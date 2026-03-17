@@ -285,10 +285,12 @@ class TestHardFilters:
         passes, _ = self._filter(portfolio=portfolio)
         assert passes is True
 
-    def test_pdt_violation_rejects(self):
+    def test_pdt_guard_never_blocks_entry(self):
+        # PDT is not checked at entry time — a new position is never a day trade
+        # until it is closed the same day. PDT gating is validate_entry's job at close time.
         passes, reason = self._filter(pdt=_pdt_guard(allow=False))
-        assert passes is False
-        assert "PDT" in reason
+        assert passes is True
+        assert reason == ""
 
     def test_low_volume_in_signals_rejects(self):
         # avg_daily_volume lives in the nested "signals" sub-dict of the TA output
@@ -377,10 +379,11 @@ class TestRankOpportunities:
         ranked = self._rank(opps, signals=_tech("AAPL"), mkt_open=False)
         assert ranked == []
 
-    def test_pdt_rejection_removes_opportunity(self):
+    def test_pdt_guard_does_not_block_entry(self):
+        # PDT is never checked at entry time; a pdt_guard that denies has no effect.
         opps = [_opportunity()]
         ranked = self._rank(opps, signals=_tech("AAPL"), pdt=_pdt_guard(allow=False))
-        assert ranked == []
+        assert len(ranked) == 1
 
     def test_score_fields_populated(self):
         opps = [_opportunity()]

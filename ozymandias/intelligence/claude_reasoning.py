@@ -733,52 +733,39 @@ class ClaudeReasoningEngine:
         self,
         opportunity: dict,
         market_context: dict,
-        indicators: dict,
+        portfolio: dict,
     ) -> Optional[dict]:
         """
-        Skeptical challenge of a proposed large-position entry.
+        Concern-level review of a proposed large-position entry.
 
-        Returns dict with {proceed: bool, conviction: float, challenge_reasoning: str}
-        or None if parsing fails (caller should proceed with original sizing on failure).
+        Returns dict with {concern_level: float, reasoning: str} where concern_level
+        is 0.0–1.0 (higher = more concern). The caller applies this as a bounded size
+        penalty; the trade is never blocked by this call.
+
+        Returns None if parsing fails (caller proceeds with original sizing).
         """
         symbol = opportunity.get("symbol", "?")
-        sig_summary = indicators.get(symbol, {})
-        signals = sig_summary.get("signals", sig_summary)
-
         template = self._load_prompt("thesis_challenge.txt")
-        # Use compact key signals only — not the full summary — to minimize input tokens.
-        key_signals = {k: signals.get(k) for k in (
-            "rsi", "macd_signal", "trend_structure", "vwap_position",
-            "roc_5", "volume_ratio", "atr_14",
-        ) if signals.get(k) is not None}
 
         raw_text = await self.call_claude(
             template,
             {
                 "opportunity_json": json.dumps(opportunity, indent=2),
-                "indicators_json": json.dumps(
-                    {
-                        "symbol": symbol,
-                        "composite_score": sig_summary.get("composite_technical_score"),
-                        "signals": key_signals,
-                    },
-                    indent=2,
-                ),
                 "market_context_json": json.dumps(market_context, default=str, indent=2),
+                "portfolio_json": json.dumps(portfolio, default=str, indent=2),
             },
-            max_tokens_override=512,  # response is just {proceed, conviction, reasoning}
+            max_tokens_override=256,
         )
 
         parsed = parse_claude_response(raw_text)
         if parsed is None:
-            log.warning("Thesis challenge for %s: unparseable — proceeding with original sizing", symbol)
+            log.warning("Thesis challenge for %s: unparseable — using original sizing", symbol)
             return None
 
+        concern = parsed.get("concern_level", 0.0)
+        reasoning = parsed.get("reasoning", "")
         log.info(
-            "Thesis challenge [%s]: proceed=%s  conviction=%.2f  reason=%s",
-            symbol,
-            parsed.get("proceed", True),
-            parsed.get("conviction", 0.0),
-            parsed.get("challenge_reasoning", ""),
+            "Thesis challenge [%s]: concern_level=%.2f  reason=%s",
+            symbol, concern, reasoning,
         )
         return parsed

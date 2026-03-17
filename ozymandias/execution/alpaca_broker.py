@@ -220,12 +220,20 @@ class AlpacaBroker(BrokerInterface):
         else:
             if order.limit_price is None:
                 raise ValueError(f"limit_price required for limit order on {order.symbol}")
+            # Alpaca rejects sub-penny prices: ≥$1.00 → round to $0.01; <$1.00 → round to $0.0001
+            tick = 0.01 if order.limit_price >= 1.0 else 0.0001
+            rounded_price = round(round(order.limit_price / tick) * tick, 4)
+            if rounded_price != order.limit_price:
+                log.debug(
+                    "Rounded limit_price for %s: %.6f → %.4f (tick=%.4f)",
+                    order.symbol, order.limit_price, rounded_price, tick,
+                )
             req = LimitOrderRequest(
                 symbol=order.symbol,
                 qty=order.quantity,
                 side=side,
                 time_in_force=tif,
-                limit_price=order.limit_price,
+                limit_price=rounded_price,
             )
 
         log.info(

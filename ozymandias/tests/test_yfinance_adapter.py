@@ -6,6 +6,7 @@ yfinance calls are fully mocked — this test suite never hits the real API.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -327,3 +328,114 @@ class TestErrorPropagation:
         adapter = YFinanceAdapter()
         with pytest.raises(RuntimeError):
             await adapter.fetch_quote('AAPL')
+
+
+# ---------------------------------------------------------------------------
+# fetch_news
+# ---------------------------------------------------------------------------
+
+class TestFetchNews:
+    def _make_news_items(self, ages_hours: list[float]) -> list[dict]:
+        """Build fake yfinance news items with publish times relative to now."""
+        now = time.time()
+        return [
+            {
+                "title":               f"Headline {i}",
+                "publisher":           "TestWire",
+                "providerPublishTime": int(now - age * 3600),
+            }
+            for i, age in enumerate(ages_hours)
+        ]
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_returns_headlines_within_24h(self, mock_ticker_cls):
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.news = self._make_news_items([1.0, 5.0, 10.0])
+
+        adapter = YFinanceAdapter()
+        result = await adapter.fetch_news('AAPL', max_items=5)
+
+        assert len(result) == 3
+        assert all(item["age_hours"] <= 24.0 for item in result)
+        assert result[0]["title"] == "Headline 0"
+        assert result[0]["publisher"] == "TestWire"
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_filters_items_older_than_24h(self, mock_ticker_cls):
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        # Mix: 2 recent, 2 older than 24h
+        mock_ticker.news = self._make_news_items([1.0, 25.0, 2.0, 48.0])
+
+        adapter = YFinanceAdapter()
+        result = await adapter.fetch_news('AAPL', max_items=5)
+
+        assert len(result) == 2
+        assert all(item["age_hours"] <= 24.0 for item in result)
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_respects_max_items_cap(self, mock_ticker_cls):
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.news = self._make_news_items([1.0, 2.0, 3.0, 4.0, 5.0])
+
+        adapter = YFinanceAdapter()
+        result = await adapter.fetch_news('AAPL', max_items=3)
+
+        assert len(result) == 3
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_returns_empty_list_on_exception(self, mock_ticker_cls):
+        mock_ticker_cls.side_effect = RuntimeError("network failure")
+
+        adapter = YFinanceAdapter()
+        result = await adapter.fetch_news('AAPL')
+
+        assert result == []
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_returns_empty_list_when_no_news(self, mock_ticker_cls):
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.news = None
+
+        adapter = YFinanceAdapter()
+        result = await adapter.fetch_news('AAPL')
+
+        assert result == []
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.time.monotonic')
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_second_call_within_ttl_uses_cache(self, mock_ticker_cls, mock_mono):
+        mock_mono.return_value = 0.0
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.news = self._make_news_items([1.0])
+
+        adapter = YFinanceAdapter(news_ttl=900)
+        await adapter.fetch_news('AAPL')
+        await adapter.fetch_news('AAPL')
+
+        assert mock_ticker_cls.call_count == 1
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_result_contains_no_links(self, mock_ticker_cls):
+        """News items sent to Claude must not include URLs (token budget)."""
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        mock_ticker.news = [
+            {
+                "title": "Test Headline",
+                "publisher": "Reuters",
+                "link": "https://example.com/article",
+                "providerPublishTime": int(time.time() - 3600),
+            }
+        ]
+
+        adapter = YFinanceAdapter()
+        result = await adapter.fetch_news('AAPL')
+
+        assert len(result) == 1
+        assert "link" not in result[0]
+        assert set(result[0].keys()) == {"title", "publisher", "age_hours"}
