@@ -19,6 +19,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from ozymandias.core.direction import ACTION_TO_DIRECTION, direction_from_action
 from ozymandias.core.market_hours import is_market_open
 from ozymandias.core.state_manager import PortfolioState
 from ozymandias.execution.broker_interface import AccountInfo
@@ -39,13 +40,6 @@ _W_LIQ = 0.15
 _MAX_POSITIONS = 8
 _MIN_AVG_DAILY_VOLUME = 100_000
 _MAX_REWARD_RISK_RATIO = 5.0
-
-# Maps broker action string → composite score direction.
-# Add one entry here to support a new action type; scoring logic is unchanged.
-_ACTION_TO_DIRECTION: dict[str, str] = {
-    "buy":        "long",
-    "sell_short": "short",
-}
 
 # Strategy gate lookup tables — maps action → the indicator value that disqualifies
 # the entry.  To support a new action type, add one entry here; gate logic is unchanged.
@@ -201,7 +195,7 @@ class OpportunityRanker:
         # bearish signal strength.  Falls back to the cached long-biased score when
         # raw signals are unavailable (e.g. symbol missing from technical_signals).
         action = opportunity.get("action", "buy")
-        direction = _ACTION_TO_DIRECTION.get(action, "long")
+        direction = direction_from_action(action)
         technical_score = (
             compute_composite_score(nested_signals, direction=direction)
             if nested_signals
@@ -290,7 +284,7 @@ class OpportunityRanker:
         if technical_signals is not None:
             sig_summary = technical_signals.get(symbol, {})
             raw_signals = sig_summary.get("signals", {})
-            direction = _ACTION_TO_DIRECTION.get(opportunity.get("action", "buy"), "long")
+            direction = direction_from_action(opportunity.get("action", "buy"))
             tech_score = (
                 compute_composite_score(raw_signals, direction=direction)
                 if raw_signals

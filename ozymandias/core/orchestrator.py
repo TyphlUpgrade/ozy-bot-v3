@@ -21,6 +21,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from ozymandias.core.config import Config, load_config
+from ozymandias.core.direction import EXIT_SIDE, direction_from_action, is_short
 from ozymandias.core.logger import setup_logging
 from ozymandias.core.market_hours import Session, get_current_session, is_market_open
 from ozymandias.core.reasoning_cache import ReasoningCache
@@ -839,9 +840,9 @@ class Orchestrator:
 
             entry_price = position.avg_cost
             exit_price = change.fill_price
-            is_short = position.intention.direction == "short"
+            pos_is_short = is_short(position.intention.direction)
             if entry_price > 0 and exit_price > 0:
-                if is_short:
+                if pos_is_short:
                     pnl_pct = round((entry_price - exit_price) / entry_price * 100, 4)
                 else:
                     pnl_pct = round((exit_price - entry_price) / entry_price * 100, 4)
@@ -853,7 +854,7 @@ class Orchestrator:
             # stop is above entry (loss when price rises).
             stop = position.intention.exit_targets.stop_loss
             target = position.intention.exit_targets.profit_target
-            if is_short:
+            if pos_is_short:
                 if exit_price > 0 and target > 0 and exit_price <= target * 1.001:
                     exit_reason = "target"
                 elif exit_price > 0 and stop > 0 and exit_price >= stop * 0.999:
@@ -915,7 +916,7 @@ class Orchestrator:
 
             # Override signals are long-biased.
             # Skip quant overrides for short positions — they rely on stop/target instead.
-            if position.intention.direction == "short":
+            if is_short(position.intention.direction):
                 continue
 
             # Resolve which override signals apply to this position's strategy.
@@ -996,7 +997,7 @@ class Orchestrator:
                 continue
 
             # Place market exit order (buy to close short, sell to close long)
-            exit_side = "buy" if position.intention.direction == "short" else "sell"
+            exit_side = EXIT_SIDE[position.intention.direction]
             exit_order = Order(
                 symbol=symbol,
                 side=exit_side,
@@ -1143,7 +1144,7 @@ class Orchestrator:
                     "pnl_pct": round(
                         (
                             (pos.avg_cost - current_price) / pos.avg_cost * 100
-                            if pos.intention.direction == "short"
+                            if is_short(pos.intention.direction)
                             else (current_price - pos.avg_cost) / pos.avg_cost * 100
                         )
                         if pos.avg_cost > 0 and current_price > 0 else 0.0, 4
@@ -1522,8 +1523,8 @@ class Orchestrator:
                 )
                 return False
 
-        is_short = top.action == "sell_short"
-        order_side = "sell" if is_short else "buy"
+        entry_direction = direction_from_action(top.action)
+        order_side = "sell" if is_short(entry_direction) else "buy"
         strategy_name = top.strategy
 
         # Phase 11: Staleness / drift check — skip entry if price has moved too far from Claude's target.
@@ -1532,7 +1533,7 @@ class Orchestrator:
         # Direction is inverted for shorts.
         if top.suggested_entry > 0:
             drift = (entry_price - top.suggested_entry) / top.suggested_entry
-            if is_short:
+            if is_short(entry_direction):
                 if drift < -self._config.ranker.max_entry_drift_pct:
                     log.info(
                         "Entry skipped for %s: short chase — current %.2f vs suggested %.2f (%.1f%%)",
@@ -1663,7 +1664,7 @@ class Orchestrator:
         # For shorts, stop is above entry (loss if price rises) and target is below entry.
         atr_for_intention = ind.get("atr_14", 0.0)
         atr_or_pct = atr_for_intention if atr_for_intention > 0 else entry_price * 0.02
-        if is_short:
+        if is_short(entry_direction):
             use_stop = (
                 top.suggested_stop if top.suggested_stop > 0
                 else entry_price + 2 * atr_or_pct
@@ -1711,7 +1712,7 @@ class Orchestrator:
             "target": round(use_target, 4),
             "strategy": strategy_name,
             "reasoning": top.reasoning,
-            "direction": "short" if is_short else "long",
+            "direction": entry_direction,
             "_signals": dict(self._latest_indicators.get(symbol, {})),
             "_claude_conviction": float(top.ai_conviction),
             "_composite_score": float(top.composite_score),
@@ -1803,7 +1804,7 @@ class Orchestrator:
                     exit_sug = None
 
                 # buy to close short, sell to close long
-                exit_side = "buy" if position.intention.direction == "short" else "sell"
+                exit_side = EXIT_SIDE[position.intention.direction]
                 if exit_sug and exit_sug.order_type == "limit" and exit_sug.exit_price > 0:
                     exit_order = Order(
                         symbol=symbol,
@@ -2290,7 +2291,7 @@ class Orchestrator:
                             symbol,
                         )
                         break
-                    exit_side = "buy" if pos.intention.direction == "short" else "sell"
+                    exit_side = EXIT_SIDE[pos.intention.direction]
                     exit_order = Order(
                         symbol=symbol,
                         side=exit_side,

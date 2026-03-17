@@ -365,3 +365,29 @@ Read the relevant phase section before modifying or debugging any module built i
 - **Spec:** *(testing constraint)*
 - **Impl:** Three test setups that assign `orch._data_adapter = MagicMock()` now also set `orch._data_adapter.fetch_news = AsyncMock(return_value=[])`.
 - **Why:** `_build_market_context` calls `asyncio.gather(*[adapter.fetch_news(s) for s in tier1])`. A bare `MagicMock()` returns a non-awaitable on call; `asyncio.gather` raises `TypeError`. Tests that exercise the slow loop path (`test_full_cycle_places_order`) fail without this fix.
+
+---
+
+### Phase 16 — Direction Unification
+
+**`ozymandias/core/direction.py`** · spec *(not defined — post-MVP Phase 16)* · `core/direction.py`
+- **Spec:** *(not defined)*
+- **Impl:** New module `core/direction.py` is the single source of truth for all direction-related mappings. Exports: `Direction = Literal["long", "short"]`, `ACTION_TO_DIRECTION`, `ENTRY_SIDE`, `EXIT_SIDE`, `direction_from_action(action) -> Direction`, `is_short(direction) -> bool`. Unknown action strings in `direction_from_action` log WARNING and default to `"long"`.
+- **Why:** Direction was expressed four ways across the codebase (Claude action strings, internal direction strings, broker side strings, ad-hoc inline checks). Centralising in one module means adding a new action type is one dict entry with no logic changes elsewhere.
+
+**`TradeIntention.direction` annotation** · spec *(not defined)* · `core/state_manager.py`
+- **Spec:** `direction: str = "long"`
+- **Impl:** `direction: Direction = "long"` — type narrowed from `str` to `Direction` (imported from `core/direction`). Runtime behaviour unchanged; adds static typing benefit.
+- **Why:** Phase 16 requirement: annotate `PositionIntention.direction` as `Direction` type.
+
+**Migrated call sites** · spec *(not defined)* · `intelligence/opportunity_ranker.py`, `core/orchestrator.py`
+- **Spec:** *(not defined)*
+- **Impl:**
+  - `opportunity_ranker.py`: removed local `_ACTION_TO_DIRECTION` dict; imports `ACTION_TO_DIRECTION` and `direction_from_action` from `core/direction`. Both `_ACTION_TO_DIRECTION.get(action, "long")` call sites replaced with `direction_from_action(action)`.
+  - `orchestrator.py`: imports `EXIT_SIDE`, `direction_from_action`, `is_short` from `core/direction`. `is_short = top.action == "sell_short"` in `_medium_try_entry` replaced with `entry_direction = direction_from_action(top.action)` + `is_short(entry_direction)` predicate calls. `is_short = position.intention.direction == "short"` in `_journal_closed_trade` replaced with `pos_is_short = is_short(position.intention.direction)`. Three `exit_side = "buy" if ... == "short" else "sell"` ternaries replaced with `EXIT_SIDE[direction]` table lookup. Inline `direction == "short"` check in `_fast_step_quant_overrides` and pnl calculation replaced with `is_short()` predicate.
+- **Why:** Eliminates all ad-hoc direction string comparisons outside `core/direction.py` and `core/broker_interface.py`. Adding a new action type now requires only one dict entry in `core/direction.py`.
+
+**`tests/test_direction.py`** · spec *(Phase 16 §4)* · `tests/test_direction.py`
+- **Spec:** 7 tests covering round-trips, unknown action, `ENTRY_SIDE`/`EXIT_SIDE` inverses, `is_short` predicate.
+- **Impl:** 13 tests in 5 classes (`TestActionToDirection`, `TestDirectionFromAction`, `TestSideInverses`, `TestRoundTrips`, `TestIsShort`). All pass.
+- **Why:** Comprehensive coverage of all tables and helpers.

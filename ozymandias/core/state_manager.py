@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from ozymandias.core.direction import Direction
+
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -41,7 +43,7 @@ class ExitTargets:
 @dataclass
 class TradeIntention:
     catalyst: str = ""
-    direction: str = "long"            # "long" only for now
+    direction: Direction = "long"
     strategy: str = "momentum"         # "momentum" | "swing"
     expected_move: str = ""
     reasoning: str = ""
