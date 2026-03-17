@@ -33,6 +33,13 @@ External Data (yfinance) → Orchestrator (3 async loops) → Intelligence (Clau
 - Fill protection: never place a new order for a symbol that has a PENDING or PARTIALLY_FILLED order
 - PDT buffer: default reserve 1 of 3 allowed day trades for emergency exits
 - Never hardcode tunable parameters (thresholds, multipliers, intervals, weights, limits). Put them in config.json with a comment in the code explaining what the config value controls.
+- Entry limit orders use current market price (from `_latest_indicators`), never Claude's cached
+  `suggested_entry`. Claude's suggested price is a reference for drift checks only.
+- Claude specifies per-trade `entry_conditions` in `new_opportunities` output. The medium loop
+  evaluates these against current indicator values before entering. Absent conditions = no gate.
+  This is the bridge between Claude's per-ticker knowledge and TA's real-time confirmation.
+- Never modify files in `phases/` or `ozymandias_v3_spec_revised.md` unless explicitly instructed.
+  Phase files are historical records; spec deviations go in DRIFT_LOG.md and CLAUDE.md only.
 
 ## Testing Standards
 - Every module gets unit tests. TA functions tested against hand-calculated values.
@@ -52,6 +59,9 @@ External Data (yfinance) → Orchestrator (3 async loops) → Intelligence (Clau
   changes from what the phase file specified, a dependency or assumption is discovered that affects
   future phases, or a meaningful architectural decision is made. Do not modify phase files or the
   spec file — document deviations here instead.
+- **Never modify phase documents or the spec file.** `phases/` files and `ozymandias_v3_spec_revised.md`
+  are immutable historical records. All deviations, decisions, and post-MVP additions belong in
+  DRIFT_LOG.md and CLAUDE.md only. Only create new phase files when explicitly instructed to do so.
 
 ## Adding Features Beyond the Spec
 Features not described in the spec may be requested. When implementing them, follow existing patterns:
@@ -60,23 +70,29 @@ Features not described in the spec may be requested. When implementing them, fol
 - New persistent state → extend existing JSON schemas in `state/`, don't create new files
 - New loop logic → integrate into the orchestrator's existing loop structure
 - All new code uses `async`, `get_logger()`, and `StateManager`
+- New Claude output fields (like `entry_conditions`) → add to prompt schema in `config/prompts/vN.N.N/reasoning.txt`, add to `ReasoningResult` or carry through `ScoredOpportunity`, add evaluator function in `intelligence/opportunity_ranker.py`
 
 ## Post-MVP Status
-All 10 spec phases complete. The bot is feature-complete per `ozymandias_v3_spec_revised.md`.
-Current focus is post-MVP hardening and paper trading validation.
 
-<!--All 536 tests pass: 62+28+60+81+96+52+42+47+37+14+17 (P01–P10 + anti-bias hardening)-->
+All 10 spec phases complete per `ozymandias_v3_spec_revised.md`. Post-MVP phases (11–14) are addressing architectural gaps discovered during paper trading.
+
 Last spec phase completed: Phase 10 (March 15)
+Last post-MVP phase completed: *(none yet — see roadmap below)*
 
 ### Completed post-MVP work
 - **Anti-bias hardening** (March 15): conviction sanity floor, `rejected_opportunities` logging,
   adversarial `updated_reasoning` prompts, thesis challenge for large positions
+- **Paper session bug fixes** (March 16): 9 bugs fixed — re-adoption runaway, Claude exits ignored,
+  short direction inference, fill dispatch routing, ghost cleanup race, test isolation,
+  cash sync, exit price fallback, PDT broker floor (see BUGS_2026-03-16.md)
+- **Index ticker blacklist + dead field cleanup** (March 16): Anomalies 10 + 12 fixed
 
-### Known gaps / next candidates
-- Paper trading monitoring (observability, dashboards, log review tooling)
-- Short selling support (requires `account_type` check from broker; `sell_short` is in the
-  opportunity schema but the orchestrator only places `buy` orders)
-- Settlement warning suppression for margin accounts (minor log hygiene; not urgent)
+### Post-MVP Roadmap: Phases 11–14
+
+- **Phase 11 — Execution Fidelity**: see `phases/11_execution_fidelity.md`
+- **Phase 12 — Claude-Directed Entry Conditions**: see `phases/12_claude_directed_entry_conditions.md`
+- **Phase 13 — Context Enrichment**: see `phases/13_context_enrichment.md`
+- **Phase 14 — Short Position Protection**: see `phases/14_short_protection.md`
 
 ## Spec Drift Log
 See `DRIFT_LOG.md`. Read the relevant phase section of DRIFT_LOG.md before modifying or debugging any module built in a previous phase.

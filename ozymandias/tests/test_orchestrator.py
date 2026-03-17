@@ -765,7 +765,8 @@ class TestThesisChallenge:
         orch._risk_manager.calculate_position_size = MagicMock(return_value=10)
         orch._risk_manager.validate_entry = MagicMock(return_value=(True, ""))
         orch._fill_protection.can_place_order = MagicMock(return_value=True)
-        orch._latest_indicators = {}
+        # composite_technical_score=1.0 → TA size factor=1.0, no quantity reduction
+        orch._latest_indicators = {"AAPL": {"composite_technical_score": 1.0}}
         orch._latest_market_context = {}
 
     @pytest.mark.asyncio
@@ -885,7 +886,8 @@ class TestThesisChallengeCache:
         orch._risk_manager.calculate_position_size = MagicMock(return_value=10)
         orch._risk_manager.validate_entry = MagicMock(return_value=(True, ""))
         orch._fill_protection.can_place_order = MagicMock(return_value=True)
-        orch._latest_indicators = {}
+        # composite_technical_score=1.0 → TA size factor=1.0, no quantity reduction
+        orch._latest_indicators = {"AAPL": {"composite_technical_score": 1.0}}
         orch._latest_market_context = {}
 
     @pytest.mark.asyncio

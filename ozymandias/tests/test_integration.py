@@ -250,6 +250,12 @@ class TestFullCycle:
         orch._data_adapter = MagicMock()
         orch._data_adapter.fetch_bars = AsyncMock(return_value=bars)
 
+        # Phase 11 drift check: Claude's suggested_entry must be close to the current
+        # market price (bars ~875). Override the fixture's default price=200 response.
+        orch._claude._client.messages.create = AsyncMock(
+            return_value=_mock_claude_response(price=875.0, symbol="NVDA")
+        )
+
         # Patch is_market_open so ranker hard filter passes
         # Patch is_market_open in orchestrator (used by ranker) AND get_current_session
         # in risk_manager (used by validate_entry._check_market_hours).

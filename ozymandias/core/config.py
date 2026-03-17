@@ -80,6 +80,10 @@ class RankerConfig:
     min_conviction_threshold: float = 0.10   # sanity floor: rejects degenerate zero-conviction Claude output
     thesis_challenge_size_threshold: float = 0.15  # position_size_pct >= this triggers skeptical review
     thesis_challenge_ttl_min: int = 10  # minutes to cache a thesis challenge result before re-evaluating
+    max_entry_drift_pct: float = 0.015   # skip long buy if current price > suggested_entry × (1 + this)
+    max_adverse_drift_pct: float = 0.020  # skip long buy if current price < suggested_entry × (1 - this)
+    min_technical_score: float = 0.30    # hard filter floor: composite_technical_score below this rejects
+    ta_size_factor_min: float = 0.60     # at composite_technical_score=0, enter at this fraction of risk-sized qty
 
 
 @dataclass

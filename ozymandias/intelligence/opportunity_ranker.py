@@ -99,6 +99,7 @@ class OpportunityRanker:
         self._max_positions = int(cfg.get("max_positions", _MAX_POSITIONS))
         self._min_volume = float(cfg.get("min_avg_daily_volume", _MIN_AVG_DAILY_VOLUME))
         self._min_conviction = float(cfg.get("min_conviction_threshold", 0.10))  # sanity floor
+        self._min_technical_score = float(cfg.get("min_technical_score", 0.30))  # TA quality floor
 
     # ------------------------------------------------------------------
     # Sub-scores
@@ -235,6 +236,17 @@ class OpportunityRanker:
         conviction = float(opportunity.get("conviction", 0.0))
         if conviction < self._min_conviction:
             return False, f"{symbol}: conviction {conviction:.2f} below threshold {self._min_conviction:.2f}"
+
+        # 0.5. Minimum composite technical score floor
+        if technical_signals is not None:
+            sig_summary = technical_signals.get(symbol, {})
+            tech_score = float(sig_summary.get("composite_technical_score", 0.0))
+            if tech_score < self._min_technical_score:
+                return (
+                    False,
+                    f"{symbol}: composite_technical_score {tech_score:.2f} below floor "
+                    f"{self._min_technical_score:.2f}",
+                )
 
         # 1. Regular-hours check
         if not _is_open():

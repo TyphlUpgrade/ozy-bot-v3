@@ -275,6 +275,8 @@ class Orchestrator:
             "weight_liquidity":            self._config.ranker.weight_liquidity,
             "min_conviction_threshold":    self._config.ranker.min_conviction_threshold,
             "thesis_challenge_size_threshold": self._config.ranker.thesis_challenge_size_threshold,
+            "min_technical_score":         self._config.ranker.min_technical_score,
+            "ta_size_factor_min":          self._config.ranker.ta_size_factor_min,
         }
         self._ranker = OpportunityRanker(config=ranker_cfg)
 
@@ -1319,7 +1321,19 @@ class Orchestrator:
         (so the caller can try the next ranked candidate).
         """
         symbol = top.symbol
-        entry_price = top.suggested_entry
+        ind = self._latest_indicators.get(symbol, {})
+
+        # Phase 11: Use current market price as limit order price.
+        # top.suggested_entry is retained only as a reference for the drift check below.
+        current_price = ind.get("price")
+        if current_price is not None:
+            entry_price = current_price
+        else:
+            log.warning(
+                "Medium loop: current price unavailable for %s — falling back to suggested_entry %.2f",
+                symbol, top.suggested_entry,
+            )
+            entry_price = top.suggested_entry
 
         # Conservative startup mode — suppress new entries until timer expires
         if self._conservative_mode_until is not None:
@@ -1334,8 +1348,40 @@ class Orchestrator:
         order_side = "sell" if is_short else "buy"
         strategy_name = top.strategy
 
+        # Phase 11: Staleness / drift check — skip entry if price has moved too far from Claude's target.
+        # Long chase: price ran past Claude's entry (momentum already captured without us).
+        # Long adverse: price broke below Claude's intended buy level (thesis likely invalid).
+        # Direction is inverted for shorts.
+        if top.suggested_entry > 0:
+            drift = (entry_price - top.suggested_entry) / top.suggested_entry
+            if is_short:
+                if drift < -self._config.ranker.max_entry_drift_pct:
+                    log.info(
+                        "Entry skipped for %s: short chase — current %.2f vs suggested %.2f (%.1f%%)",
+                        symbol, entry_price, top.suggested_entry, drift * 100,
+                    )
+                    return False
+                if drift > self._config.ranker.max_adverse_drift_pct:
+                    log.info(
+                        "Entry skipped for %s: short adverse drift — current %.2f vs suggested %.2f (+%.1f%%)",
+                        symbol, entry_price, top.suggested_entry, drift * 100,
+                    )
+                    return False
+            else:
+                if drift > self._config.ranker.max_entry_drift_pct:
+                    log.info(
+                        "Entry skipped for %s: long chase — current %.2f vs suggested %.2f (+%.1f%%)",
+                        symbol, entry_price, top.suggested_entry, drift * 100,
+                    )
+                    return False
+                if drift < -self._config.ranker.max_adverse_drift_pct:
+                    log.info(
+                        "Entry skipped for %s: long adverse drift — current %.2f vs suggested %.2f (%.1f%%)",
+                        symbol, entry_price, top.suggested_entry, drift * 100,
+                    )
+                    return False
+
         # Determine ATR for position sizing
-        ind = self._latest_indicators.get(symbol, {})
         atr = ind.get("atr_14", 0.0)
         avg_vol = ind.get("avg_daily_volume")
 
@@ -1345,6 +1391,20 @@ class Orchestrator:
         if quantity <= 0:
             log.debug("Medium loop: position size = 0 for %s — skipping", symbol)
             return False
+
+        # Phase 11: Scale quantity by TA signal quality.
+        # At composite_technical_score=0 → ta_size_factor_min of base qty; at 1.0 → 100% of base qty.
+        tech_score = ind.get("composite_technical_score", 0.5)
+        size_factor = (
+            self._config.ranker.ta_size_factor_min
+            + (1.0 - self._config.ranker.ta_size_factor_min) * tech_score
+        )
+        orig_qty = quantity
+        quantity = max(1, int(quantity * size_factor))
+        log.debug(
+            "TA size factor %.2f (tech_score=%.2f), qty %d → %d",
+            size_factor, tech_score, orig_qty, quantity,
+        )
 
         allowed, reason = self._risk_manager.validate_entry(
             symbol=symbol,

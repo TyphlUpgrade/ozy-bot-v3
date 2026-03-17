@@ -48,7 +48,11 @@
     "weight_risk": 0.20,
     "weight_liquidity": 0.15,
     "min_conviction_threshold": 0.10,
-    "thesis_challenge_size_threshold": 0.15
+    "thesis_challenge_size_threshold": 0.15,
+    "max_entry_drift_pct": 0.015,
+    "max_adverse_drift_pct": 0.020,
+    "min_technical_score": 0.30,
+    "ta_size_factor_min": 0.60
   },
   "strategy": {
     "active_strategies": ["momentum"],
