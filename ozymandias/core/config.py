@@ -108,8 +108,9 @@ class RankerConfig:
 @dataclass
 class StrategyConfig:
     active_strategies: list[str] = field(default_factory=lambda: ["momentum", "swing"])  # must match keys in get_strategy() registry
-    momentum_params: dict = field(default_factory=dict)   # overrides for MomentumStrategy._DEFAULT_PARAMS
-    swing_params: dict = field(default_factory=dict)      # overrides for SwingStrategy._DEFAULT_PARAMS
+    strategy_params: dict[str, dict] = field(default_factory=dict)
+    # Maps strategy name → param overrides dict.  Add one entry here per new strategy;
+    # no code changes needed.  Example: {"momentum": {"min_rvol": 1.2}, "scalp": {...}}
 
 
 @dataclass

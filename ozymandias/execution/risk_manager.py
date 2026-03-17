@@ -112,7 +112,7 @@ class RiskManager:
         side: str,
         quantity: float,
         price: float,
-        strategy: str,
+        blocks_eod_entries: bool,
         account: AccountInfo,
         portfolio: PortfolioState,
         orders: list[OrderRecord],
@@ -125,17 +125,19 @@ class RiskManager:
         First failing check is returned; remaining checks are skipped.
 
         Args:
-            symbol:            Ticker symbol.
-            side:              "buy" or "sell".
-            quantity:          Number of shares.
-            price:             Estimated fill price (limit price or last quote).
-            strategy:          "momentum" or "swing" — affects hours check.
-            account:           Current account snapshot from broker.
-            portfolio:         Local portfolio state.
-            orders:            All known order records (for PDT and buying-power checks).
-            avg_daily_volume:  Stock's average daily volume from fundamentals.
-                               Skip the min-volume check if None.
-            now:               Override current time (for testing).
+            symbol:             Ticker symbol.
+            side:               "buy" or "sell".
+            quantity:           Number of shares.
+            price:              Estimated fill price (limit price or last quote).
+            blocks_eod_entries: True if this strategy blocks entries in the last
+                                5 minutes of the session (i.e. is_intraday).
+                                Pass ``strategy_obj.blocks_eod_entries``.
+            account:            Current account snapshot from broker.
+            portfolio:          Local portfolio state.
+            orders:             All known order records (for PDT and buying-power checks).
+            avg_daily_volume:   Stock's average daily volume from fundamentals.
+                                Skip the min-volume check if None.
+            now:                Override current time (for testing).
         """
         now = now or datetime.now(ET)
 
@@ -168,7 +170,7 @@ class RiskManager:
             )
 
         # 5. Market hours
-        hours_ok, hours_msg = self._check_market_hours(strategy, now)
+        hours_ok, hours_msg = self._check_market_hours(blocks_eod_entries, now)
         if not hours_ok:
             return False, hours_msg
 
@@ -207,9 +209,9 @@ class RiskManager:
 
         return True, "All risk checks passed"
 
-    def _check_market_hours(self, strategy: str, now: datetime) -> tuple[bool, str]:
+    def _check_market_hours(self, blocks_eod_entries: bool, now: datetime) -> tuple[bool, str]:
         """Block entries in non-regular sessions; block all entries in dead zone;
-        block momentum in last 5 minutes."""
+        block intraday strategies (blocks_eod_entries=True) in last 5 minutes."""
         if self._bypass_market_hours:
             return True, "Market hours bypass active"
         session = get_current_session(now)
@@ -227,10 +229,9 @@ class RiskManager:
                 f"{self._dead_zone_end.strftime('%H:%M')} ET) "
                 "— new entries suspended"
             )
-        if strategy == "momentum" and is_last_five_minutes(now):
+        if blocks_eod_entries and is_last_five_minutes(now):
             return False, (
-                "Momentum entries blocked in last 5 minutes of regular session "
-                "(3:55–4:00 PM ET)"
+                "Entry blocked — last 5 minutes of regular session (3:55–4:00 PM ET)"
             )
         return True, "Market hours OK"
 

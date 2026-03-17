@@ -41,16 +41,6 @@ _MAX_POSITIONS = 8
 _MIN_AVG_DAILY_VOLUME = 100_000
 _MAX_REWARD_RISK_RATIO = 5.0
 
-# Strategy gate lookup tables — maps action → the indicator value that disqualifies
-# the entry.  To support a new action type, add one entry here; gate logic is unchanged.
-_MOMENTUM_WRONG_VWAP: dict[str, str] = {
-    "buy":        "below",   # longs need price above VWAP
-    "sell_short": "above",   # shorts need price below VWAP
-}
-_SWING_WRONG_TREND: dict[str, str] = {
-    "buy":        "bearish_aligned",   # longs avoid downtrends
-    "sell_short": "bullish_aligned",   # shorts avoid uptrends
-}
 
 
 # ---------------------------------------------------------------------------
@@ -113,10 +103,6 @@ class OpportunityRanker:
         self._min_volume = float(cfg.get("min_avg_daily_volume", _MIN_AVG_DAILY_VOLUME))
         self._min_conviction = float(cfg.get("min_conviction_threshold", 0.10))  # sanity floor
         self._min_technical_score = float(cfg.get("min_technical_score", 0.30))  # TA quality floor
-        # Strategy-specific TA minimum gates — checked inside apply_hard_filters
-        self._momentum_min_rvol = float(cfg.get("momentum_min_rvol", 1.0))
-        self._momentum_require_vwap_above = bool(cfg.get("momentum_require_vwap_above", True))
-        self._swing_block_bearish_trend = bool(cfg.get("swing_block_bearish_trend", True))
         # Symbols that may appear on the watchlist for market context but must never be entered.
         no_entry_raw = cfg.get("no_entry_symbols", [
             "SPY", "QQQ", "IWM", "DIA",
@@ -248,6 +234,7 @@ class OpportunityRanker:
         market_hours_fn=None,
         orders: list | None = None,
         technical_signals: dict[str, dict] | None = None,
+        strategy_lookup: dict | None = None,
     ) -> tuple[bool, str]:
         """
         Run pre-scoring hard filters.  Any failure removes the opportunity.
@@ -297,37 +284,29 @@ class OpportunityRanker:
                     f"{self._min_technical_score:.2f}",
                 )
 
-        # 2b. Strategy-specific TA minimum gates
-        # These are deterministic floors independent of the composite score:
-        # - Momentum requires minimum volume participation and price above VWAP.
-        # - Swing rejects entries when the long-term trend is fully bearish-aligned.
+        # 2b. Strategy-specific TA gates — delegated to each Strategy via apply_entry_gate().
+        # To add a new strategy-specific filter, implement apply_entry_gate() in the
+        # strategy class — no changes here are needed.
         if technical_signals is not None:
-            strategy = opportunity.get("strategy", "")
+            strategy_name = opportunity.get("strategy", "")
             action = opportunity.get("action", "buy")
-            sig_outer = technical_signals.get(symbol, {})
-            sig = sig_outer.get("signals", {})
+            sig = technical_signals.get(symbol, {}).get("signals", {})
 
-            if strategy == "momentum":
-                rvol = sig.get("volume_ratio")
-                if rvol is not None and rvol < self._momentum_min_rvol:
-                    return (
-                        False,
-                        f"{symbol}: momentum RVOL {rvol:.2f} below floor "
-                        f"{self._momentum_min_rvol:.2f} — no volume participation",
-                    )
-                if self._momentum_require_vwap_above:
-                    wrong_vwap = _MOMENTUM_WRONG_VWAP.get(action)
-                    if wrong_vwap and sig.get("vwap_position", "") == wrong_vwap:
-                        return False, f"{symbol}: momentum {action} rejected — price {wrong_vwap} VWAP"
+            # Resolve strategy object: prefer pre-built lookup for efficiency,
+            # fall back to on-demand construction for callers that don't pass one.
+            _lookup = strategy_lookup or {}
+            strategy_obj = _lookup.get(strategy_name)
+            if strategy_obj is None and strategy_name:
+                try:
+                    from ozymandias.strategies.base_strategy import get_strategy
+                    strategy_obj = get_strategy(strategy_name)
+                except (ValueError, ImportError):
+                    pass
 
-            elif strategy == "swing":
-                if self._swing_block_bearish_trend:
-                    wrong_trend = _SWING_WRONG_TREND.get(action)
-                    if wrong_trend and sig.get("trend_structure", "") == wrong_trend:
-                        return (
-                            False,
-                            f"{symbol}: swing {action} rejected — {wrong_trend} trend",
-                        )
+            if strategy_obj is not None:
+                passed, reason = strategy_obj.apply_entry_gate(action, sig)
+                if not passed:
+                    return False, f"{symbol}: {reason}"
 
         # 3. Regular-hours check
         if not _is_open():
@@ -385,6 +364,7 @@ class OpportunityRanker:
         pdt_guard: PDTGuard,
         market_hours_fn=None,
         orders: list | None = None,
+        strategy_lookup: dict | None = None,
     ) -> list[ScoredOpportunity]:
         """
         Full ranking pipeline:
@@ -412,6 +392,7 @@ class OpportunityRanker:
                 market_hours_fn,
                 orders,
                 technical_signals,
+                strategy_lookup,
             )
             if not passes:
                 # Already-open rejections are expected every medium cycle while Claude's

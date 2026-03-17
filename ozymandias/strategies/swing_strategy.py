@@ -30,6 +30,14 @@ log = logging.getLogger(__name__)
 _FALLBACK_STOP_PCT = 0.07    # 7% below entry (wider than momentum)
 _FALLBACK_TARGET_PCT = 0.15  # 15% above entry (swing trades aim further)
 
+# Entry gate: maps action → the trend_structure value that disqualifies the entry.
+# Longs avoid bearish downtrends; shorts avoid bullish uptrends.
+# To support a new action type, add one entry here; gate logic is unchanged.
+_SWING_WRONG_TREND: dict[str, str] = {
+    "buy":        "bearish_aligned",   # longs avoid downtrends
+    "sell_short": "bullish_aligned",   # shorts avoid uptrends
+}
+
 
 class SwingStrategy(Strategy):
     """
@@ -65,6 +73,9 @@ class SwingStrategy(Strategy):
         # Hard RVOL gate: current bar volume / 20-bar SMA must meet this floor.
         # Softer than momentum (0.8 vs 1.0) — swing entries tolerate quieter tape.
         "min_rvol_for_entry": 0.8,
+        # Entry gate: when True, reject entries where trend_structure is fully adverse.
+        # Longs reject bearish_aligned; shorts reject bullish_aligned.
+        "block_bearish_trend": True,
     }
 
     def applicable_override_signals(self) -> frozenset[str]:
@@ -79,6 +90,26 @@ class SwingStrategy(Strategy):
         widen _ATR_TRAILING_STOP_MULTIPLIER in risk_manager.py for swing positions.
         """
         return frozenset()
+
+    @property
+    def is_intraday(self) -> bool:
+        return False
+
+    @property
+    def uses_market_orders(self) -> bool:
+        return False
+
+    @property
+    def blocks_eod_entries(self) -> bool:
+        return False
+
+    def apply_entry_gate(self, action: str, signals: dict) -> tuple[bool, str]:
+        """Reject swing entries when the long-term trend is fully adverse."""
+        if self._p("block_bearish_trend"):
+            wrong_trend = _SWING_WRONG_TREND.get(action)
+            if wrong_trend and signals.get("trend_structure", "") == wrong_trend:
+                return False, f"swing {action} rejected — {wrong_trend} trend"
+        return True, ""
 
     # ------------------------------------------------------------------
     # Entry signals

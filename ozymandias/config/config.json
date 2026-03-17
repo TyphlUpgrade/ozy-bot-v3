@@ -67,18 +67,22 @@
     ]
   },
   "strategy": {
-    "active_strategies": ["momentum, swing"],
-    "momentum_params": {
-      "min_vol_regime_ratio": 0.85,
-      "rsi_entry_min": 45,
-      "rsi_entry_max": 65,
-      "block_bearish_aligned": true,
-      "min_rvol_for_entry": 1.0
-    },
-    "swing_params": {
-      "target_atr_multiplier": 5.0,
-      "min_signals_for_entry": 5,
-      "min_rvol_for_entry": 0.8
+    "active_strategies": ["momentum", "swing"],
+    "strategy_params": {
+      "momentum": {
+        "min_vol_regime_ratio": 0.85,
+        "rsi_entry_min": 45,
+        "rsi_entry_max": 65,
+        "block_bearish_aligned": true,
+        "min_rvol_for_entry": 1.0,
+        "require_vwap_gate": true
+      },
+      "swing": {
+        "target_atr_multiplier": 5.0,
+        "min_signals_for_entry": 5,
+        "min_rvol_for_entry": 0.8,
+        "block_bearish_trend": true
+      }
     }
   },
   "timezone": "America/New_York"

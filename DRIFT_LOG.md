@@ -391,3 +391,48 @@ Read the relevant phase section before modifying or debugging any module built i
 - **Spec:** 7 tests covering round-trips, unknown action, `ENTRY_SIDE`/`EXIT_SIDE` inverses, `is_short` predicate.
 - **Impl:** 13 tests in 5 classes (`TestActionToDirection`, `TestDirectionFromAction`, `TestSideInverses`, `TestRoundTrips`, `TestIsShort`). All pass.
 - **Why:** Comprehensive coverage of all tables and helpers.
+
+
+---
+
+### Phase 17 — Strategy Modularity
+
+**`Strategy` ABC: 3 trait properties + `apply_entry_gate` abstract method** · spec *(not defined — post-MVP Phase 17)* · `strategies/base_strategy.py`
+- **Spec:** *(not defined)*
+- **Impl:** Added `is_intraday`, `uses_market_orders`, `blocks_eod_entries` concrete properties (safe defaults: True/False/False) and `apply_entry_gate(action, signals) -> tuple[bool, str]` abstract method to the `Strategy` ABC. These are the single source of truth for strategy-specific behaviour that was previously scattered across orchestrator, ranker, and risk manager.
+- **Why:** Adding a third strategy previously required touching 4 files outside the strategy itself. Phase 17 reduces this to `strategies/new_strategy.py` + one `config.json` entry.
+
+**`MomentumStrategy`/`SwingStrategy`: implement new ABC members** · spec *(not defined)* · `strategies/momentum_strategy.py`, `strategies/swing_strategy.py`
+- **Spec:** *(not defined)*
+- **Impl:** Both concrete strategies implement `is_intraday`, `uses_market_orders`, `blocks_eod_entries`, and `apply_entry_gate`. Lookup tables `_MOMENTUM_WRONG_VWAP` and `_SWING_WRONG_TREND` moved from `opportunity_ranker.py` to their respective strategy files. New `_DEFAULT_PARAMS` keys: `"require_vwap_gate": True` (momentum) and `"block_bearish_trend": True` (swing).
+- **Why:** Strategy-specific gate logic belongs in the strategy class.
+
+**`StrategyConfig`: `momentum_params`/`swing_params` → `strategy_params: dict[str, dict]`** · spec *(not defined)* · `core/config.py`, `config/config.json`
+- **Spec:** *(not defined)*
+- **Impl:** `StrategyConfig` replaces two named fields with a single `strategy_params: dict[str, dict]` dict (maps strategy name → overrides). `config.json` updated to `"strategy_params": {"momentum": {...}, "swing": {...}}`. Note: `config.json` `active_strategies` was incorrectly `["momentum, swing"]` (one string with a comma); fixed to `["momentum", "swing"]` (two strings).
+- **Why:** Per-strategy named fields required a new field per new strategy. The dict requires only a new key.
+
+**`orchestrator.py`: `_build_strategies()` uses registry** · spec *(not defined)* · `core/orchestrator.py`
+- **Spec:** *(not defined)*
+- **Impl:** `_build_strategies()` now returns `dict[str, Strategy]` keyed by strategy name, using `get_strategy()` for all construction. `self._strategy_lookup` added alongside `self._strategies` (list). PDT gate uses `strategy_obj.is_intraday`; market order decision uses `strategy_obj.uses_market_orders`; `validate_entry` receives `strategy_obj.blocks_eod_entries`. Strategy-specific ranker config keys (`momentum_min_rvol`, `momentum_require_vwap_above`, `swing_block_bearish_trend`) removed from `ranker_cfg` dict — logic now lives in strategy classes.
+- **Why:** Removes all hardcoded strategy name checks from the orchestrator.
+
+**`opportunity_ranker.py`: delegates strategy gates to `apply_entry_gate()`** · spec *(not defined)* · `intelligence/opportunity_ranker.py`
+- **Spec:** *(not defined)*
+- **Impl:** `apply_hard_filters()` section 2b replaced with a delegate call to `strategy_obj.apply_entry_gate(action, sig)`. Accepts optional `strategy_lookup: dict` parameter; falls back to lazy `get_strategy()` construction when not provided (preserves existing test compatibility). `_MOMENTUM_WRONG_VWAP`, `_SWING_WRONG_TREND` removed from this module.
+- **Why:** if/elif over strategy name violated modularity — adding a third strategy would require editing the ranker.
+
+**`risk_manager.validate_entry`: `strategy: str` → `blocks_eod_entries: bool`** · spec *(not defined)* · `execution/risk_manager.py`
+- **Spec:** `validate_entry(symbol, side, quantity, price, strategy, ...)`
+- **Impl:** `strategy: str` parameter replaced with `blocks_eod_entries: bool`. `_check_market_hours` updated identically. Call site in orchestrator passes `strategy_obj.blocks_eod_entries`. Risk manager no longer imports from `strategies/`.
+- **Why:** Avoids importing `Strategy` into `execution/` layer; passes only the boolean behaviour flag needed.
+
+**`tests/test_strategy_traits.py`** · spec *(Phase 17)* · `tests/test_strategy_traits.py`
+- **Spec:** *(not defined)*
+- **Impl:** 28 tests in 4 classes covering all 3 trait properties for both strategies, `apply_entry_gate` for all action/signal combinations, and registry-based `_build_strategies` simulation. All pass.
+- **Why:** Phase 17 requirement.
+
+**`tests/test_risk_manager.py`**: `strategy="momentum"/"swing"` → `blocks_eod_entries=True/False`** · spec *(testing constraint)* · `tests/test_risk_manager.py`
+- **Spec:** *(testing constraint)*
+- **Impl:** All `validate_entry` and `_check_market_hours` call sites updated to pass `blocks_eod_entries: bool` instead of the removed `strategy: str` parameter. Test `test_dead_zone_applies_to_swing_strategy` renamed to `test_dead_zone_applies_regardless_of_eod_flag`. Test names for momentum/swing last-5-min tests updated to reflect the boolean semantics.
+- **Why:** `validate_entry` API change required test updates.

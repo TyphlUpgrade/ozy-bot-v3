@@ -37,6 +37,14 @@ log = logging.getLogger(__name__)
 _FALLBACK_STOP_PCT = 0.05   # 5% below entry
 _FALLBACK_TARGET_PCT = 0.10  # 10% above entry
 
+# Entry gate: maps action → the VWAP position value that disqualifies the entry.
+# Longs need price above VWAP; shorts need price below VWAP.
+# To support a new action type, add one entry here; gate logic is unchanged.
+_MOMENTUM_WRONG_VWAP: dict[str, str] = {
+    "buy":        "below",   # longs need price above VWAP
+    "sell_short": "above",   # shorts need price below VWAP
+}
+
 
 class MomentumStrategy(Strategy):
     """
@@ -71,6 +79,9 @@ class MomentumStrategy(Strategy):
         # any entry is considered. Prevents momentum entries when nobody is trading.
         # Distinct from the soft high_volume condition (rewarded at 1.2+, weight 0.15).
         "min_rvol_for_entry": 1.0,
+        # Entry gate: when True, reject entries where price is on the wrong side of VWAP.
+        # Longs need price above VWAP; shorts need price below VWAP.
+        "require_vwap_gate": True,
     }
 
     def applicable_override_signals(self) -> frozenset[str]:
@@ -82,6 +93,34 @@ class MomentumStrategy(Strategy):
             "atr_trailing_stop",
             "rsi_divergence",
         })
+
+    @property
+    def is_intraday(self) -> bool:
+        return True
+
+    @property
+    def uses_market_orders(self) -> bool:
+        return True
+
+    @property
+    def blocks_eod_entries(self) -> bool:
+        return True
+
+    def apply_entry_gate(self, action: str, signals: dict) -> tuple[bool, str]:
+        """Reject momentum entries that lack volume participation or are on the
+        wrong side of VWAP."""
+        rvol = signals.get("volume_ratio")
+        if rvol is not None and rvol < self._p("min_rvol_for_entry"):
+            return (
+                False,
+                f"momentum RVOL {rvol:.2f} below floor {self._p('min_rvol_for_entry'):.2f}"
+                " — no volume participation",
+            )
+        if self._p("require_vwap_gate"):
+            wrong_vwap = _MOMENTUM_WRONG_VWAP.get(action)
+            if wrong_vwap and signals.get("vwap_position", "") == wrong_vwap:
+                return False, f"momentum {action} rejected — price {wrong_vwap} VWAP"
+        return True, ""
 
     # ------------------------------------------------------------------
     # Entry signals

@@ -138,6 +138,59 @@ class Strategy(ABC):
         open position.
         """
 
+    # ---------------------------------------------------------------------------
+    # Strategy behavioural traits — override in subclasses.
+    # These properties are the single source of truth for strategy-specific
+    # behaviour that the orchestrator, ranker, and risk manager need to know.
+    # To add a new strategy behaviour, add one property here and implement it
+    # in each concrete class; no other file needs to change.
+    # ---------------------------------------------------------------------------
+
+    @property
+    def is_intraday(self) -> bool:
+        """True if this strategy opens and closes within a single session.
+
+        Intraday strategies are subject to PDT rules and get forced EOD close.
+        Swing strategies that hold overnight return False.
+        """
+        return True  # safe default; swing overrides to False
+
+    @property
+    def uses_market_orders(self) -> bool:
+        """True if this strategy may use market orders at high conviction.
+
+        Strategies that require precise limit entries (e.g. swing) return False.
+        """
+        return False  # safe default; momentum overrides to True
+
+    @property
+    def blocks_eod_entries(self) -> bool:
+        """True if new entries should be blocked in the last 5 minutes of session.
+
+        Intraday momentum strategies block entries near close to avoid being
+        forced into an EOD exit with no time to fill. Swing strategies may
+        enter near close intentionally.
+        """
+        return False  # safe default; momentum overrides to True
+
+    @abstractmethod
+    def apply_entry_gate(
+        self,
+        action: str,
+        signals: dict,
+    ) -> tuple[bool, str]:
+        """Strategy-specific hard filter evaluated before scoring.
+
+        Called by OpportunityRanker.apply_hard_filters() for each opportunity.
+        Returns (True, "") to pass, or (False, reason) to reject.
+
+        The ranker passes the raw signals sub-dict (same as generate_signals()
+        receives). The action string is the Claude action ("buy" / "sell_short").
+
+        To add a new strategy-specific filter, implement it here — no changes
+        to opportunity_ranker.py are needed.
+        """
+
     # ------------------------------------------------------------------
     # Concrete helpers
     # ------------------------------------------------------------------
@@ -196,11 +249,15 @@ def get_strategy(name: str, params: dict | None = None) -> Strategy:
     ------
     ValueError
         If *name* is not a registered strategy.
+
+    Extension point: To add a new strategy, add one entry to *registry* below
+    and register its class — no other files need to change.
     """
     # Import here to avoid circular imports at module load time.
     from ozymandias.strategies.momentum_strategy import MomentumStrategy
     from ozymandias.strategies.swing_strategy import SwingStrategy
 
+    # To add a new strategy, add one entry here and implement the Strategy ABC.
     registry: dict[str, type[Strategy]] = {
         "momentum": MomentumStrategy,
         "swing": SwingStrategy,

@@ -45,9 +45,7 @@ from ozymandias.intelligence.claude_reasoning import (
 )
 from ozymandias.intelligence.opportunity_ranker import OpportunityRanker
 from ozymandias.intelligence.technical_analysis import generate_signal_summary
-from ozymandias.strategies.base_strategy import Strategy
-from ozymandias.strategies.momentum_strategy import MomentumStrategy
-from ozymandias.strategies.swing_strategy import SwingStrategy
+from ozymandias.strategies.base_strategy import Strategy, get_strategy
 
 log = logging.getLogger(__name__)
 
@@ -157,6 +155,7 @@ class Orchestrator:
 
         # -- Strategies (instantiated in _startup) ----------------------------
         self._strategies: list[Strategy] = []
+        self._strategy_lookup: dict[str, Strategy] = {}  # name → instance, built in _startup
 
         # -- Runtime state ---------------------------------------------------
         self._degradation = DegradationState()
@@ -313,14 +312,14 @@ class Orchestrator:
             "thesis_challenge_size_threshold": self._config.ranker.thesis_challenge_size_threshold,
             "min_technical_score":         self._config.ranker.min_technical_score,
             "ta_size_factor_min":          self._config.ranker.ta_size_factor_min,
-            "momentum_min_rvol":           self._config.ranker.momentum_min_rvol,
-            "momentum_require_vwap_above": self._config.ranker.momentum_require_vwap_above,
-            "swing_block_bearish_trend":   self._config.ranker.swing_block_bearish_trend,
+            # Strategy-specific gate thresholds are now owned by each Strategy class
+            # via _DEFAULT_PARAMS and apply_entry_gate().  No ranker config needed.
         }
         self._ranker = OpportunityRanker(config=ranker_cfg)
 
         # -- Strategies -------------------------------------------------------
-        self._strategies = self._build_strategies()
+        self._strategy_lookup = self._build_strategies()
+        self._strategies = list(self._strategy_lookup.values())
         log.info(
             "Active strategies: %s",
             [type(s).__name__ for s in self._strategies],
@@ -1439,6 +1438,7 @@ class Orchestrator:
             self._pdt_guard,
             self._is_market_open,
             orders=orders_state.orders,
+            strategy_lookup=self._strategy_lookup,
         )
 
         log.debug(
@@ -1495,10 +1495,10 @@ class Orchestrator:
         # Re-entry cooldown: block new entries for a symbol after it was closed.
         # Prevents rapid churn (e.g. TSLA exited at 15:22, re-entered at 15:23).
         # Cooldown duration is strategy-specific: look up re_entry_cooldown_min in
-        # the strategy's params dict (momentum_params / swing_params); fall back to 5 min.
+        # the strategy's params dict (strategy_params[name]); fall back to 5 min.
         closed_at = self._recently_closed.get(symbol, 0.0)
         if closed_at > 0:
-            strategy_params = getattr(self._config.strategy, f"{top.strategy}_params", {})
+            strategy_params = self._config.strategy.strategy_params.get(top.strategy, {})
             cooldown_min = int(strategy_params.get("re_entry_cooldown_min", 5))
             elapsed = time.monotonic() - closed_at
             if elapsed < cooldown_min * 60:
@@ -1509,17 +1509,18 @@ class Orchestrator:
                 )
                 return False
 
-        # Hard PDT gate for momentum: this strategy forces same-day exit (last-5-min
-        # rule). With 0 day trades remaining, that forced exit becomes a PDT violation.
-        # Swing may hold overnight so it is exempt.
-        if top.strategy == "momentum":
+        # Hard PDT gate for intraday strategies: an intraday strategy forces same-day
+        # exit (last-5-min rule). With 0 day trades remaining that forced exit becomes
+        # a PDT violation.  Strategies that hold overnight (is_intraday=False) are exempt.
+        strategy_obj = self._strategy_lookup.get(top.strategy)
+        if strategy_obj is not None and strategy_obj.is_intraday:
             pdt_used = self._pdt_guard.count_day_trades(orders, portfolio)
             pdt_remaining = max(0, 3 - self._config.risk.pdt_buffer - pdt_used)
             if pdt_remaining == 0:
                 log.info(
                     "Medium loop: PDT block — 0 day trades remaining, "
-                    "skipping momentum entry for %s",
-                    symbol,
+                    "skipping intraday entry for %s (%s)",
+                    symbol, top.strategy,
                 )
                 return False
 
@@ -1590,7 +1591,7 @@ class Orchestrator:
             side=order_side,
             quantity=quantity,
             price=entry_price,
-            strategy=strategy_name,
+            blocks_eod_entries=strategy_obj.blocks_eod_entries if strategy_obj is not None else False,
             account=acct,
             portfolio=portfolio,
             orders=orders,
@@ -1683,11 +1684,12 @@ class Orchestrator:
                 else entry_price + 3 * atr_or_pct
             )
 
-        # High-conviction momentum entries use market orders for immediate fills.
-        # Below the threshold, or for non-momentum strategies, use a limit order.
+        # High-conviction market-order strategies use market orders for immediate fills.
+        # Below the threshold, or for strategies that require limit entries, use a limit.
         mkt_threshold = self._config.scheduler.market_order_conviction_threshold
         use_market = (
-            strategy_name == "momentum"
+            strategy_obj is not None
+            and strategy_obj.uses_market_orders
             and top.ai_conviction >= mkt_threshold
         )
         order = Order(
@@ -2443,12 +2445,14 @@ class Orchestrator:
             )
         return api_key, secret_key
 
-    def _build_strategies(self) -> list[Strategy]:
-        """Instantiate the strategies listed in config."""
-        strategies: list[Strategy] = []
-        active = self._config.strategy.active_strategies
-        if "momentum" in active:
-            strategies.append(MomentumStrategy(self._config.strategy.momentum_params or {}))
-        if "swing" in active:
-            strategies.append(SwingStrategy(self._config.strategy.swing_params or {}))
-        return strategies
+    def _build_strategies(self) -> dict[str, Strategy]:
+        """Instantiate strategies from config via the registry.
+
+        To add a new strategy: register it in get_strategy() in base_strategy.py
+        and add its name to config.json active_strategies + strategy_params.
+        No changes needed here.
+        """
+        return {
+            name: get_strategy(name, self._config.strategy.strategy_params.get(name, {}))
+            for name in self._config.strategy.active_strategies
+        }

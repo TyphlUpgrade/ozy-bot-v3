@@ -169,7 +169,7 @@ class TestCalculatePositionSize:
 class TestValidateEntry:
 
     def _call(self, rm=None, symbol="AAPL", side="buy", qty=10, price=100.0,
-              strategy="momentum", account=None, portfolio=None, orders=None,
+              blocks_eod_entries=True, account=None, portfolio=None, orders=None,
               avg_daily_volume=None, now=None):
         rm = rm or _rm()
         account = account or _account()
@@ -179,7 +179,7 @@ class TestValidateEntry:
         # Seed daily tracker so halt check doesn't fail on first call
         rm._reset_daily_if_needed(account, now.date())
         return rm.validate_entry(
-            symbol, side, qty, price, strategy,
+            symbol, side, qty, price, blocks_eod_entries,
             account, portfolio, orders,
             avg_daily_volume=avg_daily_volume, now=now,
         )
@@ -230,13 +230,13 @@ class TestValidateEntry:
         assert not ok
         assert "regular hours" in msg.lower()
 
-    def test_momentum_last_5_min_blocked(self):
-        ok, msg = self._call(strategy="momentum", now=_LAST_5_MIN)
+    def test_blocks_eod_entries_last_5_min_blocked(self):
+        ok, msg = self._call(blocks_eod_entries=True, now=_LAST_5_MIN)
         assert not ok
-        assert "5 minutes" in msg or "3:55" in msg
+        assert "5 minutes" in msg or "Entry blocked" in msg
 
-    def test_swing_last_5_min_allowed(self):
-        ok, _ = self._call(strategy="swing", now=_LAST_5_MIN)
+    def test_no_eod_block_last_5_min_allowed(self):
+        ok, _ = self._call(blocks_eod_entries=False, now=_LAST_5_MIN)
         assert ok
 
     # Buying power
@@ -353,7 +353,7 @@ class TestDailyLossHalt:
         rm.check_daily_loss(down, now=now)
         # validate_entry should now block
         ok, msg = rm.validate_entry(
-            "AAPL", "buy", 10, 100.0, "momentum",
+            "AAPL", "buy", 10, 100.0, True,
             down, _portfolio(), [], now=now,
         )
         assert not ok
@@ -720,8 +720,8 @@ def _rm_with_dead_zone(start: str = "11:30", end: str = "14:30") -> RiskManager:
 class TestDeadZone:
     """Dead zone blocks new entries during 11:30–14:30 ET; exits unaffected."""
 
-    def _call_hours(self, rm: RiskManager, now: datetime, strategy: str = "momentum") -> tuple[bool, str]:
-        return rm._check_market_hours(strategy, now)
+    def _call_hours(self, rm: RiskManager, now: datetime, blocks_eod_entries: bool = True) -> tuple[bool, str]:
+        return rm._check_market_hours(blocks_eod_entries, now)
 
     def test_dead_zone_blocks_entry_at_noon(self):
         rm = _rm_with_dead_zone()
@@ -760,10 +760,10 @@ class TestDeadZone:
         ok, _ = self._call_hours(rm, now)
         assert ok
 
-    def test_dead_zone_applies_to_swing_strategy(self):
+    def test_dead_zone_applies_regardless_of_eod_flag(self):
         rm = _rm_with_dead_zone()
         now = datetime(2026, 3, 11, 13, 0, tzinfo=ET)
-        ok, msg = self._call_hours(rm, now, strategy="swing")
+        ok, msg = self._call_hours(rm, now, blocks_eod_entries=False)
         assert not ok
         assert "dead zone" in msg.lower()
 
@@ -773,7 +773,7 @@ class TestDeadZone:
         now = datetime(2026, 3, 11, 12, 0, tzinfo=ET)
         rm._reset_daily_if_needed(_account(), now.date())
         ok, msg = rm.validate_entry(
-            "AAPL", "buy", 10, 100.0, "momentum",
+            "AAPL", "buy", 10, 100.0, True,
             _account(), _portfolio(), [], now=now,
         )
         assert not ok
@@ -784,7 +784,7 @@ class TestDeadZone:
         rm = _rm()  # no scheduler passed — uses defaults
         # Default dead zone is 11:30–14:30; verify noon is blocked
         now = datetime(2026, 3, 11, 12, 0, tzinfo=ET)
-        ok, msg = rm._check_market_hours("momentum", now)
+        ok, msg = rm._check_market_hours(True, now)
         assert not ok
         assert "dead zone" in msg.lower()
 
@@ -806,7 +806,7 @@ class TestShortEntryValidation:
         # Give tiny buying power — would block a long entry
         acct = _account(buying_power=1.0)
         ok, msg = rm.validate_entry(
-            "TSLA", "sell", 10, 200.0, "momentum",
+            "TSLA", "sell", 10, 200.0, True,
             acct, _portfolio(), [], now=self._now_regular(),
         )
         assert ok, f"Short entry should pass with low buying power; got: {msg}"
@@ -816,7 +816,7 @@ class TestShortEntryValidation:
         rm = _rm()
         acct = _account(buying_power=1.0)
         ok, msg = rm.validate_entry(
-            "TSLA", "buy", 10, 200.0, "momentum",
+            "TSLA", "buy", 10, 200.0, True,
             acct, _portfolio(), [], now=self._now_regular(),
         )
         assert not ok
@@ -829,7 +829,7 @@ class TestShortEntryValidation:
         # One position already open — at the limit
         portfolio = _portfolio(["AAPL"])
         ok, msg = rm.validate_entry(
-            "TSLA", "sell", 5, 200.0, "momentum",
+            "TSLA", "sell", 5, 200.0, True,
             _account(), portfolio, [], now=self._now_regular(),
         )
         assert not ok
