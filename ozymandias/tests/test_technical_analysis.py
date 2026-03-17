@@ -576,6 +576,83 @@ class TestComputeCompositeScore:
         score = compute_composite_score({})
         assert 0.0 <= score <= 1.0
 
+    # --- Direction-aware scoring ---
+
+    def _bearish_signals(self) -> dict:
+        """Mirror of _bullish_signals() — every signal flipped to the bearish side.
+        Expected score with direction='short': 0.700 (symmetry check).
+        Expected score with direction='long':  ~0.295 (confirms shorts were penalised).
+
+        Derivation (direction='short'):
+          VWAP below:         0.20 * 0.7  = 0.140
+          RSI 45 → eff 55:    0.15 * 0.5  = 0.075
+          MACD bear_cross:    0.15 * 0.8  = 0.120
+          Trend bearish:      0.15 * 0.9  = 0.135
+          ROC -1.5 → eff +1.5:0.10 * 0.8 = 0.080
+          Vol > 1.5:          0.10 * 0.8  = 0.080
+          BB lower_half:      0.10 * 0.7  = 0.070
+          No divergence:                    0.000
+          Total                             0.700
+        """
+        return {
+            'vwap_position':    'below',
+            'rsi':              45.0,
+            'rsi_divergence':   False,
+            'macd_signal':      'bearish_cross',
+            'trend_structure':  'bearish_aligned',
+            'roc_5':            -1.5,
+            'roc_deceleration': False,
+            'volume_ratio':     1.8,
+            'bollinger_position': 'lower_half',
+        }
+
+    def test_short_direction_bearish_signals_score_0_70(self):
+        """Perfect short setup scores 0.70 — symmetric with the bullish long case."""
+        assert compute_composite_score(self._bearish_signals(), direction="short") == pytest.approx(0.70, abs=1e-9)
+
+    def test_short_direction_bullish_signals_score_low(self):
+        """Bullish signals are penalised for a short, mirroring how bearish signals
+        are penalised for a long."""
+        long_score  = compute_composite_score(self._bullish_signals(), direction="long")
+        short_score = compute_composite_score(self._bullish_signals(), direction="short")
+        assert short_score < 0.35, "bullish signals should score poorly for shorts"
+        assert long_score == pytest.approx(0.70, abs=1e-9)
+
+    def test_long_direction_bearish_signals_score_low(self):
+        """Bearish signals are penalised for a long (regression guard)."""
+        score = compute_composite_score(self._bearish_signals(), direction="long")
+        assert score < 0.35, "bearish signals should score poorly for longs"
+
+    def test_rsi_overbought_good_for_short(self):
+        """RSI 75 (overbought) should yield a higher short score than RSI 55 (neutral)."""
+        s_neutral    = {**self._bearish_signals(), 'rsi': 55.0}
+        s_overbought = {**self._bearish_signals(), 'rsi': 75.0}
+        assert compute_composite_score(s_overbought, direction="short") > compute_composite_score(s_neutral, direction="short")
+
+    def test_rsi_oversold_bad_for_short(self):
+        """RSI 25 (oversold) should score lower for shorts — the move is largely done."""
+        s_neutral  = {**self._bearish_signals(), 'rsi': 55.0}
+        s_oversold = {**self._bearish_signals(), 'rsi': 25.0}
+        assert compute_composite_score(s_oversold, direction="short") < compute_composite_score(s_neutral, direction="short")
+
+    def test_short_bearish_divergence_is_bonus(self):
+        """Bearish RSI divergence confirms the short — should add +0.1."""
+        base  = compute_composite_score(self._bearish_signals(), direction="short")
+        bonus = compute_composite_score({**self._bearish_signals(), 'rsi_divergence': 'bearish'}, direction="short")
+        assert bonus == pytest.approx(base + 0.1, abs=1e-9)
+
+    def test_short_bullish_divergence_is_penalty(self):
+        """Bullish RSI divergence warns against the short — should subtract 0.2."""
+        base    = compute_composite_score(self._bearish_signals(), direction="short")
+        penalty = compute_composite_score({**self._bearish_signals(), 'rsi_divergence': 'bullish'}, direction="short")
+        assert penalty == pytest.approx(base - 0.2, abs=1e-9)
+
+    def test_unknown_direction_defaults_to_long(self):
+        """Unrecognised direction strings fall back to long scoring silently."""
+        score_long    = compute_composite_score(self._bullish_signals(), direction="long")
+        score_unknown = compute_composite_score(self._bullish_signals(), direction="spread")
+        assert score_unknown == pytest.approx(score_long, abs=1e-9)
+
 
 # ---------------------------------------------------------------------------
 # generate_signal_summary

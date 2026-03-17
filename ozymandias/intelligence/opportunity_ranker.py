@@ -24,6 +24,7 @@ from ozymandias.core.state_manager import PortfolioState
 from ozymandias.execution.broker_interface import AccountInfo
 from ozymandias.execution.pdt_guard import PDTGuard
 from ozymandias.intelligence.claude_reasoning import ReasoningResult
+from ozymandias.intelligence.technical_analysis import compute_composite_score
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,24 @@ _W_LIQ = 0.15
 _MAX_POSITIONS = 8
 _MIN_AVG_DAILY_VOLUME = 100_000
 _MAX_REWARD_RISK_RATIO = 5.0
+
+# Maps broker action string → composite score direction.
+# Add one entry here to support a new action type; scoring logic is unchanged.
+_ACTION_TO_DIRECTION: dict[str, str] = {
+    "buy":        "long",
+    "sell_short": "short",
+}
+
+# Strategy gate lookup tables — maps action → the indicator value that disqualifies
+# the entry.  To support a new action type, add one entry here; gate logic is unchanged.
+_MOMENTUM_WRONG_VWAP: dict[str, str] = {
+    "buy":        "below",   # longs need price above VWAP
+    "sell_short": "above",   # shorts need price below VWAP
+}
+_SWING_WRONG_TREND: dict[str, str] = {
+    "buy":        "bearish_aligned",   # longs avoid downtrends
+    "sell_short": "bullish_aligned",   # shorts avoid uptrends
+}
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +119,10 @@ class OpportunityRanker:
         self._min_volume = float(cfg.get("min_avg_daily_volume", _MIN_AVG_DAILY_VOLUME))
         self._min_conviction = float(cfg.get("min_conviction_threshold", 0.10))  # sanity floor
         self._min_technical_score = float(cfg.get("min_technical_score", 0.30))  # TA quality floor
+        # Strategy-specific TA minimum gates — checked inside apply_hard_filters
+        self._momentum_min_rvol = float(cfg.get("momentum_min_rvol", 1.0))
+        self._momentum_require_vwap_above = bool(cfg.get("momentum_require_vwap_above", True))
+        self._swing_block_bearish_trend = bool(cfg.get("swing_block_bearish_trend", True))
         # Symbols that may appear on the watchlist for market context but must never be entered.
         no_entry_raw = cfg.get("no_entry_symbols", [
             "SPY", "QQQ", "IWM", "DIA",
@@ -118,14 +141,20 @@ class OpportunityRanker:
         """
         reward-to-risk ratio, capped at 5:1 and normalised to [0, 1].
 
-        Returns 0.0 when the setup is invalid (stop >= entry).
+        Geometry-agnostic: works for longs (stop < entry < exit_),
+        shorts (exit_ < entry < stop), and any future direction.
+        Returns 0.0 when the geometry is invalid (stop and exit on same side of entry).
         """
-        if stop >= entry or entry <= 0:
+        if entry <= 0:
             return 0.0
-        ratio = (exit_ - entry) / (entry - stop)
-        if ratio <= 0:
+        risk = abs(entry - stop)
+        reward = abs(exit_ - entry)
+        if risk == 0:
             return 0.0
-        return min(ratio / _MAX_REWARD_RISK_RATIO, 1.0)
+        # Stop and exit must be on opposite sides of entry.
+        if (stop > entry) == (exit_ > entry):
+            return 0.0
+        return min((reward / risk) / _MAX_REWARD_RISK_RATIO, 1.0)
 
     def _liquidity_score(self, avg_daily_volume: float | None) -> float:
         """
@@ -168,8 +197,16 @@ class OpportunityRanker:
         nested_signals = sig_summary.get("signals", {})
 
         ai_conviction = float(opportunity.get("conviction", 0.5))
-        # composite_technical_score is at the top level of the summary dict.
-        technical_score = float(sig_summary.get("composite_technical_score", 0.0))
+        # Recompute composite score with direction so shorts are evaluated against
+        # bearish signal strength.  Falls back to the cached long-biased score when
+        # raw signals are unavailable (e.g. symbol missing from technical_signals).
+        action = opportunity.get("action", "buy")
+        direction = _ACTION_TO_DIRECTION.get(action, "long")
+        technical_score = (
+            compute_composite_score(nested_signals, direction=direction)
+            if nested_signals
+            else float(sig_summary.get("composite_technical_score", 0.0))
+        )
 
         entry = float(opportunity.get("suggested_entry", 0.0))
         exit_ = float(opportunity.get("suggested_exit", 0.0))
@@ -247,16 +284,56 @@ class OpportunityRanker:
         if conviction < self._min_conviction:
             return False, f"{symbol}: conviction {conviction:.2f} below threshold {self._min_conviction:.2f}"
 
-        # 2. Minimum composite technical score floor
+        # 2. Minimum composite technical score floor — computed with direction so
+        #    short opportunities are evaluated against bearish signal strength,
+        #    not penalised for the absence of bullish signals.
         if technical_signals is not None:
             sig_summary = technical_signals.get(symbol, {})
-            tech_score = float(sig_summary.get("composite_technical_score", 0.0))
+            raw_signals = sig_summary.get("signals", {})
+            direction = _ACTION_TO_DIRECTION.get(opportunity.get("action", "buy"), "long")
+            tech_score = (
+                compute_composite_score(raw_signals, direction=direction)
+                if raw_signals
+                else float(sig_summary.get("composite_technical_score", 0.0))
+            )
             if tech_score < self._min_technical_score:
                 return (
                     False,
                     f"{symbol}: composite_technical_score {tech_score:.2f} below floor "
                     f"{self._min_technical_score:.2f}",
                 )
+
+        # 2b. Strategy-specific TA minimum gates
+        # These are deterministic floors independent of the composite score:
+        # - Momentum requires minimum volume participation and price above VWAP.
+        # - Swing rejects entries when the long-term trend is fully bearish-aligned.
+        if technical_signals is not None:
+            strategy = opportunity.get("strategy", "")
+            action = opportunity.get("action", "buy")
+            sig_outer = technical_signals.get(symbol, {})
+            sig = sig_outer.get("signals", {})
+
+            if strategy == "momentum":
+                rvol = sig.get("volume_ratio")
+                if rvol is not None and rvol < self._momentum_min_rvol:
+                    return (
+                        False,
+                        f"{symbol}: momentum RVOL {rvol:.2f} below floor "
+                        f"{self._momentum_min_rvol:.2f} — no volume participation",
+                    )
+                if self._momentum_require_vwap_above:
+                    wrong_vwap = _MOMENTUM_WRONG_VWAP.get(action)
+                    if wrong_vwap and sig.get("vwap_position", "") == wrong_vwap:
+                        return False, f"{symbol}: momentum {action} rejected — price {wrong_vwap} VWAP"
+
+            elif strategy == "swing":
+                if self._swing_block_bearish_trend:
+                    wrong_trend = _SWING_WRONG_TREND.get(action)
+                    if wrong_trend and sig.get("trend_structure", "") == wrong_trend:
+                        return (
+                            False,
+                            f"{symbol}: swing {action} rejected — {wrong_trend} trend",
+                        )
 
         # 3. Regular-hours check
         if not _is_open():
@@ -343,7 +420,10 @@ class OpportunityRanker:
                 technical_signals,
             )
             if not passes:
-                logger.info("Hard filter rejected %s: %s", symbol, reason)
+                # Already-open rejections are expected every medium cycle while Claude's
+                # reasoning result is stale — log at DEBUG to avoid repetitive INFO spam.
+                level = logging.DEBUG if "already open in portfolio" in reason else logging.INFO
+                logger.log(level, "Hard filter rejected %s: %s", symbol, reason)
                 continue
             scored.append(
                 self.score_opportunity(opp, technical_signals, account_info, portfolio)

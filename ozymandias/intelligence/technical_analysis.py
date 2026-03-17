@@ -287,14 +287,49 @@ def classify_trend_structure(
 
 
 # ---------------------------------------------------------------------------
+# Composite technical score — direction-aware lookup tables
+# ---------------------------------------------------------------------------
+# Each table maps direction → (signal_value → sub-score).
+# Adding a new tradeable direction requires one entry per table; scoring logic
+# is unchanged.  "long" is the default and matches the original spec values.
+
+_VWAP_SCORE: dict[str, dict[str, float]] = {
+    "long":  {"above": 0.7, "at": 0.5, "below": 0.3},
+    "short": {"below": 0.7, "at": 0.5, "above": 0.3},
+}
+_MACD_SCORE: dict[str, dict[str, float]] = {
+    "long":  {"bullish_cross": 0.8, "bullish": 0.6, "bearish": 0.3, "bearish_cross": 0.1},
+    "short": {"bearish_cross": 0.8, "bearish": 0.6, "bullish": 0.3, "bullish_cross": 0.1},
+}
+_TREND_SCORE: dict[str, dict[str, float]] = {
+    "long":  {"bullish_aligned": 0.9, "mixed": 0.5, "bearish_aligned": 0.1},
+    "short": {"bearish_aligned": 0.9, "mixed": 0.5, "bullish_aligned": 0.1},
+}
+_BOLLINGER_SCORE: dict[str, dict[str, float]] = {
+    "long":  {"upper_half": 0.7, "middle": 0.5, "lower_half": 0.3},
+    "short": {"lower_half": 0.7, "middle": 0.5, "upper_half": 0.3},
+}
+_RSI_DIV_BONUS: dict[str, dict[str, float]] = {
+    "long":  {"bullish": 0.1, "bearish": -0.2},
+    "short": {"bearish": 0.1, "bullish": -0.2},
+}
+
+
+# ---------------------------------------------------------------------------
 # Composite technical score
 # ---------------------------------------------------------------------------
 
-def compute_composite_score(signals: dict) -> float:
+def compute_composite_score(signals: dict, direction: str = "long") -> float:
     """
     Compute a composite technical score from individual signal values.
 
     Weights and scoring rules per spec section 4.4. Returns 0.0–1.0 (clamped).
+
+    ``direction`` controls which side of each signal is favourable.  Pass
+    ``"short"`` for short opportunities; all other values default to ``"long"``.
+    The score stored by :func:`generate_signal_summary` uses the default
+    (long) direction for Claude-context display; the ranker recomputes with
+    the actual trade direction before scoring or filtering.
 
     Expected keys in ``signals``:
         vwap_position     : 'above' | 'at' | 'below'
@@ -307,55 +342,49 @@ def compute_composite_score(signals: dict) -> float:
         volume_ratio      : float
         bollinger_position: 'upper_half' | 'middle' | 'lower_half'
     """
+    dir_ = direction if direction in _VWAP_SCORE else "long"
     score = 0.0
 
     # VWAP position — weight 0.20
-    vwap_score = {'above': 0.7, 'at': 0.5, 'below': 0.3}
-    score += 0.20 * vwap_score.get(signals.get('vwap_position', 'at'), 0.5)
+    score += 0.20 * _VWAP_SCORE[dir_].get(signals.get('vwap_position', 'at'), 0.5)
 
     # RSI — weight 0.15
+    # For shorts, mirror RSI so overbought (70+) maps to the same sub-score as
+    # oversold (30-) for longs.  roc_deceleration only fires on positive ROC so
+    # the same mirror technique is applied there.
     rsi = float(signals.get('rsi', 50.0))
-    if rsi < 30:
-        rs = 0.7      # extreme oversold → potential long opportunity
-    elif rsi < 40:
-        rs = 0.6      # oversold
-    elif rsi <= 60:
-        rs = 0.5      # neutral
-    elif rsi <= 70:
-        rs = 0.4      # overbought
+    effective_rsi = (100.0 - rsi) if dir_ == "short" else rsi
+    if effective_rsi < 30:
+        rs = 0.7
+    elif effective_rsi < 40:
+        rs = 0.6
+    elif effective_rsi <= 60:
+        rs = 0.5
+    elif effective_rsi <= 70:
+        rs = 0.4
     else:
-        rs = 0.3      # extreme overbought
+        rs = 0.3
     score += 0.15 * rs
 
     # MACD — weight 0.15
-    macd_score = {
-        'bullish_cross': 0.8,
-        'bullish': 0.6,
-        'bearish': 0.3,
-        'bearish_cross': 0.1,
-    }
-    score += 0.15 * macd_score.get(signals.get('macd_signal', 'bearish'), 0.3)
+    score += 0.15 * _MACD_SCORE[dir_].get(signals.get('macd_signal', 'bearish'), 0.3)
 
     # Trend structure — weight 0.15
-    trend_score = {
-        'bullish_aligned': 0.9,
-        'mixed': 0.5,
-        'bearish_aligned': 0.1,
-    }
-    score += 0.15 * trend_score.get(signals.get('trend_structure', 'mixed'), 0.5)
+    score += 0.15 * _TREND_SCORE[dir_].get(signals.get('trend_structure', 'mixed'), 0.5)
 
     # ROC — weight 0.10
     roc_5 = float(signals.get('roc_5', 0.0))
     roc_decel = bool(signals.get('roc_deceleration', False))
-    if roc_5 > 0 and not roc_decel:
-        roc_s = 0.8   # positive and accelerating
-    elif roc_5 > 0:
-        roc_s = 0.5   # positive but decelerating
+    effective_roc = (-roc_5) if dir_ == "short" else roc_5
+    if effective_roc > 0 and not roc_decel:
+        roc_s = 0.8
+    elif effective_roc > 0:
+        roc_s = 0.5
     else:
-        roc_s = 0.2   # negative
+        roc_s = 0.2
     score += 0.10 * roc_s
 
-    # Volume ratio — weight 0.10
+    # Volume ratio — weight 0.10 (direction-agnostic: both sides need participation)
     vol_ratio = float(signals.get('volume_ratio', 1.0))
     if vol_ratio > 1.5:
         vol_s = 0.8
@@ -366,16 +395,12 @@ def compute_composite_score(signals: dict) -> float:
     score += 0.10 * vol_s
 
     # Bollinger position — weight 0.10
-    bb_score = {'upper_half': 0.7, 'middle': 0.5, 'lower_half': 0.3}
-    score += 0.10 * bb_score.get(signals.get('bollinger_position', 'middle'), 0.5)
+    score += 0.10 * _BOLLINGER_SCORE[dir_].get(signals.get('bollinger_position', 'middle'), 0.5)
 
-    # RSI divergence — direct penalty/bonus (weight 0.05 indicates importance;
-    # the -0.2 and +0.1 values are absolute adjustments to the composite score)
+    # RSI divergence — direct adjustment (not a weighted component)
     rsi_div = signals.get('rsi_divergence', False)
-    if rsi_div == 'bearish':
-        score -= 0.2
-    elif rsi_div == 'bullish':
-        score += 0.1
+    if isinstance(rsi_div, str):
+        score += _RSI_DIV_BONUS[dir_].get(rsi_div, 0.0)
 
     return float(max(0.0, min(1.0, score)))
 
@@ -418,7 +443,16 @@ def generate_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
     last_roc        = float(roc.iloc[-1])        if not pd.isna(roc.iloc[-1])        else 0.0
     last_atr        = float(atr.iloc[-1])        if not pd.isna(atr.iloc[-1])        else 0.0
     last_vol_regime = float(vol_regime.iloc[-1]) if not pd.isna(vol_regime.iloc[-1]) else 1.0
-    last_vol     = float(df['volume'].iloc[-1])
+    # Use the last bar with non-zero volume. The current (most recent) bar may be
+    # partially formed — yfinance returns it with volume=0 for the first seconds of
+    # each new interval, which would make volume_ratio=0 for every symbol at bar
+    # boundaries and falsely trigger the RVOL gate. Fall back to iloc[-2] when the
+    # last bar has zero volume.
+    _raw_last_vol = float(df['volume'].iloc[-1])
+    if _raw_last_vol == 0.0 and len(df) >= 2:
+        last_vol = float(df['volume'].iloc[-2])
+    else:
+        last_vol = _raw_last_vol
     # If the 20-bar vol SMA hasn't warmed up yet, use the mean of all available
     # bars as a proxy rather than last_vol (which would always produce ratio=1.0
     # and mask real spikes/collapses during warm-up).

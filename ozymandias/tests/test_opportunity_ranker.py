@@ -23,6 +23,7 @@ from ozymandias.intelligence.opportunity_ranker import (
     _MAX_REWARD_RISK_RATIO,
 )
 from ozymandias.intelligence.claude_reasoning import ReasoningResult
+from ozymandias.intelligence.technical_analysis import compute_composite_score
 from ozymandias.execution.broker_interface import AccountInfo
 from ozymandias.core.state_manager import PortfolioState, Position
 
@@ -138,18 +139,36 @@ class TestRiskAdjustedReturn:
         r = _ranker()
         assert r._risk_adjusted_return(100, 110, 100) == 0.0
 
-    def test_stop_above_entry_returns_zero(self):
+    def test_stop_and_exit_same_side_returns_zero(self):
+        # stop=105 and exit=110 are both above entry=100 — invalid geometry
         r = _ranker()
         assert r._risk_adjusted_return(100, 110, 105) == 0.0
 
     def test_negative_expected_gain_returns_zero(self):
         r = _ranker()
-        # exit below entry even though stop is below entry
+        # exit=90 and stop=80 are both below entry=100 — invalid geometry
         assert r._risk_adjusted_return(100, 90, 80) == 0.0
 
     def test_zero_entry_returns_zero(self):
         r = _ranker()
         assert r._risk_adjusted_return(0, 10, -5) == 0.0
+
+    # Short geometry tests
+    def test_short_normal_setup(self):
+        r = _ranker()
+        # entry=100, exit=90 (profit), stop=105 (loss cap)
+        # risk = |100-105| = 5, reward = |90-100| = 10 → ratio=2.0 → 2/5 = 0.40
+        assert r._risk_adjusted_return(100, 90, 105) == pytest.approx(0.40)
+
+    def test_short_capped_at_five_to_one(self):
+        r = _ranker()
+        # risk=5, reward=25 → ratio=5.0 → normalised=1.0
+        assert r._risk_adjusted_return(100, 75, 105) == pytest.approx(1.0)
+
+    def test_short_inverted_geometry_returns_zero(self):
+        # exit=110 > entry=100: profit direction wrong for a short
+        r = _ranker()
+        assert r._risk_adjusted_return(100, 110, 105) == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -194,17 +213,32 @@ class TestCompositeScore:
             suggested_stop=145.0,
         )
         # rar = (165-150)/(150-145) = 3.0 → normalised = 0.60
-        # liq = 1.0 (1M vol) — use real schema: composite_technical_score at top, avg_daily_volume nested
-        signals = {"AAPL": {"composite_technical_score": 0.7, "signals": {"avg_daily_volume": 1_000_000}}}
+        # liq = 1.0 (1M vol)
+        # technical_score is recomputed from raw signals with direction="long"
+        raw = {
+            "avg_daily_volume": 1_000_000,
+            "vwap_position": "above",
+            "rsi": 35.0,
+            "macd_signal": "bullish",
+            "trend_structure": "bullish_aligned",
+            "roc_5": 2.0,
+            "roc_deceleration": False,
+            "volume_ratio": 2.0,
+            "bollinger_position": "upper_half",
+            "rsi_divergence": False,
+        }
+        signals = {"AAPL": {"composite_technical_score": 0.7, "signals": raw}}
         result = r.score_opportunity(opp, signals, _account(), _portfolio())
 
+        expected_tech = compute_composite_score(raw, direction="long")
         expected = (
             0.8 * _W_AI
-            + 0.7 * _W_TECH
+            + expected_tech * _W_TECH
             + 0.60 * _W_RISK
             + 1.0 * _W_LIQ
         )
         assert result.composite_score == pytest.approx(expected, abs=1e-6)
+        assert result.technical_score == pytest.approx(expected_tech, abs=1e-6)
         assert result.risk_adjusted_return == pytest.approx(0.60, abs=1e-6)
         assert result.liquidity_score == pytest.approx(1.0)
 
@@ -532,3 +566,111 @@ class TestConvictionThreshold:
                 rr, {}, _account(), _portfolio(), _pdt_guard(True), _market_open(True), []
             )
         assert any("JUNK" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# 8. Short-direction hard filter gates
+# ---------------------------------------------------------------------------
+
+def _short_opportunity(**kw) -> dict:
+    base = {
+        "symbol": "TSLA",
+        "action": "sell_short",
+        "strategy": "momentum",
+        "timeframe": "short",
+        "conviction": 0.8,
+        "suggested_entry": 200.0,
+        "suggested_exit": 185.0,   # profit for a short
+        "suggested_stop":  208.0,  # loss cap for a short
+        "position_size_pct": 0.05,
+        "reasoning": "Bearish breakdown.",
+    }
+    base.update(kw)
+    return base
+
+
+def _signals_with(symbol: str, vwap_position: str = "above", trend: str = "bearish_aligned",
+                  rvol: float = 1.5) -> dict:
+    return {
+        symbol: {
+            "composite_technical_score": 0.7,
+            "signals": {
+                "avg_daily_volume": 1_000_000,
+                "vwap_position": vwap_position,
+                "trend_structure": trend,
+                "volume_ratio": rvol,
+            },
+        }
+    }
+
+
+class TestShortDirectionFilters:
+    """Strategy gate lookup tables must flip the pass/fail sense for sell_short."""
+
+    def _filter(self, opp, signals):
+        r = _ranker()
+        return r.apply_hard_filters(
+            opp,
+            _account(),
+            _portfolio(),
+            _pdt_guard(True),
+            _market_open(True),
+            orders=[],
+            technical_signals=signals,
+        )
+
+    # --- Momentum VWAP gate ---
+
+    def test_momentum_short_price_above_vwap_rejected(self):
+        """Short entry with price above VWAP is the wrong side — reject."""
+        opp = _short_opportunity(strategy="momentum")
+        passes, reason = self._filter(opp, _signals_with("TSLA", vwap_position="above"))
+        assert passes is False
+        assert "above VWAP" in reason
+
+    def test_momentum_short_price_below_vwap_passes(self):
+        """Short entry with price below VWAP is the correct side — pass."""
+        opp = _short_opportunity(strategy="momentum")
+        passes, _ = self._filter(opp, _signals_with("TSLA", vwap_position="below"))
+        assert passes is True
+
+    def test_momentum_long_price_below_vwap_rejected(self):
+        """Long entry with price below VWAP is still rejected (regression guard)."""
+        opp = _opportunity(strategy="momentum", action="buy",
+                           suggested_entry=150.0, suggested_exit=165.0, suggested_stop=145.0)
+        signals = _signals_with("AAPL", vwap_position="below")
+        r = _ranker()
+        passes, reason = r.apply_hard_filters(
+            opp, _account(), _portfolio(), _pdt_guard(True), _market_open(True),
+            orders=[], technical_signals=signals,
+        )
+        assert passes is False
+        assert "below VWAP" in reason
+
+    # --- Swing trend gate ---
+
+    def test_swing_short_bearish_trend_passes(self):
+        """Bearish-aligned trend is the ideal environment for a swing short — pass."""
+        opp = _short_opportunity(strategy="swing")
+        passes, _ = self._filter(opp, _signals_with("TSLA", trend="bearish_aligned"))
+        assert passes is True
+
+    def test_swing_short_bullish_trend_rejected(self):
+        """Bullish-aligned trend is adverse for a swing short — reject."""
+        opp = _short_opportunity(strategy="swing")
+        passes, reason = self._filter(opp, _signals_with("TSLA", trend="bullish_aligned"))
+        assert passes is False
+        assert "bullish_aligned" in reason
+
+    def test_swing_long_bearish_trend_rejected(self):
+        """Bearish-aligned trend still rejects a swing long (regression guard)."""
+        opp = _opportunity(strategy="swing", action="buy",
+                           suggested_entry=150.0, suggested_exit=165.0, suggested_stop=145.0)
+        signals = _signals_with("AAPL", trend="bearish_aligned")
+        r = _ranker()
+        passes, reason = r.apply_hard_filters(
+            opp, _account(), _portfolio(), _pdt_guard(True), _market_open(True),
+            orders=[], technical_signals=signals,
+        )
+        assert passes is False
+        assert "bearish_aligned" in reason

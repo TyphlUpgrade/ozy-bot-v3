@@ -67,6 +67,19 @@ class SwingStrategy(Strategy):
         "min_rvol_for_entry": 0.8,
     }
 
+    def applicable_override_signals(self) -> frozenset[str]:
+        """
+        Swing positions are held for days and managed by their explicit stop/target
+        levels and Claude's slow-loop position review. Intraday momentum signals
+        (ROC deceleration, VWAP crossover, momentum score flip) are noise on a
+        multi-day timeframe and must not trigger exits.
+
+        No override signals are active for swing by default. To add catastrophic
+        loss protection via ATR trailing stop, add "atr_trailing_stop" here and
+        widen _ATR_TRAILING_STOP_MULTIPLIER in risk_manager.py for swing positions.
+        """
+        return frozenset()
+
     # ------------------------------------------------------------------
     # Entry signals
     # ------------------------------------------------------------------
@@ -162,7 +175,7 @@ class SwingStrategy(Strategy):
         bb_pos = indicators.get("bollinger_position", "middle")
         macd = indicators.get("macd_signal", "bearish_cross")
         trend = indicators.get("trend_structure", "mixed")
-        vol_ratio = float(indicators.get("volume_ratio") or 1.0)
+        vol_ratio = float(indicators.get("volume_ratio", 1.0))
         rsi_turning = bool(indicators.get("rsi_turning", False))
 
         conditions = {
@@ -208,7 +221,7 @@ class SwingStrategy(Strategy):
         rsi = float(indicators.get("rsi") or 50.0)
         trend = indicators.get("trend_structure", "mixed")
         price = float(indicators.get("price") or market_data["close"].iloc[-1])
-        vol_ratio = float(indicators.get("volume_ratio") or 1.0)
+        vol_ratio = float(indicators.get("volume_ratio", 1.0))
 
         stop = position.intention.exit_targets.stop_loss
         target = position.intention.exit_targets.profit_target

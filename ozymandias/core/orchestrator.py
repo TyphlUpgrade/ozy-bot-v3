@@ -217,6 +217,15 @@ class Orchestrator:
         # Recently-closed symbols: symbol → monotonic timestamp of closure.
         # Prevents _fast_step_position_sync from re-adopting a position the bot just
         # closed (which would cause a runaway loop of repeated exit orders).
+        # Values are time.monotonic() timestamps of when the position was closed.
+        #
+        # PHASE 14 NOTE — persistence reload math:
+        # When reloading _recently_closed from disk (UTC timestamps), convert each entry as:
+        #   elapsed = (datetime.now(timezone.utc) - stored_utc_ts).total_seconds()
+        #   self._recently_closed[symbol] = time.monotonic() - elapsed
+        # Do NOT set time.monotonic() directly — that restarts the full guard window
+        # from now, rather than expiring it relative to the actual close time.
+        # A position closed 58 seconds before restart should expire in ~2 seconds, not 60.
         self._recently_closed: dict[str, float] = {}
 
         log.debug("Orchestrator created (config loaded, modules not yet connected)")
@@ -303,6 +312,9 @@ class Orchestrator:
             "thesis_challenge_size_threshold": self._config.ranker.thesis_challenge_size_threshold,
             "min_technical_score":         self._config.ranker.min_technical_score,
             "ta_size_factor_min":          self._config.ranker.ta_size_factor_min,
+            "momentum_min_rvol":           self._config.ranker.momentum_min_rvol,
+            "momentum_require_vwap_above": self._config.ranker.momentum_require_vwap_above,
+            "swing_block_bearish_trend":   self._config.ranker.swing_block_bearish_trend,
         }
         self._ranker = OpportunityRanker(config=ranker_cfg)
 
@@ -901,9 +913,31 @@ class Orchestrator:
         for position in portfolio.positions:
             symbol = position.symbol
 
-            # Override signals (VWAP crossover, ATR trailing stop) are long-biased.
+            # Override signals are long-biased.
             # Skip quant overrides for short positions — they rely on stop/target instead.
             if position.intention.direction == "short":
+                continue
+
+            # Resolve which override signals apply to this position's strategy.
+            # Each strategy declares its applicable signals via applicable_override_signals().
+            # Fall back to the first active strategy if the original is no longer loaded.
+            target_name = position.intention.strategy
+            matching = [
+                s for s in self._strategies
+                if type(s).__name__.replace("Strategy", "").lower() == target_name
+            ]
+            strategy_for_position = (matching or self._strategies)[0] if (matching or self._strategies) else None
+            allow_signals = (
+                strategy_for_position.applicable_override_signals()
+                if strategy_for_position is not None else None
+            )
+
+            # If the strategy declares no applicable signals, skip override evaluation entirely.
+            if allow_signals is not None and not allow_signals:
+                log.debug(
+                    "Override check skipped for %s — %s strategy has no applicable override signals",
+                    symbol, target_name,
+                )
                 continue
 
             # Enforce minimum hold time before overrides can fire.
@@ -942,7 +976,7 @@ class Orchestrator:
             intraday_high = self._intraday_highs.get(symbol, current_price or 0.0)
 
             should_exit, triggered_signals = self._risk_manager.evaluate_overrides(
-                position, indicators, intraday_high
+                position, indicators, intraday_high, allow_signals=allow_signals
             )
 
             if not should_exit:
@@ -1443,7 +1477,7 @@ class Orchestrator:
             entry_price = top.suggested_entry
 
         # Conservative startup mode — suppress new entries until timer expires
-        if self._conservative_mode_until is not None:
+        if self._conservative_mode_until is not None and not self._config.scheduler.disable_conservative_mode:
             now = datetime.now(timezone.utc)
             if now < self._conservative_mode_until:
                 log.info(
@@ -1451,6 +1485,43 @@ class Orchestrator:
                     self._conservative_mode_until.isoformat(), symbol,
                 )
                 return False
+        # Fill protection is the cheapest possible check — a dict lookup.
+        # Run it here, before ATR sizing, validate_entry, and thesis challenge.
+        if not self._fill_protection.can_place_order(symbol):
+            log.debug("Medium loop: fill protection blocking entry for %s", symbol)
+            return False
+
+        # Re-entry cooldown: block new entries for a symbol after it was closed.
+        # Prevents rapid churn (e.g. TSLA exited at 15:22, re-entered at 15:23).
+        # Cooldown duration is strategy-specific: look up re_entry_cooldown_min in
+        # the strategy's params dict (momentum_params / swing_params); fall back to 5 min.
+        closed_at = self._recently_closed.get(symbol, 0.0)
+        if closed_at > 0:
+            strategy_params = getattr(self._config.strategy, f"{top.strategy}_params", {})
+            cooldown_min = int(strategy_params.get("re_entry_cooldown_min", 5))
+            elapsed = time.monotonic() - closed_at
+            if elapsed < cooldown_min * 60:
+                log.info(
+                    "Medium loop: re-entry cooldown for %s (%s) — closed %.0fmin ago "
+                    "(cooldown=%dmin)",
+                    symbol, top.strategy, elapsed / 60, cooldown_min,
+                )
+                return False
+
+        # Hard PDT gate for momentum: this strategy forces same-day exit (last-5-min
+        # rule). With 0 day trades remaining, that forced exit becomes a PDT violation.
+        # Swing may hold overnight so it is exempt.
+        if top.strategy == "momentum":
+            pdt_used = self._pdt_guard.count_day_trades(orders, portfolio)
+            pdt_remaining = max(0, 3 - self._config.risk.pdt_buffer - pdt_used)
+            if pdt_remaining == 0:
+                log.info(
+                    "Medium loop: PDT block — 0 day trades remaining, "
+                    "skipping momentum entry for %s",
+                    symbol,
+                )
+                return False
+
         is_short = top.action == "sell_short"
         order_side = "sell" if is_short else "buy"
         strategy_name = top.strategy
@@ -1526,10 +1597,6 @@ class Orchestrator:
         )
         if not allowed:
             log.debug("Medium loop: entry blocked for %s — %s", symbol, reason)
-            return False
-
-        if not self._fill_protection.can_place_order(symbol):
-            log.debug("Medium loop: fill protection blocking entry for %s", symbol)
             return False
 
         # Thesis challenge for large positions — returns a concern_level (0–1) that applies
@@ -1694,7 +1761,17 @@ class Orchestrator:
 
             sigs_flat = ind_summary["signals"]
 
-            for strategy in self._strategies:
+            # Route to the strategy that opened this position so a swing position is
+            # not evaluated by MomentumStrategy (and vice versa). Fall back to the
+            # first active strategy if the original strategy has since been disabled.
+            target_name = position.intention.strategy
+            matching = [
+                s for s in self._strategies
+                if type(s).__name__.replace("Strategy", "").lower() == target_name
+            ]
+            eval_strategies = matching if matching else self._strategies[:1]
+
+            for strategy in eval_strategies:
                 try:
                     eval_result = await strategy.evaluate_position(position, df, sigs_flat)
                 except Exception as exc:
@@ -2005,6 +2082,8 @@ class Orchestrator:
             "pdt_trades_remaining": max(0, pdt_remaining),
             "account_equity":    acct.equity,
             "buying_power":      acct.buying_power,
+            # Active strategies from config — Claude must only recommend strategies in this list.
+            "active_strategies": self._config.strategy.active_strategies,
         }
 
     async def _run_claude_cycle(self, trigger_name: str) -> None:

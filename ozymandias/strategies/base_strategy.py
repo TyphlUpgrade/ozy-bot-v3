@@ -142,6 +142,27 @@ class Strategy(ABC):
     # Concrete helpers
     # ------------------------------------------------------------------
 
+    def applicable_override_signals(self) -> frozenset[str]:
+        """
+        Return the set of RiskManager override signal names that apply to
+        positions opened by this strategy.
+
+        Override in subclasses to restrict which fast-loop quant signals can
+        trigger an exit for this strategy's positions.  The default returns
+        all known signals so that any new strategy is safe by default.
+
+        Known signal names (from RiskManager.evaluate_overrides):
+            "vwap_crossover", "roc_deceleration", "momentum_score_flip",
+            "atr_trailing_stop", "rsi_divergence"
+        """
+        return frozenset({
+            "vwap_crossover",
+            "roc_deceleration",
+            "momentum_score_flip",
+            "atr_trailing_stop",
+            "rsi_divergence",
+        })
+
     def get_parameters(self) -> dict[str, Any]:
         """Return a copy of the current strategy parameters."""
         return dict(self._params)

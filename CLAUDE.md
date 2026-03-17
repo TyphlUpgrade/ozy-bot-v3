@@ -25,6 +25,35 @@ External Data (yfinance) → Orchestrator (3 async loops) → Intelligence (Clau
 - **State files:** JSON with atomic writes (write temp file, then rename). Validate schemas on startup.
 - **Broker abstraction:** All broker-specific code behind `BrokerInterface` ABC. No broker imports outside `execution/alpaca_broker.py`.
 
+## Modularity Philosophy
+
+This is an experimental system with no proven approach. The trading logic, signals, strategies, and
+direction types will change as paper trading reveals what works. **The primary structural goal is
+that any single component — a strategy, an indicator, a signal, an instrument type, a direction —
+can be added or removed without requiring changes scattered across multiple modules.**
+
+Concrete rules that enforce this:
+
+- **Prefer lookup tables over if/elif chains** for any categorisation that might grow. A new
+  direction type, strategy, or signal value should require adding one entry to one dict, not finding
+  and updating every conditional that branches on it.
+- **Every lookup table is a documented extension point.** Comment it: *"To add X, add one entry
+  here."* If a reader can't see where to add a new case without grepping the codebase, the
+  abstraction is incomplete.
+- **Cross-cutting concerns live in `core/`.** Direction, market hours, config, and state are used
+  by every layer. They must not be defined in `intelligence/` or `execution/` and then imported
+  upward — that creates circular dependency risk and hides extension points.
+- **No string-literal conventions duplicated across modules.** If two modules both check
+  `action == "sell_short"`, one of them is wrong. The convention belongs in one place and
+  everything else imports it.
+- **Strategies and signals are independently testable.** A new TA signal added to
+  `technical_analysis.py` should not require changes to `orchestrator.py` to test. A new strategy
+  in `strategies/` should not require changes to `opportunity_ranker.py` to register.
+
+When a new feature requires touching more than two modules to add a single new value to an existing
+category (direction, strategy type, signal name), that is a signal the abstraction is wrong — fix
+the abstraction first, then add the value.
+
 ## Key Design Rules
 - Modules communicate via interfaces and JSON, never direct coupling
 - Only the orchestrator knows about all other modules
@@ -74,7 +103,7 @@ Features not described in the spec may be requested. When implementing them, fol
 
 ## Post-MVP Status
 
-All 10 spec phases complete per `ozymandias_v3_spec_revised.md`. Post-MVP phases (11–14) are addressing architectural gaps discovered during paper trading.
+All 10 spec phases complete per `ozymandias_v3_spec_revised.md`. Post-MVP phases (11–16) are addressing architectural gaps discovered during paper trading.
 
 Last spec phase completed: Phase 10 (March 15)
 Last post-MVP phase completed: *(none yet — see roadmap below)*
@@ -86,13 +115,24 @@ Last post-MVP phase completed: *(none yet — see roadmap below)*
   short direction inference, fill dispatch routing, ghost cleanup race, test isolation,
   cash sync, exit price fallback, PDT broker floor (see BUGS_2026-03-16.md)
 - **Index ticker blacklist + dead field cleanup** (March 16): Anomalies 10 + 12 fixed
+- **Short-entry unblocking** (March 17): geometry-agnostic RAR, direction-aware VWAP/trend filters
+  via lookup tables, direction-aware `compute_composite_score` — shorts were silently scoring ~0.10
+  and failing the 0.30 tech-score floor; now score correctly against bearish signal strength
 
-### Post-MVP Roadmap: Phases 11–14
+### Post-MVP Roadmap: Phases 11–16
 
 - **Phase 11 — Execution Fidelity**: see `phases/11_execution_fidelity.md`
 - **Phase 12 — Claude-Directed Entry Conditions**: see `phases/12_claude_directed_entry_conditions.md`
 - **Phase 13 — Context Enrichment**: see `phases/13_context_enrichment.md`
+  - *Additions:* execution statistics digest for Claude calibration; watchlist `expected_direction`
+    tagging with direction-adjusted TA scores in context
 - **Phase 14 — Short Position Protection**: see `phases/14_short_protection.md`
+  - *Additions:* `roc_negative_deceleration` signal (closes short TA scoring gap); ATR-based
+    position size cap in `_medium_try_entry`
+- **Phase 15 — Context Compression**: see `phases/15_context_compression.md`
+- **Phase 16 — Direction Unification**: see `phases/16_direction_unification.md`
+  - Canonical `Direction` type + all cross-convention mappings in `core/direction.py`;
+    migrates all ad-hoc `action == "sell_short"` checks to a single importable module
 
 ## Spec Drift Log
 See `DRIFT_LOG.md`. Read the relevant phase section of DRIFT_LOG.md before modifying or debugging any module built in a previous phase.

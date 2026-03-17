@@ -386,28 +386,41 @@ class RiskManager:
         position: Position,
         indicators: dict,
         intraday_high: float,
+        allow_signals: frozenset[str] | None = None,
     ) -> tuple[bool, list[str]]:
         """
-        Evaluate all quantitative override signals and apply trigger logic.
+        Evaluate quantitative override signals and apply trigger logic.
 
         Trigger logic per spec §4.7:
           - Signals 1 (VWAP), 3 (ROC), 4 (momentum flip), 5 (ATR stop):
             trigger independently.
           - Signal 2 (RSI divergence): requires at least one other signal active.
 
+        Parameters
+        ----------
+        allow_signals:
+            Optional set of signal names to evaluate. Signals not in this set
+            are skipped regardless of their computed value. None means all signals
+            are evaluated (backward-compatible default). Pass the result of
+            ``strategy.applicable_override_signals()`` to restrict to the signals
+            relevant for the position's strategy type.
+
         Returns:
             (should_exit: bool, triggered_signals: list[str])
         """
-        triggered: list[str] = []
-        rsi_div_active = self.check_rsi_divergence(position, indicators)
+        def _allowed(name: str) -> bool:
+            return allow_signals is None or name in allow_signals
 
-        if self.check_vwap_crossover(position, indicators):
+        triggered: list[str] = []
+        rsi_div_active = _allowed("rsi_divergence") and self.check_rsi_divergence(position, indicators)
+
+        if _allowed("vwap_crossover") and self.check_vwap_crossover(position, indicators):
             triggered.append("vwap_crossover")
-        if self.check_roc_deceleration(position, indicators):
+        if _allowed("roc_deceleration") and self.check_roc_deceleration(position, indicators):
             triggered.append("roc_deceleration")
-        if self.check_momentum_score_flip(position, indicators):
+        if _allowed("momentum_score_flip") and self.check_momentum_score_flip(position, indicators):
             triggered.append("momentum_score_flip")
-        if self.check_atr_trailing_stop(position, indicators, intraday_high):
+        if _allowed("atr_trailing_stop") and self.check_atr_trailing_stop(position, indicators, intraday_high):
             triggered.append("atr_trailing_stop")
 
         # RSI divergence requires at least one other signal

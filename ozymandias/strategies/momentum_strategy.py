@@ -73,6 +73,16 @@ class MomentumStrategy(Strategy):
         "min_rvol_for_entry": 1.0,
     }
 
+    def applicable_override_signals(self) -> frozenset[str]:
+        """Momentum positions respond to all intraday override signals."""
+        return frozenset({
+            "vwap_crossover",
+            "roc_deceleration",
+            "momentum_score_flip",
+            "atr_trailing_stop",
+            "rsi_divergence",
+        })
+
     # ------------------------------------------------------------------
     # Entry signals
     # ------------------------------------------------------------------
@@ -152,7 +162,7 @@ class MomentumStrategy(Strategy):
         rsi = float(indicators.get("rsi") or 50.0)
         vwap_pos = indicators.get("vwap_position", "at")
         macd = indicators.get("macd_signal", "bearish")
-        vol_ratio = float(indicators.get("volume_ratio") or 1.0)
+        vol_ratio = float(indicators.get("volume_ratio", 1.0))
         trend = indicators.get("trend_structure", "mixed")
         rsi_div = indicators.get("rsi_divergence", False)
 
@@ -197,7 +207,7 @@ class MomentumStrategy(Strategy):
         """
         rsi = float(indicators.get("rsi") or 50.0)
         vwap_pos = indicators.get("vwap_position", "at")
-        vol_ratio = float(indicators.get("volume_ratio") or 1.0)
+        vol_ratio = float(indicators.get("volume_ratio", 1.0))
         price = float(indicators.get("price") or market_data["close"].iloc[-1])
         roc_decel = bool(indicators.get("roc_deceleration", False))
 

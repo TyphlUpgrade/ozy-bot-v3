@@ -62,7 +62,72 @@ Audit `startup_reconciliation()` lines 253–350 (the adopted position block). T
 
 Add a log line for each adopted position showing the inferred direction so it's visible in startup logs.
 
-## 5. Tests to Write
+## 5. `roc_negative_deceleration` TA Signal
+
+`roc_deceleration` only fires when ROC is positive, so `compute_composite_score` with `direction="short"` currently scores all negative-ROC bars at 0.8 regardless of whether bearish momentum is fading. This overstates short quality when a downmove is losing steam.
+
+In `generate_signal_summary` (`intelligence/technical_analysis.py`), add a symmetric counterpart immediately after the existing `roc_deceleration` block:
+
+```python
+# --- ROC negative deceleration (bearish momentum slowing) ---
+roc_negative_deceleration = False
+roc_clean = roc.dropna()
+if len(roc_clean) >= 2:
+    prev_roc = float(roc_clean.iloc[-2])
+    if last_roc < 0 and prev_roc < 0 and last_roc > prev_roc:
+        roc_negative_deceleration = True
+```
+
+Add `'roc_negative_deceleration': roc_negative_deceleration` to the `signals` dict output.
+
+In `compute_composite_score` (`intelligence/technical_analysis.py`), replace the current single `roc_decel` lookup with a direction-resolved one:
+
+```python
+roc_decel = bool(signals.get('roc_deceleration', False))
+roc_neg_decel = bool(signals.get('roc_negative_deceleration', False))
+effective_decel = roc_neg_decel if dir_ == "short" else roc_decel
+```
+
+Use `effective_decel` in the existing ROC scoring block (no other changes). A short with decelerating bearish momentum now scores 0.5 instead of 0.8, matching the treatment longs get when positive ROC is fading.
+
+The signal is included in `ta_readiness` automatically via Phase 13's `indicators[symbol]["signals"]` pass-through, so Claude can reference it in `entry_conditions`.
+
+## 6. ATR-Based Position Sizing Cap
+
+Claude specifies `position_size_pct` per trade, but has no visibility into realised intraday volatility. On a high-ATR day a 10% position can incur 3%+ portfolio risk from a single stop-out.
+
+In `_medium_try_entry` (`core/orchestrator.py`), after the drift check and before `place_order`, apply a volatility cap:
+
+```python
+if self._config.risk.atr_position_size_cap_enabled:
+    atr = self._latest_indicators.get(symbol, {}).get("atr_14", 0.0)
+    if atr > 0 and entry_price > 0:
+        atr_pct = atr / entry_price
+        max_size_by_risk = (
+            self._config.risk.max_risk_per_trade_pct / atr_pct
+        )
+        if position_size_pct > max_size_by_risk:
+            logger.info(
+                "ATR cap reduced %s position: %.1f%% → %.1f%% "
+                "(ATR %.2f%%, max risk %.1f%%)",
+                symbol,
+                position_size_pct * 100,
+                max_size_by_risk * 100,
+                atr_pct * 100,
+                self._config.risk.max_risk_per_trade_pct * 100,
+            )
+            position_size_pct = max_size_by_risk
+```
+
+The cap applies to both longs and shorts — direction is irrelevant; ATR measures two-way risk symmetrically.
+
+New config keys (add to `RiskConfig` and `config.json`):
+- `atr_position_size_cap_enabled: bool = True`
+- `max_risk_per_trade_pct: float = 0.02` — maximum fraction of equity to risk per trade (2%)
+
+At default settings, a stock with 2% ATR hits the cap exactly at `position_size_pct = 1.0` (100%), so normal 5–10% positions are unaffected unless ATR exceeds 20–40% — i.e., the cap only bites on extreme volatility spikes, which is the intended behaviour. Tune `max_risk_per_trade_pct` downward to tighten.
+
+## 7. Tests to Write
 
 Create `tests/test_short_protection.py`:
 
@@ -78,6 +143,14 @@ Create `tests/test_short_protection.py`:
 - **`_recently_closed` reload on startup**: entry < 60s old → loaded into `_recently_closed` in-memory dict
 - **`_recently_closed` discard on reload**: entry ≥ 60s old → not loaded (guard does not fire)
 - **Short direction adoption**: mock broker position with `side="short"` → adopted `Position` has `direction="short"`
+- **`roc_negative_deceleration` fires**: two bars with ROC -3%, -1% (fading negative) → signal True
+- **`roc_negative_deceleration` does not fire**: two bars with ROC -1%, -3% (deepening negative) → signal False
+- **`roc_negative_deceleration` does not fire when ROC positive**: two bars with ROC +1%, -1% → signal False (only fires on consecutive negative bars)
+- **Short ROC decel reduces score**: `roc_5=-2%, roc_negative_deceleration=True` with `direction="short"` → `compute_composite_score` ROC component = 0.5, not 0.8
+- **ATR cap fires on high volatility**: `atr_14=20, entry_price=100` (20% ATR), `max_risk_per_trade_pct=0.02`, `position_size_pct=0.10` → cap reduces to 0.10 (20% ATR means max = 0.02/0.20 = 0.10, exact match)
+- **ATR cap fires and logs**: position reduced by cap → INFO log contains symbol, original size, capped size
+- **ATR cap does not fire on normal volatility**: `atr_14=2, entry_price=100` (2% ATR), `max_risk_per_trade_pct=0.02`, `position_size_pct=0.05` → no reduction (max = 0.02/0.02 = 1.0 > 0.05)
+- **ATR cap disabled**: `atr_position_size_cap_enabled=False` → no cap applied regardless of ATR
 
 ## Done When
 
@@ -85,4 +158,7 @@ Create `tests/test_short_protection.py`:
 - Short positions with ATR stops trigger buy-to-cover in fast loop integration test
 - `portfolio.recently_closed` field present in loaded PortfolioState
 - `_recently_closed` loaded correctly from state on orchestrator startup in test
+- `roc_negative_deceleration` present in `generate_signal_summary` output
+- `compute_composite_score` with `direction="short"` uses `roc_negative_deceleration` for decel penalty
+- ATR cap applied correctly in `_medium_try_entry`; `atr_position_size_cap_enabled=False` disables it cleanly
 - DRIFT_LOG.md has a Phase 14 entry covering all new fields and behaviors

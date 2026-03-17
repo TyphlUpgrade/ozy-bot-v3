@@ -16,6 +16,7 @@
     "min_equity_for_trading": 25500
   },
   "scheduler": {
+    "bypass_market_hours": true,
     "fast_loop_sec": 10,
     "medium_loop_sec": 120,
     "slow_loop_check_sec": 300,
@@ -66,7 +67,7 @@
     ]
   },
   "strategy": {
-    "active_strategies": ["momentum"],
+    "active_strategies": ["momentum, swing"],
     "momentum_params": {
       "min_vol_regime_ratio": 0.85,
       "rsi_entry_min": 45,

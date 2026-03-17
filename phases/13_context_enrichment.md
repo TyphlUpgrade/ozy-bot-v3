@@ -96,7 +96,69 @@ In `assemble_reasoning_context`, currently each tier-1 watchlist entry includes 
 
 This comes directly from `indicators[symbol]["signals"]` — no new computation needed. The existing string `_make_technical_summary()` result can be retained as `technical_summary_text` alongside `ta_readiness` for Claude's narrative reference, or dropped to save tokens (prefer dropping to stay within token budget).
 
-## 5. Update Prompt Template
+## 5. Execution Statistics Digest
+
+In `assemble_reasoning_context`, add an `execution_stats` section alongside `recent_executions`. Where `recent_executions` shows individual trades, `execution_stats` shows aggregated calibration data:
+
+```json
+"execution_stats": {
+  "total_trades": 12,
+  "win_rate_pct": 50,
+  "short_win_rate_pct": 33,
+  "avg_hold_min": 43,
+  "avg_pnl_pct": 0.28,
+  "high_conviction_win_rate_pct": 75
+}
+```
+
+Add `TradeJournal.compute_session_stats() -> dict` that reads the last `max(N, 20)` completed trades and computes:
+- `total_trades` — count
+- `win_rate_pct` — integer, trades where `pnl_pct > 0`
+- `short_win_rate_pct` — same filter, direction == `"short"` only; omit key if no short trades
+- `avg_hold_min` — mean of `duration_min` across all trades
+- `avg_pnl_pct` — mean `pnl_pct` rounded to 2dp
+- `high_conviction_win_rate_pct` — win rate for trades where `claude_conviction >= 0.75`; omit key if fewer than 3 high-conviction trades
+
+Returns `{}` if fewer than `execution_stats_min_trades` (default 3) completed trades are available — not enough data to calibrate from.
+
+New config key (add to `ClaudeConfig` and `config.json`):
+- `execution_stats_min_trades: int = 3`
+
+## 6. Watchlist Direction Tagging
+
+Add `expected_direction: str = "either"` to `WatchlistEntry` in `core/state_manager.py`. Valid values: `"long"`, `"short"`, `"either"` (default). This is Claude's declared directional thesis for the symbol and is stored persistently with the watchlist.
+
+Update Claude's `watchlist_changes.add` schema in the prompt template to include the optional field:
+
+```json
+"add": [
+  {
+    "symbol": "TSLA",
+    "reason": "Bearish breakdown below key support",
+    "priority_tier": 1,
+    "strategy": "momentum",
+    "expected_direction": "short"
+  }
+]
+```
+
+`expected_direction` is optional — `_process_watchlist_changes` defaults to `"either"` when absent for backward compatibility with Claude outputs that omit the field.
+
+In `ta_readiness` (Section 4 above), compute `composite_score` using the direction-adjusted scorer:
+
+```python
+from ozymandias.intelligence.technical_analysis import compute_composite_score
+from ozymandias.core.direction import ACTION_TO_DIRECTION
+
+direction = entry.expected_direction if entry.expected_direction != "either" else "long"
+ta_readiness["composite_score"] = compute_composite_score(raw_signals, direction=direction)
+```
+
+This ensures Claude sees a bearish-quality score for short-tagged watchlist candidates rather than the long-biased default.
+
+Also include `expected_direction` in the watchlist entry's context block so Claude can see what direction it previously tagged and confirm or revise it.
+
+## 7. Update Prompt Template
 
 In `config/prompts/v3.4.0/reasoning.txt` (or create v3.5.0 if Phase 12 changes require it — prefer v3.4.0 if both phases produce a single clean prompt version):
 
@@ -108,7 +170,11 @@ Add instructions for the new context fields:
 
 **For `ta_readiness`**: "The `ta_readiness` dict in each watchlist entry shows current indicator values. Use these values to calibrate `entry_conditions` in your opportunities — e.g., if current RSI is 58 and the stock's typical momentum range is 50–72, specify `rsi_min: 50, rsi_max: 72`."
 
-## 6. Tests to Write
+**For `execution_stats`**: "Use `execution_stats` to calibrate conviction and position sizing. If `short_win_rate_pct` is below 40%, reduce short opportunity conviction or tighten entry conditions. If `high_conviction_win_rate_pct` is below 50%, your conviction scores are not predictive — consider using the full conviction range rather than clustering near 0.8+."
+
+**For `expected_direction` in watchlist entries**: "The `expected_direction` field shows the directional thesis you assigned when adding this symbol. Confirm or revise it in your position reviews. When adding new symbols via `watchlist_changes.add`, always specify `expected_direction` — it affects how TA scores and entry conditions are evaluated in subsequent cycles."
+
+## 8. Tests to Write
 
 Create `tests/test_context_enrichment.py`:
 
@@ -122,14 +188,23 @@ Create `tests/test_context_enrichment.py`:
 - **`recent_executions` phantom filter**: entries with `entry_price=0` excluded
 - **`ta_readiness` dict structure**: contains expected keys (above_vwap, rsi, macd, volume_ratio, trend, composite_score)
 - **`ta_readiness` populated from indicators**: values match `indicators[symbol]["signals"]`
+- **`ta_readiness` uses direction-adjusted score**: watchlist entry with `expected_direction="short"` → `composite_score` is bearish-adjusted, not long-default
+- **`execution_stats` returns empty when < min trades**: fewer than `execution_stats_min_trades` journal entries → `execution_stats: {}`
+- **`execution_stats` win rate correct**: mock journal with 4 wins / 6 losses → `win_rate_pct: 40`
+- **`execution_stats` short win rate omitted when no shorts**: journal has no short trades → `short_win_rate_pct` key absent
+- **`execution_stats` high conviction win rate omitted when < 3 samples**: fewer than 3 trades with conviction >= 0.75 → `high_conviction_win_rate_pct` key absent
+- **`WatchlistEntry.expected_direction` persists**: watchlist entry written with `expected_direction="short"` → reloaded state has same value
+- **`expected_direction` defaults to `"either"` when absent**: Claude output missing the field → entry saved with `"either"`
 - **Token budget**: assembled context with all new sections stays within 8K token estimate; if not, verify truncation fires correctly
-- **Backward compat**: `assemble_reasoning_context` called with `indicators={}` (no data) → `pending_entries: []`, `recent_executions: []`, `ta_readiness: {}` — no crash
+- **Backward compat**: `assemble_reasoning_context` called with `indicators={}` (no data) → `pending_entries: []`, `recent_executions: []`, `ta_readiness: {}`, `execution_stats: {}` — no crash
 
 ## Done When
 
 - All existing tests pass; all `test_context_enrichment.py` tests pass
-- Claude's assembled context JSON includes `pending_entries`, `recent_executions`, and `ta_readiness` sections
-- `TradeJournal.load_recent(n)` method implemented and tested
+- Claude's assembled context JSON includes `pending_entries`, `recent_executions`, `ta_readiness`, and `execution_stats` sections
+- `TradeJournal.load_recent(n)` and `TradeJournal.compute_session_stats()` implemented and tested
+- `WatchlistEntry.expected_direction` field present, persisted, and defaulting correctly
+- `ta_readiness.composite_score` uses direction-adjusted scoring when `expected_direction != "either"`
 - Token budget guard still enforces 8K limit after new sections added
 - In a paper session run, Claude's market_assessment or position_reviews referencing pending entry drift is observable in reasoning cache files
-- DRIFT_LOG.md has a Phase 13 entry covering context schema additions and `TradeJournal.load_recent`
+- DRIFT_LOG.md has a Phase 13 entry covering context schema additions, `TradeJournal` new methods, and `WatchlistEntry.expected_direction`

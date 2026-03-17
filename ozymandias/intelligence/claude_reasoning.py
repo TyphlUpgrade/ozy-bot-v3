@@ -313,8 +313,22 @@ class ClaudeReasoningEngine:
             })
 
         # --- Tier 1 watchlist candidates (fill remaining budget) ---
+        # Sort by current composite technical score descending so Claude always
+        # sees the highest-signal symbols. Without this, the slice is insertion-
+        # order, meaning the same seed symbols appear every cycle regardless of
+        # what the rest of the watchlist is doing.
         slots = max(0, max_tier1 - len(position_entries))
-        tier1_watch = [e for e in watchlist.entries if e.priority_tier == 1][:slots]
+
+        all_tier1 = [e for e in watchlist.entries if e.priority_tier == 1]
+        total_tier1 = len(all_tier1)
+
+        def _tier1_score(entry) -> float:
+            ind = indicators.get(entry.symbol, {})
+            # Handle both flat (_latest_indicators) and nested (generate_signal_summary) formats
+            return ind.get("composite_technical_score") \
+                or ind.get("signals", {}).get("composite_technical_score", 0.0)
+
+        tier1_watch = sorted(all_tier1, key=_tier1_score, reverse=True)[:slots]
 
         watchlist_tier1: list[dict] = []
         for entry in tier1_watch:
@@ -346,10 +360,17 @@ class ClaudeReasoningEngine:
             context["watchlist_tier1"].pop()
             context_json = json.dumps(context, default=str)
 
+        # Tell Claude exactly how many tier-1 symbols exist and how many it's seeing.
+        # Without this, Claude can't tell it's working from a sample and will keep
+        # recommending adds for symbols already in the invisible tail.
+        context["watchlist_tier1_shown"] = len(context["watchlist_tier1"])
+        context["watchlist_tier1_total"] = total_tier1
+
         log.debug(
-            "Context: %d positions, %d tier1 watchlist, ~%d tokens",
+            "Context: %d positions, %d/%d tier1 watchlist, ~%d tokens",
             len(position_entries),
-            len(context["watchlist_tier1"]),
+            context["watchlist_tier1_shown"],
+            total_tier1,
             _estimate_tokens(context_json),
         )
         return context

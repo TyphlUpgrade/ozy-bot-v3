@@ -50,6 +50,7 @@ class SchedulerConfig:
     market_order_conviction_threshold: float = 0.80  # use market order (immediate fill) for momentum entries at or above this conviction
     min_hold_before_override_min: int = 5            # quant overrides cannot fire within this many minutes of position entry
     bypass_market_hours: bool = False                # when True, skip all market-hours gates (loop guards, dead zone, session check); for off-hours testing only
+    disable_conservative_mode: bool = False          # when True, skip conservative startup mode; use after manually closing broker positions that triggered reconciliation errors
 
 
 @dataclass
@@ -92,6 +93,9 @@ class RankerConfig:
     max_adverse_drift_pct: float = 0.020  # skip long buy if current price < suggested_entry × (1 - this); entry level broken
     min_technical_score: float = 0.30    # hard filter floor: composite_technical_score below this rejects entry regardless of conviction
     ta_size_factor_min: float = 0.60     # at composite_technical_score=0, enter at this fraction of risk-sized qty; scales linearly to 1.0
+    momentum_min_rvol: float = 1.0           # momentum hard gate: reject if current volume_ratio < this (ensures participation)
+    momentum_require_vwap_above: bool = True  # momentum hard gate: reject if price is below VWAP at entry
+    swing_block_bearish_trend: bool = True    # swing hard gate: reject if trend_structure is bearish_aligned
     no_entry_symbols: list = field(default_factory=lambda: [
         # Broad-market and volatility ETFs used as market-context monitors only.
         # These may appear on the watchlist (tier 2) but must never be entered as trades.

@@ -71,13 +71,19 @@ def _stub_hours(session: str = "regular") -> MarketHours:
 def _make_bars(n: int = 60, base_price: float = 200.0) -> pd.DataFrame:
     """Synthetic OHLCV DataFrame — enough bars for all TA indicators."""
     np.random.seed(42)
-    close = base_price + np.cumsum(np.random.randn(n) * 0.5)
+    # Flat at base_price; last 5 bars step up 0.3% so last_close > cumulative VWAP
+    # (passes momentum long VWAP filter) while staying well within the 1.5% drift ceiling.
+    close = np.full(n, base_price, dtype=float)
+    close[-5:] = base_price * 1.003
+    # Uniform volume with last bar spiked 1.5× so RVOL > 1.0 floor.
+    volume = np.full(n, 1_000_000, dtype=float)
+    volume[-1] = 1_500_000.0
     df = pd.DataFrame({
         "open":   close * 0.999,
         "high":   close * 1.005,
         "low":    close * 0.995,
         "close":  close,
-        "volume": np.random.randint(500_000, 2_000_000, size=n).astype(float),
+        "volume": volume,
     }, index=pd.date_range("2026-01-01", periods=n, freq="1min"))
     return df
 

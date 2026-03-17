@@ -1994,6 +1994,7 @@ class TestOvernightGates:
 
     @pytest.mark.asyncio
     async def test_fast_loop_silent_when_market_closed(self, orch):
+        orch._config.scheduler.bypass_market_hours = False
         with patch("ozymandias.core.orchestrator.is_market_open", return_value=False):
             await orch._fast_loop_cycle()
         orch._broker.get_open_orders.assert_not_called()
@@ -2001,12 +2002,14 @@ class TestOvernightGates:
 
     @pytest.mark.asyncio
     async def test_medium_loop_silent_when_market_closed(self, orch):
+        orch._config.scheduler.bypass_market_hours = False
         with patch("ozymandias.core.orchestrator.is_market_open", return_value=False):
             await orch._medium_loop_cycle()
         orch._broker.get_account.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_slow_loop_silent_when_market_closed(self, orch):
+        orch._config.scheduler.bypass_market_hours = False
         with patch("ozymandias.core.orchestrator.is_market_open", return_value=False):
             with patch.object(orch, "_run_claude_cycle", AsyncMock()) as mock_claude:
                 await orch._slow_loop_cycle()
