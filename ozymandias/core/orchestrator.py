@@ -1191,7 +1191,10 @@ class Orchestrator:
         # Cache indicators for the fast loop (quant overrides).
         # Track whether this is the first population so we can fire Claude immediately.
         indicators_were_empty = not getattr(self, "_latest_indicators", {})
-        self._latest_indicators = {sym: v["signals"] for sym, v in indicators.items()}
+        self._latest_indicators = {
+            sym: {**v["signals"], "composite_technical_score": v.get("composite_technical_score", 0.0)}
+            for sym, v in indicators.items()
+        }
 
         log.debug("Medium loop: scanned %d symbol(s)", len(indicators))
 
