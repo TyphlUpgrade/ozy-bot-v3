@@ -75,7 +75,7 @@ class RiskManager:
         rm = RiskManager(cfg.risk, pdt_guard)
 
         allowed, reason = rm.validate_entry(
-            "AAPL", "buy", 10, 175.0, "momentum",
+            "AAPL", "buy", 10, 175.0, True,   # blocks_eod_entries=strategy_obj.blocks_eod_entries
             account, portfolio, orders,
         )
         should_exit, signals = rm.evaluate_overrides(position, indicators, intraday_high)

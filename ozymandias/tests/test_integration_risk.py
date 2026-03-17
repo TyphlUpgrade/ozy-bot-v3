@@ -325,7 +325,7 @@ class TestBrokerTypesWithRiskManager:
         now = _REGULAR_HOURS
         rm._reset_daily_if_needed(account, now.date())
         ok, msg = rm.validate_entry(
-            "AAPL", "buy", 10, 100.0, "momentum",
+            "AAPL", "buy", 10, 100.0, True,
             account, _portfolio(), [], now=now,
         )
         assert not ok
@@ -339,7 +339,7 @@ class TestBrokerTypesWithRiskManager:
         now = _REGULAR_HOURS
         rm._reset_daily_if_needed(account, now.date())
         ok, msg = rm.validate_entry(
-            "AAPL", "buy", 10, 100.0, "momentum",
+            "AAPL", "buy", 10, 100.0, True,
             account, _portfolio(), [], now=now,
         )
         assert not ok
@@ -376,7 +376,7 @@ class TestBrokerTypesWithRiskManager:
         now = _REGULAR_HOURS
         rm._reset_daily_if_needed(account, now.date())
         ok, _ = rm.validate_entry(
-            "AAPL", "buy", 1, 100.0, "momentum",
+            "AAPL", "buy", 1, 100.0, True,
             account, _portfolio(), [], now=now,
         )
         # Equity floor check passes; other checks should also pass for small order
@@ -426,7 +426,7 @@ class TestOrderRecordIntegration:
         existing = _order(qty=10.0, limit_price=150.0, status="PENDING")
         # New order: 10 × $60 = $600. Available = 2000 - 1500 = $500. 600 > 500 → block
         ok, msg = rm.validate_entry(
-            "TSLA", "buy", 10, 60.0, "momentum",
+            "TSLA", "buy", 10, 60.0, True,
             account, _portfolio(), [existing], now=now,
         )
         assert not ok
@@ -441,7 +441,7 @@ class TestOrderRecordIntegration:
         filled = _order(qty=10.0, limit_price=150.0, status="FILLED")
         # New order: 10 × $60 = $600. Available = 2000 (filled order not counted). Passes.
         ok, _ = rm.validate_entry(
-            "TSLA", "buy", 10, 60.0, "momentum",
+            "TSLA", "buy", 10, 60.0, True,
             account, _portfolio(), [filled], now=now,
         )
         assert ok
@@ -454,7 +454,7 @@ class TestOrderRecordIntegration:
         rm._reset_daily_if_needed(account, now.date())
         mkt_order = _order(order_type="market", limit_price=None, status="PENDING")
         ok, _ = rm.validate_entry(
-            "TSLA", "buy", 10, 100.0, "momentum",
+            "TSLA", "buy", 10, 100.0, True,
             account, _portfolio(), [mkt_order], now=now,
         )
         # $1000 order, $2000 buying power, market order not deducted → passes
@@ -561,7 +561,7 @@ class TestPDTGuardIntegration:
         now = _REGULAR_HOURS
         rm._reset_daily_if_needed(account, now.date())
         ok, msg = rm.validate_entry(
-            "AAPL", "buy", 1, 1.0, "momentum",
+            "AAPL", "buy", 1, 1.0, True,
             account, _portfolio(), [], now=now,
         )
         assert not ok
@@ -582,7 +582,7 @@ class TestPDTGuardIntegration:
         portfolio = _portfolio(["AAPL"])
         # No prior fills in orders list → 0 day trades counted → allowed
         ok, _ = rm.validate_entry(
-            "AAPL", "sell", 5, 110.0, "momentum",
+            "AAPL", "sell", 5, 110.0, True,
             account, portfolio, [], now=now,
         )
         assert ok
@@ -597,7 +597,7 @@ class TestPDTGuardIntegration:
         now = _REGULAR_HOURS
         rm._reset_daily_if_needed(account, now.date())
         ok, _ = rm.validate_entry(
-            "AAPL", "buy", 1, 100.0, "momentum",
+            "AAPL", "buy", 1, 100.0, True,
             account, _portfolio(), [], now=now,
         )
         assert ok
