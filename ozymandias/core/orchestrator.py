@@ -2093,6 +2093,11 @@ class Orchestrator:
         from cryptography.fernet import Fernet, InvalidToken
 
         creds_path = self._config.credentials_path
+        if not creds_path.exists():
+            raise RuntimeError(
+                f"Credentials file not found: {creds_path}\n"
+                f"Create it with:  python scripts/encrypt_credentials.py"
+            )
         raw = creds_path.read_bytes()
 
         if raw.lstrip().startswith(b"gAAAAA"):

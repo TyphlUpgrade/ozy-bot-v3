@@ -10,17 +10,44 @@ Session definitions (ET):
   post_market     16:00 – 20:00
   closed          20:00 – 04:00 (next day)
   weekends        Saturday / Sunday → closed
-
-Holiday detection: # TODO: NYSE holiday calendar
+  holidays        NYSE-scheduled full-day closures → closed
 """
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import date, datetime, time
 from enum import Enum
 from zoneinfo import ZoneInfo
 
 
 ET = ZoneInfo("America/New_York")
+
+# NYSE scheduled full-day closures.  When a holiday falls on Saturday the
+# preceding Friday is observed; when it falls on Sunday the following Monday
+# is observed.  Extend this set at the start of each calendar year.
+_NYSE_HOLIDAYS: frozenset[date] = frozenset({
+    # 2025
+    date(2025, 1,  1),   # New Year's Day
+    date(2025, 1, 20),   # MLK Jr. Day
+    date(2025, 2, 17),   # Presidents' Day
+    date(2025, 4, 18),   # Good Friday
+    date(2025, 5, 26),   # Memorial Day
+    date(2025, 6, 19),   # Juneteenth
+    date(2025, 7,  4),   # Independence Day
+    date(2025, 9,  1),   # Labor Day
+    date(2025, 11, 27),  # Thanksgiving
+    date(2025, 12, 25),  # Christmas Day
+    # 2026
+    date(2026, 1,  1),   # New Year's Day
+    date(2026, 1, 19),   # MLK Jr. Day
+    date(2026, 2, 16),   # Presidents' Day
+    date(2026, 4,  3),   # Good Friday
+    date(2026, 5, 25),   # Memorial Day
+    date(2026, 6, 19),   # Juneteenth
+    date(2026, 7,  3),   # Independence Day (observed; July 4 is Saturday)
+    date(2026, 9,  7),   # Labor Day
+    date(2026, 11, 26),  # Thanksgiving
+    date(2026, 12, 25),  # Christmas Day
+})
 
 # Session boundary times (ET)
 _PRE_MARKET_OPEN  = time(4, 0)
@@ -65,12 +92,10 @@ def get_current_session(now: datetime | None = None) -> Session:
         timezone-naive datetimes. Timezone-naive datetimes are assumed to be ET.
         UTC datetimes are converted automatically.
     """
-    # TODO: NYSE holiday calendar — treat market holidays as CLOSED
-
     et = _now_et(now)
     t = et.time()
 
-    if is_weekend(et):
+    if is_weekend(et) or et.date() in _NYSE_HOLIDAYS:
         return Session.CLOSED
 
     if _PRE_MARKET_OPEN <= t < _REGULAR_OPEN:
