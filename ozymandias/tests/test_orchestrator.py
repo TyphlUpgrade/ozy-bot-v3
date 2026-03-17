@@ -1164,6 +1164,388 @@ class TestTradeJournalIsolation:
         assert any(e["symbol"] == "JOURNALTEST" for e in entries)
 
 
+# ===========================================================================
+# _recently_closed re-adoption guard — Bug #1 (2026-03-16)
+# ===========================================================================
+
+class TestRecentlyClosedGuard:
+    """
+    _recently_closed TTL prevents position_sync from re-adopting a symbol
+    within 60 seconds of it being closed.
+
+    Regression for Bug #1: after _journal_closed_trade removed AMD from local
+    portfolio, _fast_step_position_sync re-adopted it from broker 10s later
+    (position still showing there), quant overrides fired a new SELL, and the
+    cycle repeated 16 times producing 16 AMD sell orders in 3 minutes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_journal_close_populates_recently_closed(self, orch):
+        """_journal_closed_trade must record the symbol in _recently_closed."""
+        from ozymandias.core.state_manager import ExitTargets, TradeIntention
+        from ozymandias.execution.fill_protection import StateChange
+
+        pos = Position(
+            symbol="AMD", shares=30.0, avg_cost=198.07,
+            entry_date=datetime.now(timezone.utc).isoformat(),
+            intention=TradeIntention(
+                strategy="swing", direction="short", reasoning="",
+                exit_targets=ExitTargets(stop_loss=202.0, profit_target=192.0),
+            ),
+        )
+        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
+
+        change = StateChange(
+            order_id="ord_001", symbol="AMD",
+            old_status="PENDING", new_status="FILLED",
+            fill_qty=30.0, fill_price=195.0,
+            side="buy", change_type="fill",
+        )
+        await orch._journal_closed_trade(change)
+
+        assert "AMD" in orch._recently_closed, (
+            "_journal_closed_trade must populate _recently_closed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_position_sync_skips_readoption_within_60s(self, orch):
+        """Position sync must not re-adopt a symbol closed within the last 60s."""
+        import time
+        from ozymandias.execution.broker_interface import BrokerPosition
+        from unittest.mock import patch
+
+        # Mark AMD as just closed
+        orch._recently_closed["AMD"] = time.monotonic()
+
+        # Broker still shows AMD (settlement delay)
+        orch._broker.get_positions = AsyncMock(return_value=[
+            BrokerPosition(
+                symbol="AMD", qty=30.0, avg_entry_price=198.07,
+                current_price=195.0, market_value=5852.1, unrealized_pl=-90.0,
+            )
+        ])
+
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            await orch._fast_step_position_sync()
+
+        portfolio = await orch._state_manager.load_portfolio()
+        assert not any(p.symbol == "AMD" for p in portfolio.positions), (
+            "AMD must not be re-adopted within the 60s TTL window"
+        )
+
+    @pytest.mark.asyncio
+    async def test_position_sync_allows_adoption_after_ttl_expires(self, orch):
+        """After the 60s TTL, position sync may adopt the symbol again."""
+        import time
+        from ozymandias.execution.broker_interface import BrokerPosition
+        from unittest.mock import patch
+
+        # Simulate close that happened 90s ago (TTL = 60s)
+        orch._recently_closed["AMD"] = time.monotonic() - 90.0
+
+        orch._broker.get_positions = AsyncMock(return_value=[
+            BrokerPosition(
+                symbol="AMD", qty=30.0, avg_entry_price=198.07,
+                current_price=195.0, market_value=5852.1, unrealized_pl=-90.0,
+            )
+        ])
+
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            await orch._fast_step_position_sync()
+
+        portfolio = await orch._state_manager.load_portfolio()
+        assert any(p.symbol == "AMD" for p in portfolio.positions), (
+            "AMD should be adoptable after the 60s TTL has expired"
+        )
+
+
+# ===========================================================================
+# _apply_position_reviews exit action — Bug #2 (2026-03-16)
+# ===========================================================================
+
+class TestApplyPositionReviewsExit:
+    """
+    _apply_position_reviews must place a market exit order when action="exit".
+
+    Regression for Bug #2: Claude returned action="exit" on AMD 6 consecutive
+    times from 15:12–16:42 ET. The field was read but never acted upon — no
+    exit order was placed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_exit_action_on_long_places_sell_order(self, orch):
+        """action='exit' on a long position must place a market SELL order."""
+        from ozymandias.execution.broker_interface import OrderResult
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        pos = Position(
+            symbol="AAPL", shares=10.0, avg_cost=200.0, entry_date=now_iso,
+            intention=TradeIntention(direction="long"),
+        )
+        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
+        portfolio = await orch._state_manager.load_portfolio()
+
+        orch._broker.place_order = AsyncMock(return_value=OrderResult(
+            order_id="exit-001", status="pending_new",
+            submitted_at=datetime.now(timezone.utc),
+        ))
+
+        reviews = [{"symbol": "AAPL", "action": "exit",
+                    "updated_reasoning": "Thesis invalidated — exit immediately."}]
+        await orch._apply_position_reviews(portfolio, reviews)
+
+        orch._broker.place_order.assert_called_once()
+        order = orch._broker.place_order.call_args[0][0]
+        assert order.symbol == "AAPL"
+        assert order.side == "sell"
+        assert order.quantity == 10.0
+        assert order.order_type == "market"
+
+    @pytest.mark.asyncio
+    async def test_exit_action_on_short_places_buy_order(self, orch):
+        """action='exit' on a short position must place a market BUY (buy-to-cover) order."""
+        from ozymandias.execution.broker_interface import OrderResult
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        pos = Position(
+            symbol="AMD", shares=30.0, avg_cost=198.07, entry_date=now_iso,
+            intention=TradeIntention(direction="short"),
+        )
+        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
+        portfolio = await orch._state_manager.load_portfolio()
+
+        orch._broker.place_order = AsyncMock(return_value=OrderResult(
+            order_id="exit-002", status="pending_new",
+            submitted_at=datetime.now(timezone.utc),
+        ))
+
+        reviews = [{"symbol": "AMD", "action": "exit",
+                    "updated_reasoning": "Short thesis completely invalidated."}]
+        await orch._apply_position_reviews(portfolio, reviews)
+
+        orch._broker.place_order.assert_called_once()
+        order = orch._broker.place_order.call_args[0][0]
+        assert order.symbol == "AMD"
+        assert order.side == "buy", "Short exit must be a buy-to-cover order"
+        assert order.quantity == 30.0
+        assert order.order_type == "market"
+
+    @pytest.mark.asyncio
+    async def test_exit_action_blocked_when_order_pending(self, orch):
+        """action='exit' is blocked if a pending exit order already exists."""
+        from ozymandias.execution.broker_interface import OrderResult
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        pos = Position(
+            symbol="AMD", shares=30.0, avg_cost=198.07, entry_date=now_iso,
+            intention=TradeIntention(direction="short"),
+        )
+        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
+        portfolio = await orch._state_manager.load_portfolio()
+
+        # Simulate an existing pending order
+        existing = OrderRecord(
+            order_id="pending-001", symbol="AMD", side="buy",
+            quantity=30.0, order_type="market", limit_price=None,
+            status="PENDING", created_at=now_iso, last_checked_at=now_iso,
+        )
+        await orch._fill_protection.record_order(existing)
+
+        orch._broker.place_order = AsyncMock(return_value=OrderResult(
+            order_id="exit-003", status="pending_new",
+            submitted_at=datetime.now(timezone.utc),
+        ))
+
+        reviews = [{"symbol": "AMD", "action": "exit",
+                    "updated_reasoning": "Exit now."}]
+        await orch._apply_position_reviews(portfolio, reviews)
+
+        orch._broker.place_order.assert_not_called()
+
+
+# ===========================================================================
+# Ghost cleanup avg_cost fallback — Bug #8 (2026-03-16)
+# ===========================================================================
+
+class TestGhostCleanupExitPrice:
+    """
+    Ghost cleanup must fall back to pos.avg_cost when no market price is cached.
+
+    Regression for Bug #8: NVDA journal entry showed exit_price=0.0 and
+    pnl=0% because _latest_indicators had no price for NVDA at cleanup time.
+    """
+
+    @pytest.mark.asyncio
+    async def test_ghost_cleanup_uses_avg_cost_when_no_indicator_price(self, orch):
+        """When indicators have no price for symbol, ghost cleanup uses avg_cost."""
+        import json
+        from ozymandias.execution.broker_interface import BrokerPosition
+        from unittest.mock import patch
+
+        avg_cost = 184.81
+        pos = Position(
+            symbol="NVDA", shares=32.0, avg_cost=avg_cost,
+            entry_date=datetime.now(timezone.utc).isoformat(),
+            intention=TradeIntention(strategy="unknown", direction="long"),
+        )
+        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
+
+        # No indicators for NVDA → price defaults to 0.0
+        orch._latest_indicators = {}
+
+        # Broker does NOT show NVDA → ghost cleanup fires
+        orch._broker.get_positions = AsyncMock(return_value=[])
+
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            await orch._fast_step_position_sync()
+
+        # Position should be removed
+        portfolio = await orch._state_manager.load_portfolio()
+        assert not any(p.symbol == "NVDA" for p in portfolio.positions)
+
+        # Journal entry must use avg_cost as exit_price, not 0.0
+        journal_path = orch._trade_journal._path
+        assert journal_path.exists(), "Expected ghost cleanup to write a journal entry"
+        entries = [json.loads(line) for line in journal_path.read_text().splitlines()]
+        nvda_entries = [e for e in entries if e.get("symbol") == "NVDA"]
+        assert nvda_entries, "No NVDA journal entry written by ghost cleanup"
+        entry = nvda_entries[-1]
+        assert entry["exit_price"] == pytest.approx(avg_cost), (
+            f"Expected exit_price={avg_cost} (avg_cost fallback), got {entry['exit_price']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ghost_cleanup_uses_market_price_when_available(self, orch):
+        """When indicators have a price, ghost cleanup uses the market price."""
+        import json
+        from ozymandias.execution.broker_interface import BrokerPosition
+        from unittest.mock import patch
+
+        avg_cost = 184.81
+        market_price = 190.0
+        pos = Position(
+            symbol="NVDA", shares=32.0, avg_cost=avg_cost,
+            entry_date=datetime.now(timezone.utc).isoformat(),
+            intention=TradeIntention(strategy="unknown", direction="long"),
+        )
+        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
+
+        # Indicators have a live price
+        orch._latest_indicators = {"NVDA": {"price": market_price}}
+        orch._broker.get_positions = AsyncMock(return_value=[])
+
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            await orch._fast_step_position_sync()
+
+        journal_path = orch._trade_journal._path
+        assert journal_path.exists()
+        entries = [json.loads(line) for line in journal_path.read_text().splitlines()]
+        nvda_entries = [e for e in entries if e.get("symbol") == "NVDA"]
+        assert nvda_entries
+        entry = nvda_entries[-1]
+        assert entry["exit_price"] == pytest.approx(market_price)
+
+
+# ===========================================================================
+# Portfolio cash/buying_power broker sync — Bug #7 (2026-03-16)
+# ===========================================================================
+
+class TestPortfolioCashSync:
+    """
+    Medium loop must sync portfolio.cash and portfolio.buying_power from broker.
+
+    Regression for Bug #7: portfolio.json showed cash=0.0, buying_power=0.0
+    for the entire session. The medium loop fetched the account but never
+    wrote the values back to portfolio state.
+    """
+
+    def _medium_loop_mocks(self, orch, broker_cash, broker_bp):
+        """
+        Return a context manager that patches the medium loop's data-fetch
+        dependencies so the cycle runs to step 4 (account fetch) without
+        hitting real I/O or the slow loop.
+        """
+        import pandas as pd
+        from unittest.mock import patch
+
+        # Minimal OHLCV DataFrame — enough for generate_signal_summary to succeed
+        idx = pd.date_range("2026-03-16 09:30", periods=5, freq="5min", tz="UTC")
+        mock_df = pd.DataFrame({
+            "open":   [100.0] * 5, "high":  [105.0] * 5,
+            "low":    [98.0]  * 5, "close": [103.0] * 5,
+            "volume": [1_000_000] * 5,
+        }, index=idx)
+
+        orch._data_adapter.fetch_bars = AsyncMock(return_value=mock_df)
+        orch._broker.get_account = AsyncMock(return_value=AccountInfo(
+            equity=100_000.0, buying_power=broker_bp, cash=broker_cash,
+            currency="USD", pdt_flag=False, daytrade_count=0, account_id="test",
+        ))
+        orch._ranker.rank_opportunities = MagicMock(return_value=[])
+        orch._broker.get_open_orders = AsyncMock(return_value=[])
+        orch._broker.get_positions = AsyncMock(return_value=[])
+        # Pre-seed indicators so the slow-loop trigger (indicators_were_empty) won't fire
+        orch._latest_indicators = {"AAPL": {}}
+
+        return patch.multiple(
+            "ozymandias.core.orchestrator",
+            is_market_open=MagicMock(return_value=True),
+            get_current_session=MagicMock(return_value=MagicMock(value="regular")),
+        )
+
+    @pytest.mark.asyncio
+    async def test_medium_loop_syncs_cash_and_buying_power(self, orch):
+        """After medium loop step 4 (acct fetch), portfolio cash/buying_power match broker."""
+        broker_cash = 50_000.0
+        broker_bp = 80_000.0
+
+        # Stale portfolio with zero cash
+        await orch._state_manager.save_portfolio(
+            PortfolioState(cash=0.0, buying_power=0.0, positions=[])
+        )
+        await _set_watchlist(orch, tier1=["AAPL"])
+
+        with self._medium_loop_mocks(orch, broker_cash, broker_bp):
+            await orch._medium_loop_cycle()
+
+        saved = await orch._state_manager.load_portfolio()
+        assert saved.cash == pytest.approx(broker_cash), (
+            f"Expected cash={broker_cash}, got {saved.cash}"
+        )
+        assert saved.buying_power == pytest.approx(broker_bp), (
+            f"Expected buying_power={broker_bp}, got {saved.buying_power}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_medium_loop_no_save_when_cash_already_matches(self, orch):
+        """No extra portfolio save when cash/buying_power already match broker."""
+        broker_cash = 50_000.0
+        broker_bp = 80_000.0
+
+        # Portfolio already matches broker
+        await orch._state_manager.save_portfolio(
+            PortfolioState(cash=broker_cash, buying_power=broker_bp, positions=[])
+        )
+        await _set_watchlist(orch, tier1=["AAPL"])
+
+        # Spy: save_portfolio must NOT be called for the cash sync
+        original_save = orch._state_manager.save_portfolio
+        save_calls: list = []
+
+        async def counting_save(p):
+            save_calls.append(p)
+            return await original_save(p)
+
+        orch._state_manager.save_portfolio = counting_save
+
+        with self._medium_loop_mocks(orch, broker_cash, broker_bp):
+            await orch._medium_loop_cycle()
+
+        assert len(save_calls) == 0, (
+            "save_portfolio called unnecessarily when cash/buying_power already matched broker"
+        )
+
+
 class TestDispatchConfirmedFill:
     """_dispatch_confirmed_fill routes to open or close based on portfolio state."""
 

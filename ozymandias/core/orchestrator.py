@@ -1855,6 +1855,13 @@ class Orchestrator:
         now_iso = datetime.now(timezone.utc).isoformat()
         from ozymandias.core.state_manager import WatchlistEntry
 
+        # Non-tradeable index tickers that Alpaca cannot order (config.json entry would be
+        # overkill for a static safety blacklist — these never change).
+        _INDEX_BLACKLIST = {
+            "VIX", "VXN", "SPX", "NDX", "RUT", "DJI", "COMP",
+            "INDU", "NYA", "XAX", "OEX", "MID", "SML",
+        }
+
         existing_symbols = {e.symbol for e in watchlist.entries}
 
         for item in add_list:
@@ -1870,6 +1877,9 @@ class Orchestrator:
                 tier = item.get("priority_tier", 1)
                 strategy = item.get("strategy", "both")
             if not symbol or symbol in existing_symbols:
+                continue
+            if symbol in _INDEX_BLACKLIST or symbol.startswith("^"):
+                log.warning("Watchlist: rejected non-tradeable index ticker %s", symbol)
                 continue
             watchlist.entries.append(WatchlistEntry(
                 symbol=symbol,

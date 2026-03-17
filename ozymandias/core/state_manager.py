@@ -77,7 +77,6 @@ class WatchlistEntry:
     date_added: str                    # ISO date string
     reason: str
     priority_tier: int = 2            # 1 = active candidate, 2 = monitoring, 3 = cooling off
-    last_evaluated: str = ""
     strategy: str = "both"            # "momentum" | "swing" | "both"
     removal_candidate: bool = False
 
@@ -163,7 +162,6 @@ def _from_dict_watchlist_entry(d: dict) -> WatchlistEntry:
         date_added=d["date_added"],
         reason=d["reason"],
         priority_tier=d.get("priority_tier", 2),
-        last_evaluated=d.get("last_evaluated", ""),
         strategy=d.get("strategy", "both"),
         removal_candidate=d.get("removal_candidate", False),
     )

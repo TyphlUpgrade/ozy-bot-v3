@@ -24,6 +24,8 @@ TIER ASSIGNMENT RULES (strictly enforced):
   or as secondary candidates if tier 1 slots are exhausted.
 
 Do NOT put broad market or sector ETFs in tier 1 — they belong in tier 2 as market-context monitors.
+Do NOT add non-tradeable index tickers (VIX, VXN, SPX, NDX, RUT, DJI, COMP, or any caret-prefixed ^symbol).
+  Indices cannot be ordered on Alpaca. Use tradeable proxies instead (e.g. UVXY or VIXY for volatility).
 Do NOT repeat symbols already in the current watchlist unless you are re-tiering them.
 
 Return ONLY a JSON object. No markdown, no explanation outside the JSON.

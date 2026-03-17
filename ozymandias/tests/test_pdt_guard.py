@@ -366,6 +366,83 @@ class TestCheckEquityFloor:
 
 
 # ---------------------------------------------------------------------------
+# broker_floor — Bug #9 (2026-03-16)
+# ---------------------------------------------------------------------------
+
+class TestBrokerFloor:
+    """
+    broker_floor ensures count_day_trades never undercounts vs broker.
+
+    Regression test for Bug #9: bot counted 1 day trade (NVDA), broker
+    reported 5. Phantom/adoption trades executed at broker level (AMD 16 sells,
+    SPY buys) were invisible to the local order-based counter.
+    """
+
+    def test_default_floor_zero_has_no_effect(self):
+        """broker_floor=0 (default) does not affect local count."""
+        guard = _guard()
+        orders = [
+            _filled_order("o1", "AAPL", "buy", TUE),
+            _filled_order("o2", "AAPL", "sell", TUE),
+        ]
+        # local=1, broker_floor=0 → max(1, 0)=1
+        assert guard.count_day_trades(orders, _portfolio(), reference_date=WED) == 1
+
+    def test_broker_floor_higher_than_local_returns_floor(self):
+        """When broker_floor exceeds local count, broker floor is used."""
+        guard = _guard()
+        guard.broker_floor = 5
+        orders = [
+            _filled_order("o1", "AAPL", "buy", TUE),
+            _filled_order("o2", "AAPL", "sell", TUE),
+        ]
+        # local=1, broker_floor=5 → max(1, 5)=5
+        assert guard.count_day_trades(orders, _portfolio(), reference_date=WED) == 5
+
+    def test_local_count_beats_lower_broker_floor(self):
+        """Local count beats broker_floor when local is higher."""
+        guard = _guard()
+        guard.broker_floor = 1
+        orders = [
+            _filled_order("o1", "AAPL", "buy", TUE),
+            _filled_order("o2", "AAPL", "sell", TUE),
+            _filled_order("o3", "TSLA", "buy", WED),
+            _filled_order("o4", "TSLA", "sell", WED),
+            _filled_order("o5", "NVDA", "buy", WED),
+            _filled_order("o6", "NVDA", "sell", WED),
+        ]
+        # local=3, broker_floor=1 → max(3, 1)=3
+        assert guard.count_day_trades(orders, _portfolio(), reference_date=WED) == 3
+
+    def test_can_day_trade_blocked_by_broker_floor(self):
+        """can_day_trade is blocked when broker_floor brings count to the limit."""
+        guard = _guard(pdt_buffer=1)  # effective limit = 3-1 = 2
+        guard.broker_floor = 2        # broker already at limit; local has 0
+        orders = []
+        # max(0, 2)=2 >= effective_limit 2 → blocked
+        allowed, reason = guard.can_day_trade("AAPL", orders, _portfolio(), reference_date=WED)
+        assert allowed is False
+        assert "limit" in reason.lower()
+
+    def test_can_day_trade_allowed_when_broker_floor_below_limit(self):
+        """can_day_trade is allowed when broker_floor is below the effective limit."""
+        guard = _guard(pdt_buffer=1)  # effective limit = 2
+        guard.broker_floor = 1        # 1 below limit; local also 0
+        orders = []
+        allowed, _ = guard.can_day_trade("AAPL", orders, _portfolio(), reference_date=WED)
+        assert allowed is True
+
+    def test_broker_floor_persists_across_calls(self):
+        """broker_floor stays set between calls — simulates orchestrator refresh pattern."""
+        guard = _guard()
+        guard.broker_floor = 3
+        # First call
+        assert guard.count_day_trades([], _portfolio(), reference_date=WED) == 3
+        # Second call without resetting — floor must still apply
+        assert guard.count_day_trades([], _portfolio(), reference_date=WED) == 3
+
+
+# ---------------------------------------------------------------------------
 # is_emergency_exit (stub)
 # ---------------------------------------------------------------------------
 

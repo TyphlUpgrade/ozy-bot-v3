@@ -227,6 +227,53 @@ class TestStartupReconciliation:
         assert order.cancelled_at != ""
 
     @pytest.mark.asyncio
+    async def test_broker_short_position_adopted_with_correct_direction(self, orch):
+        """
+        Broker reports side='short' → adopted position has direction='short'.
+
+        Regression for Bug #3 (2026-03-16): startup_reconciliation used bare
+        TradeIntention() which defaults to direction='long', causing quant
+        overrides to fire SELL orders on newly-adopted short positions.
+        """
+        await orch._state_manager.save_portfolio(PortfolioState())
+        orch._broker.get_positions = AsyncMock(return_value=[
+            BrokerPosition(
+                symbol="AMD", qty=-30.0, avg_entry_price=198.07,
+                current_price=195.0, market_value=-5942.1, unrealized_pl=90.0,
+                side="short",
+            )
+        ])
+
+        await orch.startup_reconciliation()
+
+        loaded = await orch._state_manager.load_portfolio()
+        pos = next((p for p in loaded.positions if p.symbol == "AMD"), None)
+        assert pos is not None, "AMD not adopted"
+        assert pos.intention.direction == "short", (
+            f"Expected direction='short' for broker short, got '{pos.intention.direction}'"
+        )
+        assert pos.shares == pytest.approx(30.0), "Shares must be stored as positive"
+
+    @pytest.mark.asyncio
+    async def test_broker_long_position_adopted_with_long_direction(self, orch):
+        """Broker reports side='long' → adopted position has direction='long'."""
+        await orch._state_manager.save_portfolio(PortfolioState())
+        orch._broker.get_positions = AsyncMock(return_value=[
+            BrokerPosition(
+                symbol="AAPL", qty=10.0, avg_entry_price=200.0,
+                current_price=205.0, market_value=2050.0, unrealized_pl=50.0,
+                side="long",
+            )
+        ])
+
+        await orch.startup_reconciliation()
+
+        loaded = await orch._state_manager.load_portfolio()
+        pos = next((p for p in loaded.positions if p.symbol == "AAPL"), None)
+        assert pos is not None
+        assert pos.intention.direction == "long"
+
+    @pytest.mark.asyncio
     async def test_conservative_mode_activates_on_any_error(self, orch):
         """Any reconciliation error → conservative_mode_until is set to ~now + configured minutes."""
         cfg_mins = orch._config.scheduler.conservative_startup_mode_min
