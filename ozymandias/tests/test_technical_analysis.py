@@ -670,6 +670,7 @@ class TestGenerateSignalSummary:
         assert 'timestamp' in result
         assert 'signals' in result
         assert 'composite_technical_score' in result
+        assert result['bars_available'] == 50
 
     def test_signal_keys_present(self):
         signals = generate_signal_summary("TEST", self._df())['signals']

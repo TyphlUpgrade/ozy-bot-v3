@@ -529,4 +529,5 @@ def generate_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
         'timestamp':                datetime.now(timezone.utc).isoformat(),
         'signals':                  signals,
         'composite_technical_score': round(compute_composite_score(signals), 4),
+        'bars_available':           len(df),  # raw bar count; used by orchestrator warm-up guard
     }

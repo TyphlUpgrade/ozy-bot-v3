@@ -43,8 +43,8 @@ from ozymandias.intelligence.claude_reasoning import (
     ReasoningResult,
     _result_from_raw_reasoning,
 )
-from ozymandias.intelligence.opportunity_ranker import OpportunityRanker
-from ozymandias.intelligence.technical_analysis import generate_signal_summary
+from ozymandias.intelligence.opportunity_ranker import OpportunityRanker, evaluate_entry_conditions
+from ozymandias.intelligence.technical_analysis import compute_composite_score, generate_signal_summary
 from ozymandias.strategies.base_strategy import Strategy, get_strategy
 
 log = logging.getLogger(__name__)
@@ -515,6 +515,23 @@ class Orchestrator:
         else:
             log.info("Step 5 OK — startup reconciliation clean, proceeding normally")
 
+        # Repopulate _entry_contexts from TradeIntention fields on open positions.
+        # These were written when each fill was first registered. Without this,
+        # any position that was open when the bot last stopped loses its signal
+        # context and the trade journal records zeros for signals/conviction/score.
+        portfolio = await self._state_manager.load_portfolio()
+        restored = 0
+        for pos in portfolio.positions:
+            if pos.intention.entry_signals or pos.intention.entry_conviction:
+                self._entry_contexts[pos.symbol] = {
+                    "signals": pos.intention.entry_signals,
+                    "claude_conviction": pos.intention.entry_conviction,
+                    "composite_score": pos.intention.entry_score,
+                }
+                restored += 1
+        if restored:
+            log.info("Startup: restored entry context for %d open position(s)", restored)
+
         log.info("=== Startup reconciliation complete ===")
 
     # -----------------------------------------------------------------------
@@ -804,6 +821,11 @@ class Orchestrator:
                 stop_loss=pending.get("stop", 0.0),
                 profit_target=pending.get("target", 0.0),
             ),
+            # Persist signal context in portfolio.json so it survives bot restarts.
+            # _entry_contexts (in-memory) is populated from these fields at startup.
+            entry_signals=self._entry_contexts.get(symbol, {}).get("signals", {}),
+            entry_conviction=self._entry_contexts.get(symbol, {}).get("claude_conviction", 0.0),
+            entry_score=self._entry_contexts.get(symbol, {}).get("composite_score", 0.0),
         )
         portfolio.positions.append(Position(
             symbol=symbol,
@@ -869,12 +891,32 @@ class Orchestrator:
                     exit_reason = "strategy"
 
             ctx = self._entry_contexts.pop(symbol, {})
+            # Fall back to TradeIntention fields if in-memory context was lost (e.g. restart).
+            signals_at_entry = (
+                ctx.get("signals")
+                or position.intention.entry_signals
+            )
+            claude_conviction = (
+                ctx.get("claude_conviction")
+                or position.intention.entry_conviction
+            )
+            composite_score = (
+                ctx.get("composite_score")
+                or position.intention.entry_score
+            )
+            exit_time = datetime.now(timezone.utc)
+            try:
+                entry_dt = datetime.fromisoformat(position.entry_date)
+                hold_duration_min = round((exit_time - entry_dt).total_seconds() / 60, 1)
+            except Exception:
+                hold_duration_min = None
             await self._trade_journal.append({
                 "symbol": symbol,
                 "strategy": position.intention.strategy,
                 "direction": position.intention.direction,
                 "entry_time": position.entry_date,
-                "exit_time": datetime.now(timezone.utc).isoformat(),
+                "exit_time": exit_time.isoformat(),
+                "hold_duration_min": hold_duration_min,
                 "entry_price": entry_price,
                 "exit_price": exit_price,
                 "shares": change.fill_qty,
@@ -882,9 +924,9 @@ class Orchestrator:
                 "stop_price": stop,
                 "target_price": target,
                 "exit_reason": exit_reason,
-                "signals_at_entry": ctx.get("signals", {}),
-                "claude_conviction": ctx.get("claude_conviction", 0.0),
-                "composite_score": ctx.get("composite_score", 0.0),
+                "signals_at_entry": signals_at_entry,
+                "claude_conviction": claude_conviction,
+                "composite_score": composite_score,
                 "source": "live",
             })
 
@@ -1178,6 +1220,22 @@ class Orchestrator:
                         bp.symbol, time.monotonic() - closed_at,
                     )
                     continue
+                # Guard: if we have an active (PENDING or PARTIALLY_FILLED) opening
+                # order for this symbol, the fill handler will register it properly
+                # with the full intention when the order completes. Adopting here
+                # would consume _pending_intentions prematurely, which causes the full
+                # fill to be routed as a close (position already exists) and then
+                # re-adopted without intention (strategy="unknown").
+                in_flight = [
+                    o for o in self._fill_protection.get_orders_for_symbol(bp.symbol)
+                    if o.status in ("PENDING", "PARTIALLY_FILLED")
+                ]
+                if in_flight:
+                    log.debug(
+                        "Position sync: skipping adoption of %s — in-flight opening order %s",
+                        bp.symbol, in_flight[0].order_id,
+                    )
+                    continue
                 pending = self._pending_intentions.pop(bp.symbol, {})
                 if pending:
                     self._entry_contexts[bp.symbol] = {
@@ -1296,7 +1354,7 @@ class Orchestrator:
 
         for symbol in scan_symbols:
             try:
-                df = await self._data_adapter.fetch_bars(symbol, interval="5m", period="1d")
+                df = await self._data_adapter.fetch_bars(symbol, interval="5m", period="5d")
                 if df is None or df.empty:
                     log.warning("Medium loop: no bars returned for %s", symbol)
                     continue
@@ -1317,7 +1375,11 @@ class Orchestrator:
         # Track whether this is the first population so we can fire Claude immediately.
         indicators_were_empty = not getattr(self, "_latest_indicators", {})
         self._latest_indicators = {
-            sym: {**v["signals"], "composite_technical_score": v.get("composite_technical_score", 0.0)}
+            sym: {
+                **v["signals"],
+                "composite_technical_score": v.get("composite_technical_score", 0.0),
+                "bars_available": v.get("bars_available", 0),
+            }
             for sym, v in indicators.items()
         }
 
@@ -1332,7 +1394,7 @@ class Orchestrator:
                 self._market_context_indicators[ctx_sym] = indicators[ctx_sym]
                 continue
             try:
-                df = await self._data_adapter.fetch_bars(ctx_sym, interval="5m", period="1d")
+                df = await self._data_adapter.fetch_bars(ctx_sym, interval="5m", period="5d")
                 if df is not None and not df.empty:
                     self._market_context_indicators[ctx_sym] = generate_signal_summary(ctx_sym, df)
             except Exception as exc:
@@ -1441,7 +1503,7 @@ class Orchestrator:
             strategy_lookup=self._strategy_lookup,
         )
 
-        log.debug(
+        log.info(
             "Medium loop: ranker returned %d opportunity/ies (from %d Claude candidates)",
             len(ranked), len(reasoning_result.new_opportunities),
         )
@@ -1463,6 +1525,10 @@ class Orchestrator:
         (so the caller can try the next ranked candidate).
         """
         symbol = top.symbol
+        log.info(
+            "Medium loop: attempting entry — %s  action=%s  conviction=%.2f  score=%.2f  strategy=%s",
+            symbol, top.action, top.ai_conviction, top.composite_score, top.strategy,
+        )
         ind = self._latest_indicators.get(symbol, {})
 
         # Phase 11: Use current market price as limit order price.
@@ -1512,15 +1578,32 @@ class Orchestrator:
         # Hard PDT gate for intraday strategies: an intraday strategy forces same-day
         # exit (last-5-min rule). With 0 day trades remaining that forced exit becomes
         # a PDT violation.  Strategies that hold overnight (is_intraday=False) are exempt.
+        # PDT rules only apply below min_equity_for_trading ($25,500); above that the
+        # broker permits unlimited day trades regardless of PDT designation.
         strategy_obj = self._strategy_lookup.get(top.strategy)
         if strategy_obj is not None and strategy_obj.is_intraday:
-            pdt_used = self._pdt_guard.count_day_trades(orders, portfolio)
-            pdt_remaining = max(0, 3 - self._config.risk.pdt_buffer - pdt_used)
-            if pdt_remaining == 0:
+            if acct.equity < self._config.risk.min_equity_for_trading:
+                pdt_used = self._pdt_guard.count_day_trades(orders, portfolio)
+                pdt_remaining = max(0, 3 - self._config.risk.pdt_buffer - pdt_used)
+                if pdt_remaining == 0:
+                    log.info(
+                        "Medium loop: PDT block — 0 day trades remaining, "
+                        "skipping intraday entry for %s (%s)",
+                        symbol, top.strategy,
+                    )
+                    return False
+
+        # Phase 14: Claude's per-trade entry conditions gate.
+        # Checked here — after the cheapest guards (fill protection, cooldown, PDT)
+        # and before any computation (drift, sizing, risk manager).
+        # Log at INFO — blocked conditions are normal expected behaviour, not errors.
+        entry_conds = getattr(top, "entry_conditions", {}) or {}
+        if entry_conds:
+            conds_met, conds_reason = evaluate_entry_conditions(entry_conds, ind)
+            if not conds_met:
                 log.info(
-                    "Medium loop: PDT block — 0 day trades remaining, "
-                    "skipping intraday entry for %s (%s)",
-                    symbol, top.strategy,
+                    "Entry conditions not met for %s: %s — will retry next cycle",
+                    symbol, conds_reason,
                 )
                 return False
 
@@ -1598,7 +1681,7 @@ class Orchestrator:
             avg_daily_volume=avg_vol,
         )
         if not allowed:
-            log.debug("Medium loop: entry blocked for %s — %s", symbol, reason)
+            log.info("Medium loop: entry blocked for %s — %s", symbol, reason)
             return False
 
         # Thesis challenge for large positions — returns a concern_level (0–1) that applies
@@ -2061,18 +2144,20 @@ class Orchestrator:
         watchlist = await self._state_manager.load_watchlist()
         tier1 = [e.symbol for e in watchlist.entries if e.priority_tier == 1]
         max_items = self._config.claude.news_max_items_per_symbol
+        max_age = self._config.claude.news_max_age_hours
         news_results = await asyncio.gather(
-            *[self._data_adapter.fetch_news(s, max_items=max_items) for s in tier1],
+            *[
+                self._data_adapter.fetch_news(s, max_items=max_items, max_age_hours=max_age)
+                for s in tier1
+            ],
             return_exceptions=True,
         )
-        max_age = self._config.claude.news_max_age_hours
         watchlist_news: dict[str, list] = {}
         for sym, result in zip(tier1, news_results):
             if isinstance(result, Exception):
                 continue
-            filtered = [item for item in result if item.get("age_hours", 9999) < max_age]
-            if filtered:
-                watchlist_news[sym] = filtered
+            if result:
+                watchlist_news[sym] = result
 
         return {
             "spy_trend":         _classify_trend("SPY"),
@@ -2110,8 +2195,13 @@ class Orchestrator:
             return
         self._mark_broker_available()
 
-        pdt_remaining = 3 - self._config.risk.pdt_buffer - \
-            self._pdt_guard.count_day_trades(orders_state.orders, portfolio)
+        # PDT rules only apply below the equity floor; above it the broker permits
+        # unlimited day trades regardless of PDT designation.
+        if acct.equity < self._config.risk.min_equity_for_trading:
+            pdt_remaining = 3 - self._config.risk.pdt_buffer - \
+                self._pdt_guard.count_day_trades(orders_state.orders, portfolio)
+        else:
+            pdt_remaining = 3
 
         market_data = await self._build_market_context(acct, pdt_remaining)
 
@@ -2156,8 +2246,9 @@ class Orchestrator:
         changes = result.watchlist_changes
         add_list    = changes.get("add", [])
         remove_list = changes.get("remove", [])
-        if add_list or remove_list:
-            await self._apply_watchlist_changes(watchlist, add_list, remove_list)
+        open_symbols = {p.symbol for p in portfolio.positions}
+        # Always call — enforces the size cap even when Claude suggests no changes.
+        await self._apply_watchlist_changes(watchlist, add_list, remove_list, open_symbols)
 
         # -- Apply position review notes -------------------------------------
         if result.position_reviews:
@@ -2195,8 +2286,14 @@ class Orchestrator:
         watchlist: "WatchlistState",
         add_list: list[dict],
         remove_list: list[str],
+        open_symbols: set[str] | None = None,
     ) -> None:
-        """Apply Claude-suggested watchlist additions and removals."""
+        """Apply Claude-suggested watchlist additions and removals, then enforce the size cap.
+
+        ``open_symbols`` is the set of symbols with active positions — these are
+        never pruned regardless of score or rank.  Pass an empty set when no
+        positions are open.
+        """
         now_iso = datetime.now(timezone.utc).isoformat()
         from ozymandias.core.state_manager import WatchlistEntry
 
@@ -2245,6 +2342,44 @@ class Orchestrator:
             if removed:
                 log.info("Watchlist: removed %d symbol(s): %s", removed, remove_list)
 
+        # Hard size cap — prune lowest-scoring entries beyond the limit.
+        # Open positions are always protected; entries with no recent TA data
+        # (score=0.0) are pruned first, followed by weakest-signal entries.
+        # Phase 18 will replace this with direction-aware scoring once
+        # expected_direction is added to WatchlistEntry.
+        max_entries = self._config.claude.watchlist_max_entries
+        if len(watchlist.entries) > max_entries:
+            # Newly-added symbols are protected for this cycle: they haven't been
+            # through a medium loop scan yet so _latest_indicators has no data for
+            # them, giving a score of 0.0 that would cause immediate eviction.
+            newly_added = {
+                (item if isinstance(item, str) else item.get("symbol", "")).upper()
+                for item in add_list
+            } - {""}
+            protected = (open_symbols or set()) | newly_added
+
+            def _prune_score(e) -> float:
+                ind = self._latest_indicators.get(e.symbol, {})
+                raw = ind.get("signals") or {}
+                if raw:
+                    return max(
+                        compute_composite_score(raw, direction="long"),
+                        compute_composite_score(raw, direction="short"),
+                    )
+                return ind.get("composite_technical_score", 0.0)
+
+            keep_protected = [e for e in watchlist.entries if e.symbol in protected]
+            prunable = [e for e in watchlist.entries if e.symbol not in protected]
+            slots = max(0, max_entries - len(keep_protected))
+            prunable.sort(key=_prune_score, reverse=True)
+            pruned = [e.symbol for e in prunable[slots:]]
+            watchlist.entries = keep_protected + prunable[:slots]
+            if pruned:
+                log.info(
+                    "Watchlist: pruned %d entries over cap=%d: %s",
+                    len(pruned), max_entries, pruned,
+                )
+
         await self._state_manager.save_watchlist(watchlist)
 
     async def _apply_position_reviews(
@@ -2276,6 +2411,27 @@ class Orchestrator:
                 # Claude recommends exiting — place a market exit order immediately.
                 # thesis_intact=False is a hard signal; action="exit" is sufficient.
                 if action == "exit":
+                    # Guard: swing positions must be held for a minimum time before
+                    # Claude review exits are honoured. Intraday signal deterioration
+                    # is expected noise for a multi-day strategy; acting on it causes
+                    # same-session exits that defeat the swing thesis entirely.
+                    # Positions with strategy="unknown" (broker-adopted) are treated
+                    # as swing for this gate — conservative default.
+                    swing_strategies = {"swing", "unknown"}
+                    if pos.intention.strategy in swing_strategies:
+                        min_hold = self._config.strategy.swing_min_hold_hours
+                        try:
+                            entry_dt = datetime.fromisoformat(pos.entry_date)
+                            hold_hours = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 3600
+                        except Exception:
+                            hold_hours = 9999.0  # unparseable date → assume held long enough
+                        if hold_hours < min_hold:
+                            log.info(
+                                "Claude review exit blocked for %s (%s) — "
+                                "held %.1fh < swing_min_hold_hours=%.1fh",
+                                symbol, pos.intention.strategy, hold_hours, min_hold,
+                            )
+                            break
                     # Guard against the override-vs-Claude race: if this symbol was
                     # closed by the fast loop (override/stop) while Claude's API call
                     # was in flight, the position no longer exists — skip the exit.

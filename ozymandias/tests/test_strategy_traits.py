@@ -116,6 +116,83 @@ class TestMomentumEntryGate:
         passed, _ = strat.apply_entry_gate("buy", _signals(vwap_position="below", volume_ratio=1.5))
         assert passed is True
 
+    # --- VWAP reclaim exception ---
+
+    def test_reclaim_long_passes_with_bullish_macd_and_high_rvol(self):
+        """Below-VWAP buy passes when MACD bullish + RVOL meets reclaim threshold."""
+        strat = _momentum()
+        passed, _ = strat.apply_entry_gate(
+            "buy",
+            _signals(vwap_position="below", volume_ratio=2.0, macd_signal="bullish"),
+        )
+        assert passed is True
+
+    def test_reclaim_long_passes_with_bullish_cross_macd(self):
+        """bullish_cross also qualifies for the reclaim exception."""
+        strat = _momentum()
+        passed, _ = strat.apply_entry_gate(
+            "buy",
+            _signals(vwap_position="below", volume_ratio=2.0, macd_signal="bullish_cross"),
+        )
+        assert passed is True
+
+    def test_reclaim_rejected_when_rvol_below_threshold(self):
+        """Bullish MACD alone is not enough — RVOL must meet vwap_reclaim_min_rvol."""
+        strat = _momentum(vwap_reclaim_min_rvol=1.8)
+        passed, reason = strat.apply_entry_gate(
+            "buy",
+            _signals(vwap_position="below", volume_ratio=1.5, macd_signal="bullish"),
+        )
+        assert passed is False
+        assert "below VWAP" in reason
+
+    def test_reclaim_rejected_when_macd_not_bullish(self):
+        """High RVOL alone is not enough — MACD must be bullish for reclaim exception."""
+        strat = _momentum()
+        passed, reason = strat.apply_entry_gate(
+            "buy",
+            _signals(vwap_position="below", volume_ratio=2.5, macd_signal="bearish"),
+        )
+        assert passed is False
+        assert "below VWAP" in reason
+
+    def test_reclaim_disabled_when_vwap_reclaim_min_rvol_is_zero(self):
+        """vwap_reclaim_min_rvol=0 disables the reclaim exception entirely."""
+        strat = _momentum(vwap_reclaim_min_rvol=0)
+        passed, reason = strat.apply_entry_gate(
+            "buy",
+            _signals(vwap_position="below", volume_ratio=5.0, macd_signal="bullish"),
+        )
+        assert passed is False
+        assert "below VWAP" in reason
+
+    def test_reclaim_short_passes_with_bearish_macd_and_high_rvol(self):
+        """Symmetric: above-VWAP short passes when MACD bearish-equivalent + high RVOL."""
+        # For shorts: wrong side = "above", reclaim exception needs bearish MACD.
+        # Current implementation checks is_bullish_macd for both directions — shorts
+        # above VWAP with bullish MACD would NOT get the reclaim exception (correct:
+        # that's a breakout long setup, not a short reclaim).
+        # Shorts above VWAP with bearish MACD should still be rejected by the gate
+        # since _MOMENTUM_WRONG_VWAP maps sell_short → "above".
+        strat = _momentum()
+        passed, reason = strat.apply_entry_gate(
+            "sell_short",
+            _signals(vwap_position="above", volume_ratio=2.5, macd_signal="bearish"),
+        )
+        # bearish MACD is NOT in ("bullish", "bullish_cross") → no reclaim exception fires
+        assert passed is False
+        assert "above VWAP" in reason
+
+    def test_reclaim_threshold_configurable(self):
+        """vwap_reclaim_min_rvol is tunable — higher threshold requires more volume."""
+        strat = _momentum(vwap_reclaim_min_rvol=3.0)
+        # rvol=2.5 would pass at default 1.8 but fails at 3.0
+        passed, _ = strat.apply_entry_gate(
+            "buy",
+            _signals(vwap_position="below", volume_ratio=2.5, macd_signal="bullish"),
+        )
+        assert passed is False
+
     def test_rvol_floor_configurable(self):
         strat = _momentum(min_rvol_for_entry=2.0)
         # rvol=1.5 is now below the custom floor

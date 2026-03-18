@@ -362,17 +362,31 @@ class TestFetchNews:
         assert result[0]["publisher"] == "TestWire"
 
     @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
-    async def test_filters_items_older_than_24h(self, mock_ticker_cls):
+    async def test_filters_items_older_than_max_age_hours(self, mock_ticker_cls):
         mock_ticker = MagicMock()
         mock_ticker_cls.return_value = mock_ticker
-        # Mix: 2 recent, 2 older than 24h
+        # Mix: 2 recent (1h, 2h), 2 older (25h, 48h)
         mock_ticker.news = self._make_news_items([1.0, 25.0, 2.0, 48.0])
 
         adapter = YFinanceAdapter()
-        result = await adapter.fetch_news('AAPL', max_items=5)
+        # Explicit 24h window — only the two recent items pass
+        result = await adapter.fetch_news('AAPL', max_items=5, max_age_hours=24.0)
 
         assert len(result) == 2
         assert all(item["age_hours"] <= 24.0 for item in result)
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_extended_age_window_returns_older_news(self, mock_ticker_cls):
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        # 4 items: 1h, 25h, 2h, 48h — all within 168h
+        mock_ticker.news = self._make_news_items([1.0, 25.0, 2.0, 48.0])
+
+        adapter = YFinanceAdapter()
+        result = await adapter.fetch_news('AAPL', max_items=5, max_age_hours=168.0)
+
+        assert len(result) == 4
+        assert all(item["age_hours"] <= 168.0 for item in result)
 
     @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
     async def test_respects_max_items_cap(self, mock_ticker_cls):
@@ -439,3 +453,55 @@ class TestFetchNews:
         assert len(result) == 1
         assert "link" not in result[0]
         assert set(result[0].keys()) == {"title", "publisher", "age_hours"}
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_new_nested_schema_parsed_correctly(self, mock_ticker_cls):
+        """yfinance ≥ 0.2.54 returns nested content dicts with ISO-8601 pubDate."""
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        # New-style nested schema (pubDate 2h ago)
+        pub_iso = datetime.fromtimestamp(
+            time.time() - 2 * 3600, tz=timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        mock_ticker.news = [
+            {
+                "id": "abc-123",
+                "content": {
+                    "title": "NVDA GTC Keynote",
+                    "pubDate": pub_iso,
+                    "provider": {"displayName": "Yahoo Finance"},
+                },
+            }
+        ]
+
+        adapter = YFinanceAdapter()
+        result = await adapter.fetch_news('NVDA', max_items=5, max_age_hours=168.0)
+
+        assert len(result) == 1
+        assert result[0]["title"] == "NVDA GTC Keynote"
+        assert result[0]["publisher"] == "Yahoo Finance"
+        assert result[0]["age_hours"] == pytest.approx(2.0, abs=0.1)
+
+    @patch('ozymandias.data.adapters.yfinance_adapter.yf.Ticker')
+    async def test_new_schema_filtered_by_age(self, mock_ticker_cls):
+        """New nested schema items beyond the age window are still rejected."""
+        mock_ticker = MagicMock()
+        mock_ticker_cls.return_value = mock_ticker
+        old_iso = datetime.fromtimestamp(
+            time.time() - 200 * 3600, tz=timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        mock_ticker.news = [
+            {
+                "id": "old-1",
+                "content": {
+                    "title": "Stale headline",
+                    "pubDate": old_iso,
+                    "provider": {"displayName": "Reuters"},
+                },
+            }
+        ]
+
+        adapter = YFinanceAdapter()
+        result = await adapter.fetch_news('NVDA', max_items=5, max_age_hours=168.0)
+
+        assert result == []

@@ -368,7 +368,7 @@ Read the relevant phase section before modifying or debugging any module built i
 
 ---
 
-### Phase 16 — Direction Unification
+### Phase 12 — Direction Unification
 
 **`ozymandias/core/direction.py`** · spec *(not defined — post-MVP Phase 16)* · `core/direction.py`
 - **Spec:** *(not defined)*
@@ -395,7 +395,7 @@ Read the relevant phase section before modifying or debugging any module built i
 
 ---
 
-### Phase 17 — Strategy Modularity
+### Phase 13 — Strategy Modularity
 
 **`Strategy` ABC: 3 trait properties + `apply_entry_gate` abstract method** · spec *(not defined — post-MVP Phase 17)* · `strategies/base_strategy.py`
 - **Spec:** *(not defined)*
@@ -436,3 +436,72 @@ Read the relevant phase section before modifying or debugging any module built i
 - **Spec:** *(testing constraint)*
 - **Impl:** All `validate_entry` and `_check_market_hours` call sites updated to pass `blocks_eod_entries: bool` instead of the removed `strategy: str` parameter. Test `test_dead_zone_applies_to_swing_strategy` renamed to `test_dead_zone_applies_regardless_of_eod_flag`. Test names for momentum/swing last-5-min tests updated to reflect the boolean semantics.
 - **Why:** `validate_entry` API change required test updates.
+
+---
+
+### Phase 14 — Claude-Directed Entry Conditions
+
+**`evaluate_entry_conditions()` function** · spec *(not defined — post-MVP Phase 14)* · `intelligence/opportunity_ranker.py`
+- **Spec:** *(not defined)*
+- **Impl:** Module-level function `evaluate_entry_conditions(conditions, signals) -> tuple[bool, str]`. Checks five condition keys: `require_above_vwap`, `rsi_min`, `rsi_max`, `require_volume_ratio_min`, `require_macd_bullish`. Missing signal key → condition unmet, not exception. Empty or `None` conditions → `(True, "")` always. Extension point: add new condition keys here with no other changes.
+- **Why:** Context-blind TA gates apply identical thresholds to every symbol. Claude can now specify per-trade conditions calibrated to each name's regime (e.g. NVDA momentum RSI 52–72 vs a quieter name 48–65).
+
+**`ScoredOpportunity.entry_conditions`** · spec *(not defined)* · `intelligence/opportunity_ranker.py`
+- **Spec:** *(not defined)*
+- **Impl:** `entry_conditions: dict = field(default_factory=dict)` added to `ScoredOpportunity`. Populated from `opportunity.get("entry_conditions") or {}` in `score_opportunity()`. `None` from Claude output normalised to `{}`.
+- **Why:** Carries Claude's conditions through the ranker pipeline to `_medium_try_entry` intact without additional state.
+
+**`_medium_try_entry` entry gate** · spec *(not defined)* · `core/orchestrator.py`
+- **Spec:** *(not defined)*
+- **Impl:** After the PDT gate, before drift check and sizing. Reads `top.entry_conditions`, calls `evaluate_entry_conditions(entry_conds, self._latest_indicators.get(symbol, {}))`. Blocked entries log at INFO and return `False` (deferred to next cycle). Empty conditions = no-op. The caller's loop tries the next ranked candidate on `False` — a deferred entry does not block other candidates.
+- **Why:** `_latest_indicators` holds the freshest available signals from the most recent medium loop scan. Checking them here guarantees conditions are evaluated against current data, not Claude's 60-minute-old snapshot.
+
+**Prompt version `v3.4.0`** · spec *(not defined)* · `config/prompts/v3.4.0/reasoning.txt`, `config/config.json`
+- **Spec:** *(not defined)*
+- **Impl:** `v3.4.0/reasoning.txt` adds `entry_conditions` object to the `new_opportunities` schema and a FIELD INSTRUCTIONS bullet explaining per-key semantics. All other prompt files (`review.txt`, `watchlist.txt`, `thesis_challenge.txt`) copied unchanged from `v3.3.0`. `config.json` `claude.prompt_version` updated to `"v3.4.0"`.
+- **Why:** Claude ignores new output fields without explicit schema documentation and instructions.
+
+**Watchlist hard size cap** · spec *(not defined)* · `core/orchestrator.py`, `core/config.py`, `config/config.json`
+- **Spec:** *(not defined)*
+- **Impl:** `ClaudeConfig.watchlist_max_entries: int = 30` added. `_apply_watchlist_changes` enforces the cap after every Claude cycle (not just when changes are made). Pruning sorts by `max(compute_composite_score(raw, "long"), compute_composite_score(raw, "short"))` so bearish short setups score fairly. Open positions always protected. Newly-added symbols also protected for the cycle they are added — they have no `_latest_indicators` entry yet and would otherwise score `0.0` and be immediately evicted.
+- **Why:** Without a cap, watchlist grew unboundedly — `removal_candidate` field was never set and Claude's `remove` list rarely fired. The immediate-eviction bug was discovered by log inspection and fixed in the same session.
+
+**`_tier1_score` direction-agnostic sort** · spec *(not defined)* · `intelligence/claude_reasoning.py`
+- **Spec:** *(not defined)*
+- **Impl:** `_tier1_score()` previously returned `composite_technical_score` from `_latest_indicators`, which is always computed long-direction. Replaced with `max(compute_composite_score(raw, "long"), compute_composite_score(raw, "short"))` from raw signals when available. Falls back to cached score when signals absent.
+- **Why:** Strong bearish setups scored ~0.275 (long-direction) and were being trimmed from tier-1 before Claude could see them. A bearish COIN setup with RSI 42, MACD bullish, RVOL 2.4x scored 0.580 short-direction but was invisible to Claude. Fix ensures short candidates compete fairly for tier-1 context slots.
+
+**Entry conditions use single `ind` snapshot** · spec *(not defined)* · `core/orchestrator.py`
+- **Spec:** *(not defined)*
+- **Impl:** `_medium_try_entry` had two separate `_latest_indicators.get(symbol, {})` reads — one for price/drift at line ~1474 and one for condition evaluation at line ~1541. Consolidated to use the `ind` snapshot already captured at the top. No `await` between the reads so no actual async race existed, but a single read is the correct contract.
+- **Why:** Defensive correctness; also removes the confusing `current_sigs` local variable.
+
+**Log level promotions** · spec *(not defined)* · `core/orchestrator.py`
+- **Spec:** *(not defined)*
+- **Impl:** Three orchestrator log statements promoted from DEBUG to INFO: (1) "Medium loop: ranker returned N opportunities", (2) "Medium loop: entry blocked for %s — %s", (3) new INFO log at top of `_medium_try_entry` showing symbol/action/conviction/score/strategy on each entry attempt.
+- **Why:** Entry path was invisible at INFO level during paper trading. All three are normal operational events, not noise.
+
+**Test file placement fix** · spec *(testing constraint)* · `tests/test_entry_conditions.py` → `ozymandias/tests/test_entry_conditions.py`
+- **Spec:** *(testing constraint)*
+- **Impl:** `test_entry_conditions.py` was created in `tests/` (project root). `pytest.ini` sets `testpaths = ozymandias/tests`. Moved to `ozymandias/tests/`. Three tests in the file also had a stale `AccountInfo` constructor (missing `currency` and `account_id` fields added in a prior phase) — fixed.
+- **Why:** Tests in the wrong directory are silently uncollected; 22 new Phase 14 tests were not running.
+
+---
+
+### Post-Phase-14 Debug Fixes
+
+**VWAP reclaim exception in `MomentumStrategy.apply_entry_gate`** · `strategies/momentum_strategy.py`
+- **Impl:** New `_DEFAULT_PARAMS` key `vwap_reclaim_min_rvol: 1.8`. When `require_vwap_gate` fires (price on wrong side of VWAP), the rejection is bypassed if `macd_signal` is `"bullish"` or `"bullish_cross"` AND `volume_ratio >= vwap_reclaim_min_rvol`. Set to `0` to disable the exception.
+- **Why:** Log inspection found COIN rejected with MACD bullish + RVOL 2.4x. Being below VWAP with bullish MACD divergence and elevated volume is a VWAP reclaim setup — accumulation before reclaim — which is a valid momentum long entry. The binary VWAP gate had no exception for this case. 7 new tests in `test_strategy_traits.py`.
+
+**PDT gate respects equity floor** · `core/orchestrator.py`
+- **Impl:** Two fixes applied. (1) `_medium_try_entry` PDT early gate: wrapped in `if acct.equity < self._config.risk.min_equity_for_trading` — accounts above $25,500 skip the day trade count check entirely. (2) Slow loop context assembly: `pdt_remaining` computation wrapped in same equity check; uses `pdt_remaining = 3` unconditionally above the floor. Previously both paths counted day trades with no equity check, so well-capitalised accounts saw `pdt_trades_remaining: 0` in Claude's context and `PDT block` log lines during momentum entry attempts.
+- **Why:** FINRA PDT rules only apply below $25,500 equity. Above that level the broker permits unlimited day trades regardless of PDT flag or local trade count. Log showed broker=38, local=10 day trades, causing the gate to block all momentum entries on a $30k paper account. 2 new integration tests in `TestPDTBlocking`.
+
+**Signal context persisted through bot restarts** · `core/state_manager.py`, `core/orchestrator.py`
+- **Impl:** Three new fields added to `TradeIntention`: `entry_signals: dict`, `entry_conviction: float`, `entry_score: float`. `_from_dict_position` updated to deserialize them. `_register_opening_fill` writes these fields from `_entry_contexts` at the moment the position is created in `portfolio.json`. `startup_reconciliation` restores `_entry_contexts` from open positions' `TradeIntention` fields at boot. `_journal_closed_trade` falls back to `TradeIntention` fields if `_entry_contexts` is empty (e.g. restart occurred between fill and close).
+- **Why:** `_entry_contexts` and `_pending_intentions` are in-memory dicts. Every trade in the journal showed `signals_at_entry: {}`, `claude_conviction: 0.0`, `composite_score: 0.0` because the bot was restarted between entry and exit in every recorded session. Phase 15's execution stats context feature reads `claude_conviction` from journal entries — without this fix all conviction values would be 0. 2 new tests in `TestRegisterOpeningFill`.
+
+**Partial fill race: adoption guard in `_fast_step_position_sync`** · `core/orchestrator.py`
+- **Impl:** Added an in-flight order guard to the untracked-position adoption block in `_fast_step_position_sync`. Before adopting a broker position that isn't in local portfolio, checks `_fill_protection.get_orders_for_symbol()` for any PENDING or PARTIALLY_FILLED order on that symbol. If found, skips adoption with a DEBUG log — the fill handler will register the position with full intention when the order completes.
+- **Why:** Log showed CVX override exit 6 minutes after a swing entry. Root cause: partial fill (5/24 shares) arrived 0.7s after order placement, triggering position sync before `_register_opening_fill` could run. Position sync adopted the 5-share position (consuming `_pending_intentions["CVX"]`). When the full fill arrived, `_dispatch_confirmed_fill` saw an existing CVX position → routed as close → journaled with pnl=0.00%. After 60s cooldown, position was re-adopted without intention (`strategy="unknown"`). Override check's fallback from "unknown" to `self._strategies[0]` (MomentumStrategy) caused `roc_deceleration` to fire on a swing position. Fix prevents the adoption, keeping `_pending_intentions` intact for `_register_opening_fill`. 1 new regression test `test_skips_adoption_when_opening_order_in_flight` in `TestPositionSyncQtyCorrection`.

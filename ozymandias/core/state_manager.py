@@ -51,6 +51,11 @@ class TradeIntention:
     max_expected_loss: float = 0.0
     entry_date: str = ""               # ISO date string
     review_notes: list[str] = field(default_factory=list)
+    # Signal context captured at entry — persisted here so it survives bot restarts.
+    # Used by the trade journal when the position closes; also feeds Phase 15 execution stats.
+    entry_signals: dict = field(default_factory=dict)
+    entry_conviction: float = 0.0
+    entry_score: float = 0.0
 
 
 @dataclass
@@ -145,6 +150,9 @@ def _from_dict_position(d: dict) -> Position:
         max_expected_loss=intention_raw.get("max_expected_loss", 0.0),
         entry_date=intention_raw.get("entry_date", ""),
         review_notes=intention_raw.get("review_notes", []),
+        entry_signals=intention_raw.get("entry_signals", {}),
+        entry_conviction=intention_raw.get("entry_conviction", 0.0),
+        entry_score=intention_raw.get("entry_score", 0.0),
     )
     return Position(
         symbol=d["symbol"],

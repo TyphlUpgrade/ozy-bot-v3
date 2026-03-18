@@ -687,6 +687,39 @@ class TestSlowLoopStateApplication:
         assert "AAPL" in symbols
 
     @pytest.mark.asyncio
+    async def test_newly_added_symbols_not_pruned_same_cycle(self, orch):
+        """Symbols added by Claude must survive the cap prune in the same cycle.
+
+        Newly-added symbols have no _latest_indicators entry yet (first medium
+        loop scan hasn't run), so their prune score is 0.0. Without protection
+        they would be immediately evicted — defeating the purpose of the add.
+        """
+        # Fill watchlist to the cap with symbols that have no indicator data
+        # (score=0.0 for all), so the cap will be triggered after the add.
+        cap = orch._config.claude.watchlist_max_entries
+        existing = [f"SYM{i:02d}" for i in range(cap)]
+        await _set_watchlist(orch, tier1=existing)
+        wl = await orch._state_manager.load_watchlist()
+        assert len(wl.entries) == cap
+
+        # No indicator data for anyone — fair fight (all score 0.0)
+        orch._latest_indicators = {}
+
+        # Claude adds two new symbols
+        add_list = [
+            {"symbol": "AAPL", "reason": "catalyst", "priority_tier": 1},
+            {"symbol": "MSFT", "reason": "catalyst", "priority_tier": 1},
+        ]
+        await orch._apply_watchlist_changes(wl, add_list, [])
+
+        saved = await orch._state_manager.load_watchlist()
+        symbols = {e.symbol for e in saved.entries}
+
+        assert "AAPL" in symbols, "Newly-added AAPL was pruned in same cycle"
+        assert "MSFT" in symbols, "Newly-added MSFT was pruned in same cycle"
+        assert len(saved.entries) == cap, f"Should still be at cap={cap}, got {len(saved.entries)}"
+
+    @pytest.mark.asyncio
     async def test_apply_watchlist_no_duplicate_add(self, orch):
         await _set_watchlist(orch, tier1=["AAPL"])
         wl = await orch._state_manager.load_watchlist()
@@ -1084,6 +1117,60 @@ class TestRegisterOpeningFill:
         assert abs(ctx.get("claude_conviction", 0) - 0.82) < 0.001
 
     @pytest.mark.asyncio
+    async def test_signal_context_persisted_in_trade_intention(self, orch):
+        """Signal context is written into TradeIntention so it survives restarts."""
+        orch._pending_intentions["AMD"] = {
+            "stop": 194.0, "target": 205.0, "strategy": "swing",
+            "direction": "long", "reasoning": "r",
+            "_signals": {"rsi": 62.0}, "_claude_conviction": 0.82, "_composite_score": 0.73,
+        }
+        await orch._register_opening_fill(self._make_change())
+        portfolio = await orch._state_manager.load_portfolio()
+        pos = portfolio.positions[0]
+        assert pos.intention.entry_signals == {"rsi": 62.0}
+        assert abs(pos.intention.entry_conviction - 0.82) < 0.001
+        assert abs(pos.intention.entry_score - 0.73) < 0.001
+
+    @pytest.mark.asyncio
+    async def test_entry_contexts_restored_at_startup(self, orch):
+        """startup_reconciliation restores _entry_contexts from TradeIntention on open positions.
+
+        This is the restart-survival path: signals written to portfolio.json at fill time
+        are read back into _entry_contexts so the journal records real values, not zeros.
+        """
+        from ozymandias.core.state_manager import ExitTargets, TradeIntention
+        pos = Position(
+            symbol="NVDA", shares=10.0, avg_cost=900.0,
+            entry_date=datetime.now(timezone.utc).isoformat(),
+            intention=TradeIntention(
+                strategy="momentum", direction="long",
+                exit_targets=ExitTargets(stop_loss=880.0, profit_target=930.0),
+                entry_signals={"rsi": 58.0, "volume_ratio": 1.4},
+                entry_conviction=0.77,
+                entry_score=0.68,
+            ),
+        )
+        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
+
+        # Simulate a fresh start: _entry_contexts is empty
+        orch._entry_contexts.clear()
+
+        # Mock broker to report the same position so reconciliation passes
+        from ozymandias.execution.broker_interface import BrokerPosition
+        orch._broker.get_positions = AsyncMock(return_value=[
+            BrokerPosition(symbol="NVDA", qty=10.0, avg_entry_price=900.0,
+                           current_price=900.0, market_value=9000.0,
+                           unrealized_pl=0.0, side="long")
+        ])
+
+        await orch.startup_reconciliation()
+
+        ctx = orch._entry_contexts.get("NVDA", {})
+        assert ctx.get("signals") == {"rsi": 58.0, "volume_ratio": 1.4}
+        assert abs(ctx.get("claude_conviction", 0) - 0.77) < 0.001
+        assert abs(ctx.get("composite_score", 0) - 0.68) < 0.001
+
+    @pytest.mark.asyncio
     async def test_no_duplicate_if_position_already_exists(self, orch):
         """Duplicate fill event: guard prevents second position."""
         from ozymandias.core.state_manager import ExitTargets, TradeIntention
@@ -1466,6 +1553,116 @@ class TestApplyPositionReviewsExit:
 
         orch._broker.place_order.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_swing_exit_blocked_within_min_hold_window(self, orch):
+        """Swing exit recommended by Claude is blocked if position held < swing_min_hold_hours."""
+        from ozymandias.core.state_manager import ExitTargets
+
+        # Entry 30 minutes ago — well within 4h minimum hold
+        entry_dt = datetime.now(timezone.utc) - timedelta(minutes=30)
+        pos = Position(
+            symbol="XOM", shares=31.0, avg_cost=159.78,
+            entry_date=entry_dt.isoformat(),
+            intention=TradeIntention(
+                strategy="swing", direction="long",
+                exit_targets=ExitTargets(profit_target=166.0, stop_loss=155.2),
+            ),
+        )
+        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
+        portfolio = await orch._state_manager.load_portfolio()
+
+        orch._config.strategy.swing_min_hold_hours = 4.0
+        orch._broker.place_order = AsyncMock()
+
+        reviews = [{"symbol": "XOM", "action": "exit",
+                    "updated_reasoning": "MACD bearish cross — exit now."}]
+        await orch._apply_position_reviews(portfolio, reviews)
+
+        orch._broker.place_order.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_swing_exit_allowed_after_min_hold_window(self, orch):
+        """Swing exit is allowed once swing_min_hold_hours have elapsed."""
+        from ozymandias.core.state_manager import ExitTargets
+        from ozymandias.execution.broker_interface import OrderResult
+
+        # Entry 5 hours ago — beyond 4h minimum hold
+        entry_dt = datetime.now(timezone.utc) - timedelta(hours=5)
+        pos = Position(
+            symbol="XOM", shares=31.0, avg_cost=159.78,
+            entry_date=entry_dt.isoformat(),
+            intention=TradeIntention(
+                strategy="swing", direction="long",
+                exit_targets=ExitTargets(profit_target=166.0, stop_loss=155.2),
+            ),
+        )
+        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
+        portfolio = await orch._state_manager.load_portfolio()
+
+        orch._config.strategy.swing_min_hold_hours = 4.0
+        orch._broker.place_order = AsyncMock(return_value=OrderResult(
+            order_id="exit-swing", status="pending_new",
+            submitted_at=datetime.now(timezone.utc),
+        ))
+        orch._fill_protection.record_order = AsyncMock()
+
+        reviews = [{"symbol": "XOM", "action": "exit",
+                    "updated_reasoning": "Target reached — exit."}]
+        await orch._apply_position_reviews(portfolio, reviews)
+
+        orch._broker.place_order.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_unknown_strategy_exit_blocked_within_min_hold_window(self, orch):
+        """Adopted positions (strategy='unknown') are protected by the swing min-hold gate."""
+        entry_dt = datetime.now(timezone.utc) - timedelta(minutes=20)
+        pos = Position(
+            symbol="XLE", shares=85.0, avg_cost=58.88,
+            entry_date=entry_dt.isoformat(),
+            intention=TradeIntention(strategy="unknown", direction="long"),
+        )
+        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
+        portfolio = await orch._state_manager.load_portfolio()
+
+        orch._config.strategy.swing_min_hold_hours = 4.0
+        orch._broker.place_order = AsyncMock()
+
+        reviews = [{"symbol": "XLE", "action": "exit", "updated_reasoning": "Exit."}]
+        await orch._apply_position_reviews(portfolio, reviews)
+
+        orch._broker.place_order.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_momentum_exit_not_blocked_by_swing_gate(self, orch):
+        """Momentum exits are NOT subject to the swing minimum hold gate."""
+        from ozymandias.core.state_manager import ExitTargets
+        from ozymandias.execution.broker_interface import OrderResult
+
+        # Entry only 5 minutes ago — would be blocked for swing, not for momentum
+        entry_dt = datetime.now(timezone.utc) - timedelta(minutes=5)
+        pos = Position(
+            symbol="NVDA", shares=10.0, avg_cost=900.0,
+            entry_date=entry_dt.isoformat(),
+            intention=TradeIntention(
+                strategy="momentum", direction="long",
+                exit_targets=ExitTargets(profit_target=920.0, stop_loss=888.0),
+            ),
+        )
+        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
+        portfolio = await orch._state_manager.load_portfolio()
+
+        orch._config.strategy.swing_min_hold_hours = 4.0
+        orch._broker.place_order = AsyncMock(return_value=OrderResult(
+            order_id="exit-mom", status="pending_new",
+            submitted_at=datetime.now(timezone.utc),
+        ))
+        orch._fill_protection.record_order = AsyncMock()
+
+        reviews = [{"symbol": "NVDA", "action": "exit", "updated_reasoning": "Override exit."}]
+        await orch._apply_position_reviews(portfolio, reviews)
+
+        orch._broker.place_order.assert_called_once()
+
 
 # ===========================================================================
 # Ghost cleanup avg_cost fallback — Bug #8 (2026-03-16)
@@ -1827,6 +2024,57 @@ class TestPositionSyncQtyCorrection:
         portfolio = await orch._state_manager.load_portfolio()
         # Shares must remain positive so exit order quantity= works correctly
         assert portfolio.positions[0].shares == 9.0
+
+    @pytest.mark.asyncio
+    async def test_skips_adoption_when_opening_order_in_flight(self, orch):
+        """
+        Regression: partial fill race.
+
+        When a PARTIALLY_FILLED buy order is in flight, position_sync sees the
+        broker position before _register_opening_fill runs. It must NOT adopt —
+        adoption consumes _pending_intentions early, causing the final fill to be
+        routed as a close (strategy="unknown" re-adoption bug).
+        """
+        from ozymandias.core.state_manager import OrderRecord
+        from ozymandias.execution.broker_interface import BrokerPosition
+
+        # Active buy order for CVX — simulates a partially-filled entry order
+        buy_record = OrderRecord(
+            order_id="buy_001", symbol="CVX", side="buy",
+            quantity=24, order_type="limit", limit_price=200.55,
+            status="PARTIALLY_FILLED",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            last_checked_at=datetime.now(timezone.utc).isoformat(),
+        )
+        await orch._fill_protection.record_order(buy_record)
+
+        # Store the pending intention (simulates _medium_try_entry having run)
+        orch._pending_intentions["CVX"] = {
+            "strategy": "swing", "direction": "long",
+            "stop": 195.5, "target": 208.0, "reasoning": "energy breakout",
+            "_signals": {}, "_claude_conviction": 0.65, "_composite_score": 0.49,
+        }
+
+        # Broker reports 5 shares (the partial fill) — local portfolio is empty
+        orch._broker.get_positions = AsyncMock(return_value=[
+            BrokerPosition(
+                symbol="CVX", qty=5.0, avg_entry_price=200.55,
+                current_price=200.55, market_value=1002.75, unrealized_pl=0.0,
+            )
+        ])
+
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            await orch._fast_step_position_sync()
+
+        # Position must NOT have been adopted — fill handler will register it properly
+        portfolio = await orch._state_manager.load_portfolio()
+        assert not any(p.symbol == "CVX" for p in portfolio.positions), (
+            "CVX was adopted during partial fill despite having an in-flight buy order"
+        )
+        # _pending_intentions must still be intact for _register_opening_fill to use
+        assert "CVX" in orch._pending_intentions, (
+            "_pending_intentions was consumed prematurely — full fill would get strategy='unknown'"
+        )
 
     @pytest.mark.asyncio
     async def test_defers_ghost_cleanup_when_exit_order_pending(self, orch):

@@ -73,8 +73,9 @@ class ClaudeConfig:
     prompt_version: str = "v3.3.0"            # versioned subdirectory under config/prompts/ loaded for all templates
     tier1_max_symbols: int = 12               # max tier-1 watchlist symbols passed to Claude with full indicator detail
     tier2_max_symbols: int = 28               # max tier-2 symbols passed as watchlist replenishment candidates
+    watchlist_max_entries: int = 30           # hard cap on total watchlist entries; lowest-scoring entries pruned first; open positions always protected
     max_reasoning_interval_min: int = 60      # time-ceiling trigger: Claude runs at least this often during market hours
-    news_max_age_hours: int = 168             # secondary age gate for watchlist_news in Claude context (7 days); adapter pre-filters to 24h
+    news_max_age_hours: int = 168             # age gate for watchlist_news passed to Claude; adapter filters to this window (default 7 days)
     news_max_items_per_symbol: int = 3        # headline cap per symbol sent to Claude; controls token budget
 
 
@@ -111,6 +112,7 @@ class StrategyConfig:
     strategy_params: dict[str, dict] = field(default_factory=dict)
     # Maps strategy name → param overrides dict.  Add one entry here per new strategy;
     # no code changes needed.  Example: {"momentum": {"min_rvol": 1.2}, "scalp": {...}}
+    swing_min_hold_hours: float = 4.0  # block Claude review exits for swing positions held less than this many hours; prevents same-session exits on intraday signal noise
 
 
 @dataclass

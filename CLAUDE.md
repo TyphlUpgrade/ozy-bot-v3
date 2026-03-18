@@ -103,10 +103,10 @@ Features not described in the spec may be requested. When implementing them, fol
 
 ## Post-MVP Status
 
-All 10 spec phases complete per `ozymandias_v3_spec_revised.md`. Post-MVP phases (11–16) are addressing architectural gaps discovered during paper trading.
+All 10 spec phases complete per `ozymandias_v3_spec_revised.md`. Post-MVP phases (11–18) are addressing architectural gaps discovered during paper trading.
 
 Last spec phase completed: Phase 10 (March 15)
-Last post-MVP phase completed: *(none yet — see roadmap below)*
+Last post-MVP phase completed: Phase 14 — Claude-Directed Entry Conditions (March 18)
 
 ### Completed post-MVP work
 - **Anti-bias hardening** (March 15): conviction sanity floor, `rejected_opportunities` logging,
@@ -115,24 +115,45 @@ Last post-MVP phase completed: *(none yet — see roadmap below)*
   short direction inference, fill dispatch routing, ghost cleanup race, test isolation,
   cash sync, exit price fallback, PDT broker floor (see BUGS_2026-03-16.md)
 - **Index ticker blacklist + dead field cleanup** (March 16): Anomalies 10 + 12 fixed
-- **Short-entry unblocking** (March 17): geometry-agnostic RAR, direction-aware VWAP/trend filters
-  via lookup tables, direction-aware `compute_composite_score` — shorts were silently scoring ~0.10
-  and failing the 0.30 tech-score floor; now score correctly against bearish signal strength
+- **Phase 11 — Execution Fidelity** (March 16): see `phases/11_execution_fidelity.md`
+- **Phase 12 — Direction Unification** (March 17): canonical `Direction` type + all cross-convention
+  mappings in `core/direction.py`; geometry-agnostic RAR, direction-aware VWAP/trend filters,
+  direction-aware `compute_composite_score` — shorts now score correctly against bearish signals
+- **Phase 13 — Strategy Modularity** (March 17): `is_intraday`/`uses_market_orders`/`blocks_eod_entries`
+  traits + `apply_entry_gate()` abstract method on Strategy ABC; `_build_strategies()` uses registry;
+  `StrategyConfig.strategy_params: dict[str,dict]` replaces per-strategy fields;
+  adding a new strategy now requires only 2 files
+- **Phase 14 — Claude-Directed Entry Conditions** (March 18): `entry_conditions` field in Claude
+  prompt and `ScoredOpportunity`; `evaluate_entry_conditions()` in ranker; medium loop defers
+  entries when live signals fail Claude's per-trade TA gates
 
-### Post-MVP Roadmap: Phases 11–16
+### Post-MVP Roadmap: Phases 15–18
 
-- **Phase 11 — Execution Fidelity**: see `phases/11_execution_fidelity.md`
-- **Phase 12 — Claude-Directed Entry Conditions**: see `phases/12_claude_directed_entry_conditions.md`
-- **Phase 13 — Context Enrichment**: see `phases/13_context_enrichment.md`
-  - *Additions:* execution statistics digest for Claude calibration; watchlist `expected_direction`
-    tagging with direction-adjusted TA scores in context
-- **Phase 14 — Short Position Protection**: see `phases/14_short_protection.md`
-  - *Additions:* `roc_negative_deceleration` signal (closes short TA scoring gap); ATR-based
-    position size cap in `_medium_try_entry`
-- **Phase 15 — Context Compression**: see `phases/15_context_compression.md`
-- **Phase 16 — Direction Unification**: see `phases/16_direction_unification.md`
-  - Canonical `Direction` type + all cross-convention mappings in `core/direction.py`;
-    migrates all ad-hoc `action == "sell_short"` checks to a single importable module
+**Implementation order: 16 → 15 → 17 → 18.** Phase 16 must precede Phase 15 because Phase 15's
+`ta_readiness` dict is a pass-through of `indicators[symbol]["signals"]` — all Phase 16 pattern
+signals appear in Claude's context automatically once Phase 15 is implemented.
+
+- **Phase 16 — Pattern Signal Layer + Short Protection** *(implement first)*:
+  see `phases/16_short_protection.md`
+  - *TA pattern signals:* `roc_negative_deceleration`, `rsi_slope_5`, `macd_histogram_expanding`,
+    `bb_squeeze`, `volume_trend_bars` — gives the bot velocity/trajectory awareness; all signals
+    are snapshot-free and flow automatically to strategies, `ta_readiness`, and `entry_conditions`
+  - *Momentum gate fix:* slope-aware RSI ceiling in `MomentumStrategy._evaluate_entry_conditions`;
+    `rsi_max_absolute` (78) and `rsi_slope_threshold` (2.0) configurable — closes the INTC-class
+    rejected-entry bug (RSI 73 climbing blocked by static ceiling)
+  - *Short protection:* fast-loop ATR trailing stop + VWAP crossover exit for short positions;
+    EOD forced close for momentum shorts; `_recently_closed` persisted through restarts
+  - *Position sizing:* ATR-based position size cap in `_medium_try_entry`
+- **Phase 15 — Context Enrichment** *(implement after Phase 16)*:
+  see `phases/15_context_enrichment.md`
+  - *Additions:* `ta_readiness` structured dict (replaces `technical_summary` string) exposes all
+    Phase 16 signals to Claude; execution statistics digest for conviction calibration; watchlist
+    `expected_direction` tagging with direction-adjusted composite scores; pending entry visibility;
+    session execution history
+- **Phase 17 — Context Compression**: see `phases/17_context_compression.md`
+- **Phase 18 — Watchlist Intelligence**: see `phases/18_watchlist_intelligence.md`
+  - Dynamic universe (Yahoo Finance screener + Wikipedia indices), RVOL-ranked candidates,
+    Brave Search tool use for Claude to research catalysts at watchlist build time
 
 ## Spec Drift Log
 See `DRIFT_LOG.md`. Read the relevant phase section of DRIFT_LOG.md before modifying or debugging any module built in a previous phase.

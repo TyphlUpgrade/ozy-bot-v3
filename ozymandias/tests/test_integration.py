@@ -469,6 +469,109 @@ class TestPDTBlocking:
         )
         assert allowed_emergency, f"Emergency should allow but got: {reason}"
 
+    @pytest.mark.asyncio
+    async def test_pdt_gate_bypassed_above_equity_floor(self, orch):
+        """Orchestrator PDT gate must NOT block entries when equity >= min_equity_for_trading.
+
+        Above $25,500 FINRA PDT rules don't apply — the broker permits unlimited
+        day trades regardless of PDT flag or local trade count.
+        """
+        from ozymandias.core.market_hours import Session
+        from ozymandias.strategies.momentum_strategy import MomentumStrategy
+
+        # Equity well above PDT floor; trade count irrelevant above floor
+        above_floor = _stub_account(equity=50_000.0, buying_power=80_000.0)
+        orch._broker.get_account = AsyncMock(return_value=above_floor)
+
+        # Exhaust all 3 day trades locally
+        ts = self._TRADE_DATE
+        orders = (
+            self._filled_round_trip("SYM1", "dt1") +
+            self._filled_round_trip("SYM2", "dt2") +
+            self._filled_round_trip("SYM3", "dt3")
+        )
+        orch._broker.get_open_orders = AsyncMock(return_value=orders)
+
+        bars = _make_bars(60, base_price=200.0)
+        orch._data_adapter = MagicMock()
+        orch._data_adapter.fetch_bars = AsyncMock(return_value=bars)
+        orch._data_adapter.fetch_news = AsyncMock(return_value=[])
+
+        orch._claude._client.messages.create = AsyncMock(
+            return_value=_mock_claude_response(price=200.0, symbol="NVDA")
+        )
+        await _seed_watchlist(orch, ["NVDA"] * 11, tier=1)
+        await _seed_portfolio(orch, [])
+
+        orch._risk_manager._dead_zone_start = dtime(0, 0)
+        orch._risk_manager._dead_zone_end   = dtime(0, 1)
+
+        with (
+            patch("ozymandias.core.orchestrator.is_market_open", return_value=True),
+            patch("ozymandias.execution.risk_manager.get_current_session",
+                  return_value=Session.REGULAR_HOURS),
+        ):
+            orch._trigger_state.last_claude_call_utc = (
+                datetime.now(timezone.utc) - timedelta(hours=2)
+            )
+            await orch._slow_loop_cycle()
+            await orch._medium_loop_cycle()
+
+        # Order should have been placed — PDT gate must not have blocked it
+        assert orch._broker.place_order.called, (
+            "Entry was blocked despite equity above PDT floor — "
+            "PDT gate incorrectly applied to well-capitalised account"
+        )
+
+    @pytest.mark.asyncio
+    async def test_pdt_gate_blocks_below_equity_floor(self, orch):
+        """Orchestrator PDT gate MUST block intraday entries when equity < min_equity_for_trading
+        and day trades are exhausted."""
+        from ozymandias.core.market_hours import Session
+
+        # Equity below PDT floor
+        below_floor = _stub_account(equity=24_000.0, buying_power=40_000.0)
+        orch._broker.get_account = AsyncMock(return_value=below_floor)
+
+        # Exhaust all buffered day trades locally (3 round-trips, buffer=1 → 0 remaining)
+        ts = self._TRADE_DATE
+        orders = (
+            self._filled_round_trip("SYM1", "dt1") +
+            self._filled_round_trip("SYM2", "dt2") +
+            self._filled_round_trip("SYM3", "dt3")
+        )
+        orch._broker.get_open_orders = AsyncMock(return_value=orders)
+
+        bars = _make_bars(60, base_price=200.0)
+        orch._data_adapter = MagicMock()
+        orch._data_adapter.fetch_bars = AsyncMock(return_value=bars)
+        orch._data_adapter.fetch_news = AsyncMock(return_value=[])
+
+        orch._claude._client.messages.create = AsyncMock(
+            return_value=_mock_claude_response(price=200.0, symbol="NVDA")
+        )
+        await _seed_watchlist(orch, ["NVDA"] * 11, tier=1)
+        await _seed_portfolio(orch, [])
+
+        orch._risk_manager._dead_zone_start = dtime(0, 0)
+        orch._risk_manager._dead_zone_end   = dtime(0, 1)
+
+        with (
+            patch("ozymandias.core.orchestrator.is_market_open", return_value=True),
+            patch("ozymandias.execution.risk_manager.get_current_session",
+                  return_value=Session.REGULAR_HOURS),
+        ):
+            orch._trigger_state.last_claude_call_utc = (
+                datetime.now(timezone.utc) - timedelta(hours=2)
+            )
+            await orch._slow_loop_cycle()
+            await orch._medium_loop_cycle()
+
+        # Order must NOT have been placed — PDT gate should block momentum below floor
+        assert not orch._broker.place_order.called, (
+            "PDT gate failed to block intraday entry on under-capitalised account"
+        )
+
 
 # ===========================================================================
 # Test 4: Degradation

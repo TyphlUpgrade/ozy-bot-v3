@@ -29,6 +29,7 @@ import anthropic
 from ozymandias.core.config import ClaudeConfig, Config
 from ozymandias.core.reasoning_cache import ReasoningCache
 from ozymandias.core.state_manager import PortfolioState, Position, WatchlistState
+from ozymandias.intelligence.technical_analysis import compute_composite_score
 
 log = logging.getLogger(__name__)
 
@@ -290,12 +291,22 @@ class ClaudeReasoningEngine:
                 if current_price is not None
                 else None
             )
+            entry_date_str = pos.intention.entry_date or pos.entry_date
+            try:
+                from datetime import datetime, timezone as _tz
+                entry_dt = datetime.fromisoformat(entry_date_str)
+                hold_hours = round(
+                    (datetime.now(_tz.utc) - entry_dt).total_seconds() / 3600, 1
+                )
+            except Exception:
+                hold_hours = None
             position_entries.append({
                 "symbol": pos.symbol,
                 "shares": pos.shares,
                 "avg_cost": pos.avg_cost,
                 "current_price": current_price,
                 "unrealized_pnl": unrealized_pnl,
+                "hold_hours": hold_hours,
                 "intention": {
                     "catalyst": pos.intention.catalyst,
                     "direction": pos.intention.direction,
@@ -307,7 +318,7 @@ class ClaudeReasoningEngine:
                         "stop_loss": pos.intention.exit_targets.stop_loss,
                     },
                     "max_expected_loss": pos.intention.max_expected_loss,
-                    "entry_date": pos.intention.entry_date or pos.entry_date,
+                    "entry_date": entry_date_str,
                     "review_notes": pos.intention.review_notes[-3:],
                 },
             })
@@ -324,9 +335,18 @@ class ClaudeReasoningEngine:
 
         def _tier1_score(entry) -> float:
             ind = indicators.get(entry.symbol, {})
-            # Handle both flat (_latest_indicators) and nested (generate_signal_summary) formats
-            return ind.get("composite_technical_score") \
-                or ind.get("signals", {}).get("composite_technical_score", 0.0)
+            # Use raw signals when available so bearish short setups score on their
+            # actual short-direction strength.  WatchlistEntry has no direction field
+            # yet (added in Phase 15), so take max(long, short) — this correctly
+            # prioritises any strongly-directional setup regardless of which way it
+            # leans without requiring a schema change here.
+            raw = ind.get("signals") or {}
+            if raw:
+                return max(
+                    compute_composite_score(raw, direction="long"),
+                    compute_composite_score(raw, direction="short"),
+                )
+            return ind.get("composite_technical_score", 0.0)
 
         tier1_watch = sorted(all_tier1, key=_tier1_score, reverse=True)[:slots]
 

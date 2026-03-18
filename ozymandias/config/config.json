@@ -16,7 +16,7 @@
     "min_equity_for_trading": 25500
   },
   "scheduler": {
-    "bypass_market_hours": true,
+    "bypass_market_hours": false,
     "fast_loop_sec": 10,
     "medium_loop_sec": 120,
     "slow_loop_check_sec": 300,
@@ -31,7 +31,7 @@
   "claude": {
     "model": "claude-sonnet-4-20250514",
     "max_tokens_per_cycle": 4096,
-    "prompt_version": "v3.3.0",
+    "prompt_version": "v3.4.0",
     "tier1_max_symbols": 12,
     "tier2_max_symbols": 28,
     "news_max_age_hours": 168,
@@ -68,6 +68,7 @@
   },
   "strategy": {
     "active_strategies": ["momentum", "swing"],
+    "swing_min_hold_hours": 4.0,
     "strategy_params": {
       "momentum": {
         "min_vol_regime_ratio": 0.85,

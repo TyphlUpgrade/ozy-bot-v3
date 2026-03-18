@@ -64,6 +64,7 @@ class ScoredOpportunity:
     position_size_pct: float    # fraction of portfolio (e.g. 0.10 = 10%)
     reasoning: str
     require_strong_entry: bool = False  # if True, raise min_signals_for_entry by 1 for this trade
+    entry_conditions: dict = field(default_factory=dict)  # Claude's per-trade TA gate; empty = no check
 
 
 @dataclass
@@ -74,6 +75,81 @@ class ExitAction:
     urgency: float              # 0.0 – 1.0 (higher = act sooner)
     reasoning: str
     adjusted_targets: dict | None = None  # {"profit_target": ..., "stop_loss": ...}
+
+
+# ---------------------------------------------------------------------------
+# Entry conditions evaluator (Phase 14)
+# ---------------------------------------------------------------------------
+
+def evaluate_entry_conditions(conditions: dict | None, signals: dict) -> tuple[bool, str]:
+    """Check Claude's per-trade entry conditions against current live signals.
+
+    Parameters
+    ----------
+    conditions:
+        The ``entry_conditions`` dict from a Claude opportunity.  May be
+        ``None`` or empty — either case returns ``(True, "")``.
+    signals:
+        Flat signals dict from ``_latest_indicators[symbol]`` (same shape as
+        ``generate_signal_summary()["signals"]``).
+
+    Returns
+    -------
+    ``(True, "")`` if all specified conditions are satisfied.
+    ``(False, reason)`` on the first failing condition.
+
+    If a required signal key is absent from *signals*, the condition is
+    treated as unmet: ``(False, "signal '<key>' unavailable")``.
+
+    Extension point: to add a new condition key, add one branch below.
+    """
+    if not conditions:
+        return True, ""
+
+    # require_above_vwap ---------------------------------------------------
+    if conditions.get("require_above_vwap"):
+        val = signals.get("vwap_position")
+        if val is None:
+            return False, "signal 'vwap_position' unavailable"
+        if val != "above":
+            return False, f"require_above_vwap not met: vwap_position={val!r}"
+
+    # rsi_min --------------------------------------------------------------
+    if "rsi_min" in conditions:
+        val = signals.get("rsi")
+        if val is None:
+            return False, "signal 'rsi' unavailable"
+        if float(val) < float(conditions["rsi_min"]):
+            return False, f"rsi_min not met: RSI {float(val):.1f} < {float(conditions['rsi_min']):.1f}"
+
+    # rsi_max --------------------------------------------------------------
+    if "rsi_max" in conditions:
+        val = signals.get("rsi")
+        if val is None:
+            return False, "signal 'rsi' unavailable"
+        if float(val) > float(conditions["rsi_max"]):
+            return False, f"rsi_max exceeded: RSI {float(val):.1f} > {float(conditions['rsi_max']):.1f}"
+
+    # require_volume_ratio_min ---------------------------------------------
+    if "require_volume_ratio_min" in conditions:
+        val = signals.get("volume_ratio")
+        if val is None:
+            return False, "signal 'volume_ratio' unavailable"
+        if float(val) < float(conditions["require_volume_ratio_min"]):
+            return False, (
+                f"require_volume_ratio_min not met: "
+                f"volume_ratio {float(val):.2f} < {float(conditions['require_volume_ratio_min']):.2f}"
+            )
+
+    # require_macd_bullish -------------------------------------------------
+    if conditions.get("require_macd_bullish"):
+        val = signals.get("macd_signal")
+        if val is None:
+            return False, "signal 'macd_signal' unavailable"
+        if val not in ("bullish", "bullish_cross"):
+            return False, f"require_macd_bullish not met: macd_signal={val!r}"
+
+    return True, ""
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +295,7 @@ class OpportunityRanker:
             position_size_pct=float(opportunity.get("position_size_pct", 0.05)),
             reasoning=opportunity.get("reasoning", ""),
             require_strong_entry=bool(opportunity.get("require_strong_entry", False)),
+            entry_conditions=opportunity.get("entry_conditions") or {},
         )
 
     # ------------------------------------------------------------------

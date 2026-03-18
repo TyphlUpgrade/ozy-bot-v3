@@ -122,42 +122,47 @@ class YFinanceAdapter(DataAdapter):
         self._set_cache(key, fundamentals, self._fundamentals_ttl)
         return fundamentals
 
-    async def fetch_news(self, symbol: str, max_items: int = 5) -> list[dict]:
+    async def fetch_news(
+        self,
+        symbol: str,
+        max_items: int = 5,
+        max_age_hours: float = 168.0,
+    ) -> list[dict]:
         """
         Fetch recent news headlines for a symbol (best-effort).
 
         Returns a list of {title, publisher, age_hours} dicts for items
-        published within the last 24 hours, capped at max_items.
+        published within max_age_hours, capped at max_items.
         Returns [] on any exception.
+
+        Raw items (with age_hours attached) are cached before age filtering so
+        callers with different max_age_hours windows share the same cache entry.
         """
         key = f"news:{symbol}"
         cached = self._get_cache(key)
-        if cached is not None:
-            log.debug("Cache hit: news %s", symbol)
-            return cached
+        if cached is None:
+            try:
+                raw_items = await asyncio.to_thread(self._download_news, symbol)
+            except Exception as exc:
+                log.debug("fetch_news failed for %s: %s", symbol, exc)
+                return []
 
-        try:
-            raw_items = await asyncio.to_thread(self._download_news, symbol)
-        except Exception as exc:
-            log.debug("fetch_news failed for %s: %s", symbol, exc)
-            return []
-
-        now_ts = time.time()
-        result = []
-        for item in raw_items:
-            pub_ts = item.get("providerPublishTime", 0)
-            age_hours = (now_ts - pub_ts) / 3600.0
-            if age_hours <= 24.0:
-                result.append({
+            now_ts = time.time()
+            annotated = []
+            for item in raw_items:
+                pub_ts = item.get("providerPublishTime", 0)
+                age_hours = (now_ts - pub_ts) / 3600.0
+                annotated.append({
                     "title":     item.get("title", ""),
                     "publisher": item.get("publisher", ""),
                     "age_hours": round(age_hours, 1),
                 })
-            if len(result) >= max_items:
-                break
+            self._set_cache(key, annotated, self._news_ttl)
+            cached = annotated
+        else:
+            log.debug("Cache hit: news %s", symbol)
 
-        self._set_cache(key, result, self._news_ttl)
-        return result
+        return [item for item in cached if item["age_hours"] <= max_age_hours][:max_items]
 
     async def is_available(self) -> bool:
         """Lightweight health check — tries to fetch SPY fast_info."""
@@ -250,8 +255,44 @@ class YFinanceAdapter(DataAdapter):
 
     @staticmethod
     def _download_news(symbol: str) -> list[dict]:
-        """Return raw news items from yfinance (list of dicts)."""
-        return yf.Ticker(symbol).news or []
+        """Return raw news items from yfinance, normalised to a flat dict.
+
+        yfinance v0.2.x returned flat dicts with top-level ``providerPublishTime``
+        (unix int), ``title``, and ``publisher`` fields.  Newer versions nest
+        everything under a ``content`` sub-dict and use an ISO-8601 ``pubDate``
+        string instead.  We normalise both formats here so the caller sees a
+        consistent schema with ``providerPublishTime`` (unix int), ``title``, and
+        ``publisher`` regardless of the installed yfinance version.
+        """
+        raw = yf.Ticker(symbol).news or []
+        normalised = []
+        for item in raw:
+            content = item.get("content")
+            if content:
+                # New nested schema (yfinance ≥ 0.2.54 / 2026 API change)
+                title     = content.get("title", "")
+                publisher = (content.get("provider") or {}).get("displayName", "")
+                pub_date  = content.get("pubDate", "")
+                try:
+                    from datetime import datetime, timezone as _tz
+                    pub_ts = int(
+                        datetime.fromisoformat(
+                            pub_date.replace("Z", "+00:00")
+                        ).timestamp()
+                    )
+                except Exception:
+                    pub_ts = 0
+            else:
+                # Legacy flat schema
+                title     = item.get("title", "")
+                publisher = item.get("publisher", "")
+                pub_ts    = item.get("providerPublishTime", 0)
+            normalised.append({
+                "title":               title,
+                "publisher":           publisher,
+                "providerPublishTime": pub_ts,
+            })
+        return normalised
 
     @staticmethod
     def _health_check() -> None:

@@ -82,6 +82,11 @@ class MomentumStrategy(Strategy):
         # Entry gate: when True, reject entries where price is on the wrong side of VWAP.
         # Longs need price above VWAP; shorts need price below VWAP.
         "require_vwap_gate": True,
+        # VWAP reclaim exception: when price is on the wrong side of VWAP but MACD is
+        # bullish and RVOL meets this threshold, the gate is bypassed.  This allows
+        # accumulation/reclaim setups (price dipped below VWAP but volume and MACD
+        # diverge bullishly, signalling a push back through).  Set to 0 to disable.
+        "vwap_reclaim_min_rvol": 1.8,
     }
 
     def applicable_override_signals(self) -> frozenset[str]:
@@ -108,7 +113,13 @@ class MomentumStrategy(Strategy):
 
     def apply_entry_gate(self, action: str, signals: dict) -> tuple[bool, str]:
         """Reject momentum entries that lack volume participation or are on the
-        wrong side of VWAP."""
+        wrong side of VWAP.
+
+        VWAP reclaim exception: when price is on the wrong side of VWAP but MACD
+        is bullish and RVOL meets vwap_reclaim_min_rvol, the gate is bypassed.
+        This covers accumulation-before-reclaim setups that the binary VWAP check
+        would otherwise incorrectly block.
+        """
         rvol = signals.get("volume_ratio")
         if rvol is not None and rvol < self._p("min_rvol_for_entry"):
             return (
@@ -119,6 +130,14 @@ class MomentumStrategy(Strategy):
         if self._p("require_vwap_gate"):
             wrong_vwap = _MOMENTUM_WRONG_VWAP.get(action)
             if wrong_vwap and signals.get("vwap_position", "") == wrong_vwap:
+                # VWAP reclaim exception: bullish MACD divergence + elevated RVOL
+                # signals accumulation; price is expected to reclaim VWAP imminently.
+                reclaim_rvol = self._p("vwap_reclaim_min_rvol")
+                macd = signals.get("macd_signal", "")
+                is_bullish_macd = macd in ("bullish", "bullish_cross")
+                rvol_qualifies = rvol is not None and reclaim_rvol > 0 and rvol >= reclaim_rvol
+                if is_bullish_macd and rvol_qualifies:
+                    return True, ""
                 return False, f"momentum {action} rejected — price {wrong_vwap} VWAP"
         return True, ""
 
