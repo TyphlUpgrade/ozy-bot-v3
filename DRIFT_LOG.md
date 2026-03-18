@@ -576,3 +576,39 @@ Read the relevant phase section before modifying or debugging any module built i
 - 21 tests in `test_short_protection.py` (ATR trailing stop, VWAP crossover, hard stop, EOD close, `_recently_closed` persistence, ATR position cap).
 - 21 new tests in `test_strategies.py` classes `TestMomentumSlopeAwareRsiGate` and `TestSwingSlopeAwareRsiGate`.
 - Updated `test_technical_analysis.py` (5 tests) and `test_orchestrator.py` (1 test).
+
+---
+
+### Phase 16 Option A — RSI Gate in Live Path + Prompt Audit (March 18)
+
+**RSI gate moved from dead `_evaluate_entry_conditions` to live `apply_entry_gate`** · `strategies/momentum_strategy.py`
+- **Impl:** After Phase 14 dead code cleanup removed `generate_signals` from the orchestrator's medium loop, `MomentumStrategy._evaluate_entry_conditions` became unreachable. The slope-aware RSI gate lived there but was never executed in production. Option A moves the gate into `apply_entry_gate` (the live production path, called by `apply_hard_filters` in the ranker), makes it direction-aware, and removes the dead method entirely.
+- **Gate logic (direction-aware):**
+  - Long: normal zone [45,65] always pass; extended zone (65,78] requires `rsi_slope_5 ≥ rsi_slope_threshold (2.0)`; >78 always block; <45 block.
+  - Short (mirror symmetry): hard floor at `100 - rsi_max_absolute (22)` — below floor is oversold/bounce risk, block; low extended zone [22,35] requires `rsi_slope_5 ≤ -rsi_slope_threshold (-2.0)`; ≥35 passes (no ceiling — RSI 80 falling is a valid short entry).
+- **Tests:** 22 new tests in `TestMomentumApplyEntryGateRsi` in `test_strategies.py`. Gate ordering test confirms RVOL failure takes priority over VWAP failure takes priority over RSI gate.
+
+**`entry_conditions` expansion — 6 new short-direction keys** · `intelligence/opportunity_ranker.py`, `ozymandias/tests/test_entry_conditions.py`
+- **Impl:** `evaluate_entry_conditions()` extended with 6 new keys:
+  - `require_below_vwap` (bool, SHORT) — rejects if `vwap_position != "below"`.
+  - `rsi_slope_min` (float, LONG) — rejects if `rsi_slope_5 < value`.
+  - `rsi_slope_max` (float, SHORT) — rejects if `rsi_slope_5 > value`.
+  - `require_volume_trend_bars_min` (int, BOTH) — rejects if `volume_trend_bars < value`.
+  - `require_macd_bearish` (bool, SHORT) — rejects if `macd_signal` not in `{"bearish","bearish_cross"}`.
+  - `require_macd_histogram_expanding` (bool, BOTH) — rejects if `macd_histogram_expanding` is not True.
+- **Tests:** 6 new test classes (50 total in `test_entry_conditions.py`). Each covers pass/fail/missing-signal/False-is-noop.
+
+**`catalyst_type` conviction cap enforced in code** · `intelligence/opportunity_ranker.py`, `ozymandias/tests/test_opportunity_ranker.py`
+- **Impl:** `apply_hard_filters()` rejects swing entries with `catalyst_type == "technical_only"` and `conviction > 0.50`. Was prompt-only enforcement before.
+- **Tests:** 6 tests in `TestCatalystTypeConvictionCap`.
+
+**`reasoning.txt` v3.4.0 audit — 5 bugs fixed** · `ozymandias/config/prompts/v3.4.0/reasoning.txt`
+1. Stop-loss direction wrong for shorts: "price has fallen below" was specified for all positions. Now: short position stop is breached when price rises above stop.
+2. Phantom "long-term" strategy: FOCUS section listed a third strategy not in the system. Rewritten to document only momentum (intraday) and swing (multi-day).
+3. `catalyst_type` template confusion: field appeared without "(swing only)" annotation, misleading Claude to include it on momentum entries. Annotated and instruction added: "SWING ENTRIES ONLY — omit this field for momentum".
+4. `position_size_pct` default 0.10 → 0.05: template default was 2× the documented floor. Changed to 0.05.
+5. PDT instruction misleading: old text implied Claude manages PDT. Rewritten to "system enforces PDT limits automatically — be conservative with exit recommendations when count is 1 or 0".
+- **Additional:** `timeframe` template field removed (unused); all 11 `entry_conditions` keys documented with long/short direction examples; position review instruction made direction-aware.
+
+**`test_integration.py` `_make_bars` fix** · `ozymandias/tests/test_integration.py`
+- **Impl:** Old flat + step-up price series produced RSI ≈ 100 (one gain, no losses → RS = ∞). New series: first 50 bars alternating ±small moves (~54% up → RSI ≈ 58), last 10 bars biased upward [+,+,-,+,+,-,+,+,-,+] → RSI ≈ 73 with `rsi_slope_5 ≈ 7.2 > 2.0 threshold`. Final close ≈ 1.04% above base (within drift ceiling). Passes RVOL, VWAP, and new RSI gates.

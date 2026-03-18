@@ -119,13 +119,24 @@ class MomentumStrategy(Strategy):
         return True
 
     def apply_entry_gate(self, action: str, signals: dict) -> tuple[bool, str]:
-        """Reject momentum entries that lack volume participation or are on the
-        wrong side of VWAP.
+        """Reject momentum entries that fail RVOL, VWAP, or RSI gates.
 
-        VWAP reclaim exception: when price is on the wrong side of VWAP but MACD
-        is bullish and RVOL meets vwap_reclaim_min_rvol, the gate is bypassed.
-        This covers accumulation-before-reclaim setups that the binary VWAP check
-        would otherwise incorrectly block.
+        Three gates evaluated in order:
+
+        1. RVOL floor — no volume participation means no momentum.
+        2. VWAP position — longs need price above VWAP; shorts below.
+           VWAP reclaim exception: bullish MACD + high RVOL bypasses the gate
+           for accumulation-before-reclaim long setups.
+        3. RSI slope-aware gate (direction-aware three-zone logic):
+           Longs:  normal [rsi_entry_min, rsi_entry_max] passes; extended
+                   (rsi_entry_max, rsi_max_absolute] requires slope ≥
+                   rsi_slope_threshold; above rsi_max_absolute always blocked;
+                   below rsi_entry_min blocked.
+           Shorts: mirror — hard floor at (100 − rsi_max_absolute) blocks
+                   oversold-bounce entries; low extended zone
+                   [floor, 100 − rsi_entry_max) requires slope ≤
+                   −rsi_slope_threshold; above extended zone passes
+                   (no ceiling — RSI 80 falling is a valid short entry).
         """
         rvol = signals.get("volume_ratio")
         if rvol is not None and rvol < self._p("min_rvol_for_entry"):
@@ -146,6 +157,56 @@ class MomentumStrategy(Strategy):
                 if is_bullish_macd and rvol_qualifies:
                     return True, ""
                 return False, f"momentum {action} rejected — price {wrong_vwap} VWAP"
+
+        # RSI slope-aware gate — direction-aware.
+        # Short thresholds derived from long thresholds by symmetry (100 − long_threshold)
+        # so that the same config values govern both directions with no extra keys.
+        rsi = float(signals.get("rsi") or 50.0)
+        rsi_slope = float(signals.get("rsi_slope_5", 0.0))
+        rsi_min = self._p("rsi_entry_min")          # default 45
+        rsi_max = self._p("rsi_entry_max")          # default 65
+        rsi_ceiling = self._p("rsi_max_absolute")   # default 78
+        slope_threshold = self._p("rsi_slope_threshold")  # default 2.0
+
+        if action == "buy":
+            if rsi > rsi_ceiling:
+                return False, (
+                    f"momentum long RSI {rsi:.1f} above hard ceiling {rsi_ceiling:.0f}"
+                    " — genuinely overextended"
+                )
+            if rsi > rsi_max:
+                if rsi_slope < slope_threshold:
+                    return False, (
+                        f"momentum long RSI {rsi:.1f} in extended zone"
+                        f" ({rsi_max:.0f}–{rsi_ceiling:.0f})"
+                        f" with insufficient slope {rsi_slope:.2f} < {slope_threshold:.2f}"
+                    )
+            elif rsi < rsi_min:
+                return False, (
+                    f"momentum long RSI {rsi:.1f} below minimum {rsi_min:.0f}"
+                    " — insufficient upward momentum"
+                )
+        else:  # sell_short
+            # Mirror: hard floor = 100 − rsi_max_absolute (e.g. 22 at defaults).
+            # Extended low zone = [floor, 100 − rsi_entry_max) (e.g. 22–35).
+            # No upper ceiling for shorts — RSI 80 falling is a valid short entry.
+            rsi_hard_floor = 100.0 - rsi_ceiling      # default 22.0
+            rsi_ext_ceiling = 100.0 - rsi_max         # default 35.0
+            short_slope_threshold = -slope_threshold   # default -2.0
+
+            if rsi < rsi_hard_floor:
+                return False, (
+                    f"momentum short RSI {rsi:.1f} below floor {rsi_hard_floor:.0f}"
+                    " — oversold, bounce risk"
+                )
+            if rsi < rsi_ext_ceiling:
+                if rsi_slope > short_slope_threshold:
+                    return False, (
+                        f"momentum short RSI {rsi:.1f} in low extended zone"
+                        f" ({rsi_hard_floor:.0f}–{rsi_ext_ceiling:.0f})"
+                        f" with insufficient decline {rsi_slope:.2f} > {short_slope_threshold:.2f}"
+                    )
+
         return True, ""
 
     # ------------------------------------------------------------------

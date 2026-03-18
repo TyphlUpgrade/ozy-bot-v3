@@ -69,12 +69,28 @@ def _stub_hours(session: str = "regular") -> MarketHours:
 
 
 def _make_bars(n: int = 60, base_price: float = 200.0) -> pd.DataFrame:
-    """Synthetic OHLCV DataFrame — enough bars for all TA indicators."""
-    np.random.seed(42)
-    # Flat at base_price; last 5 bars step up 0.3% so last_close > cumulative VWAP
-    # (passes momentum long VWAP filter) while staying well within the 1.5% drift ceiling.
-    close = np.full(n, base_price, dtype=float)
-    close[-5:] = base_price * 1.003
+    """Synthetic OHLCV DataFrame — enough bars for all TA indicators.
+
+    Price design: alternating up/down moves for the first 50 bars (ratio ~54% up
+    → RSI ≈ 58 base), then 10 bars biased upward [+,+,-,+,+,-,+,+,-,+] to push
+    RSI into the extended zone (~73) with positive rsi_slope_5 (~7.2 > 2.0
+    threshold).  Final close lands ~1.0% above base_price — well within the 1.5%
+    drift ceiling.  Last close > VWAP (passes VWAP gate).
+    """
+    step = base_price * 0.0012
+    step_dn = base_price * 0.0010
+    # First 50 bars: alternating up / down
+    deltas = []
+    for i in range(n - 10):
+        deltas.append(step if i % 2 == 0 else -step_dn)
+    # Last 10 bars: 7 up, 3 down — biased upward pattern
+    tail_pattern = [1, 1, -1, 1, 1, -1, 1, 1, -1, 1]
+    for d in tail_pattern:
+        deltas.append(d * step)
+    close = np.empty(n, dtype=float)
+    close[0] = base_price
+    for i in range(1, n):
+        close[i] = close[i - 1] + deltas[i - 1]
     # Uniform volume with last bar spiked 1.5× so RVOL > 1.0 floor.
     volume = np.full(n, 1_000_000, dtype=float)
     volume[-1] = 1_500_000.0

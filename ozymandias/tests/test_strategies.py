@@ -851,3 +851,195 @@ class TestSwingSlopeAwareRsiGate:
         inds["bollinger_position"] = "middle"  # remove one more to ensure fail
         signals = await s.generate_signals("TSLA", _df(), inds)
         assert len(signals) == 0
+
+
+# ---------------------------------------------------------------------------
+# 12. apply_entry_gate RSI — live gate (direction-aware three-zone logic)
+# Tests the production path: apply_entry_gate() is called by apply_hard_filters
+# in the ranker for every candidate opportunity.
+# ---------------------------------------------------------------------------
+
+def _gate_signals_long(**overrides) -> dict:
+    """Signals that pass RVOL and VWAP for a long — only RSI varies."""
+    base = {
+        "vwap_position": "above",
+        "volume_ratio": 1.5,
+        "macd_signal": "bullish",
+        "rsi": 55.0,
+        "rsi_slope_5": 0.0,
+    }
+    base.update(overrides)
+    return base
+
+
+def _gate_signals_short(**overrides) -> dict:
+    """Signals that pass RVOL and VWAP for a short — only RSI varies."""
+    base = {
+        "vwap_position": "below",
+        "volume_ratio": 1.5,
+        "macd_signal": "bearish",
+        "rsi": 55.0,
+        "rsi_slope_5": -3.0,
+    }
+    base.update(overrides)
+    return base
+
+
+class TestMomentumApplyEntryGateRsi:
+    """Direction-aware RSI gate in apply_entry_gate (live production path)."""
+
+    # --- Long entries ---
+
+    def test_long_normal_zone_passes(self):
+        """RSI 55 in normal zone [45, 65] → gate passes."""
+        s = MomentumStrategy()
+        passed, _ = s.apply_entry_gate("buy", _gate_signals_long(rsi=55.0))
+        assert passed is True
+
+    def test_long_at_lower_bound_passes(self):
+        """RSI exactly at rsi_entry_min=45 → passes."""
+        s = MomentumStrategy()
+        passed, _ = s.apply_entry_gate("buy", _gate_signals_long(rsi=45.0))
+        assert passed is True
+
+    def test_long_below_lower_bound_blocked(self):
+        """RSI 44 < rsi_entry_min=45 → blocked."""
+        s = MomentumStrategy()
+        passed, reason = s.apply_entry_gate("buy", _gate_signals_long(rsi=44.0))
+        assert passed is False
+        assert "minimum" in reason
+
+    def test_long_extended_zone_good_slope_passes(self):
+        """RSI 70 (extended) + slope 3.0 >= threshold 2.0 → passes."""
+        s = MomentumStrategy()
+        passed, _ = s.apply_entry_gate("buy", _gate_signals_long(rsi=70.0, rsi_slope_5=3.0))
+        assert passed is True
+
+    def test_long_extended_zone_at_slope_threshold_passes(self):
+        """RSI 70 + slope exactly == threshold 2.0 → passes (>= is inclusive)."""
+        s = MomentumStrategy()
+        passed, _ = s.apply_entry_gate("buy", _gate_signals_long(rsi=70.0, rsi_slope_5=2.0))
+        assert passed is True
+
+    def test_long_extended_zone_low_slope_blocked(self):
+        """RSI 70 + slope 1.5 < threshold 2.0 → blocked."""
+        s = MomentumStrategy()
+        passed, reason = s.apply_entry_gate("buy", _gate_signals_long(rsi=70.0, rsi_slope_5=1.5))
+        assert passed is False
+        assert "extended zone" in reason
+        assert "slope" in reason
+
+    def test_long_extended_zone_negative_slope_blocked(self):
+        """RSI 70 falling → blocked (RSI 73 falling = exhaustion not acceleration)."""
+        s = MomentumStrategy()
+        passed, reason = s.apply_entry_gate("buy", _gate_signals_long(rsi=70.0, rsi_slope_5=-2.0))
+        assert passed is False
+
+    def test_long_at_hard_ceiling_good_slope_passes(self):
+        """RSI 78 (boundary, not > 78) + slope 3.0 → passes."""
+        s = MomentumStrategy()
+        passed, _ = s.apply_entry_gate("buy", _gate_signals_long(rsi=78.0, rsi_slope_5=3.0))
+        assert passed is True
+
+    def test_long_above_hard_ceiling_always_blocked(self):
+        """RSI 79 > rsi_max_absolute=78 → always blocked regardless of slope."""
+        s = MomentumStrategy()
+        passed, reason = s.apply_entry_gate("buy", _gate_signals_long(rsi=79.0, rsi_slope_5=10.0))
+        assert passed is False
+        assert "ceiling" in reason
+
+    def test_long_rsi_ceiling_configurable(self):
+        """Custom rsi_max_absolute=75: RSI 76 + high slope → blocked."""
+        s = MomentumStrategy(params={"rsi_max_absolute": 75})
+        passed, _ = s.apply_entry_gate("buy", _gate_signals_long(rsi=76.0, rsi_slope_5=5.0))
+        assert passed is False
+
+    # --- Short entries ---
+
+    def test_short_normal_zone_passes(self):
+        """RSI 55 (≥ 35 = 100 − 65) → normal zone, passes."""
+        s = MomentumStrategy()
+        passed, _ = s.apply_entry_gate("sell_short", _gate_signals_short(rsi=55.0))
+        assert passed is True
+
+    def test_short_high_rsi_falling_passes(self):
+        """RSI 78 falling (slope -4.0) — no ceiling for shorts, passes."""
+        s = MomentumStrategy()
+        passed, _ = s.apply_entry_gate(
+            "sell_short", _gate_signals_short(rsi=78.0, rsi_slope_5=-4.0)
+        )
+        assert passed is True
+
+    def test_short_at_extended_ceiling_passes(self):
+        """RSI exactly 35 (100 - rsi_entry_max=65) → normal zone boundary, passes."""
+        s = MomentumStrategy()
+        passed, _ = s.apply_entry_gate("sell_short", _gate_signals_short(rsi=35.0))
+        assert passed is True
+
+    def test_short_low_extended_zone_good_slope_passes(self):
+        """RSI 28 (in [22, 35]) + slope -3.0 <= -2.0 → passes."""
+        s = MomentumStrategy()
+        passed, _ = s.apply_entry_gate(
+            "sell_short", _gate_signals_short(rsi=28.0, rsi_slope_5=-3.0)
+        )
+        assert passed is True
+
+    def test_short_low_extended_zone_at_slope_threshold_passes(self):
+        """RSI 28 + slope exactly == -2.0 (threshold boundary) → passes."""
+        s = MomentumStrategy()
+        passed, _ = s.apply_entry_gate(
+            "sell_short", _gate_signals_short(rsi=28.0, rsi_slope_5=-2.0)
+        )
+        assert passed is True
+
+    def test_short_low_extended_zone_weak_slope_blocked(self):
+        """RSI 28 + slope -0.5 > -2.0 → not actively falling enough, blocked."""
+        s = MomentumStrategy()
+        passed, reason = s.apply_entry_gate(
+            "sell_short", _gate_signals_short(rsi=28.0, rsi_slope_5=-0.5)
+        )
+        assert passed is False
+        assert "extended zone" in reason
+
+    def test_short_below_hard_floor_blocked(self):
+        """RSI 20 < floor (100 - 78 = 22) → oversold bounce risk, blocked."""
+        s = MomentumStrategy()
+        passed, reason = s.apply_entry_gate(
+            "sell_short", _gate_signals_short(rsi=20.0, rsi_slope_5=-5.0)
+        )
+        assert passed is False
+        assert "floor" in reason or "oversold" in reason
+
+    def test_short_at_hard_floor_passes(self):
+        """RSI exactly at floor (22) → not < floor, passes (extended zone with slope)."""
+        s = MomentumStrategy()
+        passed, _ = s.apply_entry_gate(
+            "sell_short", _gate_signals_short(rsi=22.0, rsi_slope_5=-3.0)
+        )
+        assert passed is True
+
+    def test_short_hard_floor_derived_from_config(self):
+        """Custom rsi_max_absolute=75 → short hard floor = 25; RSI 24 → blocked."""
+        s = MomentumStrategy(params={"rsi_max_absolute": 75})
+        passed, _ = s.apply_entry_gate(
+            "sell_short", _gate_signals_short(rsi=24.0, rsi_slope_5=-5.0)
+        )
+        assert passed is False
+
+    # --- Gate ordering: RVOL and VWAP still take priority ---
+
+    def test_rvol_failure_takes_priority_over_rsi(self):
+        """Low RVOL blocks before RSI gate is reached."""
+        s = MomentumStrategy()
+        sigs = _gate_signals_long(rsi=55.0, volume_ratio=0.5)
+        passed, reason = s.apply_entry_gate("buy", sigs)
+        assert passed is False
+        assert "rvol" in reason.lower() or "volume" in reason.lower()
+
+    def test_vwap_failure_takes_priority_over_rsi(self):
+        """Wrong VWAP side blocks before RSI gate is reached."""
+        s = MomentumStrategy()
+        sigs = _gate_signals_long(rsi=55.0, vwap_position="below")
+        passed, reason = s.apply_entry_gate("buy", sigs)
+        assert passed is False
+        assert "vwap" in reason.lower()
