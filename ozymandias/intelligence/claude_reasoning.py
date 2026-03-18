@@ -52,7 +52,7 @@ class ReasoningResult:
     market_assessment: str
     risk_flags: list[str]
     rejected_opportunities: list[dict]  # [{symbol, considered_reason, rejection_reason}]
-    session_veto: list[str] = field(default_factory=list)  # strategy names to suppress for this session
+    session_veto: list[str] = field(default_factory=list)  # direction strings to suppress ("long"/"short"); enforced in rank_opportunities
     raw: dict = field(default_factory=dict)                # full parsed Claude response
 
 

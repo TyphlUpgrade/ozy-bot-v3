@@ -1537,9 +1537,7 @@ class Orchestrator:
             except Exception as exc:
                 log.error("Immediate slow loop cycle after indicator seed failed: %s", exc, exc_info=True)
 
-        # -- Step 3: detect entry signals ------------------------------------
-        # Load the most recent Claude reasoning result early so session_veto and
-        # require_strong_entry can gate signal generation before ranking.
+        # -- Step 3: load Claude reasoning result for ranking -----------------
         cached_raw = self._reasoning_cache.load_latest_if_fresh()
         if cached_raw:
             parsed = cached_raw.get("parsed_response") or {}
@@ -1557,44 +1555,7 @@ class Orchestrator:
                 raw={},
             )
 
-        # Build per-(symbol, strategy) require_strong_entry lookup from Claude opportunities.
-        _require_strong: dict[tuple[str, str], bool] = {
-            (opp["symbol"], opp.get("strategy", "")): bool(opp.get("require_strong_entry", False))
-            for opp in reasoning_result.new_opportunities
-            if "symbol" in opp
-        }
-
-        # {symbol: [Signal, ...]}
-        entry_signals: dict[str, list] = {}
-        for symbol, summary in indicators.items():
-            df = bars.get(symbol)
-            if df is None:
-                continue
-            sigs_flat = summary["signals"]
-            for strategy in self._strategies:
-                strategy_name = type(strategy).__name__.replace("Strategy", "").lower()
-
-                # require_strong_entry: temporarily raise min_signals_for_entry by 1
-                # for this symbol. Safe because asyncio is single-threaded (no races).
-                strong = _require_strong.get((symbol, strategy_name), False)
-                if strong:
-                    orig_min = strategy._params["min_signals_for_entry"]
-                    strategy._params["min_signals_for_entry"] = orig_min + 1
-                try:
-                    sigs = await strategy.generate_signals(symbol, df, sigs_flat)
-                    if sigs:
-                        entry_signals.setdefault(symbol, []).extend(sigs)
-                except Exception as exc:
-                    log.warning(
-                        "Medium loop: generate_signals failed for %s/%s: %s",
-                        symbol, type(strategy).__name__, exc,
-                    )
-                finally:
-                    if strong:
-                        strategy._params["min_signals_for_entry"] = orig_min
-
         # -- Step 4: re-rank opportunity queue --------------------------------
-        # reasoning_result already loaded above (before step 3).
 
         try:
             acct = await self._broker.get_account()
