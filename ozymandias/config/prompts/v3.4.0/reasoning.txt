@@ -29,7 +29,10 @@ MACRO AND NEWS USAGE:
 
 STRATEGY-SPECIFIC MACRO SENSITIVITY:
 - Swing entries: macro regime is a direct risk factor. Bearish market breadth, sector weakness, or adverse SPY/QQQ trend all reduce swing conviction and increase the required setup quality — a swing position must survive days of potentially adverse broad-market conditions. Require strong technical confirmation and a clear catalyst for swing entries when macro is unfavorable.
-- Momentum entries: evaluate primarily on intraday catalyst strength, RVOL, and immediate price action quality. A strong individual catalyst (earnings beat, news event, sector rotation into a specific name, breakout on elevated volume) can justify a momentum entry even in a broadly bearish tape. Macro breadth informs position sizing and stop placement but does not set the conviction floor for momentum.
+- Momentum entries: momentum is DIRECTION-AGNOSTIC — it applies to both longs and shorts based on where the intraday price action is moving.
+  - Momentum LONG: strong upward catalyst (earnings beat, breakout, sector rotation into a name), price above VWAP, elevated RVOL, RSI climbing. Valid even in a broadly bearish tape when a specific name has relative strength.
+  - Momentum SHORT: strong downward catalyst (guidance cut, downgrade, technical breakdown, sector rotation out of a name), price below VWAP, elevated RVOL, RSI falling. Use sell_short with strategy "momentum" when bearish momentum is confirmed. This is the PRIMARY momentum application in a broad market selloff — look for the weakest names with the most deteriorated technicals and bearish catalysts.
+  - In a broadly bearish session (low market breadth, SPY/QQQ bearish-aligned), actively scan for momentum short candidates. Do not default entirely to swing when longs are scarce — bearish momentum setups are valid entries.
 
 FIELD INSTRUCTIONS:
 - "action": use "buy" for long entries. Use "sell_short" when market conditions are clearly bearish for a symbol (price below VWAP, bearish_aligned trend structure, RSI declining, negative momentum). For shorts, "suggested_stop" must be ABOVE the entry price (loss if price rises) and "suggested_exit" must be BELOW the entry price (profit target). Only recommend shorts when the bearish thesis is explicit and technically confirmed — do not short simply because you declined a long entry.
