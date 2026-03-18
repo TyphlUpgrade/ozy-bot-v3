@@ -28,8 +28,11 @@ def _full_signals(**overrides) -> dict:
     base = {
         "vwap_position": "above",
         "rsi": 58.0,
+        "rsi_slope_5": 0.8,
         "volume_ratio": 1.6,
+        "volume_trend_bars": 3,
         "macd_signal": "bullish",
+        "macd_histogram_expanding": True,
         "trend_structure": "bullish_aligned",
         "rsi_divergence": False,
         "bollinger_position": "upper_half",
@@ -274,3 +277,237 @@ class TestScoredOpportunityPropagation:
         }
         result = r.score_opportunity(opp, _make_signals(), _make_account(), _make_portfolio())
         assert result.entry_conditions == {}
+
+
+# ---------------------------------------------------------------------------
+# New condition keys added in Phase 16 session (short-direction support)
+# ---------------------------------------------------------------------------
+
+class TestRequireBelowVwap:
+    def test_passes_when_below(self):
+        passed, reason = evaluate_entry_conditions(
+            _conditions(require_below_vwap=True),
+            _full_signals(vwap_position="below"),
+        )
+        assert passed is True
+        assert reason == ""
+
+    def test_fails_when_above(self):
+        passed, reason = evaluate_entry_conditions(
+            _conditions(require_below_vwap=True),
+            _full_signals(vwap_position="above"),
+        )
+        assert passed is False
+        assert "vwap" in reason.lower()
+        assert "above" in reason
+
+    def test_false_is_noop(self):
+        passed, _ = evaluate_entry_conditions(
+            _conditions(require_below_vwap=False),
+            _full_signals(vwap_position="above"),
+        )
+        assert passed is True
+
+    def test_missing_signal(self):
+        sigs = _full_signals()
+        del sigs["vwap_position"]
+        passed, reason = evaluate_entry_conditions(_conditions(require_below_vwap=True), sigs)
+        assert passed is False
+        assert "vwap_position" in reason
+        assert "unavailable" in reason
+
+
+class TestRsiSlopeMin:
+    def test_passes_when_slope_meets_min(self):
+        passed, _ = evaluate_entry_conditions(
+            _conditions(rsi_slope_min=0.5),
+            _full_signals(rsi_slope_5=0.8),
+        )
+        assert passed is True
+
+    def test_passes_at_exact_boundary(self):
+        passed, _ = evaluate_entry_conditions(
+            _conditions(rsi_slope_min=0.5),
+            _full_signals(rsi_slope_5=0.5),
+        )
+        assert passed is True
+
+    def test_fails_when_slope_below_min(self):
+        passed, reason = evaluate_entry_conditions(
+            _conditions(rsi_slope_min=0.5),
+            _full_signals(rsi_slope_5=0.2),
+        )
+        assert passed is False
+        assert "rsi_slope_min" in reason
+        assert "0.20" in reason
+
+    def test_fails_when_slope_negative(self):
+        passed, reason = evaluate_entry_conditions(
+            _conditions(rsi_slope_min=0.5),
+            _full_signals(rsi_slope_5=-1.0),
+        )
+        assert passed is False
+
+    def test_missing_signal(self):
+        sigs = _full_signals()
+        del sigs["rsi_slope_5"]
+        passed, reason = evaluate_entry_conditions(_conditions(rsi_slope_min=0.5), sigs)
+        assert passed is False
+        assert "rsi_slope_5" in reason
+        assert "unavailable" in reason
+
+
+class TestRsiSlopeMax:
+    def test_passes_when_slope_at_or_below_max(self):
+        passed, _ = evaluate_entry_conditions(
+            _conditions(rsi_slope_max=-0.5),
+            _full_signals(rsi_slope_5=-0.8),
+        )
+        assert passed is True
+
+    def test_passes_at_exact_boundary(self):
+        passed, _ = evaluate_entry_conditions(
+            _conditions(rsi_slope_max=-0.5),
+            _full_signals(rsi_slope_5=-0.5),
+        )
+        assert passed is True
+
+    def test_fails_when_slope_above_max(self):
+        passed, reason = evaluate_entry_conditions(
+            _conditions(rsi_slope_max=-0.5),
+            _full_signals(rsi_slope_5=0.3),
+        )
+        assert passed is False
+        assert "rsi_slope_max" in reason
+        assert "0.30" in reason
+
+    def test_missing_signal(self):
+        sigs = _full_signals()
+        del sigs["rsi_slope_5"]
+        passed, reason = evaluate_entry_conditions(_conditions(rsi_slope_max=-0.5), sigs)
+        assert passed is False
+        assert "rsi_slope_5" in reason
+        assert "unavailable" in reason
+
+
+class TestRequireVolumeTrendBarsMin:
+    def test_passes_when_bars_meet_min(self):
+        passed, _ = evaluate_entry_conditions(
+            _conditions(require_volume_trend_bars_min=2),
+            _full_signals(volume_trend_bars=3),
+        )
+        assert passed is True
+
+    def test_passes_at_exact_boundary(self):
+        passed, _ = evaluate_entry_conditions(
+            _conditions(require_volume_trend_bars_min=3),
+            _full_signals(volume_trend_bars=3),
+        )
+        assert passed is True
+
+    def test_fails_when_bars_below_min(self):
+        passed, reason = evaluate_entry_conditions(
+            _conditions(require_volume_trend_bars_min=3),
+            _full_signals(volume_trend_bars=1),
+        )
+        assert passed is False
+        assert "volume_trend_bars" in reason
+        assert "1" in reason
+
+    def test_fails_when_zero_bars(self):
+        passed, _ = evaluate_entry_conditions(
+            _conditions(require_volume_trend_bars_min=1),
+            _full_signals(volume_trend_bars=0),
+        )
+        assert passed is False
+
+    def test_missing_signal(self):
+        sigs = _full_signals()
+        del sigs["volume_trend_bars"]
+        passed, reason = evaluate_entry_conditions(
+            _conditions(require_volume_trend_bars_min=2), sigs
+        )
+        assert passed is False
+        assert "volume_trend_bars" in reason
+        assert "unavailable" in reason
+
+
+class TestRequireMacdBearish:
+    def test_passes_on_bearish(self):
+        passed, _ = evaluate_entry_conditions(
+            _conditions(require_macd_bearish=True),
+            _full_signals(macd_signal="bearish"),
+        )
+        assert passed is True
+
+    def test_passes_on_bearish_cross(self):
+        passed, _ = evaluate_entry_conditions(
+            _conditions(require_macd_bearish=True),
+            _full_signals(macd_signal="bearish_cross"),
+        )
+        assert passed is True
+
+    def test_fails_on_bullish(self):
+        passed, reason = evaluate_entry_conditions(
+            _conditions(require_macd_bearish=True),
+            _full_signals(macd_signal="bullish"),
+        )
+        assert passed is False
+        assert "macd" in reason.lower()
+
+    def test_fails_on_neutral(self):
+        passed, _ = evaluate_entry_conditions(
+            _conditions(require_macd_bearish=True),
+            _full_signals(macd_signal="neutral"),
+        )
+        assert passed is False
+
+    def test_false_is_noop(self):
+        passed, _ = evaluate_entry_conditions(
+            _conditions(require_macd_bearish=False),
+            _full_signals(macd_signal="bullish"),
+        )
+        assert passed is True
+
+    def test_missing_signal(self):
+        sigs = _full_signals()
+        del sigs["macd_signal"]
+        passed, reason = evaluate_entry_conditions(_conditions(require_macd_bearish=True), sigs)
+        assert passed is False
+        assert "macd_signal" in reason
+        assert "unavailable" in reason
+
+
+class TestRequireMacdHistogramExpanding:
+    def test_passes_when_expanding(self):
+        passed, _ = evaluate_entry_conditions(
+            _conditions(require_macd_histogram_expanding=True),
+            _full_signals(macd_histogram_expanding=True),
+        )
+        assert passed is True
+
+    def test_fails_when_contracting(self):
+        passed, reason = evaluate_entry_conditions(
+            _conditions(require_macd_histogram_expanding=True),
+            _full_signals(macd_histogram_expanding=False),
+        )
+        assert passed is False
+        assert "macd_histogram" in reason.lower() or "macd" in reason.lower()
+        assert "contracting" in reason
+
+    def test_false_is_noop(self):
+        passed, _ = evaluate_entry_conditions(
+            _conditions(require_macd_histogram_expanding=False),
+            _full_signals(macd_histogram_expanding=False),
+        )
+        assert passed is True
+
+    def test_missing_signal(self):
+        sigs = _full_signals()
+        del sigs["macd_histogram_expanding"]
+        passed, reason = evaluate_entry_conditions(
+            _conditions(require_macd_histogram_expanding=True), sigs
+        )
+        assert passed is False
+        assert "macd_histogram_expanding" in reason
+        assert "unavailable" in reason

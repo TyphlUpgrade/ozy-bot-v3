@@ -791,3 +791,61 @@ class TestSessionVeto:
         assert len(ranked) == 1
         assert ranked[0].symbol == "TSLA"
         assert ranked[0].action == "sell_short"
+
+
+# ---------------------------------------------------------------------------
+# 10. catalyst_type conviction cap (swing technical_only ≤ 0.50)
+# ---------------------------------------------------------------------------
+
+class TestCatalystTypeConvictionCap:
+
+    def _filter(self, opp):
+        r = OpportunityRanker()
+        return r.apply_hard_filters(
+            opp, _account(), _portfolio(), _pdt_guard(True), _market_open(True), orders=[],
+        )
+
+    def test_swing_technical_only_above_cap_rejected(self):
+        opp = _opportunity(
+            strategy="swing", catalyst_type="technical_only", conviction=0.65,
+        )
+        passes, reason = self._filter(opp)
+        assert passes is False
+        assert "technical_only" in reason
+        assert "0.50" in reason
+
+    def test_swing_technical_only_at_cap_passes(self):
+        opp = _opportunity(
+            strategy="swing", catalyst_type="technical_only", conviction=0.50,
+        )
+        passes, _ = self._filter(opp)
+        assert passes is True
+
+    def test_swing_technical_only_below_cap_passes(self):
+        opp = _opportunity(
+            strategy="swing", catalyst_type="technical_only", conviction=0.40,
+        )
+        passes, _ = self._filter(opp)
+        assert passes is True
+
+    def test_swing_catalyst_driven_above_cap_passes(self):
+        """catalyst_driven swing can have conviction > 0.50."""
+        opp = _opportunity(
+            strategy="swing", catalyst_type="catalyst_driven", conviction=0.75,
+        )
+        passes, _ = self._filter(opp)
+        assert passes is True
+
+    def test_momentum_technical_only_above_cap_passes(self):
+        """Momentum strategy is not subject to the swing conviction cap."""
+        opp = _opportunity(
+            strategy="momentum", catalyst_type="technical_only", conviction=0.80,
+        )
+        passes, _ = self._filter(opp)
+        assert passes is True
+
+    def test_swing_no_catalyst_type_above_cap_passes(self):
+        """Absent catalyst_type field does not trigger the cap."""
+        opp = _opportunity(strategy="swing", conviction=0.75)
+        passes, _ = self._filter(opp)
+        assert passes is True

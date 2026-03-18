@@ -38,7 +38,13 @@ FIELD INSTRUCTIONS:
 - "action": use "buy" for long entries. Use "sell_short" when market conditions are clearly bearish for a symbol (price below VWAP, bearish_aligned trend structure, RSI declining, negative momentum). For shorts, "suggested_stop" must be ABOVE the entry price (loss if price rises) and "suggested_exit" must be BELOW the entry price (profit target). Only recommend shorts when the bearish thesis is explicit and technically confirmed — do not short simply because you declined a long entry.
 - "suggested_stop" / "suggested_exit": if you have a specific support/resistance level in mind (e.g. "stop below the 200-EMA at $387"), populate these. Use 0.0 if you have no strong view — the system will fall back to ATR-based levels.
 - "catalyst_type": for swing strategy opportunities only — classify as "catalyst_driven" (news event, earnings setup, volume-confirmed reversal pattern) or "technical_only" (purely TA-based, no identifiable catalyst). Conviction for "technical_only" swing entries must not exceed 0.50.
-- "entry_conditions": optional per-trade TA gate confirmed at execution time. Specify only the conditions you actually want enforced — all fields are optional. The medium loop will check these against live indicators before entering; if any condition is unmet, the entry is deferred to the next cycle. Keys: require_above_vwap (bool), rsi_min (float), rsi_max (float), require_volume_ratio_min (float), require_macd_bullish (bool). Example: NVDA momentum entry with rsi_min: 52, rsi_max: 72, require_above_vwap: true. Omit the field entirely if you have no specific conditions — the system will enter on conviction and TA score alone.
+- "entry_conditions": optional per-trade TA gate confirmed at execution time. Specify only the conditions you actually want enforced — all fields are optional. The medium loop will check these against live indicators before entering; if any condition is unmet, the entry is deferred to the next cycle. Omit the field entirely if you have no specific conditions — the system will enter on conviction and TA score alone.
+  Available keys:
+    BOTH directions: rsi_min (float), rsi_max (float), require_volume_ratio_min (float), require_volume_trend_bars_min (int — consecutive bars of increasing volume), require_macd_histogram_expanding (bool — MACD histogram growing in current direction)
+    LONG only: require_above_vwap (bool), rsi_slope_min (float — RSI rising at least this fast, e.g. 0.5), require_macd_bullish (bool)
+    SHORT only: require_below_vwap (bool), rsi_slope_max (float — RSI falling, use negative value e.g. -0.5), require_macd_bearish (bool)
+  Long example (NVDA momentum): require_above_vwap: true, rsi_min: 52, rsi_max: 72, rsi_slope_min: 0.5, require_macd_histogram_expanding: true
+  Short example (META momentum short): require_below_vwap: true, rsi_max: 50, rsi_slope_max: -0.5, require_macd_bearish: true, require_volume_trend_bars_min: 2
 - "session_veto": list of DIRECTIONS to suppress for the remainder of this session. Valid values: "long", "short". Example: ["long"] blocks all long entries while leaving short entries open; ["short"] does the reverse. Use when market regime makes one direction structurally invalid — e.g. confirmed distribution phase → veto "long" and focus on shorts; strong broad uptrend with no short setups → veto "short". Empty list is the default and correct choice in most sessions. NEVER put both "long" and "short" in the veto simultaneously — that disables all entries. If conditions are bad in all directions, lower conviction scores or return empty new_opportunities instead.
 
 Return ONLY a JSON object. No markdown, no explanation outside the JSON.
@@ -60,21 +66,14 @@ RESPONSE FORMAT:
       "symbol": "<SYMBOL>",
       "action": "buy|sell_short",
       "strategy": "momentum|swing",
-      "timeframe": "short_term|medium_term",
       "conviction": 0.0,
       "reasoning": "<catalyst and technical rationale>",
       "suggested_entry": 0.0,
       "suggested_exit": 0.0,
       "suggested_stop": 0.0,
-      "position_size_pct": 0.10,
+      "position_size_pct": 0.05,
       "catalyst_type": "catalyst_driven|technical_only",
-      "entry_conditions": {
-        "require_above_vwap": true,
-        "rsi_min": 50,
-        "rsi_max": 72,
-        "require_volume_ratio_min": 1.4,
-        "require_macd_bullish": false
-      }
+      "entry_conditions": {}
     }
   ],
   "watchlist_changes": {

@@ -105,13 +105,21 @@ def evaluate_entry_conditions(conditions: dict | None, signals: dict) -> tuple[b
     if not conditions:
         return True, ""
 
-    # require_above_vwap ---------------------------------------------------
+    # require_above_vwap — longs: price must be above VWAP at execution ------
     if conditions.get("require_above_vwap"):
         val = signals.get("vwap_position")
         if val is None:
             return False, "signal 'vwap_position' unavailable"
         if val != "above":
             return False, f"require_above_vwap not met: vwap_position={val!r}"
+
+    # require_below_vwap — shorts: price must be below VWAP at execution ----
+    if conditions.get("require_below_vwap"):
+        val = signals.get("vwap_position")
+        if val is None:
+            return False, "signal 'vwap_position' unavailable"
+        if val != "below":
+            return False, f"require_below_vwap not met: vwap_position={val!r}"
 
     # rsi_min --------------------------------------------------------------
     if "rsi_min" in conditions:
@@ -129,6 +137,28 @@ def evaluate_entry_conditions(conditions: dict | None, signals: dict) -> tuple[b
         if float(val) > float(conditions["rsi_max"]):
             return False, f"rsi_max exceeded: RSI {float(val):.1f} > {float(conditions['rsi_max']):.1f}"
 
+    # rsi_slope_min — longs: RSI must be rising at least this fast ----------
+    # Use rsi_slope_min with a positive value (e.g. 0.5) to confirm upward RSI momentum.
+    if "rsi_slope_min" in conditions:
+        val = signals.get("rsi_slope_5")
+        if val is None:
+            return False, "signal 'rsi_slope_5' unavailable"
+        if float(val) < float(conditions["rsi_slope_min"]):
+            return False, (
+                f"rsi_slope_min not met: rsi_slope_5 {float(val):.2f} < {float(conditions['rsi_slope_min']):.2f}"
+            )
+
+    # rsi_slope_max — shorts: RSI must be falling at least this fast ---------
+    # Use rsi_slope_max with a negative value (e.g. -0.5) to confirm downward RSI momentum.
+    if "rsi_slope_max" in conditions:
+        val = signals.get("rsi_slope_5")
+        if val is None:
+            return False, "signal 'rsi_slope_5' unavailable"
+        if float(val) > float(conditions["rsi_slope_max"]):
+            return False, (
+                f"rsi_slope_max exceeded: rsi_slope_5 {float(val):.2f} > {float(conditions['rsi_slope_max']):.2f}"
+            )
+
     # require_volume_ratio_min ---------------------------------------------
     if "require_volume_ratio_min" in conditions:
         val = signals.get("volume_ratio")
@@ -140,13 +170,44 @@ def evaluate_entry_conditions(conditions: dict | None, signals: dict) -> tuple[b
                 f"volume_ratio {float(val):.2f} < {float(conditions['require_volume_ratio_min']):.2f}"
             )
 
-    # require_macd_bullish -------------------------------------------------
+    # require_volume_trend_bars_min — minimum consecutive bars of increasing volume
+    # Confirms participation is building (selling pressure for shorts, buying for longs).
+    if "require_volume_trend_bars_min" in conditions:
+        val = signals.get("volume_trend_bars")
+        if val is None:
+            return False, "signal 'volume_trend_bars' unavailable"
+        if int(val) < int(conditions["require_volume_trend_bars_min"]):
+            return False, (
+                f"require_volume_trend_bars_min not met: "
+                f"volume_trend_bars {int(val)} < {int(conditions['require_volume_trend_bars_min'])}"
+            )
+
+    # require_macd_bullish — longs: MACD must be in bullish state -----------
     if conditions.get("require_macd_bullish"):
         val = signals.get("macd_signal")
         if val is None:
             return False, "signal 'macd_signal' unavailable"
         if val not in ("bullish", "bullish_cross"):
             return False, f"require_macd_bullish not met: macd_signal={val!r}"
+
+    # require_macd_bearish — shorts: MACD must be in bearish state ----------
+    if conditions.get("require_macd_bearish"):
+        val = signals.get("macd_signal")
+        if val is None:
+            return False, "signal 'macd_signal' unavailable"
+        if val not in ("bearish", "bearish_cross"):
+            return False, f"require_macd_bearish not met: macd_signal={val!r}"
+
+    # require_macd_histogram_expanding — MACD histogram must be expanding ---
+    # True when histogram absolute value grew bar-over-bar with unchanged sign
+    # (momentum building in the current direction, not fading). Works for both
+    # longs (bullish histogram growing) and shorts (bearish histogram deepening).
+    if conditions.get("require_macd_histogram_expanding"):
+        val = signals.get("macd_histogram_expanding")
+        if val is None:
+            return False, "signal 'macd_histogram_expanding' unavailable"
+        if not bool(val):
+            return False, "require_macd_histogram_expanding not met: MACD histogram contracting"
 
     return True, ""
 
@@ -339,6 +400,20 @@ class OpportunityRanker:
         conviction = float(opportunity.get("conviction", 0.0))
         if conviction < self._min_conviction:
             return False, f"{symbol}: conviction {conviction:.2f} below threshold {self._min_conviction:.2f}"
+
+        # 1b. Swing technical_only conviction cap — prompt instructs Claude to keep
+        #     technical_only swing conviction ≤ 0.50; enforce it here as a hard floor
+        #     so a miscalibrated model cannot bypass the cap.
+        if (
+            opportunity.get("strategy") == "swing"
+            and opportunity.get("catalyst_type") == "technical_only"
+            and conviction > 0.50
+        ):
+            return (
+                False,
+                f"{symbol}: swing technical_only conviction {conviction:.2f} exceeds cap 0.50 "
+                f"(no identifiable catalyst — reduce conviction or provide catalyst_driven rationale)",
+            )
 
         # 2. Minimum composite technical score floor — computed with direction so
         #    short opportunities are evaluated against bearish signal strength,
