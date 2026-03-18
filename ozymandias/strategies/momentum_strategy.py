@@ -79,6 +79,13 @@ class MomentumStrategy(Strategy):
         # any entry is considered. Prevents momentum entries when nobody is trading.
         # Distinct from the soft high_volume condition (rewarded at 1.2+, weight 0.15).
         "min_rvol_for_entry": 1.0,
+        # Hard RSI ceiling: RSI above this level is always blocked regardless of slope.
+        # Genuinely overextended; slope cannot override.
+        "rsi_max_absolute": 78,
+        # Minimum rsi_slope_5 required to enter when RSI is in the extended zone
+        # (between rsi_entry_max and rsi_max_absolute). A flat or falling RSI in
+        # that zone is rejected; a climbing RSI signals acceleration, not exhaustion.
+        "rsi_slope_threshold": 2.0,
         # Entry gate: when True, reject entries where price is on the wrong side of VWAP.
         # Longs need price above VWAP; shorts need price below VWAP.
         "require_vwap_gate": True,
@@ -224,12 +231,29 @@ class MomentumStrategy(Strategy):
         trend = indicators.get("trend_structure", "mixed")
         rsi_div = indicators.get("rsi_divergence", False)
 
+        # Slope-aware RSI gate — three zones:
+        # Normal zone (rsi_entry_min–rsi_entry_max): passes unconditionally.
+        # Extended zone (rsi_entry_max–rsi_max_absolute): requires rsi_slope_5
+        #   to meet rsi_slope_threshold — RSI must be actively climbing to enter.
+        # Hard ceiling (above rsi_max_absolute): always blocked; genuinely overextended.
+        rsi_slope = float(indicators.get("rsi_slope_5", 0.0))
+        rsi_min = self._p("rsi_entry_min")
+        rsi_max = self._p("rsi_entry_max")
+        rsi_ceiling = self._p("rsi_max_absolute")
+        slope_threshold = self._p("rsi_slope_threshold")
+        if rsi > rsi_ceiling:
+            rsi_in_range = False
+        elif rsi > rsi_max:
+            rsi_in_range = rsi_slope >= slope_threshold
+        else:
+            rsi_in_range = rsi >= rsi_min
+
         conditions = {
-            "above_vwap":      vwap_pos == "above",
-            "rsi_in_range":    self._p("rsi_entry_min") <= rsi <= self._p("rsi_entry_max"),
-            "macd_bullish":    macd in ("bullish", "bullish_cross"),
-            "high_volume":     vol_ratio >= self._p("min_volume_ratio"),
-            "trend_aligned":   trend == "bullish_aligned",
+            "above_vwap":        vwap_pos == "above",
+            "rsi_in_range":      rsi_in_range,
+            "macd_bullish":      macd in ("bullish", "bullish_cross"),
+            "high_volume":       vol_ratio >= self._p("min_volume_ratio"),
+            "trend_aligned":     trend == "bullish_aligned",
             "no_rsi_divergence": rsi_div != "bearish",
         }
         weights = {

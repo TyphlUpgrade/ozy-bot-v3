@@ -81,13 +81,14 @@ def _momentum_indicators(**overrides) -> dict:
 
 
 def _swing_indicators(**overrides) -> dict:
-    """Perfect swing indicator set (all 5 conditions met)."""
+    """Perfect swing indicator set (all 6 conditions met, including rsi_slope_5)."""
     base = {
         "bollinger_position": "lower_half",
         "rsi":               38.0,
         "macd_signal":       "bearish",     # not bearish_cross — improving
         "trend_structure":   "bullish_aligned",
         "volume_ratio":      1.1,           # no panic selling
+        "rsi_slope_5":       1.5,           # RSI rising — bottom is forming
         "atr_14":            2.5,
         "price":             97.0,
     }
@@ -668,3 +669,185 @@ class TestSwingRvolGate:
         momentum_signals = await momentum.generate_signals("AAPL", _df(), inds_m)
         assert len(swing_signals) == 1
         assert len(momentum_signals) == 0
+
+
+# ---------------------------------------------------------------------------
+# 10. Slope-aware RSI gate — momentum
+# ---------------------------------------------------------------------------
+
+class TestMomentumSlopeAwareRsiGate:
+    """
+    Three-zone RSI gate in MomentumStrategy:
+      - Normal zone [rsi_entry_min, rsi_entry_max]: always pass
+      - Extended zone (rsi_entry_max, rsi_max_absolute]: pass only when
+        rsi_slope_5 >= rsi_slope_threshold
+      - Hard ceiling (> rsi_max_absolute): always blocked
+
+    `min_signals_for_entry=4` means rsi_in_range=False alone does not block
+    the signal (5 other conditions can still pass). Tests of the gate itself
+    call _evaluate_entry_conditions directly. Tests of the full signal use
+    perfect indicator sets to confirm pass/fail where rsi_in_range IS decisive.
+    """
+
+    def test_rsi_normal_range_condition_true(self):
+        """RSI=55 in normal range → rsi_in_range=True in conditions dict."""
+        s = MomentumStrategy()
+        inds = _momentum_indicators(rsi=55.0, rsi_slope_5=0.0)
+        conditions, _ = s._evaluate_entry_conditions(inds)
+        assert conditions["rsi_in_range"] is True
+
+    def test_rsi_at_lower_bound_condition_true(self):
+        """RSI=45 exactly at rsi_entry_min → rsi_in_range=True."""
+        s = MomentumStrategy()
+        inds = _momentum_indicators(rsi=45.0, rsi_slope_5=0.0)
+        conditions, _ = s._evaluate_entry_conditions(inds)
+        assert conditions["rsi_in_range"] is True
+
+    def test_rsi_below_lower_bound_condition_false(self):
+        """RSI=44 < rsi_entry_min=45 → rsi_in_range=False."""
+        s = MomentumStrategy()
+        inds = _momentum_indicators(rsi=44.0, rsi_slope_5=5.0)
+        conditions, _ = s._evaluate_entry_conditions(inds)
+        assert conditions["rsi_in_range"] is False
+
+    def test_rsi_extended_zone_high_slope_condition_true(self):
+        """RSI=70 (extended) + slope=3.0 >= threshold=2.0 → rsi_in_range=True."""
+        s = MomentumStrategy()
+        inds = _momentum_indicators(rsi=70.0, rsi_slope_5=3.0)
+        conditions, _ = s._evaluate_entry_conditions(inds)
+        assert conditions["rsi_in_range"] is True
+
+    def test_rsi_extended_zone_low_slope_condition_false(self):
+        """RSI=70 (extended) + slope=1.5 < threshold=2.0 → rsi_in_range=False."""
+        s = MomentumStrategy()
+        inds = _momentum_indicators(rsi=70.0, rsi_slope_5=1.5)
+        conditions, _ = s._evaluate_entry_conditions(inds)
+        assert conditions["rsi_in_range"] is False
+
+    def test_rsi_extended_zone_negative_slope_condition_false(self):
+        """RSI=70 (extended) + falling slope → rsi_in_range=False."""
+        s = MomentumStrategy()
+        inds = _momentum_indicators(rsi=70.0, rsi_slope_5=-1.0)
+        conditions, _ = s._evaluate_entry_conditions(inds)
+        assert conditions["rsi_in_range"] is False
+
+    def test_rsi_exactly_at_hard_ceiling_low_slope_condition_false(self):
+        """RSI=78 (boundary of extended zone) + slope=1.0 < threshold → False."""
+        s = MomentumStrategy()
+        inds = _momentum_indicators(rsi=78.0, rsi_slope_5=1.0)
+        conditions, _ = s._evaluate_entry_conditions(inds)
+        assert conditions["rsi_in_range"] is False
+
+    def test_rsi_exactly_at_hard_ceiling_high_slope_condition_true(self):
+        """RSI=78 (boundary, not > ceiling) + slope=3.0 >= threshold → True."""
+        s = MomentumStrategy()
+        inds = _momentum_indicators(rsi=78.0, rsi_slope_5=3.0)
+        conditions, _ = s._evaluate_entry_conditions(inds)
+        assert conditions["rsi_in_range"] is True
+
+    def test_rsi_above_hard_ceiling_always_false(self):
+        """RSI=79 > rsi_max_absolute=78 → rsi_in_range=False regardless of slope."""
+        s = MomentumStrategy()
+        inds = _momentum_indicators(rsi=79.0, rsi_slope_5=10.0)
+        conditions, _ = s._evaluate_entry_conditions(inds)
+        assert conditions["rsi_in_range"] is False
+
+    def test_rsi_extended_zone_exactly_at_slope_threshold_condition_true(self):
+        """RSI=72 + slope == threshold=2.0 exactly → True (>= is inclusive)."""
+        s = MomentumStrategy()
+        inds = _momentum_indicators(rsi=72.0, rsi_slope_5=2.0)
+        conditions, _ = s._evaluate_entry_conditions(inds)
+        assert conditions["rsi_in_range"] is True
+
+    def test_slope_threshold_configurable(self):
+        """Custom rsi_slope_threshold=5.0 — slope=3.0 → rsi_in_range=False."""
+        s = MomentumStrategy(params={"rsi_slope_threshold": 5.0})
+        inds = _momentum_indicators(rsi=70.0, rsi_slope_5=3.0)
+        conditions, _ = s._evaluate_entry_conditions(inds)
+        assert conditions["rsi_in_range"] is False
+
+    @pytest.mark.asyncio
+    async def test_rsi_normal_range_generates_signal(self):
+        """RSI in normal range → full signal generated when all else passes."""
+        s = MomentumStrategy()
+        inds = _momentum_indicators(rsi=55.0, rsi_slope_5=0.0)
+        signals = await s.generate_signals("AAPL", _df(), inds)
+        assert len(signals) == 1
+
+    @pytest.mark.asyncio
+    async def test_rsi_extended_high_slope_generates_signal(self):
+        """RSI in extended zone + sufficient slope → full signal generated."""
+        s = MomentumStrategy()
+        inds = _momentum_indicators(rsi=70.0, rsi_slope_5=3.0)
+        signals = await s.generate_signals("AAPL", _df(), inds)
+        assert len(signals) == 1
+
+
+# ---------------------------------------------------------------------------
+# 11. Slope-aware RSI gate — swing
+# ---------------------------------------------------------------------------
+
+class TestSwingSlopeAwareRsiGate:
+    """
+    Swing RSI slope gate: rsi_slope_5 >= rsi_slope_min_for_entry (0.5)
+    confirms the bottom is forming, not still falling.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rising_slope_generates_signal(self):
+        """rsi_slope_5=1.5 >= 0.5 → rsi_slope_rising=True, signal generated."""
+        s = SwingStrategy()
+        inds = _swing_indicators(rsi_slope_5=1.5)
+        signals = await s.generate_signals("TSLA", _df(), inds)
+        assert len(signals) == 1
+
+    @pytest.mark.asyncio
+    async def test_slope_exactly_at_threshold_passes(self):
+        """rsi_slope_5=0.5 == min → passes (>= inclusive)."""
+        s = SwingStrategy()
+        inds = _swing_indicators(rsi_slope_5=0.5)
+        signals = await s.generate_signals("TSLA", _df(), inds)
+        assert len(signals) == 1
+
+    @pytest.mark.asyncio
+    async def test_slope_below_threshold_blocks_signal(self):
+        """rsi_slope_5=0.3 < 0.5 → rsi_slope_rising=False, one fewer condition."""
+        s = SwingStrategy()
+        # Remove one other condition to ensure we'd be at min_signals - 1
+        inds = _swing_indicators(rsi_slope_5=0.3, bollinger_position="middle")
+        signals = await s.generate_signals("TSLA", _df(), inds)
+        assert len(signals) == 0
+
+    @pytest.mark.asyncio
+    async def test_flat_slope_counts_as_not_rising(self):
+        """rsi_slope_5=0.0 (flat RSI) → fails slope gate."""
+        s = SwingStrategy()
+        inds = _swing_indicators(rsi_slope_5=0.0, bollinger_position="middle")
+        signals = await s.generate_signals("TSLA", _df(), inds)
+        assert len(signals) == 0
+
+    @pytest.mark.asyncio
+    async def test_negative_slope_counts_as_not_rising(self):
+        """rsi_slope_5=-1.0 (RSI still falling) → fails slope gate."""
+        s = SwingStrategy()
+        inds = _swing_indicators(rsi_slope_5=-1.0, bollinger_position="middle")
+        signals = await s.generate_signals("TSLA", _df(), inds)
+        assert len(signals) == 0
+
+    def test_slope_threshold_configurable(self):
+        """Custom rsi_slope_min_for_entry=2.0 — slope=1.5 → rsi_slope_rising=False."""
+        s = SwingStrategy(params={"rsi_slope_min_for_entry": 2.0})
+        inds = _swing_indicators(rsi_slope_5=1.5)
+        conditions, _ = s._evaluate_entry_conditions(inds)
+        assert conditions["rsi_slope_rising"] is False
+
+    @pytest.mark.asyncio
+    async def test_slope_default_missing_from_indicators(self):
+        """Missing rsi_slope_5 defaults to 0.0 → fails gate (< 0.5)."""
+        s = SwingStrategy()
+        inds = _swing_indicators()
+        del inds["rsi_slope_5"]
+        # Without slope signal, rsi_slope_rising=False → drops below min_signals
+        inds["bollinger_position"] = "middle"  # remove one more to ensure fail
+        signals = await s.generate_signals("TSLA", _df(), inds)
+        assert len(signals) == 0

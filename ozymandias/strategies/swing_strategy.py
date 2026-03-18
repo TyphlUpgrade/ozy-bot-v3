@@ -17,7 +17,6 @@ import logging
 import pandas as pd
 
 from ozymandias.core.state_manager import Position
-from ozymandias.intelligence.technical_analysis import compute_rsi
 from ozymandias.strategies.base_strategy import (
     ExitSuggestion,
     PositionEval,
@@ -76,6 +75,11 @@ class SwingStrategy(Strategy):
         # Entry gate: when True, reject entries where trend_structure is fully adverse.
         # Longs reject bearish_aligned; shorts reject bullish_aligned.
         "block_bearish_trend": True,
+        # Minimum rsi_slope_5 required for swing long entries. A positive slope confirms
+        # the RSI is turning up — distinguishing a genuine bottom from a still-falling RSI.
+        # For shorts, the condition is inverted: slope must be <= -rsi_slope_min_for_entry.
+        # Replaces the former 2-bar rsi_turning check with a 5-bar velocity measure.
+        "rsi_slope_min_for_entry": 0.5,
     }
 
     def applicable_override_signals(self) -> frozenset[str]:
@@ -142,22 +146,7 @@ class SwingStrategy(Strategy):
         if rvol < self._p("min_rvol_for_entry"):
             return []
 
-        # RSI turning up: distinguishes a genuine bottom from a still-falling RSI.
-        # Computed from raw bars (single O(n) pass), kept internal — not added to
-        # indicators cache so _precompute_indicators doesn't need changes.
-        rsi_series = compute_rsi(market_data)
-        rsi_turning = (
-            len(rsi_series) >= 3
-            and not pd.isna(rsi_series.iloc[-1])
-            and not pd.isna(rsi_series.iloc[-3])
-            and float(rsi_series.iloc[-1]) > float(rsi_series.iloc[-3])
-        )
-        # Inject into a local dict copy so _evaluate_entry_conditions can read it
-        # without modifying the shared indicators cache.
-        indicators_with_rsi_turn = dict(indicators)
-        indicators_with_rsi_turn["rsi_turning"] = rsi_turning
-
-        conditions, weights = self._evaluate_entry_conditions(indicators_with_rsi_turn)
+        conditions, weights = self._evaluate_entry_conditions(indicators)
         n_met = sum(1 for v in conditions.values() if v)
 
         if n_met < self._p("min_signals_for_entry"):
@@ -207,25 +196,33 @@ class SwingStrategy(Strategy):
         macd = indicators.get("macd_signal", "bearish_cross")
         trend = indicators.get("trend_structure", "mixed")
         vol_ratio = float(indicators.get("volume_ratio", 1.0))
-        rsi_turning = bool(indicators.get("rsi_turning", False))
+        rsi_slope = float(indicators.get("rsi_slope_5", 0.0))
+        slope_min = self._p("rsi_slope_min_for_entry")
+
+        # RSI slope gate: confirms the bottom is forming, not still falling.
+        # Longs require rising RSI (slope >= threshold); shorts require falling RSI.
+        # 5-bar velocity is more robust than the former 2-bar rsi_turning check and
+        # is available directly from _latest_indicators with no extra computation.
+        rsi_slope_ok = rsi_slope >= slope_min
 
         conditions = {
-            "near_support":       bb_pos == "lower_half",
-            "rsi_oversold_range": self._p("rsi_entry_min") <= rsi <= self._p("rsi_entry_max"),
+            "near_support":        bb_pos == "lower_half",
+            "rsi_oversold_range":  self._p("rsi_entry_min") <= rsi <= self._p("rsi_entry_max"),
             "macd_not_collapsing": macd != "bearish_cross",
-            "longterm_trend_ok":  trend != "bearish_aligned",
-            "no_panic_selling":   vol_ratio < self._p("panic_volume_ratio"),
-            # RSI rising: rsi[i] > rsi[i-2]. Highest single weight — a still-falling RSI
-            # is the core false-bottom failure mode for swing trades.
-            "rsi_turning":        rsi_turning,
+            "longterm_trend_ok":   trend != "bearish_aligned",
+            "no_panic_selling":    vol_ratio < self._p("panic_volume_ratio"),
+            # RSI slope: highest single weight — a still-falling RSI is the core
+            # false-bottom failure mode for swing trades. 5-bar slope confirms
+            # the turn is real, not a single-bar dead-cat bounce.
+            "rsi_slope_rising":    rsi_slope_ok,
         }
         weights = {
-            "near_support":       0.20,
-            "rsi_oversold_range": 0.20,
+            "near_support":        0.20,
+            "rsi_oversold_range":  0.20,
             "macd_not_collapsing": 0.15,
-            "longterm_trend_ok":  0.20,
-            "no_panic_selling":   0.10,
-            "rsi_turning":        0.20,
+            "longterm_trend_ok":   0.20,
+            "no_panic_selling":    0.10,
+            "rsi_slope_rising":    0.20,
         }
         return conditions, weights
 

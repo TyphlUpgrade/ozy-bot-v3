@@ -501,40 +501,46 @@ class TestComputeCompositeScore:
     Verify weighted sum arithmetic.
 
     Fully-bullish signals → expected sum:
-      VWAP above:     0.20 * 0.7  = 0.140
-      RSI 55 neutral: 0.15 * 0.5  = 0.075
-      MACD bull_x:    0.15 * 0.8  = 0.120
-      Trend bullish:  0.15 * 0.9  = 0.135
-      ROC pos accel:  0.10 * 0.8  = 0.080
-      Vol > 1.5:      0.10 * 0.8  = 0.080
-      BB upper:       0.10 * 0.7  = 0.070
-      No divergence:          0   = 0.000
-      Total                       = 0.700
+      VWAP above:                0.20 * 0.7  = 0.140
+      RSI 55 neutral:            0.15 * 0.5  = 0.075
+      MACD bull_x:               0.15 * 0.8  = 0.120
+      Trend bullish:             0.15 * 0.9  = 0.135
+      ROC pos accel:             0.10 * 0.8  = 0.080
+      Vol > 1.5:                 0.10 * 0.8  = 0.080
+      BB upper:                  0.10 * 0.7  = 0.070
+      No divergence:                     0   = 0.000
+      MACD hist expanding=True:       +0.03  = 0.030
+      RSI slope bonus (none):            0   = 0.000
+      Total                                  = 0.730
     """
 
     def _bullish_signals(self) -> dict:
         return {
-            'vwap_position':    'above',
-            'rsi':              55.0,
-            'rsi_divergence':   False,
-            'macd_signal':      'bullish_cross',
-            'trend_structure':  'bullish_aligned',
-            'roc_5':            1.5,
-            'roc_deceleration': False,
-            'volume_ratio':     1.8,
-            'bollinger_position': 'upper_half',
+            'vwap_position':            'above',
+            'rsi':                      55.0,
+            'rsi_divergence':           False,
+            'macd_signal':              'bullish_cross',
+            'macd_histogram_expanding': True,   # building momentum — +0.03 modifier
+            'trend_structure':          'bullish_aligned',
+            'roc_5':                    1.5,
+            'roc_deceleration':         False,
+            'volume_ratio':             1.8,
+            'bollinger_position':       'upper_half',
         }
 
     def test_fully_bullish(self):
-        assert compute_composite_score(self._bullish_signals()) == pytest.approx(0.70, abs=1e-9)
+        # 0.700 base + 0.030 (MACD bullish + expanding histogram) = 0.730
+        assert compute_composite_score(self._bullish_signals()) == pytest.approx(0.73, abs=1e-9)
 
     def test_bearish_divergence_penalty(self):
+        # 0.730 − 0.200 (bearish divergence penalty) = 0.530
         sig = {**self._bullish_signals(), 'rsi_divergence': 'bearish'}
-        assert compute_composite_score(sig) == pytest.approx(0.50, abs=1e-9)
+        assert compute_composite_score(sig) == pytest.approx(0.53, abs=1e-9)
 
     def test_bullish_divergence_bonus(self):
+        # 0.730 + 0.100 (bullish divergence bonus) = 0.830, clamped to 1.0
         sig = {**self._bullish_signals(), 'rsi_divergence': 'bullish'}
-        assert compute_composite_score(sig) == pytest.approx(0.80, abs=1e-9)
+        assert compute_composite_score(sig) == pytest.approx(0.83, abs=1e-9)
 
     def test_score_clamped_to_zero(self):
         """Extremely bearish signals must not produce a negative score."""
@@ -580,35 +586,37 @@ class TestComputeCompositeScore:
 
     def _bearish_signals(self) -> dict:
         """Mirror of _bullish_signals() — every signal flipped to the bearish side.
-        Expected score with direction='short': 0.700 (symmetry check).
+        Expected score with direction='short': 0.730 (symmetry check).
         Expected score with direction='long':  ~0.295 (confirms shorts were penalised).
 
         Derivation (direction='short'):
-          VWAP below:         0.20 * 0.7  = 0.140
-          RSI 45 → eff 55:    0.15 * 0.5  = 0.075
-          MACD bear_cross:    0.15 * 0.8  = 0.120
-          Trend bearish:      0.15 * 0.9  = 0.135
-          ROC -1.5 → eff +1.5:0.10 * 0.8 = 0.080
-          Vol > 1.5:          0.10 * 0.8  = 0.080
-          BB lower_half:      0.10 * 0.7  = 0.070
-          No divergence:                    0.000
-          Total                             0.700
+          VWAP below:               0.20 * 0.7  = 0.140
+          RSI 45 → eff 55:          0.15 * 0.5  = 0.075
+          MACD bear_cross:          0.15 * 0.8  = 0.120
+          Trend bearish:            0.15 * 0.9  = 0.135
+          ROC -1.5 → eff +1.5:      0.10 * 0.8  = 0.080
+          Vol > 1.5:                0.10 * 0.8  = 0.080
+          BB lower_half:            0.10 * 0.7  = 0.070
+          No divergence:                          0.000
+          MACD hist expanding=True:        +0.03  = 0.030
+          Total                                   0.730
         """
         return {
-            'vwap_position':    'below',
-            'rsi':              45.0,
-            'rsi_divergence':   False,
-            'macd_signal':      'bearish_cross',
-            'trend_structure':  'bearish_aligned',
-            'roc_5':            -1.5,
-            'roc_deceleration': False,
-            'volume_ratio':     1.8,
-            'bollinger_position': 'lower_half',
+            'vwap_position':            'below',
+            'rsi':                      45.0,
+            'rsi_divergence':           False,
+            'macd_signal':              'bearish_cross',
+            'macd_histogram_expanding': True,   # bearish histogram building — +0.03 for shorts
+            'trend_structure':          'bearish_aligned',
+            'roc_5':                    -1.5,
+            'roc_deceleration':         False,
+            'volume_ratio':             1.8,
+            'bollinger_position':       'lower_half',
         }
 
-    def test_short_direction_bearish_signals_score_0_70(self):
-        """Perfect short setup scores 0.70 — symmetric with the bullish long case."""
-        assert compute_composite_score(self._bearish_signals(), direction="short") == pytest.approx(0.70, abs=1e-9)
+    def test_short_direction_bearish_signals_score_0_73(self):
+        """Perfect short setup scores 0.73 — symmetric with the bullish long case."""
+        assert compute_composite_score(self._bearish_signals(), direction="short") == pytest.approx(0.73, abs=1e-9)
 
     def test_short_direction_bullish_signals_score_low(self):
         """Bullish signals are penalised for a short, mirroring how bearish signals
@@ -616,7 +624,7 @@ class TestComputeCompositeScore:
         long_score  = compute_composite_score(self._bullish_signals(), direction="long")
         short_score = compute_composite_score(self._bullish_signals(), direction="short")
         assert short_score < 0.35, "bullish signals should score poorly for shorts"
-        assert long_score == pytest.approx(0.70, abs=1e-9)
+        assert long_score == pytest.approx(0.73, abs=1e-9)
 
     def test_long_direction_bearish_signals_score_low(self):
         """Bearish signals are penalised for a long (regression guard)."""

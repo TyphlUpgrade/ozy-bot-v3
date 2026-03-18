@@ -2384,7 +2384,7 @@ class TestShortEntryWiring:
 
     @pytest.mark.asyncio
     async def test_short_exit_is_buy_order(self, orch):
-        """Quant override exit for a short position must place a 'buy' (buy-to-cover) order."""
+        """Short exit via VWAP crossover must place a 'buy' (buy-to-cover) order."""
         symbol = "TSLA"
         position = Position(
             symbol=symbol,
@@ -2398,12 +2398,11 @@ class TestShortEntryWiring:
             "price": 270.0,       # above entry — short is losing
             "vwap": 260.0,
             "vwap_position": "above",
-            "volume_ratio": 2.0,
+            "volume_ratio": 2.0,  # above short_vwap_exit_volume_threshold (1.3)
             "rsi": 65.0,
             "rsi_divergence": False,
             "roc_5": 0.04,
             "atr_14": 5.0,
-            "atr_trailing_stop": 265.0,
         }}
         orch._intraday_highs[symbol] = 272.0
 
@@ -2413,9 +2412,13 @@ class TestShortEntryWiring:
             submitted_at=datetime.now(timezone.utc),
         ))
 
-        # _fast_step_quant_overrides skips shorts — no buy-to-cover via quant path
+        # _fast_step_quant_overrides now delegates to _fast_step_short_exits for shorts.
+        # VWAP crossover conditions are met → buy-to-cover order placed.
         await orch._fast_step_quant_overrides()
-        orch._broker.place_order.assert_not_called()
+        orch._broker.place_order.assert_called_once()
+        call_args = orch._broker.place_order.call_args[0][0]
+        assert call_args.side == "buy", "Short exit must be a buy-to-cover order"
+        assert call_args.symbol == symbol
 
     def test_short_pnl_positive_when_price_falls(self):
         """P&L for a short closed below entry must be positive."""

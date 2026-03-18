@@ -332,15 +332,18 @@ def compute_composite_score(signals: dict, direction: str = "long") -> float:
     the actual trade direction before scoring or filtering.
 
     Expected keys in ``signals``:
-        vwap_position     : 'above' | 'at' | 'below'
-        rsi               : float (0–100)
-        rsi_divergence    : 'bearish' | 'bullish' | False
-        macd_signal       : 'bullish_cross' | 'bullish' | 'bearish' | 'bearish_cross'
-        trend_structure   : 'bullish_aligned' | 'mixed' | 'bearish_aligned'
-        roc_5             : float
-        roc_deceleration  : bool
-        volume_ratio      : float
-        bollinger_position: 'upper_half' | 'middle' | 'lower_half'
+        vwap_position              : 'above' | 'at' | 'below'
+        rsi                        : float (0–100)
+        rsi_divergence             : 'bearish' | 'bullish' | False
+        rsi_slope_5                : float — RSI change over 5 bars (positive = rising)
+        macd_signal                : 'bullish_cross' | 'bullish' | 'bearish' | 'bearish_cross'
+        macd_histogram_expanding   : bool — histogram abs value grew bar-over-bar, same sign
+        trend_structure            : 'bullish_aligned' | 'mixed' | 'bearish_aligned'
+        roc_5                      : float
+        roc_deceleration           : bool — positive ROC slowing (used for longs)
+        roc_negative_deceleration  : bool — negative ROC magnitude shrinking (used for shorts)
+        volume_ratio               : float
+        bollinger_position         : 'upper_half' | 'middle' | 'lower_half'
     """
     dir_ = direction if direction in _VWAP_SCORE else "long"
     score = 0.0
@@ -373,8 +376,13 @@ def compute_composite_score(signals: dict, direction: str = "long") -> float:
     score += 0.15 * _TREND_SCORE[dir_].get(signals.get('trend_structure', 'mixed'), 0.5)
 
     # ROC — weight 0.10
+    # Direction-resolved deceleration: shorts use roc_negative_deceleration
+    # (bearish momentum fading), longs use roc_deceleration (bullish fading).
     roc_5 = float(signals.get('roc_5', 0.0))
-    roc_decel = bool(signals.get('roc_deceleration', False))
+    if dir_ == "short":
+        roc_decel = bool(signals.get('roc_negative_deceleration', False))
+    else:
+        roc_decel = bool(signals.get('roc_deceleration', False))
     effective_roc = (-roc_5) if dir_ == "short" else roc_5
     if effective_roc > 0 and not roc_decel:
         roc_s = 0.8
@@ -401,6 +409,32 @@ def compute_composite_score(signals: dict, direction: str = "long") -> float:
     rsi_div = signals.get('rsi_divergence', False)
     if isinstance(rsi_div, str):
         score += _RSI_DIV_BONUS[dir_].get(rsi_div, 0.0)
+
+    # RSI slope bonus — direct adjustment (not a weighted component)
+    # When RSI is in the extended zone (65–78 effective) and slope is strongly
+    # aligned to direction, partially counteract the RSI sub-score penalty.
+    # Threshold of 3.0 points/5 bars = moderate-to-strong velocity.
+    rsi_slope = float(signals.get('rsi_slope_5', 0.0))
+    _RSI_EXTENDED_LOW = 65.0
+    _RSI_EXTENDED_HIGH = 78.0
+    _RSI_SLOPE_BONUS_THRESHOLD = 3.0
+    if _RSI_EXTENDED_LOW <= effective_rsi <= _RSI_EXTENDED_HIGH:
+        if dir_ == "long" and rsi_slope >= _RSI_SLOPE_BONUS_THRESHOLD:
+            score += 0.05
+        elif dir_ == "short" and rsi_slope <= -_RSI_SLOPE_BONUS_THRESHOLD:
+            score += 0.05
+
+    # MACD histogram expanding — direct adjustment (not a weighted component)
+    # Bonus when momentum is building in the favourable direction;
+    # penalty when histogram is contracting (momentum topping).
+    macd_hist_expanding = bool(signals.get('macd_histogram_expanding', False))
+    macd_sig = signals.get('macd_signal', 'bearish')
+    favorable_macd = (
+        (dir_ == "long"  and macd_sig in ("bullish", "bullish_cross")) or
+        (dir_ == "short" and macd_sig in ("bearish", "bearish_cross"))
+    )
+    if favorable_macd:
+        score += 0.03 if macd_hist_expanding else -0.03
 
     return float(max(0.0, min(1.0, score)))
 
@@ -500,6 +534,66 @@ def generate_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
         if last_roc > 0 and prev_roc > 0 and last_roc < prev_roc:
             roc_deceleration = True
 
+    # --- ROC negative deceleration (bearish momentum fading) ---
+    # Symmetric counterpart: fires when ROC is negative on both bars and
+    # magnitude is shrinking (the downmove is losing steam).
+    # Used by compute_composite_score for shorts in place of roc_deceleration.
+    roc_negative_deceleration = False
+    if len(roc_clean) >= 2:
+        prev_roc = float(roc_clean.iloc[-2])
+        if last_roc < 0 and prev_roc < 0 and abs(last_roc) < abs(prev_roc):
+            roc_negative_deceleration = True
+
+    # --- RSI slope over 5 bars (velocity / trajectory) ---
+    # Distinguishes RSI 73 climbing from RSI 73 falling.
+    # Positive = rising, negative = falling. 0.0 when fewer than 6 values.
+    rsi_clean = rsi.dropna()
+    if len(rsi_clean) >= 6:
+        rsi_slope_5 = float(rsi_clean.iloc[-1]) - float(rsi_clean.iloc[-6])
+    else:
+        rsi_slope_5 = 0.0
+
+    # --- MACD histogram expanding (momentum trajectory) ---
+    # True when the histogram's absolute value grew bar-over-bar AND the sign
+    # is unchanged (same-direction build, not a zero-crossing).
+    hist = macd_df['histogram'].dropna()
+    macd_histogram_expanding = False
+    if len(hist) >= 2:
+        curr_hist = float(hist.iloc[-1])
+        prev_hist = float(hist.iloc[-2])
+        # Same sign (not a zero-crossing) and absolute value increased
+        same_sign = (curr_hist > 0) == (prev_hist > 0) and not (curr_hist == 0 and prev_hist == 0)
+        if same_sign and abs(curr_hist) > abs(prev_hist):
+            macd_histogram_expanding = True
+
+    # --- Bollinger squeeze (price coiling before breakout) ---
+    # True when current band width (as % of middle band) is at or near its
+    # 20-bar minimum. Uses 5% tolerance to avoid flickering.
+    # Does NOT affect composite score — context for strategies and Claude only.
+    bb_squeeze = False
+    if not bb['middle'].isna().all():
+        bb_width = (bb['upper'] - bb['lower']) / bb['middle'].replace(0.0, np.nan)
+        bb_width_clean = bb_width.dropna()
+        if len(bb_width_clean) >= 20:
+            current_width = float(bb_width_clean.iloc[-1])
+            rolling_min = float(bb_width_clean.iloc[-20:].min())
+            if rolling_min > 0 and current_width <= rolling_min * 1.05:
+                bb_squeeze = True
+
+    # --- Volume trend bars (accumulation pattern) ---
+    # Count of consecutive recent bars where volume exceeded the prior bar,
+    # stopping at the first bar where volume did not increase. Capped at 5.
+    # Does NOT affect composite score — context for strategies and Claude only.
+    volume_trend_bars = 0
+    vols = df['volume'].values
+    for _i in range(len(vols) - 1, 0, -1):
+        if vols[_i] > vols[_i - 1]:
+            volume_trend_bars += 1
+            if volume_trend_bars >= 5:
+                break
+        else:
+            break
+
     # --- Volume ratio vs SMA ---
     volume_ratio = last_vol / last_vol_sma if last_vol_sma > 0 else 1.0
 
@@ -509,19 +603,24 @@ def generate_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
     avg_daily_volume = float(df['volume'].mean())
 
     signals = {
-        'vwap_position':    vwap_position,
-        'rsi':              round(last_rsi, 2),
-        'rsi_divergence':   rsi_divergence,
-        'macd_signal':      macd_signal,
-        'trend_structure':  trend_structure,
-        'roc_5':            round(last_roc, 4),
-        'roc_deceleration': roc_deceleration,
-        'volume_ratio':     round(volume_ratio, 4),
-        'atr_14':           round(last_atr, 4),
-        'bollinger_position': bollinger_position,
-        'price':            round(last_close, 4),
-        'avg_daily_volume': round(avg_daily_volume, 0),
-        'vol_regime_ratio': round(last_vol_regime, 4),
+        'vwap_position':              vwap_position,
+        'rsi':                        round(last_rsi, 2),
+        'rsi_divergence':             rsi_divergence,
+        'rsi_slope_5':                round(rsi_slope_5, 4),
+        'macd_signal':                macd_signal,
+        'macd_histogram_expanding':   macd_histogram_expanding,
+        'trend_structure':            trend_structure,
+        'roc_5':                      round(last_roc, 4),
+        'roc_deceleration':           roc_deceleration,
+        'roc_negative_deceleration':  roc_negative_deceleration,
+        'volume_ratio':               round(volume_ratio, 4),
+        'volume_trend_bars':          volume_trend_bars,
+        'atr_14':                     round(last_atr, 4),
+        'bollinger_position':         bollinger_position,
+        'bb_squeeze':                 bb_squeeze,
+        'price':                      round(last_close, 4),
+        'avg_daily_volume':           round(avg_daily_volume, 0),
+        'vol_regime_ratio':           round(last_vol_regime, 4),
     }
 
     return {

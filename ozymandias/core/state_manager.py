@@ -76,6 +76,10 @@ class PortfolioState:
     buying_power: float = 0.0
     positions: list[Position] = field(default_factory=list)
     last_updated: str = ""
+    # Persisted recently-closed guard: symbol → UTC ISO timestamp of close event.
+    # Reloaded on startup to restore the in-memory _recently_closed cooldown for
+    # entries younger than 60 seconds. Older entries are discarded on load.
+    recently_closed: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -357,6 +361,7 @@ class StateManager:
                 buying_power=data["buying_power"],
                 positions=[_from_dict_position(p) for p in data["positions"]],
                 last_updated=data["last_updated"],
+                recently_closed=data.get("recently_closed", {}),
             )
 
     async def save_portfolio(self, state: PortfolioState) -> None:

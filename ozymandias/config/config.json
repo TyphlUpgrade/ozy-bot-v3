@@ -13,7 +13,12 @@
     "max_daily_loss_pct": 0.02,
     "per_trade_max_loss_pct": 0.03,
     "pdt_buffer": 1,
-    "min_equity_for_trading": 25500
+    "min_equity_for_trading": 25500,
+    "short_atr_stop_multiplier": 2.0,
+    "short_vwap_exit_enabled": true,
+    "short_vwap_exit_volume_threshold": 1.3,
+    "atr_position_size_cap_enabled": true,
+    "max_risk_per_trade_pct": 0.02
   },
   "scheduler": {
     "bypass_market_hours": false,
@@ -74,6 +79,8 @@
         "min_vol_regime_ratio": 0.85,
         "rsi_entry_min": 45,
         "rsi_entry_max": 65,
+        "rsi_max_absolute": 78,
+        "rsi_slope_threshold": 2.0,
         "block_bearish_aligned": true,
         "min_rvol_for_entry": 1.0,
         "require_vwap_gate": true
@@ -82,7 +89,8 @@
         "target_atr_multiplier": 5.0,
         "min_signals_for_entry": 5,
         "min_rvol_for_entry": 0.8,
-        "block_bearish_trend": true
+        "block_bearish_trend": true,
+        "rsi_slope_min_for_entry": 0.5
       }
     }
   },

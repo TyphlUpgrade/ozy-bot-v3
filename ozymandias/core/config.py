@@ -32,6 +32,13 @@ class RiskConfig:
     per_trade_max_loss_pct: float = 0.03    # max stop-loss distance as fraction of equity; used by position sizer
     pdt_buffer: int = 1                     # PDT day-trades to hold in reserve as emergency exits (of 3 allowed)
     min_equity_for_trading: float = 25500.0 # block all new entries below this equity; FINRA PDT floor is $25k
+    # Short position fast-loop exit controls (symmetric to long-side ATR/VWAP overrides)
+    short_atr_stop_multiplier: float = 2.0          # ATR trail for shorts: stop = intraday_low + ATR × multiplier
+    short_vwap_exit_enabled: bool = True             # when True, price crossing above VWAP triggers buy-to-cover
+    short_vwap_exit_volume_threshold: float = 1.3   # VWAP crossover exit requires volume_ratio above this level
+    # ATR-based position size cap
+    atr_position_size_cap_enabled: bool = True  # cap Claude's requested size when ATR-implied risk exceeds max_risk_per_trade_pct
+    max_risk_per_trade_pct: float = 0.02        # max portfolio fraction at risk per trade (ATR stop-out scenario)
 
 
 @dataclass

@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 from ozymandias.core.config import Config, load_config
 from ozymandias.core.direction import EXIT_SIDE, direction_from_action, is_short
 from ozymandias.core.logger import setup_logging
-from ozymandias.core.market_hours import Session, get_current_session, is_market_open
+from ozymandias.core.market_hours import Session, get_current_session, is_last_five_minutes, is_market_open
 from ozymandias.core.reasoning_cache import ReasoningCache
 from ozymandias.core.state_manager import (
     OrderRecord,
@@ -164,6 +164,7 @@ class Orchestrator:
         # Intraday highs per symbol — maintained by the fast loop for the
         # ATR trailing stop check.
         self._intraday_highs: dict[str, float] = {}
+        self._intraday_lows: dict[str, float] = {}   # tracks minimum price seen each session for short ATR trailing stops
 
         # Monotonic timestamp of each position's opening fill — used to enforce
         # a minimum hold time before quant overrides can fire (prevents the override
@@ -531,6 +532,29 @@ class Orchestrator:
                 restored += 1
         if restored:
             log.info("Startup: restored entry context for %d open position(s)", restored)
+
+        # Reload recently_closed guard from persistent state.
+        # Only entries younger than 60 seconds are reloaded — older entries have
+        # already expired so there is no point reinstating the cooldown.
+        # Monotonic timestamps are reconstructed from the elapsed time since close:
+        #   self._recently_closed[sym] = time.monotonic() - elapsed_seconds
+        # This means the guard expires at the same real-world time regardless of restart.
+        now_utc = datetime.now(timezone.utc)
+        reloaded = 0
+        for sym, close_iso in portfolio.recently_closed.items():
+            try:
+                close_utc = datetime.fromisoformat(close_iso)
+                elapsed = (now_utc - close_utc).total_seconds()
+                if elapsed < 60.0:
+                    self._recently_closed[sym] = time.monotonic() - elapsed
+                    reloaded += 1
+                    log.debug(
+                        "Startup: reloaded recently_closed guard for %s (%.0fs elapsed)", sym, elapsed
+                    )
+            except Exception as exc:
+                log.debug("Startup: could not parse recently_closed entry %s: %s", sym, exc)
+        if reloaded:
+            log.info("Startup: reloaded recently_closed guard for %d symbol(s)", reloaded)
 
         log.info("=== Startup reconciliation complete ===")
 
@@ -931,6 +955,9 @@ class Orchestrator:
             })
 
             portfolio.positions = [p for p in portfolio.positions if p.symbol != symbol]
+            # Persist close timestamp before saving so _recently_closed survives restarts.
+            now_utc_iso = datetime.now(timezone.utc).isoformat()
+            portfolio.recently_closed[symbol] = now_utc_iso
             await self._state_manager.save_portfolio(portfolio)
             self._recently_closed[symbol] = time.monotonic()
             self._position_entry_times.pop(symbol, None)
@@ -955,9 +982,9 @@ class Orchestrator:
         for position in portfolio.positions:
             symbol = position.symbol
 
-            # Override signals are long-biased.
-            # Skip quant overrides for short positions — they rely on stop/target instead.
+            # Short positions have their own fast-loop exit logic below.
             if is_short(position.intention.direction):
+                await self._fast_step_short_exits(position)
                 continue
 
             # Resolve which override signals apply to this position's strategy.
@@ -1072,6 +1099,104 @@ class Orchestrator:
 
             except Exception as exc:
                 log.error("Failed to place override exit for %s: %s", symbol, exc)
+
+    async def _fast_step_short_exits(self, position) -> None:
+        """
+        Fast-loop exit coverage for short positions.
+
+        Three exit triggers (evaluated in priority order):
+          1. Hard stop from intention: price >= stop_loss → buy-to-cover immediately.
+          2. ATR trailing stop: price >= intraday_low + ATR × short_atr_stop_multiplier.
+          3. VWAP crossover: price crossed above VWAP with elevated volume (gated by config).
+
+        _intraday_lows tracks the running session minimum for each short symbol.
+        All orders go through the same fill protection and order record path as long exits.
+        """
+        symbol = position.symbol
+
+        indicators = getattr(self, "_latest_indicators", {}).get(symbol)
+        if indicators is None:
+            log.debug("No indicators for short exit check on %s — skipping", symbol)
+            return
+
+        current_price = indicators.get("price")
+        if current_price is None:
+            return
+
+        # Update intraday low (running minimum for this session)
+        prev_low = self._intraday_lows.get(symbol, current_price)
+        self._intraday_lows[symbol] = min(prev_low, current_price)
+        intraday_low = self._intraday_lows[symbol]
+
+        exit_reason: str | None = None
+
+        # 1. Hard stop from intention (highest priority)
+        stop_loss = position.intention.exit_targets.stop_loss
+        if stop_loss > 0 and current_price >= stop_loss:
+            exit_reason = f"hard stop hit: price {current_price:.4f} >= stop {stop_loss:.4f}"
+
+        # 2. ATR trailing stop
+        if exit_reason is None:
+            atr = float(indicators.get("atr_14") or 0.0)
+            if atr > 0:
+                trail_stop = intraday_low + atr * self._config.risk.short_atr_stop_multiplier
+                if current_price >= trail_stop:
+                    exit_reason = (
+                        f"ATR trail hit: price {current_price:.4f} >= "
+                        f"intraday_low {intraday_low:.4f} + ATR {atr:.4f} × "
+                        f"{self._config.risk.short_atr_stop_multiplier}"
+                    )
+
+        # 3. VWAP crossover exit
+        if exit_reason is None and self._config.risk.short_vwap_exit_enabled:
+            vwap_pos = indicators.get("vwap_position", "")
+            vol_ratio = float(indicators.get("volume_ratio") or 0.0)
+            threshold = self._config.risk.short_vwap_exit_volume_threshold
+            if vwap_pos == "above" and vol_ratio > threshold:
+                exit_reason = (
+                    f"VWAP crossover: price above VWAP, vol_ratio {vol_ratio:.2f} > {threshold:.2f}"
+                )
+
+        if exit_reason is None:
+            return
+
+        log.warning("SHORT EXIT TRIGGERED — %s  reason=%s", symbol, exit_reason)
+
+        if not self._fill_protection.can_place_order(symbol):
+            log.warning("Short exit for %s blocked — pending order already exists", symbol)
+            return
+
+        exit_side = EXIT_SIDE[position.intention.direction]   # buy to cover
+        exit_order = Order(
+            symbol=symbol,
+            side=exit_side,
+            quantity=position.shares,
+            order_type="market",
+            time_in_force="day",
+        )
+        try:
+            result = await self._broker.place_order(exit_order)
+            now_iso = datetime.now(timezone.utc).isoformat()
+            order_record = OrderRecord(
+                order_id=result.order_id,
+                symbol=symbol,
+                side=exit_side,
+                quantity=position.shares,
+                order_type="market",
+                limit_price=None,
+                status="PENDING",
+                created_at=now_iso,
+                last_checked_at=now_iso,
+            )
+            await self._fill_protection.record_order(order_record)
+            log.info(
+                "Short exit order placed — %s  order_id=%s  qty=%.2f",
+                symbol, result.order_id, position.shares,
+            )
+            self._override_exit_count += 1
+            self._trigger_state.last_override_exit_count = self._override_exit_count
+        except Exception as exc:
+            log.error("Failed to place short exit for %s: %s", symbol, exc)
 
     async def _fast_step_pdt_check(self) -> None:
         """
@@ -1199,8 +1324,10 @@ class Orchestrator:
                     "source": "live",
                 })
             portfolio.positions = [p for p in portfolio.positions if p.symbol not in ghost_local]
+            now_utc_iso = datetime.now(timezone.utc).isoformat()
             for symbol in ghost_local:
                 self._recently_closed[symbol] = time.monotonic()
+                portfolio.recently_closed[symbol] = now_utc_iso
             portfolio_updated = True
 
         # Positions broker has that we don't track locally.
@@ -1669,6 +1796,23 @@ class Orchestrator:
             size_factor, tech_score, orig_qty, quantity,
         )
 
+        # ATR-based position size cap: prevent a single stop-out from exceeding
+        # max_risk_per_trade_pct of portfolio equity regardless of ATR on the day.
+        # max_shares = (equity × max_risk_pct) / ATR (risk per share = one ATR).
+        # Direction-agnostic: ATR measures two-way risk symmetrically.
+        if self._config.risk.atr_position_size_cap_enabled and atr and atr > 0:
+            max_shares_by_atr = int(
+                (acct.equity * self._config.risk.max_risk_per_trade_pct) / atr
+            )
+            if max_shares_by_atr > 0 and quantity > max_shares_by_atr:
+                log.info(
+                    "ATR position cap applied for %s: qty %d → %d "
+                    "(equity=%.0f, max_risk_pct=%.1f%%, ATR=%.4f)",
+                    symbol, quantity, max_shares_by_atr,
+                    acct.equity, self._config.risk.max_risk_per_trade_pct * 100, atr,
+                )
+                quantity = max_shares_by_atr
+
         allowed, reason = self._risk_manager.validate_entry(
             symbol=symbol,
             side=order_side,
@@ -1933,6 +2077,50 @@ class Orchestrator:
                     symbol, position.shares, exit_order.order_type, type(strategy).__name__,
                 )
                 break  # one exit order per position per cycle
+
+            # EOD forced close for momentum shorts.
+            # Swing shorts may be held overnight intentionally — excluded.
+            # Only fires if no exit order was placed by strategy evaluation above.
+            if (
+                is_short(position.intention.direction)
+                and position.intention.strategy == "momentum"
+                and is_last_five_minutes()
+                and self._fill_protection.can_place_order(symbol)
+            ):
+                log.info(
+                    "Medium loop: EOD forced close — momentum short %s in last 5 minutes",
+                    symbol,
+                )
+                exit_side = EXIT_SIDE[position.intention.direction]
+                eod_order = Order(
+                    symbol=symbol,
+                    side=exit_side,
+                    quantity=position.shares,
+                    order_type="market",
+                    time_in_force="day",
+                )
+                try:
+                    result = await self._broker.place_order(eod_order)
+                except Exception as exc:
+                    self._mark_broker_failure(exc)
+                    continue
+                self._mark_broker_available()
+                now_iso = datetime.now(timezone.utc).isoformat()
+                record = OrderRecord(
+                    order_id=result.order_id,
+                    symbol=symbol,
+                    side=exit_side,
+                    quantity=position.shares,
+                    order_type="market",
+                    limit_price=None,
+                    status="PENDING",
+                    created_at=now_iso,
+                    last_checked_at=now_iso,
+                )
+                await self._fill_protection.record_order(record)
+                log.info(
+                    "EOD short exit order placed — %s  order_id=%s", symbol, result.order_id,
+                )
 
     # -----------------------------------------------------------------------
     # Slow loop

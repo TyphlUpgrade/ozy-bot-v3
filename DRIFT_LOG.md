@@ -527,3 +527,52 @@ Read the relevant phase section before modifying or debugging any module built i
 **Phase 15/16 implementation order swap** · `phases/15_context_enrichment.md`, `phases/16_short_protection.md`, `CLAUDE.md`
 - **Impl:** Phase 16 must be implemented before Phase 15. Phase 15's `ta_readiness` section is a direct pass-through of `indicators[symbol]["signals"]` — all five new Phase 16 signals appear in Claude's context automatically when Phase 15 is implemented, with no additional mapping required in Phase 15. Phase files and CLAUDE.md updated to document this dependency and ordering.
 - **Why:** Zero-cost signal propagation path discovered during Phase 16 scope analysis. Implementing 16 first means Phase 15 gets all five new pattern signals in `ta_readiness` for free, making the implementation order strictly correct rather than arbitrary.
+
+---
+
+### Phase 16 Implementation (March 18)
+
+**Five new TA pattern signals** · `intelligence/technical_analysis.py`
+- **Impl:** Added to `generate_signal_summary()` (all flow automatically into `_latest_indicators`, strategies, and `ta_readiness`):
+  - `roc_negative_deceleration` (bool): ROC negative on both bars, magnitude shrinking.
+  - `rsi_slope_5` (float): `rsi[-1] - rsi[-6]` (5-bar RSI velocity). Defaults to 0.0 when fewer than 6 RSI values available.
+  - `macd_histogram_expanding` (bool): histogram absolute value grew bar-over-bar with unchanged sign. Zero-crossings excluded.
+  - `bb_squeeze` (bool): current Bollinger Band width ≤ 105% of 20-bar minimum (price coiling).
+  - `volume_trend_bars` (int 0–5): consecutive recent bars with increasing volume (accumulation pattern).
+- **Score adjustments in `compute_composite_score`:** Direction-resolved ROC decel (shorts use `roc_negative_deceleration`); RSI slope bonus (+0.05 when RSI in extended zone 65–78 with slope ≥ 3.0 aligned to direction); MACD histogram modifier (±0.03 when MACD is directionally favorable and histogram expanding/contracting). `bb_squeeze` and `volume_trend_bars` do not affect composite score — context only.
+- **Tests:** 32 new tests in `ozymandias/tests/test_ta_pattern_signals.py`. 5 existing tests in `test_technical_analysis.py` updated for new score values (±0.03 MACD modifier, `macd_histogram_expanding: True` added to `_bullish_signals` / `_bearish_signals` helpers).
+
+**Slope-aware RSI gate in `MomentumStrategy`** · `strategies/momentum_strategy.py`
+- **Impl:** `_evaluate_entry_conditions` RSI check replaced with three-zone logic. New config keys `rsi_max_absolute: 78` and `rsi_slope_threshold: 2.0` added to `_DEFAULT_PARAMS` and `config.json`. Zone boundaries: normal (45–65, always pass), extended (65–78, requires `rsi_slope_5 >= rsi_slope_threshold`), hard ceiling (> 78, always blocked).
+- **Why:** RSI 73 with rising slope was blocked by the static `rsi_entry_max: 65`. The gate can't distinguish momentum acceleration (RSI 55→73 climbing) from late exhaustion (RSI 85→73 falling). Slope-aware gate fixes the INTC-class false rejection without removing the exhaustion block.
+
+**RSI slope gate in `SwingStrategy`** · `strategies/swing_strategy.py`
+- **Impl:** Replaced 2-bar `rsi_turning` check (`rsi[-1] > rsi[-3]`, computed from raw bars) with `rsi_slope_5 >= rsi_slope_min_for_entry (0.5)`. Removed raw-bar RSI computation import. New config key `rsi_slope_min_for_entry: 0.5` in `_DEFAULT_PARAMS` and `config.json`. Condition renamed from `"rsi_turning"` to `"rsi_slope_rising"` in conditions dict.
+- **Why:** The 2-bar check used redundant raw-bar RSI computation instead of the already-computed `rsi_slope_5` signal. The 5-bar slope is more robust and flows automatically to Claude's `ta_readiness`. Configurable threshold replaces hardcoded 2-bar comparison.
+
+**Short fast-loop exits** · `core/orchestrator.py`
+- **Impl:** New `_fast_step_short_exits(position)` method, called from `_fast_step_quant_overrides` for short positions (replaces former `continue` skip). Three exit triggers evaluated in priority order:
+  1. Hard stop from intention: `price >= stop_loss` → market buy, urgency 1.0.
+  2. ATR trailing stop: `price >= intraday_low + ATR × short_atr_stop_multiplier` → market buy, urgency 0.95.
+  3. VWAP crossover: `vwap_position == "above"` and `volume_ratio > short_vwap_exit_volume_threshold` → market buy, urgency 0.85.
+  All exits go through fill protection path. `_intraday_lows` dict added (symmetric to `_intraday_highs`) to track per-symbol session minimum price for ATR trailing stop.
+- **New config keys:** `short_atr_stop_multiplier: 2.0`, `short_vwap_exit_enabled: true`, `short_vwap_exit_volume_threshold: 1.3` in `risk`.
+
+**EOD forced close for momentum shorts** · `core/orchestrator.py`
+- **Impl:** In `_medium_evaluate_positions`, momentum short positions trigger market buy in the last 5 minutes of session (`is_last_five_minutes(now_et)` using already-imported helper). Swing shorts explicitly excluded.
+- **Why:** Momentum strategy is intraday; holding short overnight has asymmetric gap-up risk (short squeeze). Swing shorts are held overnight by design.
+
+**`_recently_closed` persistence** · `core/state_manager.py`, `core/orchestrator.py`
+- **Impl:** `PortfolioState.recently_closed: dict[str, str]` (UTC ISO timestamps) added. Written to `portfolio.json` on close events (`_journal_closed_trade` and position sync). On startup (`startup_reconciliation`), entries are reloaded if recorded within the last 60 seconds using elapsed-time monotonic math. Entries older than 60s are discarded on reload.
+- **Why:** `_recently_closed` was in-memory only; bot restarts during the 60s cooldown window allowed immediate re-entry into just-closed positions. Persisting timestamps through restarts closes the gap.
+
+**ATR position size cap** · `core/orchestrator.py`, `core/config.py`
+- **Impl:** In `_medium_try_entry`, after TA size factor is applied: `max_shares = int((equity × max_risk_per_trade_pct) / ATR)`. Applied when `atr_position_size_cap_enabled` is true and ATR > 0. Direction-agnostic.
+- **New config keys:** `atr_position_size_cap_enabled: true`, `max_risk_per_trade_pct: 0.02` in `risk`.
+- **Why:** High-ATR entries could size into positions that risk far more than the configured `per_trade_max_loss_pct` if stop distance exceeds ATR. Cap ensures risk per trade is bounded by a fixed equity fraction regardless of strategy-level stop placement.
+
+**New tests** · `ozymandias/tests/test_ta_pattern_signals.py`, `tests/test_short_protection.py`, `ozymandias/tests/test_strategies.py`
+- 32 tests in `test_ta_pattern_signals.py` (all five new signals + score modifiers).
+- 21 tests in `test_short_protection.py` (ATR trailing stop, VWAP crossover, hard stop, EOD close, `_recently_closed` persistence, ATR position cap).
+- 21 new tests in `test_strategies.py` classes `TestMomentumSlopeAwareRsiGate` and `TestSwingSlopeAwareRsiGate`.
+- Updated `test_technical_analysis.py` (5 tests) and `test_orchestrator.py` (1 test).
