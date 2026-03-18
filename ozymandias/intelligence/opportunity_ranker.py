@@ -446,9 +446,10 @@ class OpportunityRanker:
         """
         Full ranking pipeline:
         1. Extract candidates from Claude's reasoning output.
-        2. Apply hard filters.
-        3. Score remaining candidates.
-        4. Sort by composite score descending.
+        2. Drop any whose strategy is in session_veto.
+        3. Apply hard filters.
+        4. Score remaining candidates.
+        5. Sort by composite score descending.
 
         Parameters
         ----------
@@ -458,9 +459,23 @@ class OpportunityRanker:
         orders:
             Order list forwarded to the PDT guard.
         """
+        # session_veto contains direction strings: "long", "short", or both.
+        # Filtering by direction (not strategy) lets Claude block longs without
+        # killing short entries that would profit from the same bearish conditions.
+        # To add a new direction value, it flows automatically — no changes here.
+        session_veto: set[str] = set(reasoning_result.session_veto or [])
         scored: list[ScoredOpportunity] = []
         for opp in reasoning_result.new_opportunities:
             symbol = opp.get("symbol", "?")
+            # Session veto: drop opportunities whose direction Claude has assessed
+            # as structurally invalid for today's regime before scoring.
+            opp_direction = direction_from_action(opp.get("action", "buy"))
+            if opp_direction in session_veto:
+                logger.info(
+                    "rank_opportunities: %s (%s) skipped — session veto active for %s",
+                    symbol, opp.get("action", "buy"), opp_direction,
+                )
+                continue
             passes, reason = self.apply_hard_filters(
                 opp,
                 account_info,

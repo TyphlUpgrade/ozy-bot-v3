@@ -674,3 +674,120 @@ class TestShortDirectionFilters:
         )
         assert passes is False
         assert "bearish_aligned" in reason
+
+
+# ---------------------------------------------------------------------------
+# Session veto — direction-based
+# ---------------------------------------------------------------------------
+
+def _reasoning_with_veto(opportunities, veto: list[str]) -> ReasoningResult:
+    return ReasoningResult(
+        timestamp="2026-03-13T10:00:00Z",
+        position_reviews=[],
+        new_opportunities=opportunities,
+        watchlist_changes={"add": [], "remove": [], "rationale": ""},
+        market_assessment="neutral",
+        risk_flags=[],
+        rejected_opportunities=[],
+        session_veto=veto,
+        raw={},
+    )
+
+
+class TestSessionVeto:
+
+    def test_long_veto_blocks_buy_opportunity(self):
+        """session_veto: ["long"] removes buy (long) opportunities from ranked list."""
+        opp = _opportunity(action="buy", strategy="momentum")
+        signals = _tech("AAPL")
+        result = _reasoning_with_veto([opp], veto=["long"])
+        r = _ranker()
+        ranked = r.rank_opportunities(
+            result, signals, _account(), _portfolio(), _pdt_guard(), _market_open(),
+        )
+        assert ranked == []
+
+    def test_long_veto_passes_short_opportunity(self):
+        """session_veto: ["long"] does NOT block sell_short opportunities."""
+        opp = _opportunity(
+            symbol="TSLA", action="sell_short", strategy="momentum",
+            suggested_entry=200.0, suggested_exit=185.0, suggested_stop=210.0,
+        )
+        signals = _tech("TSLA")
+        result = _reasoning_with_veto([opp], veto=["long"])
+        r = _ranker()
+        ranked = r.rank_opportunities(
+            result, signals, _account(), _portfolio(), _pdt_guard(), _market_open(),
+        )
+        assert len(ranked) == 1
+        assert ranked[0].action == "sell_short"
+
+    def test_short_veto_blocks_sell_short_opportunity(self):
+        """session_veto: ["short"] removes sell_short opportunities."""
+        opp = _opportunity(
+            action="sell_short", strategy="momentum",
+            suggested_entry=200.0, suggested_exit=185.0, suggested_stop=210.0,
+        )
+        signals = _tech("AAPL")
+        result = _reasoning_with_veto([opp], veto=["short"])
+        r = _ranker()
+        ranked = r.rank_opportunities(
+            result, signals, _account(), _portfolio(), _pdt_guard(), _market_open(),
+        )
+        assert ranked == []
+
+    def test_short_veto_passes_buy_opportunity(self):
+        """session_veto: ["short"] does NOT block buy (long) opportunities."""
+        opp = _opportunity(action="buy", strategy="momentum")
+        signals = _tech("AAPL")
+        result = _reasoning_with_veto([opp], veto=["short"])
+        r = _ranker()
+        ranked = r.rank_opportunities(
+            result, signals, _account(), _portfolio(), _pdt_guard(), _market_open(),
+        )
+        assert len(ranked) == 1
+
+    def test_long_veto_allows_shorts_regardless_of_strategy(self):
+        """Direction veto is strategy-agnostic: swing short passes even when long is vetoed."""
+        opp = _opportunity(
+            symbol="MSFT", action="sell_short", strategy="swing",
+            suggested_entry=400.0, suggested_exit=380.0, suggested_stop=415.0,
+        )
+        signals = _tech("MSFT")
+        result = _reasoning_with_veto([opp], veto=["long"])
+        r = _ranker()
+        ranked = r.rank_opportunities(
+            result, signals, _account(), _portfolio(), _pdt_guard(), _market_open(),
+        )
+        assert len(ranked) == 1
+        assert ranked[0].strategy == "swing"
+
+    def test_empty_veto_no_effect(self):
+        """session_veto: [] — no opportunities filtered."""
+        opp = _opportunity(action="buy")
+        signals = _tech("AAPL")
+        result = _reasoning_with_veto([opp], veto=[])
+        r = _ranker()
+        ranked = r.rank_opportunities(
+            result, signals, _account(), _portfolio(), _pdt_guard(), _market_open(),
+        )
+        assert len(ranked) == 1
+
+    def test_mixed_veto_only_blocks_matching_direction(self):
+        """With veto=["long"], a mix of buy+sell_short: only buy is dropped."""
+        opps = [
+            _opportunity(symbol="AAPL", action="buy", strategy="momentum"),
+            _opportunity(
+                symbol="TSLA", action="sell_short", strategy="momentum",
+                suggested_entry=200.0, suggested_exit=185.0, suggested_stop=210.0,
+            ),
+        ]
+        signals = {**_tech("AAPL"), **_tech("TSLA")}
+        result = _reasoning_with_veto(opps, veto=["long"])
+        r = _ranker()
+        ranked = r.rank_opportunities(
+            result, signals, _account(), _portfolio(), _pdt_guard(), _market_open(),
+        )
+        assert len(ranked) == 1
+        assert ranked[0].symbol == "TSLA"
+        assert ranked[0].action == "sell_short"

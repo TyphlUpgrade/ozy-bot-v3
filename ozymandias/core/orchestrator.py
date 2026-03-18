@@ -1574,14 +1574,6 @@ class Orchestrator:
             for strategy in self._strategies:
                 strategy_name = type(strategy).__name__.replace("Strategy", "").lower()
 
-                # Session veto: Claude has assessed this strategy as invalid for today's regime.
-                if strategy_name in reasoning_result.session_veto:
-                    log.info(
-                        "[veto] skipping %s entry for %s — session veto active",
-                        strategy_name, symbol,
-                    )
-                    continue
-
                 # require_strong_entry: temporarily raise min_signals_for_entry by 1
                 # for this symbol. Safe because asyncio is single-threaded (no races).
                 strong = _require_strong.get((symbol, strategy_name), False)
