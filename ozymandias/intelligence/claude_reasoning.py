@@ -33,9 +33,14 @@ from ozymandias.intelligence.technical_analysis import compute_composite_score
 
 log = logging.getLogger(__name__)
 
-# Rough chars-per-token estimate for context size guard
+# Rough chars-per-token estimate for context size guard.
+# Accurate for structured JSON (context JSON estimated ≈ actual API tokens).
 _CHARS_PER_TOKEN = 4
-_TOKEN_TARGET_MAX = 8_000
+# Total token budget for the full API call (context JSON + prompt template).
+# Context trim guard uses: context_budget = _TOTAL_TOKEN_BUDGET - prompt_template_tokens,
+# both measured in chars/4 units. 25,000 keeps full-prompt cost well under $0.10/call
+# while accommodating 30+ watchlist symbols without trimming.
+_TOTAL_TOKEN_BUDGET = 25_000
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +230,15 @@ class ClaudeReasoningEngine:
         self._prompts_dir = prompts_dir or config.prompts_dir
         self._last_input_tokens: int = 0
         self._last_output_tokens: int = 0
+        # Measure prompt template overhead once at init so the context trim guard
+        # can compute the correct context budget (total_budget - template_tokens).
+        try:
+            _template_text = (self._prompts_dir / "reasoning.txt").read_text(encoding="utf-8")
+            self._prompt_template_tokens: int = len(_template_text) // _CHARS_PER_TOKEN
+        except OSError:
+            # Prompt dir not available yet (e.g. in unit tests using a custom prompts_dir).
+            # Fall back to a conservative estimate; trim guard will be slightly aggressive.
+            self._prompt_template_tokens = 6_000
         # Fallback provider state
         self._fallback_client = None          # lazy-initialized Gemini client
         self._overload_fallback_count: int = 0  # session circuit breaker counter
@@ -374,9 +388,12 @@ class ClaudeReasoningEngine:
             "market_context": market_data,
         }
 
-        # --- Token guard: trim watchlist until under target ---
+        # --- Token guard: trim watchlist until context fits within budget ---
+        # Budget = total target minus what the prompt template will consume.
+        # Both sides are in chars/4 (estimated) tokens — same unit, no conversion needed.
+        context_token_budget = _TOTAL_TOKEN_BUDGET - self._prompt_template_tokens
         context_json = json.dumps(context, default=str)
-        while _estimate_tokens(context_json) > _TOKEN_TARGET_MAX and context["watchlist_tier1"]:
+        while _estimate_tokens(context_json) > context_token_budget and context["watchlist_tier1"]:
             context["watchlist_tier1"].pop()
             context_json = json.dumps(context, default=str)
 
@@ -386,12 +403,19 @@ class ClaudeReasoningEngine:
         context["watchlist_tier1_shown"] = len(context["watchlist_tier1"])
         context["watchlist_tier1_total"] = total_tier1
 
+        context_tokens = _estimate_tokens(context_json)
         log.debug(
-            "Context: %d positions, %d/%d tier1 watchlist, ~%d tokens",
+            "Context: %d positions, %d/%d tier1 watchlist, "
+            "~%d context tokens + ~%d template tokens = ~%d total "
+            "(budget: %d context / %d total)",
             len(position_entries),
             context["watchlist_tier1_shown"],
             total_tier1,
-            _estimate_tokens(context_json),
+            context_tokens,
+            self._prompt_template_tokens,
+            context_tokens + self._prompt_template_tokens,
+            context_token_budget,
+            _TOTAL_TOKEN_BUDGET,
         )
         return context
 

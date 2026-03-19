@@ -24,14 +24,16 @@
     "bypass_market_hours": false,
     "fast_loop_sec": 10,
     "medium_loop_sec": 120,
-    "slow_loop_check_sec": 300,
+    "slow_loop_check_sec": 60,
     "slow_loop_max_interval_sec": 3600,
-    "slow_loop_price_move_threshold_pct": 2.0,
+    "slow_loop_price_move_threshold_pct": 1.5,
     "dead_zone_start_et": "11:30",
     "dead_zone_end_et": "14:30",
     "limit_order_timeout_sec": 300,
     "market_order_conviction_threshold": 0.80,
-    "min_hold_before_override_min": 5
+    "min_hold_before_override_min": 5,
+    "bars_cache_ttl_sec": 110,
+    "max_entry_defer_cycles": 5
   },
   "claude": {
     "model": "claude-sonnet-4-20250514",
@@ -59,6 +61,7 @@
     "weight_risk": 0.20,
     "weight_liquidity": 0.15,
     "min_conviction_threshold": 0.10,
+    "min_composite_score": 0.50,
     "thesis_challenge_size_threshold": 0.20,
     "thesis_challenge_max_penalty": 0.35,
     "max_entry_drift_pct": 0.015,

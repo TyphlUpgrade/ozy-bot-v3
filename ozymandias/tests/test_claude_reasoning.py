@@ -275,9 +275,10 @@ class TestAssembleReasoningContext:
             _portfolio(), large_watch, _market_data(), {}
         )
         ctx_json = json.dumps(ctx, default=str)
-        # After trimming, must be under token target
-        from ozymandias.intelligence.claude_reasoning import _TOKEN_TARGET_MAX, _CHARS_PER_TOKEN
-        assert len(ctx_json) <= _TOKEN_TARGET_MAX * _CHARS_PER_TOKEN
+        # After trimming, context must fit within context_token_budget (total budget − template tokens).
+        from ozymandias.intelligence.claude_reasoning import _TOTAL_TOKEN_BUDGET, _CHARS_PER_TOKEN
+        context_budget = _TOTAL_TOKEN_BUDGET - engine._prompt_template_tokens
+        assert len(ctx_json) // _CHARS_PER_TOKEN <= context_budget
 
     def test_market_data_passed_through_unchanged(self, tmp_path):
         engine = _engine(tmp_path)

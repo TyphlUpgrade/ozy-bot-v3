@@ -194,6 +194,27 @@ class Orchestrator:
         # by _journal_closed_trade when the position is later closed.
         self._entry_contexts: dict[str, dict] = {}
 
+        # Exit reason hints: symbol → reason string.
+        # Set by override/short-exit/EOD paths when placing exit orders; consumed
+        # by _journal_closed_trade (via _dispatch_confirmed_fill) on fill detection.
+        # Ensures override and short-protection exits are journaled with accurate
+        # exit_reason instead of the price-inferred "strategy" fallback.
+        self._pending_exit_hints: dict[str, str] = {}
+
+        # Symbols traded (entered-and-exited) within the current Claude reasoning
+        # cycle. Blocks the medium loop from re-entering the same symbol on a stale
+        # recommendation after an exit — prevents chasing the same thesis twice
+        # without fresh reasoning (the INTC double-loss pattern from 2026-03-19).
+        # Cleared each time a new Claude slow-loop call succeeds.
+        # To add a new guard: just add the symbol here; it clears automatically.
+        self._cycle_consumed_symbols: set[str] = set()
+
+        # Consecutive entry-condition defer counts per symbol.
+        # Incremented each medium cycle entry_conditions are unmet; the opportunity
+        # is dropped (gate cleared) when count reaches max_entry_defer_cycles.
+        # Cleared with _cycle_consumed_symbols on each successful Claude call.
+        self._entry_defer_counts: dict[str, int] = {}
+
         # Shutdown flag — set by _shutdown(), checked by loops
         self._stopping = False
 
@@ -295,7 +316,9 @@ class Orchestrator:
         )
 
         # -- Market data adapter ----------------------------------------------
-        self._data_adapter = YFinanceAdapter()
+        self._data_adapter = YFinanceAdapter(
+            bars_ttl=self._config.scheduler.bars_cache_ttl_sec
+        )
 
         # -- Claude reasoning engine ------------------------------------------
         self._claude = ClaudeReasoningEngine(
@@ -471,6 +494,7 @@ class Orchestrator:
         try:
             acct = await self._broker.get_account()
             self._last_known_equity = acct.equity
+            self._risk_manager.initialize_daily_tracking(acct)
             log.info(
                 "Account snapshot — equity=$%.2f  buying_power=$%.2f  cash=$%.2f  "
                 "pdt=%s  daytrades_used=%d",
@@ -798,7 +822,8 @@ class Orchestrator:
             return
         has_position = any(p.symbol == change.symbol for p in portfolio.positions)
         if has_position:
-            await self._journal_closed_trade(change)
+            hint = self._pending_exit_hints.pop(change.symbol, None)
+            await self._journal_closed_trade(change, exit_reason_hint=hint)
         else:
             await self._register_opening_fill(change)
 
@@ -868,12 +893,15 @@ class Orchestrator:
             pending.get("strategy", "unknown"), pending.get("direction", "long"),
         )
 
-    async def _journal_closed_trade(self, change) -> None:
+    async def _journal_closed_trade(self, change, exit_reason_hint: str | None = None) -> None:
         """Write a trade journal entry and remove the position from the portfolio.
 
         Called whenever a sell order fill is detected in the reconcile loop.
         Captures: entry data from portfolio, exit price from broker fill, signal
         context from _entry_contexts (populated when the buy filled).
+
+        exit_reason_hint, if provided, overrides price-inferred exit reason logic.
+        Set by override/short-exit/EOD paths via _pending_exit_hints.
         """
         symbol = change.symbol
         try:
@@ -895,11 +923,14 @@ class Orchestrator:
                 pnl_pct = 0.0
 
             # Infer exit reason from fill price vs stop/target levels.
+            # Hint from caller (override/short-protection/EOD paths) takes priority.
             # For shorts: target is below entry (profit when price falls),
             # stop is above entry (loss when price rises).
             stop = position.intention.exit_targets.stop_loss
             target = position.intention.exit_targets.profit_target
-            if pos_is_short:
+            if exit_reason_hint:
+                exit_reason = exit_reason_hint
+            elif pos_is_short:
                 if exit_price > 0 and target > 0 and exit_price <= target * 1.001:
                     exit_reason = "target"
                 elif exit_price > 0 and stop > 0 and exit_price >= stop * 0.999:
@@ -960,6 +991,7 @@ class Orchestrator:
             portfolio.recently_closed[symbol] = now_utc_iso
             await self._state_manager.save_portfolio(portfolio)
             self._recently_closed[symbol] = time.monotonic()
+            self._cycle_consumed_symbols.add(symbol)
             self._position_entry_times.pop(symbol, None)
             log.info(
                 "Trade closed and journaled: %s  pnl=%.2f%%  exit_reason=%s",
@@ -1093,9 +1125,10 @@ class Orchestrator:
                     symbol, result.order_id, position.shares,
                 )
 
+                # Tag exit reason for trade journal (consumed in _dispatch_confirmed_fill)
+                self._pending_exit_hints[symbol] = "quant_override"
                 # Increment override exit counter (feeds slow loop trigger)
                 self._override_exit_count += 1
-                self._trigger_state.last_override_exit_count = self._override_exit_count
 
             except Exception as exc:
                 log.error("Failed to place override exit for %s: %s", symbol, exc)
@@ -1193,8 +1226,9 @@ class Orchestrator:
                 "Short exit order placed — %s  order_id=%s  qty=%.2f",
                 symbol, result.order_id, position.shares,
             )
+            # Tag exit reason for trade journal (consumed in _dispatch_confirmed_fill)
+            self._pending_exit_hints[symbol] = "short_protection"
             self._override_exit_count += 1
-            self._trigger_state.last_override_exit_count = self._override_exit_count
         except Exception as exc:
             log.error("Failed to place short exit for %s: %s", symbol, exc)
 
@@ -1605,6 +1639,30 @@ class Orchestrator:
         (so the caller can try the next ranked candidate).
         """
         symbol = top.symbol
+
+        # Reasoning-cycle guard: block re-entry on a symbol that was already entered
+        # and exited within the current Claude reasoning cycle. Prevents the medium
+        # loop from re-using a stale recommendation after a loss (e.g. INTC entered
+        # at 14:36, exited at 14:41, then re-entered at 15:21 from the same cycle).
+        # Cleared by _run_claude_cycle when fresh reasoning arrives.
+        if symbol in self._cycle_consumed_symbols:
+            log.info(
+                "Medium loop: skipping %s — already traded and closed this reasoning cycle "
+                "(awaiting fresh Claude call before re-entry)",
+                symbol,
+            )
+            return False
+
+        # Composite score floor — prevents marginal entries where each individual component
+        # clears its gate but the combined score is too weak to justify capital deployment.
+        min_score = self._config.ranker.min_composite_score
+        if top.composite_score < min_score:
+            log.info(
+                "Medium loop: skipping %s — composite score %.3f < floor %.2f",
+                symbol, top.composite_score, min_score,
+            )
+            return False
+
         log.info(
             "Medium loop: attempting entry — %s  action=%s  conviction=%.2f  score=%.2f  strategy=%s",
             symbol, top.action, top.ai_conviction, top.composite_score, top.strategy,
@@ -1681,10 +1739,24 @@ class Orchestrator:
         if entry_conds:
             conds_met, conds_reason = evaluate_entry_conditions(entry_conds, ind)
             if not conds_met:
-                log.info(
-                    "Entry conditions not met for %s: %s — will retry next cycle",
-                    symbol, conds_reason,
-                )
+                max_defers = self._config.scheduler.max_entry_defer_cycles
+                self._entry_defer_counts[symbol] = self._entry_defer_counts.get(symbol, 0) + 1
+                count = self._entry_defer_counts[symbol]
+                if count >= max_defers:
+                    log.warning(
+                        "Entry conditions not met for %s: %s — "
+                        "expired after %d consecutive defers (stale thesis gate; awaiting fresh Claude call)",
+                        symbol, conds_reason, count,
+                    )
+                    # Clear the gate on the live object so the medium loop skips this check
+                    # for the remainder of the current reasoning cycle. The ranker rebuilds
+                    # from fresh reasoning on the next Claude cycle, resetting defer_count.
+                    top.entry_conditions = {}
+                else:
+                    log.info(
+                        "Entry conditions not met for %s: %s — defer %d/%d",
+                        symbol, conds_reason, count, max_defers,
+                    )
                 return False
 
         entry_direction = direction_from_action(top.action)
@@ -1914,6 +1986,8 @@ class Orchestrator:
             last_checked_at=now_iso,
         )
         await self._fill_protection.record_order(record)
+        # Order placed — clear any accumulated defer count for this symbol.
+        self._entry_defer_counts.pop(symbol, None)
         if use_market:
             log.info(
                 "Entry order placed (MARKET) — %s  qty=%d  conviction=%.2f>=%.2f  strategy=%s  "
@@ -2071,6 +2145,8 @@ class Orchestrator:
                     last_checked_at=now_iso,
                 )
                 await self._fill_protection.record_order(record)
+                # Tag exit reason for trade journal (consumed in _dispatch_confirmed_fill)
+                self._pending_exit_hints[symbol] = "eod_close"
                 log.info(
                     "EOD short exit order placed — %s  order_id=%s", symbol, result.order_id,
                 )
@@ -2138,13 +2214,15 @@ class Orchestrator:
         finally:
             self._trigger_state.claude_call_in_flight = False
 
-    async def _check_triggers(self) -> list[str]:
+    async def _check_triggers(self, now: datetime | None = None) -> list[str]:
         """
         Evaluate all slow-loop trigger conditions.
         Returns a list of trigger name strings (empty = no trigger).
+
+        ``now`` is injectable for testing; defaults to current UTC time.
         """
         triggers: list[str] = []
-        now = datetime.now(timezone.utc)
+        now = now or datetime.now(timezone.utc)
         ts = self._trigger_state
 
         # 1. Time ceiling: 60+ minutes since last Claude call
@@ -2203,7 +2281,7 @@ class Orchestrator:
         if current_session == Session.REGULAR_HOURS:
             from datetime import time as _time
             from zoneinfo import ZoneInfo as _ZI
-            et = datetime.now(_ZI("America/New_York"))
+            et = now.astimezone(_ZI("America/New_York"))
             if _time(15, 28) <= et.time() <= _time(15, 32):
                 # Only fire once in the ~5-min window; use time_ceiling or a flag
                 if "session_open" not in triggers and "time_ceiling" not in triggers:
@@ -2379,6 +2457,10 @@ class Orchestrator:
         self._degradation.claude_backoff_until_utc = None
         self._trigger_state.last_claude_call_utc = datetime.now(timezone.utc)
         self._trigger_state.last_override_exit_count = self._override_exit_count
+        # Fresh reasoning arrived — unlock all consumed symbols and reset defer counts
+        # so new opportunities from this cycle can be entered on a clean slate.
+        self._cycle_consumed_symbols.clear()
+        self._entry_defer_counts.clear()
 
         # Snapshot current prices after a successful cycle
         await self._update_trigger_prices()
@@ -2389,7 +2471,7 @@ class Orchestrator:
         remove_list = changes.get("remove", [])
         open_symbols = {p.symbol for p in portfolio.positions}
         # Always call — enforces the size cap even when Claude suggests no changes.
-        await self._apply_watchlist_changes(watchlist, add_list, remove_list, open_symbols)
+        actual_adds = await self._apply_watchlist_changes(watchlist, add_list, remove_list, open_symbols)
 
         # -- Apply position review notes -------------------------------------
         if result.position_reviews:
@@ -2399,7 +2481,7 @@ class Orchestrator:
             "Slow loop: Claude cycle complete — %d new opportunities  "
             "%d watchlist adds  %d removes  %d position reviews",
             len(result.new_opportunities),
-            len(add_list),
+            actual_adds,
             len(remove_list),
             len(result.position_reviews),
         )
@@ -2428,7 +2510,7 @@ class Orchestrator:
         add_list: list[dict],
         remove_list: list[str],
         open_symbols: set[str] | None = None,
-    ) -> None:
+    ) -> int:  # returns count of symbols actually added
         """Apply Claude-suggested watchlist additions and removals, then enforce the size cap.
 
         ``open_symbols`` is the set of symbols with active positions — these are
@@ -2446,6 +2528,7 @@ class Orchestrator:
         }
 
         existing_symbols = {e.symbol for e in watchlist.entries}
+        added = 0
 
         for item in add_list:
             # Claude may return plain strings ("SPY") or dicts ({"symbol": "SPY", ...})
@@ -2472,6 +2555,7 @@ class Orchestrator:
                 strategy=strategy,
             ))
             existing_symbols.add(symbol)
+            added += 1
             log.info("Watchlist: added %s (tier=%s)", symbol, tier)
 
         if remove_list:
@@ -2522,6 +2606,7 @@ class Orchestrator:
                 )
 
         await self._state_manager.save_watchlist(watchlist)
+        return added
 
     async def _apply_position_reviews(
         self,
@@ -2534,6 +2619,11 @@ class Orchestrator:
         for review in reviews:
             symbol = review.get("symbol", "")
             action = review.get("action", "hold")
+            note = review.get("updated_reasoning") or review.get("notes", "")
+            log.info(
+                "Position review: %s — action=%s — %s",
+                symbol, action, note or "(no rationale provided)",
+            )
             for pos in portfolio.positions:
                 if pos.symbol != symbol:
                     continue

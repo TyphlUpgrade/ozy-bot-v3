@@ -249,18 +249,20 @@ class TestCheckTriggers:
     async def test_no_trigger_when_quiet(self, orch):
         """All conditions calm — trigger list should be empty."""
         from ozymandias.core.market_hours import get_current_session
+        from zoneinfo import ZoneInfo
         symbols = [f"SYM{i}" for i in range(12)]
         await _set_watchlist(orch, tier1=symbols)
-        orch._trigger_state.last_claude_call_utc = (
-            datetime.now(timezone.utc) - timedelta(minutes=10)
-        )
+        # Use 10:00 AM ET — well within regular hours and outside the 3:28-3:32 PM
+        # approaching_close window — so the time-based trigger cannot fire.
+        quiet_now = datetime(2026, 3, 19, 14, 0, 0, tzinfo=timezone.utc)  # 10:00 AM ET
+        orch._trigger_state.last_claude_call_utc = quiet_now - timedelta(minutes=10)
         orch._trigger_state.last_prices = {}
         orch._trigger_state.last_override_exit_count = 0
         orch._override_exit_count = 0
         orch._latest_indicators = {}
         # Sync last_session to actual current session so the transition trigger doesn't fire.
         orch._trigger_state.last_session = get_current_session().value
-        triggers = await orch._check_triggers()
+        triggers = await orch._check_triggers(now=quiet_now)
         assert triggers == []
 
 

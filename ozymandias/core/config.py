@@ -45,9 +45,9 @@ class RiskConfig:
 class SchedulerConfig:
     fast_loop_sec: int = 10                          # interval for fill polling, quant overrides, position sync
     medium_loop_sec: int = 120                       # interval for TA scans, ranking, and order execution
-    slow_loop_check_sec: int = 300                   # how often to evaluate slow-loop triggers (not how often Claude runs)
+    slow_loop_check_sec: int = 60                    # how often to evaluate slow-loop triggers (not how often Claude runs); lower = faster trigger detection, zero extra cost
     slow_loop_max_interval_sec: int = 3600           # time-ceiling trigger: Claude runs at least this often during market hours
-    slow_loop_price_move_threshold_pct: float = 2.0  # price-move trigger: fires Claude if any tier-1 symbol moves this much since last call
+    slow_loop_price_move_threshold_pct: float = 1.5  # price-move trigger: fires Claude if any tier-1 symbol moves this much since last call
     conservative_startup_mode_min: int = 10          # no new entries for this many minutes after reconciliation errors on startup
     # Dead zone: block new entries during midday low-volume window (ET times, "HH:MM" format)
     dead_zone_start_et: str = "11:30"
@@ -58,6 +58,8 @@ class SchedulerConfig:
     min_hold_before_override_min: int = 5            # quant overrides cannot fire within this many minutes of position entry
     bypass_market_hours: bool = False                # when True, skip all market-hours gates (loop guards, dead zone, session check); for off-hours testing only
     disable_conservative_mode: bool = False          # when True, skip conservative startup mode; use after manually closing broker positions that triggered reconciliation errors
+    bars_cache_ttl_sec: int = 110                    # yfinance bars cache TTL; must be < medium_loop_sec to ensure fresh bars every cycle (medium_loop_sec=120)
+    max_entry_defer_cycles: int = 5                  # drop a deferred opportunity after this many consecutive entry_conditions misses; prevents indefinite deferral on stale Claude thesis
 
 
 @dataclass
@@ -94,6 +96,7 @@ class RankerConfig:
     weight_risk: float = 0.20         # risk-adjusted expected value component
     weight_liquidity: float = 0.15    # volume/liquidity quality component
     min_conviction_threshold: float = 0.10   # sanity floor: rejects degenerate zero-conviction Claude output
+    min_composite_score: float = 0.50        # composite score floor: rejects marginal entries where weak conviction × weak TA × weak RAR all clear individual gates but combine poorly
     thesis_challenge_size_threshold: float = 0.20  # position_size_pct >= this triggers adversarial Claude review before entry
     thesis_challenge_ttl_min: int = 10  # minutes to cache a thesis challenge result before re-evaluating the same symbol
     thesis_challenge_max_penalty: float = 0.35  # max fractional size reduction from thesis challenge (0.35 = up to 35% smaller)
