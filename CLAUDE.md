@@ -106,7 +106,7 @@ Features not described in the spec may be requested. When implementing them, fol
 All 10 spec phases complete per `ozymandias_v3_spec_revised.md`. Post-MVP phases (11–18) are addressing architectural gaps discovered during paper trading.
 
 Last spec phase completed: Phase 10 (March 15)
-Last post-MVP phase completed: Phase 14 — Claude-Directed Entry Conditions (March 18)
+Last post-MVP phase completed: Phase 16 + post-16 paper-trading fixes (March 19)
 
 ### Completed post-MVP work
 - **Anti-bias hardening** (March 15): conviction sanity floor, `rejected_opportunities` logging,
@@ -125,26 +125,39 @@ Last post-MVP phase completed: Phase 14 — Claude-Directed Entry Conditions (Ma
   adding a new strategy now requires only 2 files
 - **Phase 14 — Claude-Directed Entry Conditions** (March 18): `entry_conditions` field in Claude
   prompt and `ScoredOpportunity`; `evaluate_entry_conditions()` in ranker; medium loop defers
-  entries when live signals fail Claude's per-trade TA gates
+  entries when live signals fail Claude's per-trade TA gates; 6 new condition keys for shorts
+- **Phase 16 — Pattern Signal Layer + Short Protection** (March 18): 5 new TA signals
+  (`rsi_slope_5`, `roc_negative_deceleration`, `macd_histogram_expanding`, `bb_squeeze`,
+  `volume_trend_bars`); slope-aware RSI gate in `apply_entry_gate` (direction-aware, live path);
+  fast-loop short exits (ATR trailing stop + VWAP crossover + hard stop);
+  EOD forced close for momentum shorts; `_recently_closed` persisted; ATR position size cap
+- **Post-Phase-16 paper trading fixes** (March 19):
+  - *Token budget*: `_TOTAL_TOKEN_BUDGET = 25_000`; template size subtracted at runtime so Claude
+    sees full 26-symbol watchlist instead of being trimmed to ~7 symbols
+  - *Entry defer expiry*: `_entry_defer_counts` on orchestrator; stale gates expire after
+    `max_entry_defer_cycles` (default 5) consecutive misses — prevents AMD-frozen-RSI deadlock
+  - *Composite score floor*: `min_composite_score: float = 0.45` in `RankerConfig`; checked in
+    `_medium_try_entry` before sizing to block degenerate multi-component-weak entries
+  - *Position review logging*: `_apply_position_reviews` logs each review action at INFO for audit
+  - *`position_in_profit` slow-loop trigger*: fires at `position_profit_trigger_pct` (1.5%) gain
+    intervals; re-arms each interval; direction-aware for shorts; stored in
+    `SlowLoopTriggerState.last_profit_trigger_gain`; cleared on close
+  - *Prompt profit protection*: reasoning.txt instruction 1 updated to prompt Claude to consider
+    stop-tightening when thesis milestones are reached (neutral framing, not mechanical)
+  - *Trade journal versioning*: `prompt_version` and `bot_version` appended to every journal entry;
+    old entries archived to `state/trade_journal_archive_pre_v3.4.jsonl`
+  - *Position sizing fix*: `_medium_try_entry` now uses Claude's `position_size_pct` as the primary
+    sizing target (`equity × pct / price`), clamped by `max_position_pct`. Previously the ATR
+    formula ignored `position_size_pct` entirely, always sizing near the 20% cap regardless of
+    conviction. TA scale factor and ATR risk cap still apply on top.
 
 ### Post-MVP Roadmap: Phases 15–18
 
-**Implementation order: 16 → 15 → 17 → 18.** Phase 16 must precede Phase 15 because Phase 15's
-`ta_readiness` dict is a pass-through of `indicators[symbol]["signals"]` — all Phase 16 pattern
-signals appear in Claude's context automatically once Phase 15 is implemented.
+**Implementation order: 15 → 17 → 18.** Phase 16 is complete. Phase 15 can now be implemented:
+its `ta_readiness` dict is a pass-through of `indicators[symbol]["signals"]` — all Phase 16
+signals appear in Claude's context automatically.
 
-- **Phase 16 — Pattern Signal Layer + Short Protection** *(implement first)*:
-  see `phases/16_short_protection.md`
-  - *TA pattern signals:* `roc_negative_deceleration`, `rsi_slope_5`, `macd_histogram_expanding`,
-    `bb_squeeze`, `volume_trend_bars` — gives the bot velocity/trajectory awareness; all signals
-    are snapshot-free and flow automatically to strategies, `ta_readiness`, and `entry_conditions`
-  - *Momentum gate fix:* slope-aware RSI ceiling in `MomentumStrategy._evaluate_entry_conditions`;
-    `rsi_max_absolute` (78) and `rsi_slope_threshold` (2.0) configurable — closes the INTC-class
-    rejected-entry bug (RSI 73 climbing blocked by static ceiling)
-  - *Short protection:* fast-loop ATR trailing stop + VWAP crossover exit for short positions;
-    EOD forced close for momentum shorts; `_recently_closed` persisted through restarts
-  - *Position sizing:* ATR-based position size cap in `_medium_try_entry`
-- **Phase 15 — Context Enrichment** *(implement after Phase 16)*:
+- **Phase 15 — Context Enrichment** *(next)*:
   see `phases/15_context_enrichment.md`
   - *Additions:* `ta_readiness` structured dict (replaces `technical_summary` string) exposes all
     Phase 16 signals to Claude; execution statistics digest for conviction calibration; watchlist

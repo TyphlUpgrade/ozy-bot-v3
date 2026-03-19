@@ -612,3 +612,50 @@ Read the relevant phase section before modifying or debugging any module built i
 
 **`test_integration.py` `_make_bars` fix** · `ozymandias/tests/test_integration.py`
 - **Impl:** Old flat + step-up price series produced RSI ≈ 100 (one gain, no losses → RS = ∞). New series: first 50 bars alternating ±small moves (~54% up → RSI ≈ 58), last 10 bars biased upward [+,+,-,+,+,-,+,+,-,+] → RSI ≈ 73 with `rsi_slope_5 ≈ 7.2 > 2.0 threshold`. Final close ≈ 1.04% above base (within drift ceiling). Passes RVOL, VWAP, and new RSI gates.
+
+---
+
+### Post-Phase-16 Paper Trading Fixes (March 19)
+
+**Claude context token budget** · `intelligence/claude_reasoning.py`, `core/config.py`
+- **Spec:** *(not defined)*
+- **Impl:** Replaced `_TOKEN_TARGET_MAX = 8_000` (context-only ceiling) with `_TOTAL_TOKEN_BUDGET = 25_000` (full request budget). Template token count computed at engine init: `self._prompt_template_tokens = len(template) // _CHARS_PER_TOKEN` (fallback 6,000 on OSError). Trim loop guard: `context_token_budget = _TOTAL_TOKEN_BUDGET - self._prompt_template_tokens`. Debug log now shows `context + template + total vs budget`.
+- **Why:** Old 8,000 ceiling was applied to context JSON alone without accounting for the ~5,664-token prompt template. Real total was 8,000 + 5,664 ≈ 13,664 tokens — well within Claude's limit. But watchlist trimming fired aggressively, stripping down to ~7 visible symbols instead of the full 26. Fixing to a 25,000 combined budget stops over-trimming while staying safely under the 32K context window.
+
+**Entry defer expiry** · `core/orchestrator.py`, `core/config.py`, `config/config.json`
+- **Spec:** *(not defined)*
+- **Impl:** `self._entry_defer_counts: dict[str, int] = {}` added to `Orchestrator.__init__`. Incremented in `_medium_try_entry` on each `entry_conditions` miss. When count reaches `max_entry_defer_cycles` (default 5): warning logged, `top.entry_conditions` cleared so the gate no longer fires for the remainder of the reasoning cycle. Dict cleared alongside `_cycle_consumed_symbols` on each successful Claude slow-loop call. Order placement clears the count for that symbol.
+- **New config key:** `SchedulerConfig.max_entry_defer_cycles: int = 5` in `config.json`.
+- **Why:** AMD stayed frozen in the deferred queue for 3 hours because its RSI slope gate was never met — the opportunity persisted indefinitely from a stale Claude recommendation. Expiry forces the gate to clear and the next Claude cycle to make a fresh entry decision.
+
+**Composite score floor** · `core/orchestrator.py`, `core/config.py`, `config/config.json`
+- **Spec:** *(not defined)*
+- **Impl:** `RankerConfig.min_composite_score: float = 0.45` added. Checked at the top of `_medium_try_entry` (after cycle-consumed guard, before drift/sizing) — returns `False` if `top.composite_score < min_composite_score`.
+- **Why:** Prevents degenerate entries where each individual gate clears but the combined score (conviction + technical + RAR + liquidity) is too weak to justify capital deployment. Set at 0.45 after SLB analysis: SLB scored 0.455 with conviction=0.60 and technical=0.63 (solid) dragged down only by a tight 1.1:1 RAR. Floor below that natural composite floor preserves legitimate setups.
+
+**Position review audit logging** · `core/orchestrator.py`
+- **Spec:** *(not defined)*
+- **Impl:** `_apply_position_reviews` logs each review at INFO: `"Position review: %s — action=%s — %s"`.
+- **Why:** Position review actions were invisible in the log — no way to verify Claude's hold/exit/adjust decisions were being applied.
+
+**`position_in_profit` slow-loop trigger** · `core/orchestrator.py`, `core/config.py`, `config/config.json`
+- **Spec:** *(not defined)*
+- **Impl:** `SlowLoopTriggerState.last_profit_trigger_gain: dict[str, float]` tracks the unrealised gain fraction at which each position last triggered. In `_check_triggers()`, trigger 4b fires when `unrealised_gain >= last_trigger + position_profit_trigger_pct` (direction-aware for shorts: gain = `(avg_cost - price) / avg_cost`). On trigger, `last_profit_trigger_gain[symbol]` is updated to current gain. Snapshot written to `last_profit_trigger_gain` in `_run_claude_cycle` success block. Cleared in `_journal_closed_trade` when position closes.
+- **New config key:** `SchedulerConfig.position_profit_trigger_pct: float = 0.015` in `config.json`.
+- **Why:** HAL position gained +$130 then slipped to +$100 with no bot reaction. The system had no mechanism to call Claude progressively as unrealised gains grew. Mechanical trailing stops were rejected for swing positions (ATR noise would cause premature exits). Claude-based solution: trigger at 1.5% gain intervals, let Claude decide whether to tighten the stop based on thesis progress.
+
+**`reasoning.txt` profit protection instruction** · `config/prompts/v3.4.0/reasoning.txt`
+- **Spec:** *(not defined)*
+- **Impl:** Position review instruction 1 extended with: when a position has meaningful unrealised gains, explicitly assess whether the current `stop_loss` still reflects thesis risk — raising the stop is appropriate when the primary catalyst has triggered, a key milestone has been reached, or the gain is large enough that returning to entry would represent a significant missed opportunity. Explicitly states: "Do not adjust mechanically on every profit — when the thesis has substantial remaining upside and no milestone has been reached, hold with original stops is correct."
+- **Why:** Without explicit instruction, Claude had no prompt signal to act on profit trigger calls. Framing is intentionally neutral (lists when adjustment IS appropriate, not when it's required) to preserve Claude's discretion and avoid adversarial mechanical-adjustment bias.
+
+**Trade journal versioning** · `core/orchestrator.py`
+- **Spec:** *(not defined)*
+- **Impl:** `prompt_version` (`self._config.claude.prompt_version`) and `bot_version` (`self._config.claude.model`) appended to every `_trade_journal.append()` call in both `_journal_closed_trade` and the ghost-position cleanup path. Previous 79 unversioned entries archived to `state/trade_journal_archive_pre_v3.4.jsonl`; active journal starts fresh.
+- **Why:** All 79 existing entries lacked version metadata, making them unfiltereable by build for training pipelines. Future entries are now filterable by `WHERE prompt_version >= "v3.4.0"`.
+
+**Position sizing: Claude's `position_size_pct` as primary driver** · `core/orchestrator.py`
+- **Spec:** *(not defined — spec implied ATR-based sizing)*
+- **Impl:** `_medium_try_entry` sizing block replaced. Old: `calculate_position_size(symbol, price, atr, equity)` with `risk_per_trade_pct=0.01` hardcoded default — ignored `position_size_pct` entirely. New: `effective_pct = min(top.position_size_pct, cfg.risk.max_position_pct)`; `target_qty = int(equity × effective_pct / price)`. TA scale factor applied to `target_qty`; ATR cap remains as a hard risk ceiling. `calculate_position_size` no longer called from this path.
+- **Why:** ATR formula with 1% risk on a $30k account always produced ~$4-5k positions regardless of Claude's conviction level — positions were uniformly near the 20% cap. Claude recommends 5%–20% based on setup quality; those recommendations were silently discarded. Now a 5% recommendation → ~$1,500 position; 15% → ~$4,500, correctly reflecting Claude's confidence. `max_position_pct` (config) clamps the effective percent so the ceiling remains operator-configurable.
+- **Tests updated:** `TestThesisChallenge` and `TestTASizeModifier` in `test_orchestrator.py` and `test_execution_fidelity.py` — removed stale `calculate_position_size = MagicMock(return_value=N)` lines; updated quantity assertions to derive from `equity × pct / price`.
