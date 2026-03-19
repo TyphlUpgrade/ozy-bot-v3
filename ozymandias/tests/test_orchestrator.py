@@ -265,6 +265,110 @@ class TestCheckTriggers:
         triggers = await orch._check_triggers(now=quiet_now)
         assert triggers == []
 
+    # ------------------------------------------------------------------
+    # position_in_profit trigger
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_profit_trigger_fires_when_gain_exceeds_threshold(self, orch):
+        """Long position up >1.5% → position_in_profit trigger fires."""
+        now = datetime.now(timezone.utc).isoformat()
+        pos = Position(
+            symbol="HAL", shares=100, avg_cost=33.00, entry_date=now,
+            intention=TradeIntention(
+                direction="long",
+                exit_targets=ExitTargets(profit_target=35.00, stop_loss=31.50),
+            ),
+        )
+        await _set_portfolio(orch, [pos])
+        orch._trigger_state.last_claude_call_utc = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        )
+        orch._latest_indicators = {"HAL": {"price": 33.51}}  # +1.55%
+        triggers = await orch._check_triggers()
+        assert "position_in_profit:HAL" in triggers
+
+    @pytest.mark.asyncio
+    async def test_profit_trigger_does_not_fire_below_threshold(self, orch):
+        """Long position up 0.9% (below 1.5% default) → no profit trigger."""
+        now = datetime.now(timezone.utc).isoformat()
+        pos = Position(
+            symbol="HAL", shares=100, avg_cost=33.00, entry_date=now,
+            intention=TradeIntention(
+                direction="long",
+                exit_targets=ExitTargets(profit_target=35.00, stop_loss=31.50),
+            ),
+        )
+        await _set_portfolio(orch, [pos])
+        orch._trigger_state.last_claude_call_utc = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        )
+        orch._latest_indicators = {"HAL": {"price": 33.30}}  # +0.91%
+        triggers = await orch._check_triggers()
+        assert "position_in_profit:HAL" not in triggers
+
+    @pytest.mark.asyncio
+    async def test_profit_trigger_does_not_refire_until_next_interval(self, orch):
+        """After last_profit_trigger_gain is set at 1.6%, trigger doesn't refire until 3.1%."""
+        now = datetime.now(timezone.utc).isoformat()
+        pos = Position(
+            symbol="HAL", shares=100, avg_cost=33.00, entry_date=now,
+            intention=TradeIntention(
+                direction="long",
+                exit_targets=ExitTargets(profit_target=35.00, stop_loss=31.50),
+            ),
+        )
+        await _set_portfolio(orch, [pos])
+        orch._trigger_state.last_claude_call_utc = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        )
+        # Simulate Claude already reviewed at +1.6% gain
+        orch._trigger_state.last_profit_trigger_gain["HAL"] = 0.016
+        # Position is up 2.0% — not yet 1.6% + 1.5% = 3.1%
+        orch._latest_indicators = {"HAL": {"price": 33.66}}  # +2.0%
+        triggers = await orch._check_triggers()
+        assert "position_in_profit:HAL" not in triggers
+
+    @pytest.mark.asyncio
+    async def test_profit_trigger_rearms_at_next_interval(self, orch):
+        """After last review at +1.6%, trigger fires again when gain reaches 3.1%."""
+        now = datetime.now(timezone.utc).isoformat()
+        pos = Position(
+            symbol="HAL", shares=100, avg_cost=33.00, entry_date=now,
+            intention=TradeIntention(
+                direction="long",
+                exit_targets=ExitTargets(profit_target=35.00, stop_loss=31.50),
+            ),
+        )
+        await _set_portfolio(orch, [pos])
+        orch._trigger_state.last_claude_call_utc = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        )
+        orch._trigger_state.last_profit_trigger_gain["HAL"] = 0.016
+        # +3.15% = 0.016 + 0.015 threshold cleared
+        orch._latest_indicators = {"HAL": {"price": 34.04}}  # +3.15%
+        triggers = await orch._check_triggers()
+        assert "position_in_profit:HAL" in triggers
+
+    @pytest.mark.asyncio
+    async def test_profit_trigger_direction_aware_short(self, orch):
+        """Short position profits when price falls — trigger fires on downward gain."""
+        now = datetime.now(timezone.utc).isoformat()
+        pos = Position(
+            symbol="INTC", shares=100, avg_cost=46.00, entry_date=now,
+            intention=TradeIntention(
+                direction="short",
+                exit_targets=ExitTargets(profit_target=43.00, stop_loss=48.00),
+            ),
+        )
+        await _set_portfolio(orch, [pos])
+        orch._trigger_state.last_claude_call_utc = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        )
+        orch._latest_indicators = {"INTC": {"price": 45.28}}  # -1.57% from short entry
+        triggers = await orch._check_triggers()
+        assert "position_in_profit:INTC" in triggers
+
 
 # ===========================================================================
 # Slow loop control-flow tests

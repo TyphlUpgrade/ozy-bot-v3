@@ -95,6 +95,10 @@ class SlowLoopTriggerState:
     last_session: Optional[str] = None
     # Fired once after the first medium loop cycle populates indicators
     indicators_seeded: bool = False
+    # Unrealised gain pct (as a fraction) at the time of the last profit trigger per symbol.
+    # Trigger fires when gain_pct >= last value + position_profit_trigger_pct.
+    # Updated after each successful Claude call; cleared when a position closes.
+    last_profit_trigger_gain: dict[str, float] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -993,6 +997,7 @@ class Orchestrator:
             self._recently_closed[symbol] = time.monotonic()
             self._cycle_consumed_symbols.add(symbol)
             self._position_entry_times.pop(symbol, None)
+            self._trigger_state.last_profit_trigger_gain.pop(symbol, None)
             log.info(
                 "Trade closed and journaled: %s  pnl=%.2f%%  exit_reason=%s",
                 symbol, pnl_pct, exit_reason,
@@ -2266,6 +2271,26 @@ class Orchestrator:
         if self._override_exit_count > ts.last_override_exit_count:
             triggers.append("override_exit")
 
+        # 4b. Open position has reached a meaningful unrealised gain.
+        # Fires when gain_pct crosses the configured threshold, then re-arms each time
+        # gain grows by another full interval — gives Claude a chance to tighten the
+        # stop progressively as the position moves in our favour.
+        # Direction-aware: shorts profit when price falls below avg_cost.
+        profit_threshold = self._config.scheduler.position_profit_trigger_pct
+        for pos in portfolio.positions:
+            current = indicators.get(pos.symbol, {}).get("price")
+            if current is None or pos.avg_cost <= 0:
+                continue
+            if is_short(pos.intention.direction):
+                gain_pct = (pos.avg_cost - current) / pos.avg_cost
+            else:
+                gain_pct = (current - pos.avg_cost) / pos.avg_cost
+            if gain_pct < profit_threshold:
+                continue
+            last_trigger = ts.last_profit_trigger_gain.get(pos.symbol, 0.0)
+            if gain_pct >= last_trigger + profit_threshold:
+                triggers.append(f"position_in_profit:{pos.symbol}")
+
         # 5. Market session transition (open at 9:30 ET, approaching close at 3:30 ET)
         current_session = get_current_session()
         last_session = ts.last_session
@@ -2461,6 +2486,19 @@ class Orchestrator:
         # so new opportunities from this cycle can be entered on a clean slate.
         self._cycle_consumed_symbols.clear()
         self._entry_defer_counts.clear()
+
+        # Snapshot current unrealised gain for each open position so the
+        # position_in_profit trigger re-arms from the reviewed level, not from
+        # the original entry price (which would fire again immediately next cycle).
+        for pos in portfolio.positions:
+            current = indicators.get(pos.symbol, {}).get("price")
+            if current is None or pos.avg_cost <= 0:
+                continue
+            if is_short(pos.intention.direction):
+                gain_pct = (pos.avg_cost - current) / pos.avg_cost
+            else:
+                gain_pct = (current - pos.avg_cost) / pos.avg_cost
+            self._trigger_state.last_profit_trigger_gain[pos.symbol] = gain_pct
 
         # Snapshot current prices after a successful cycle
         await self._update_trigger_prices()

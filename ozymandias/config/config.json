@@ -33,7 +33,8 @@
     "market_order_conviction_threshold": 0.80,
     "min_hold_before_override_min": 5,
     "bars_cache_ttl_sec": 110,
-    "max_entry_defer_cycles": 5
+    "max_entry_defer_cycles": 5,
+    "position_profit_trigger_pct": 0.015
   },
   "claude": {
     "model": "claude-sonnet-4-20250514",
