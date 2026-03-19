@@ -987,6 +987,8 @@ class Orchestrator:
                 "claude_conviction": claude_conviction,
                 "composite_score": composite_score,
                 "source": "live",
+                "prompt_version": self._config.claude.prompt_version,
+                "bot_version": self._config.claude.model,
             })
 
             portfolio.positions = [p for p in portfolio.positions if p.symbol != symbol]
@@ -1361,6 +1363,8 @@ class Orchestrator:
                     "claude_conviction": ctx.get("claude_conviction", 0.0),
                     "composite_score": ctx.get("composite_score", 0.0),
                     "source": "live",
+                    "prompt_version": self._config.claude.prompt_version,
+                    "bot_version": self._config.claude.model,
                 })
             portfolio.positions = [p for p in portfolio.positions if p.symbol not in ghost_local]
             now_utc_iso = datetime.now(timezone.utc).isoformat()
