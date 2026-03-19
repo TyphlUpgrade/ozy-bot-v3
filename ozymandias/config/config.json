@@ -62,7 +62,7 @@
     "weight_risk": 0.20,
     "weight_liquidity": 0.15,
     "min_conviction_threshold": 0.10,
-    "min_composite_score": 0.50,
+    "min_composite_score": 0.45,
     "thesis_challenge_size_threshold": 0.20,
     "thesis_challenge_max_penalty": 0.35,
     "max_entry_drift_pct": 0.015,

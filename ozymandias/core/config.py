@@ -97,7 +97,7 @@ class RankerConfig:
     weight_risk: float = 0.20         # risk-adjusted expected value component
     weight_liquidity: float = 0.15    # volume/liquidity quality component
     min_conviction_threshold: float = 0.10   # sanity floor: rejects degenerate zero-conviction Claude output
-    min_composite_score: float = 0.50        # composite score floor: rejects marginal entries where weak conviction × weak TA × weak RAR all clear individual gates but combine poorly
+    min_composite_score: float = 0.45        # composite score floor: rejects entries where multiple components are simultaneously weak; set below the individual gate thresholds' natural composite floor (~0.38) with margin; revisit after 30+ trades
     thesis_challenge_size_threshold: float = 0.20  # position_size_pct >= this triggers adversarial Claude review before entry
     thesis_challenge_ttl_min: int = 10  # minutes to cache a thesis challenge result before re-evaluating the same symbol
     thesis_challenge_max_penalty: float = 0.35  # max fractional size reduction from thesis challenge (0.35 = up to 35% smaller)
