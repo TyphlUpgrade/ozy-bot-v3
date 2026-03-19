@@ -1809,28 +1809,36 @@ class Orchestrator:
         atr = ind.get("atr_14", 0.0)
         avg_vol = ind.get("avg_daily_volume")
 
-        quantity = self._risk_manager.calculate_position_size(
-            symbol, entry_price, atr, acct.equity
-        )
-        if quantity <= 0:
-            log.debug("Medium loop: position size = 0 for %s — skipping", symbol)
+        # Primary sizing: Claude's conviction-based position_size_pct drives the target.
+        # ATR formula (calculate_position_size) used previously ignored position_size_pct
+        # entirely, always saturating near the 20% max_position cap regardless of conviction.
+        # Claude sizes 5%–20% based on setup quality; honour that recommendation here.
+        # Clamp by max_position_pct (config) before computing shares so the ceiling is
+        # respected at the sizing step and not just caught later as a validate_entry rejection.
+        effective_pct = min(top.position_size_pct, self._config.risk.max_position_pct)
+        target_qty = int((acct.equity * effective_pct) / entry_price) if entry_price > 0 else 0
+        if target_qty <= 0:
+            log.debug(
+                "Medium loop: position_size_pct=%.2f (capped=%.2f) gives 0 shares for %s at %.2f — skipping",
+                top.position_size_pct, effective_pct, symbol, entry_price,
+            )
             return False
 
-        # Phase 11: Scale quantity by TA signal quality.
+        # Scale quantity by TA signal quality.
         # At composite_technical_score=0 → ta_size_factor_min of base qty; at 1.0 → 100% of base qty.
         tech_score = ind.get("composite_technical_score", 0.5)
         size_factor = (
             self._config.ranker.ta_size_factor_min
             + (1.0 - self._config.ranker.ta_size_factor_min) * tech_score
         )
-        orig_qty = quantity
-        quantity = max(1, int(quantity * size_factor))
+        quantity = max(1, int(target_qty * size_factor))
         log.debug(
-            "TA size factor %.2f (tech_score=%.2f), qty %d → %d",
-            size_factor, tech_score, orig_qty, quantity,
+            "Position sizing for %s: pct=%.0f%% (cap=%.0f%%) target=%d  TA_factor=%.2f (tech_score=%.2f) → qty=%d",
+            symbol, top.position_size_pct * 100, self._config.risk.max_position_pct * 100,
+            target_qty, size_factor, tech_score, quantity,
         )
 
-        # ATR-based position size cap: prevent a single stop-out from exceeding
+        # ATR-based position size cap: hard ceiling to prevent a single stop-out from exceeding
         # max_risk_per_trade_pct of portfolio equity regardless of ATR on the day.
         # max_shares = (equity × max_risk_pct) / ATR (risk per share = one ATR).
         # Direction-agnostic: ATR measures two-way risk symmetrically.

@@ -108,7 +108,6 @@ async def orch(tmp_path):
 
 def _stub_entry_guards(orch, *, indicators: dict | None = None):
     """Allow entry to proceed: bypass risk, fill protection, and thesis challenge."""
-    orch._risk_manager.calculate_position_size = MagicMock(return_value=10)
     orch._risk_manager.validate_entry = MagicMock(return_value=(True, ""))
     orch._fill_protection.can_place_order = MagicMock(return_value=True)
     orch._fill_protection.record_order = AsyncMock()
@@ -371,18 +370,23 @@ class TestMinTechnicalScoreFilter:
 # ===========================================================================
 
 class TestTASizeModifier:
-    """Tests for the TA signal strength → position size scaling in _medium_try_entry."""
+    """Tests for the TA signal strength → position size scaling in _medium_try_entry.
+
+    Sizing formula: target = int(equity × position_size_pct / entry_price)
+    then scaled by: size_factor = ta_size_factor_min + (1 − ta_size_factor_min) × tech_score
+
+    With equity=100_000, position_size_pct=0.05, entry_price=200: target = 25 shares.
+    """
 
     def _make_top(self, suggested_entry=200.0, position_size_pct=0.05):
         return _make_opportunity(suggested_entry=suggested_entry, position_size_pct=position_size_pct)
 
-    async def _run_entry(self, orch, top, tech_score: float, base_qty: int) -> list:
-        """Helper: stub entry guards with given tech_score and base_qty, return placed orders."""
+    async def _run_entry(self, orch, top, tech_score: float) -> list:
+        """Helper: stub entry guards with given tech_score, return placed orders."""
         _stub_entry_guards(orch, indicators={"NVDA": {
             "price": top.suggested_entry,  # no drift
             "composite_technical_score": tech_score,
         }})
-        orch._risk_manager.calculate_position_size = MagicMock(return_value=base_qty)
         # Disable thesis challenge
         orch._claude.run_thesis_challenge = AsyncMock(
             return_value={"proceed": True, "conviction": 0.80, "challenge_reasoning": "ok"}
@@ -402,41 +406,54 @@ class TestTASizeModifier:
 
     @pytest.mark.asyncio
     async def test_size_modifier_at_min_score(self, orch):
-        """tech_score=0.0, ta_size_factor_min=0.60 → quantity = 60% of base."""
+        """tech_score=0.0, ta_size_factor_min=0.60 → quantity = 60% of target."""
         top = self._make_top()
-        orders = await self._run_entry(orch, top, tech_score=0.0, base_qty=100)
+        orders = await self._run_entry(orch, top, tech_score=0.0)
 
         assert len(orders) == 1
-        # size_factor = 0.60 + 0.40*0.0 = 0.60; int(100*0.60) = 60
-        assert orders[0].quantity == 60
+        # target = int(100_000 × 0.05 / 200) = 25; size_factor=0.60 → int(25×0.60)=15
+        acct = _stub_account()
+        ta_min = orch._config.ranker.ta_size_factor_min
+        target = int(acct.equity * top.position_size_pct / top.suggested_entry)
+        assert orders[0].quantity == max(1, int(target * ta_min))
 
     @pytest.mark.asyncio
     async def test_size_modifier_at_max_score(self, orch):
-        """tech_score=1.0 → quantity = 100% of base (no reduction)."""
+        """tech_score=1.0 → quantity = 100% of target (no reduction)."""
         top = self._make_top()
-        orders = await self._run_entry(orch, top, tech_score=1.0, base_qty=100)
+        orders = await self._run_entry(orch, top, tech_score=1.0)
 
         assert len(orders) == 1
-        assert orders[0].quantity == 100
+        acct = _stub_account()
+        target = int(acct.equity * top.position_size_pct / top.suggested_entry)
+        assert orders[0].quantity == target
 
     @pytest.mark.asyncio
     async def test_size_modifier_at_midpoint(self, orch):
-        """tech_score=0.5, ta_size_factor_min=0.60 → quantity = 80% of base."""
+        """tech_score=0.5, ta_size_factor_min=0.60 → quantity = 80% of target."""
         top = self._make_top()
-        orders = await self._run_entry(orch, top, tech_score=0.5, base_qty=100)
+        orders = await self._run_entry(orch, top, tech_score=0.5)
 
         assert len(orders) == 1
-        # size_factor = 0.60 + 0.40*0.5 = 0.80; int(100*0.80) = 80
-        assert orders[0].quantity == 80
+        # target = 25; size_factor = 0.60 + 0.40*0.5 = 0.80 → int(25×0.80) = 20
+        acct = _stub_account()
+        ta_min = orch._config.ranker.ta_size_factor_min
+        target = int(acct.equity * top.position_size_pct / top.suggested_entry)
+        size_factor = ta_min + (1.0 - ta_min) * 0.5
+        assert orders[0].quantity == max(1, int(target * size_factor))
 
     @pytest.mark.asyncio
     async def test_size_modifier_floors_at_one(self, orch):
-        """Modifier result never below 1 share even with tiny base quantity."""
-        top = self._make_top()
-        orders = await self._run_entry(orch, top, tech_score=0.0, base_qty=1)
+        """TA scaling never reduces a 1-share target below 1 share.
+
+        position_size_pct=0.002 → target = int(100_000 × 0.002 / 200) = 1 share.
+        At tech_score=0.0, size_factor=0.60 → int(1×0.60)=0, but max(1,...) floors to 1.
+        """
+        top = self._make_top(position_size_pct=0.002)
+        orders = await self._run_entry(orch, top, tech_score=0.0)
 
         assert len(orders) == 1
-        assert orders[0].quantity >= 1
+        assert orders[0].quantity == 1
 
 
 # ===========================================================================

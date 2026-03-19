@@ -901,7 +901,6 @@ class TestThesisChallenge:
 
     def _stub_entry_guards(self, orch):
         """Mock risk_manager and fill_protection to allow entry."""
-        orch._risk_manager.calculate_position_size = MagicMock(return_value=10)
         orch._risk_manager.validate_entry = MagicMock(return_value=(True, ""))
         orch._fill_protection.can_place_order = MagicMock(return_value=True)
         # composite_technical_score=1.0 → TA size factor=1.0, no quantity reduction
@@ -941,7 +940,6 @@ class TestThesisChallenge:
         """High concern_level → quantity reduced by penalty, but trade is NOT blocked."""
         top = self._make_top(position_size_pct=0.20)
         self._stub_entry_guards(orch)
-        orch._risk_manager.calculate_position_size = MagicMock(return_value=20)
         orch._claude.run_thesis_challenge = AsyncMock(
             return_value={"concern_level": 1.0, "reasoning": "Multiple serious concerns."}
         )
@@ -959,9 +957,12 @@ class TestThesisChallenge:
 
         # Trade MUST proceed (not blocked), just with reduced quantity.
         assert len(placed_orders) == 1
-        # concern=1.0 × max_penalty=0.35 → size_factor=0.65 → int(20 × 0.65) = 13
+        # base_qty = int(equity=100_000 × pct=0.20 / price=200) = 100
+        # ta_factor=1.0 (tech_score=1.0) → pre-challenge qty = 100
+        # concern=1.0 × max_penalty=0.35 → size_factor=0.65 → int(100 × 0.65) = 65
         max_penalty = orch._config.ranker.thesis_challenge_max_penalty
-        expected_qty = max(1, int(20 * (1.0 - 1.0 * max_penalty)))
+        base_qty = int(acct.equity * top.position_size_pct / top.suggested_entry)
+        expected_qty = max(1, int(base_qty * (1.0 - 1.0 * max_penalty)))
         assert placed_orders[0].quantity == expected_qty
 
     @pytest.mark.asyncio
@@ -969,7 +970,6 @@ class TestThesisChallenge:
         """Moderate concern_level applies proportional penalty to quantity."""
         top = self._make_top(position_size_pct=0.20, ai_conviction=0.85)
         self._stub_entry_guards(orch)
-        orch._risk_manager.calculate_position_size = MagicMock(return_value=20)
         orch._claude.run_thesis_challenge = AsyncMock(
             return_value={"concern_level": 0.5, "reasoning": "Earnings in 2 days."}
         )
@@ -986,9 +986,12 @@ class TestThesisChallenge:
         await orch._medium_try_entry(top, acct, portfolio, [])
 
         assert len(placed_orders) == 1
-        # concern=0.5 × max_penalty=0.35 → size_factor=0.825 → int(20 × 0.825) = 16
+        # base_qty = int(equity=100_000 × pct=0.20 / price=200) = 100
+        # ta_factor=1.0 (tech_score=1.0) → pre-challenge qty = 100
+        # concern=0.5 × max_penalty=0.35 → size_factor=0.825 → int(100 × 0.825) = 82
         max_penalty = orch._config.ranker.thesis_challenge_max_penalty
-        expected_qty = max(1, int(20 * (1.0 - 0.5 * max_penalty)))
+        base_qty = int(acct.equity * top.position_size_pct / top.suggested_entry)
+        expected_qty = max(1, int(base_qty * (1.0 - 0.5 * max_penalty)))
         assert placed_orders[0].quantity == expected_qty
 
     @pytest.mark.asyncio
@@ -996,7 +999,6 @@ class TestThesisChallenge:
         """Challenge API failure (returns None) → trade proceeds with original quantity."""
         top = self._make_top(position_size_pct=0.20, ai_conviction=0.85)
         self._stub_entry_guards(orch)
-        orch._risk_manager.calculate_position_size = MagicMock(return_value=10)
         orch._claude.run_thesis_challenge = AsyncMock(return_value=None)
         acct = _stub_account()
         portfolio = PortfolioState(positions=[])
@@ -1010,8 +1012,10 @@ class TestThesisChallenge:
 
         await orch._medium_try_entry(top, acct, portfolio, [])
 
+        # No penalty applied; qty = int(equity=100_000 × pct=0.20 / price=200) = 100
         assert len(placed_orders) == 1
-        assert placed_orders[0].quantity == 10
+        expected_qty = int(acct.equity * top.position_size_pct / top.suggested_entry)
+        assert placed_orders[0].quantity == expected_qty
 
 
 # ===========================================================================
@@ -1032,7 +1036,6 @@ class TestThesisChallengeCache:
         )
 
     def _stub_entry_guards(self, orch):
-        orch._risk_manager.calculate_position_size = MagicMock(return_value=10)
         orch._risk_manager.validate_entry = MagicMock(return_value=(True, ""))
         orch._fill_protection.can_place_order = MagicMock(return_value=True)
         # composite_technical_score=1.0 → TA size factor=1.0, no quantity reduction
@@ -1045,7 +1048,6 @@ class TestThesisChallengeCache:
         import time as _time
         top = self._make_top()
         self._stub_entry_guards(orch)
-        orch._risk_manager.calculate_position_size = MagicMock(return_value=10)
         orch._claude.run_thesis_challenge = AsyncMock()
         orch._broker.place_order = AsyncMock(return_value=MagicMock(order_id="ord_x"))
         orch._fill_protection.record_order = AsyncMock()
@@ -1111,7 +1113,6 @@ class TestThesisChallengeCache:
         import time as _time
         top = self._make_top()
         self._stub_entry_guards(orch)
-        orch._risk_manager.calculate_position_size = MagicMock(return_value=10)
         orch._claude.run_thesis_challenge = AsyncMock()
         orch._broker.place_order = AsyncMock(return_value=MagicMock(order_id="ord_y"))
         orch._fill_protection.record_order = AsyncMock()
@@ -1124,7 +1125,9 @@ class TestThesisChallengeCache:
         await orch._medium_try_entry(top, acct, portfolio, [])
 
         orch._claude.run_thesis_challenge.assert_not_called()
-        assert orch._broker.place_order.call_args[0][0].quantity == 10
+        # quantity = int(equity × pct / price) = int(100_000 × 0.20 / 200) = 100; no penalty
+        expected_qty = int(acct.equity * top.position_size_pct / top.suggested_entry)
+        assert orch._broker.place_order.call_args[0][0].quantity == expected_qty
 
 
 # ===========================================================================
@@ -2421,7 +2424,6 @@ class TestShortEntryWiring:
         orders_state = OrdersState()
         orch._latest_indicators = {"TSLA": {"atr_14": 5.0, "price": 250.0}}
         orch._latest_market_context = {}
-        orch._risk_manager.calculate_position_size = MagicMock(return_value=10)
         orch._risk_manager.validate_entry = MagicMock(return_value=(True, ""))
         orch._fill_protection.can_place_order = MagicMock(return_value=True)
         orch._fill_protection.record_order = AsyncMock()
@@ -2469,7 +2471,6 @@ class TestShortEntryWiring:
         orders_state = OrdersState()
         orch._latest_indicators = {"NVDA": {"atr_14": 8.0, "price": entry_price}}
         orch._latest_market_context = {}
-        orch._risk_manager.calculate_position_size = MagicMock(return_value=10)
         orch._risk_manager.validate_entry = MagicMock(return_value=(True, ""))
         orch._fill_protection.can_place_order = MagicMock(return_value=True)
         orch._fill_protection.record_order = AsyncMock()
