@@ -440,6 +440,22 @@ class RiskManager:
     # Daily loss tracking
     # ------------------------------------------------------------------
 
+    def initialize_daily_tracking(self, account: AccountInfo) -> None:
+        """Seed the daily loss baseline with the startup equity snapshot.
+
+        Call once from startup_reconciliation before any orders are placed.
+        Ensures the daily loss limit is measured from a known clean baseline,
+        not from the equity at first entry attempt (which may differ due to
+        open position P&L movement).
+        """
+        et_today = datetime.now(ET).date()
+        self._daily_loss_date = et_today
+        self._daily_start_equity = account.equity
+        log.info(
+            "Daily loss tracker initialized at startup: %s (equity=$%.2f)",
+            et_today, account.equity,
+        )
+
     def _reset_daily_if_needed(self, account: AccountInfo, today: date) -> None:
         """Reset daily tracking when the calendar date changes."""
         if self._daily_loss_date != today:

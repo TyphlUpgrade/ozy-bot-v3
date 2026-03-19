@@ -73,6 +73,11 @@ def setup_logging(
     root.addHandler(file_handler)
     root.addHandler(stream_handler)
 
+    # Suppress third-party library debug noise — they inherit root DEBUG level
+    for noisy_logger in ("yfinance", "urllib3", "urllib3.connectionpool",
+                         "httpx", "httpcore", "alpaca_trade_api", "anthropic._base_client"):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+
     root.info("Logging initialized. Log file: %s", current)
     return root
 

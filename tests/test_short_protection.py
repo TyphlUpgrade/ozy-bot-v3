@@ -71,6 +71,8 @@ def _make_orch():
     orch._intraday_highs = {}
     orch._recently_closed = {}
     orch._override_exit_count = 0
+    orch._pending_exit_hints = {}
+    orch._cycle_consumed_symbols = set()
     orch._trigger_state = MagicMock()
     orch._strategies = []
     from ozymandias.execution.broker_interface import OrderResult
