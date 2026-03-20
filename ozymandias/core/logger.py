@@ -1,8 +1,15 @@
 """
-Dual-file log rotation.
+Session-based log files.
 
-On startup, current.log is renamed to previous.log (overwriting old previous),
-then a fresh current.log is created.
+On startup, a new timestamped log file is created:
+    logs/session_YYYY-MM-DDTHH-MM-SSZ.log
+
+A ``current.log`` symlink in the same directory always points to the active
+session file, so ``tail -f logs/current.log`` works across restarts.
+
+All session files are kept — nothing is deleted automatically.  Use the
+config key ``max_session_logs`` (default 0 = unlimited) to cap the number of
+retained files; the oldest are removed when the cap is exceeded.
 
 Format: ISO 8601 UTC timestamp | module | level | message
 """
@@ -16,8 +23,7 @@ from typing import Optional
 
 
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
-CURRENT_LOG = LOG_DIR / "current.log"
-PREVIOUS_LOG = LOG_DIR / "previous.log"
+CURRENT_SYMLINK = LOG_DIR / "current.log"
 
 
 class _UTCFormatter(logging.Formatter):
@@ -32,34 +38,76 @@ class _UTCFormatter(logging.Formatter):
         return f"{asctime} | {record.name:<30} | {record.levelname:<8} | {record.getMessage()}"
 
 
+def _session_log_path(target_dir: Path) -> Path:
+    """Return a new timestamped session log path (does not create the file)."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+    return target_dir / f"session_{ts}.log"
+
+
+def _update_current_symlink(target_dir: Path, session_file: Path) -> None:
+    """Point current.log symlink at *session_file* (relative target).
+
+    Silently skips if the filesystem does not support symlinks.
+    """
+    link = target_dir / "current.log"
+    try:
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        # Use the filename only so the symlink works regardless of cwd.
+        os.symlink(session_file.name, link)
+    except (OSError, NotImplementedError):
+        pass
+
+
+def _prune_old_sessions(target_dir: Path, max_keep: int) -> None:
+    """Delete the oldest session_*.log files when the count exceeds *max_keep*.
+
+    Does nothing when max_keep is 0 (unlimited).
+    """
+    if max_keep <= 0:
+        return
+    session_files = sorted(target_dir.glob("session_*.log"), key=lambda p: p.stat().st_mtime)
+    excess = len(session_files) - max_keep
+    if excess <= 0:
+        return
+    for f in session_files[:excess]:
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
 def setup_logging(
     log_dir: Optional[Path] = None,
     level: int = logging.DEBUG,
+    max_session_logs: int = 0,
 ) -> logging.Logger:
     """
     Configure root logger with two handlers:
-    - File handler → logs/current.log
-    - Stream handler → stdout (INFO+)
+    - File handler  → logs/session_<timestamp>.log  (DEBUG+)
+    - Stream handler → stdout  (INFO+)
 
-    Rotates log files on every call (startup behavior).
+    Creates a ``current.log`` symlink pointing at the new session file.
+    Prunes old session files if *max_session_logs* > 0.
+
     Returns the root logger.
     """
     target_dir = Path(log_dir) if log_dir else LOG_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    current = target_dir / "current.log"
-    previous = target_dir / "previous.log"
-
-    # Rotate: current → previous
-    if current.exists():
-        os.replace(current, previous)
+    session_file = _session_log_path(target_dir)
+    _update_current_symlink(target_dir, session_file)
 
     formatter = _UTCFormatter()
 
-    # File handler — DEBUG and above
-    file_handler = logging.FileHandler(current, encoding="utf-8")
+    # File handler — DEBUG and above → timestamped session file.
+    # Opening the handler creates the file on disk; prune AFTER so the new
+    # session counts toward the cap and the correct oldest file is removed.
+    file_handler = logging.FileHandler(session_file, encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
+
+    _prune_old_sessions(target_dir, max_session_logs)
 
     # Stream handler — INFO and above
     stream_handler = logging.StreamHandler()
@@ -67,18 +115,17 @@ def setup_logging(
     stream_handler.setFormatter(formatter)
 
     root = logging.getLogger()
-    # Remove any previously attached handlers to avoid duplication on repeated calls
     root.handlers.clear()
     root.setLevel(level)
     root.addHandler(file_handler)
     root.addHandler(stream_handler)
 
-    # Suppress third-party library debug noise — they inherit root DEBUG level
+    # Suppress third-party library debug noise
     for noisy_logger in ("yfinance", "urllib3", "urllib3.connectionpool",
                          "httpx", "httpcore", "alpaca_trade_api", "anthropic._base_client"):
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
-    root.info("Logging initialized. Log file: %s", current)
+    root.info("Logging initialized. Session log: %s", session_file)
     return root
 
 

@@ -75,9 +75,14 @@ def _print_banner(
 
 
 async def _run(args: argparse.Namespace) -> None:
-    setup_logging(level=args.log_level)
+    setup_logging(level=getattr(logging, args.log_level, logging.INFO))
 
-    cfg = load_config(args.config)
+    try:
+        cfg = load_config(args.config)
+    except Exception as exc:
+        log.critical("STARTUP FAILED — cannot load config: %s", exc)
+        raise
+
     log.info(
         "Ozymandias v3 starting — env=%s  log_level=%s  dry_run=%s",
         cfg.broker.environment, args.log_level, args.dry_run,
@@ -117,6 +122,12 @@ def main() -> None:
     except KeyboardInterrupt:
         log.info("Interrupted — exiting")
         sys.exit(0)
+    except Exception as exc:
+        # Startup or runtime failure already logged at CRITICAL by the raising code.
+        # Print a one-liner here so the terminal always shows something even if the
+        # log handler was never initialised (e.g. config parse error before setup_logging).
+        print(f"FATAL: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

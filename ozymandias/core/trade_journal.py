@@ -48,7 +48,10 @@ class TradeJournal:
         Never raises — journal write failures are logged but do not crash the bot.
         """
         record = dict(record)
-        if "trade_id" not in record:
+        if not record.get("trade_id"):
+            # Generate a UUID when trade_id is absent or explicitly None.
+            # None is passed by close/snapshot/review paths when the in-memory
+            # trade_id was lost (e.g. bot restarted between open and close).
             record["trade_id"] = str(uuid.uuid4())
         if "recorded_at" not in record:
             record["recorded_at"] = datetime.now(timezone.utc).isoformat()

@@ -72,10 +72,12 @@ def _make_bars(n: int = 60, base_price: float = 200.0) -> pd.DataFrame:
     """Synthetic OHLCV DataFrame — enough bars for all TA indicators.
 
     Price design: alternating up/down moves for the first 50 bars (ratio ~54% up
-    → RSI ≈ 58 base), then 10 bars biased upward [+,+,-,+,+,-,+,+,-,+] to push
-    RSI into the extended zone (~73) with positive rsi_slope_5 (~7.2 > 2.0
+    → RSI ≈ 58 base), then 10 bars biased upward [+,+,+,+,+,-,+,+,+,+] to push
+    RSI into the valid momentum zone (~71) with positive rsi_slope_5 (~4.8 > 2.0
     threshold).  Final close lands ~1.0% above base_price — well within the 1.5%
     drift ceiling.  Last close > VWAP (passes VWAP gate).
+    RSI of ~71 clears the rsi_entry_min=60 floor and the rsi_entry_max=65 extended
+    zone slope check (slope 4.8 > 2.0 threshold).
     """
     step = base_price * 0.0012
     step_dn = base_price * 0.0010
@@ -83,8 +85,8 @@ def _make_bars(n: int = 60, base_price: float = 200.0) -> pd.DataFrame:
     deltas = []
     for i in range(n - 10):
         deltas.append(step if i % 2 == 0 else -step_dn)
-    # Last 10 bars: 7 up, 3 down — biased upward pattern
-    tail_pattern = [1, 1, -1, 1, 1, -1, 1, 1, -1, 1]
+    # Last 10 bars: 8 up, 2 down — biased upward to produce RSI ~71 with positive slope
+    tail_pattern = [1, 1, 1, 1, 1, -1, 1, 1, 1, 1]
     for d in tail_pattern:
         deltas.append(d * step)
     close = np.empty(n, dtype=float)

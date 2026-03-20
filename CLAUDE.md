@@ -106,7 +106,7 @@ Features not described in the spec may be requested. When implementing them, fol
 All 10 spec phases complete per `ozymandias_v3_spec_revised.md`. Post-MVP phases (11–18) are addressing architectural gaps discovered during paper trading.
 
 Last spec phase completed: Phase 10 (March 15)
-Last post-MVP phase completed: Phase 16 + post-16 paper-trading fixes (March 19)
+Last post-MVP phase completed: Phase 16 + post-16 paper-trading fixes (March 19–20)
 
 ### Completed post-MVP work
 - **Anti-bias hardening** (March 15): conviction sanity floor, `rejected_opportunities` logging,
@@ -150,6 +150,28 @@ Last post-MVP phase completed: Phase 16 + post-16 paper-trading fixes (March 19)
     sizing target (`equity × pct / price`), clamped by `max_position_pct`. Previously the ATR
     formula ignored `position_size_pct` entirely, always sizing near the 20% cap regardless of
     conviction. TA scale factor and ATR risk cap still apply on top.
+- **Operational hardening** (March 20):
+  - *RSI entry floor*: `rsi_entry_min: 60` in `strategy_params.momentum`; momentum long entries
+    blocked when RSI < 60. Raised from 45 based on backtest: RSI 45–55 → 17% win rate vs RSI ≥65 → 37%.
+  - *Trade journal lifecycle*: `record_type` field (`open`/`snapshot`/`review`/`close`) on all
+    journal entries; `trade_id` UUID generated at fill time and shared across all records for a
+    trade; adoption path and startup restore now also generate a UUID so restarted positions link
+    their future records. `position_size_pct` and `claude_conviction` written to `open` records.
+  - *Session-based logging*: `core/logger.py` rewritten — each startup creates
+    `logs/session_YYYY-MM-DDTHH-MM-SSZ.log`; `current.log` symlink always points to active file;
+    `max_session_logs` param (default 0 = unlimited, never auto-deletes in production).
+  - *Graceful degradation on startup failure*: credential load, broker connect, and market hours
+    fetch each wrapped with CRITICAL log before re-raise; `main.py` catches unhandled exceptions
+    and exits cleanly with `FATAL: ...` on stderr instead of a raw Python traceback.
+  - *Stop adjustment guard*: `_apply_position_reviews` rejects any `adjusted_targets.stop_loss`
+    that would sit on the wrong side of current price (above price for long, below for short),
+    preventing Claude from forcing an immediate exit by over-tightening. Triggered by XOM incident
+    where stop was raised to $162 while price was $161.25. WARNING logged with rejected value.
+  - *Emergency exit/shutdown commands*: signal files `state/EMERGENCY_EXIT` and
+    `state/EMERGENCY_SHUTDOWN` checked at top of every fast-loop tick. Emergency exit: cancels
+    all pending orders, places market exits for all positions, polls broker every 2s for 60s to
+    confirm fills, logs CRITICAL if any remain open. Trigger via `python -m ozymandias.scripts.emergency exit|shutdown`
+    or `touch state/EMERGENCY_EXIT`. Designed for future Discord integration.
 
 ### Post-MVP Roadmap: Phases 15–18
 
@@ -167,6 +189,9 @@ signals appear in Claude's context automatically.
 - **Phase 18 — Watchlist Intelligence**: see `phases/18_watchlist_intelligence.md`
   - Dynamic universe (Yahoo Finance screener + Wikipedia indices), RVOL-ranked candidates,
     Brave Search tool use for Claude to research catalysts at watchlist build time
+  - `scripts/reset_watchlist.py`: CLI tool to replace or clear `watchlist.json` without running
+    the bot. Interface: positional symbol args + `--empty` flag + `--dry-run` preview.
+    Must use StateManager for atomic writes and schema validation.
 
 ## Spec Drift Log
 See `DRIFT_LOG.md`. Read the relevant phase section of DRIFT_LOG.md before modifying or debugging any module built in a previous phase.

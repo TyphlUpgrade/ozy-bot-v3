@@ -871,6 +871,85 @@ class TestSlowLoopStateApplication:
         assert saved.positions[0].intention.exit_targets.profit_target == 230.0
         assert saved.positions[0].intention.exit_targets.stop_loss == 195.0
 
+    @pytest.mark.asyncio
+    async def test_stop_adjustment_rejected_when_above_current_price_long(self, orch):
+        """Stop raised above current price for a long must be silently rejected.
+
+        Reproduces the XOM incident: Claude raised stop to $162 while price
+        was $161.25, causing an immediate exit on the next fast-loop cycle.
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+        pos = Position(
+            symbol="AAPL", shares=10, avg_cost=190.0, entry_date=now_iso,
+            intention=TradeIntention(
+                direction="long",
+                exit_targets=ExitTargets(profit_target=220.0, stop_loss=185.0),
+            ),
+        )
+        await _set_portfolio(orch, [pos])
+        portfolio = await orch._state_manager.load_portfolio()
+
+        # Current price is 195 — new stop of 198 is above it (would trigger immediately)
+        orch._latest_indicators = {"AAPL": {"price": 195.0}}
+        reviews = [{"symbol": "AAPL", "updated_reasoning": "",
+                    "adjusted_targets": {"stop_loss": 198.0}}]
+        await orch._apply_position_reviews(portfolio, reviews)
+
+        saved = await orch._state_manager.load_portfolio()
+        assert saved.positions[0].intention.exit_targets.stop_loss == 185.0, (
+            "Stop should have been rejected — new stop above current price"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_adjustment_applied_when_below_current_price_long(self, orch):
+        """A valid stop raise (still below current price) must be accepted."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        pos = Position(
+            symbol="AAPL", shares=10, avg_cost=190.0, entry_date=now_iso,
+            intention=TradeIntention(
+                direction="long",
+                exit_targets=ExitTargets(profit_target=220.0, stop_loss=185.0),
+            ),
+        )
+        await _set_portfolio(orch, [pos])
+        portfolio = await orch._state_manager.load_portfolio()
+
+        # Current price is 200 — new stop of 193 is safely below it
+        orch._latest_indicators = {"AAPL": {"price": 200.0}}
+        reviews = [{"symbol": "AAPL", "updated_reasoning": "",
+                    "adjusted_targets": {"stop_loss": 193.0}}]
+        await orch._apply_position_reviews(portfolio, reviews)
+
+        saved = await orch._state_manager.load_portfolio()
+        assert saved.positions[0].intention.exit_targets.stop_loss == 193.0, (
+            "Stop should have been accepted — new stop safely below current price"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_adjustment_rejected_when_below_current_price_short(self, orch):
+        """For a short, stop below current price would trigger immediately — reject it."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        pos = Position(
+            symbol="TSLA", shares=10, avg_cost=250.0, entry_date=now_iso,
+            intention=TradeIntention(
+                direction="sell_short",
+                exit_targets=ExitTargets(profit_target=220.0, stop_loss=260.0),
+            ),
+        )
+        await _set_portfolio(orch, [pos])
+        portfolio = await orch._state_manager.load_portfolio()
+
+        # Current price is 245 — new stop of 242 is below it (would trigger immediately)
+        orch._latest_indicators = {"TSLA": {"price": 245.0}}
+        reviews = [{"symbol": "TSLA", "updated_reasoning": "",
+                    "adjusted_targets": {"stop_loss": 242.0}}]
+        await orch._apply_position_reviews(portfolio, reviews)
+
+        saved = await orch._state_manager.load_portfolio()
+        assert saved.positions[0].intention.exit_targets.stop_loss == 260.0, (
+            "Stop should have been rejected — new stop below current price for short"
+        )
+
 
 # ===========================================================================
 # Thesis challenge in _medium_try_entry
@@ -2550,3 +2629,284 @@ class TestShortEntryWiring:
         else:
             pnl_pct = round((exit_price - entry_price) / entry_price * 100, 4)
         assert pnl_pct < 0, "Short closed above entry should be a loss"
+
+
+# ===========================================================================
+# Trade journal lifecycle (open / snapshot / review / close records)
+# ===========================================================================
+
+def _read_journal(tmp_path):
+    """Read all entries from the tmp_path journal file."""
+    import json
+    p = tmp_path / "trade_journal.jsonl"
+    if not p.exists():
+        return []
+    return [json.loads(line) for line in p.read_text().splitlines() if line.strip()]
+
+
+def _make_fill(symbol="NVDA", fill_qty=10.0, fill_price=900.0, side="buy"):
+    from ozymandias.execution.fill_protection import StateChange
+    return StateChange(
+        order_id="ord_jl_001", symbol=symbol,
+        old_status="PENDING", new_status="FILLED",
+        fill_qty=fill_qty, fill_price=fill_price,
+        side=side, change_type="fill",
+    )
+
+
+class TestTradeJournalLifecycle:
+    """
+    Verify that the four journal record types (open / snapshot / review / close)
+    are written at the correct lifecycle events and contain the expected fields.
+    """
+
+    def _seed_pending(self, orch, symbol="NVDA"):
+        orch._pending_intentions[symbol] = {
+            "stop": 870.0, "target": 950.0,
+            "strategy": "swing", "direction": "long", "reasoning": "breakout",
+            "_signals": {"rsi": 63.0, "vwap_position": "above"},
+            "_claude_conviction": 0.78,
+            "_composite_score": 0.71,
+            "_position_size_pct": 0.10,
+        }
+
+    # -----------------------------------------------------------------------
+    # open record
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_open_entry_written_on_fill(self, orch, tmp_path):
+        """_register_opening_fill writes a record_type='open' journal entry."""
+        self._seed_pending(orch)
+        await orch._register_opening_fill(_make_fill())
+
+        entries = _read_journal(tmp_path)
+        open_entries = [e for e in entries if e.get("record_type") == "open"]
+        assert len(open_entries) == 1
+        e = open_entries[0]
+        assert e["symbol"] == "NVDA"
+        assert e["strategy"] == "swing"
+        assert e["direction"] == "long"
+        assert abs(e["entry_price"] - 900.0) < 0.01
+        assert abs(e["shares"] - 10.0) < 0.01
+        assert abs(e["stop_price"] - 870.0) < 0.01
+        assert abs(e["target_price"] - 950.0) < 0.01
+        assert e["signals_at_entry"].get("rsi") == 63.0
+        assert abs(e["claude_conviction"] - 0.78) < 0.001
+        assert abs(e["composite_score"] - 0.71) < 0.001
+        assert abs(e["position_size_pct"] - 0.10) < 0.001
+        assert "trade_id" in e
+        assert e.get("record_type") == "open"
+
+    @pytest.mark.asyncio
+    async def test_no_open_entry_without_pending_intention(self, orch, tmp_path):
+        """Broker-adopted positions (no pending) must NOT write an open entry."""
+        # No _pending_intentions seeded — simulates broker adoption
+        await orch._register_opening_fill(_make_fill())
+
+        entries = _read_journal(tmp_path)
+        assert not any(e.get("record_type") == "open" for e in entries)
+
+    # -----------------------------------------------------------------------
+    # open + close share trade_id
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_open_and_close_share_trade_id(self, orch, tmp_path):
+        """The open and close records for the same trade must have the same trade_id."""
+        from ozymandias.execution.fill_protection import StateChange
+
+        self._seed_pending(orch)
+        await orch._register_opening_fill(_make_fill())
+
+        # Now close the position
+        close_change = StateChange(
+            order_id="ord_jl_002", symbol="NVDA",
+            old_status="PENDING", new_status="FILLED",
+            fill_qty=10.0, fill_price=930.0,
+            side="sell", change_type="fill",
+        )
+        await orch._journal_closed_trade(close_change)
+
+        entries = _read_journal(tmp_path)
+        open_entry = next((e for e in entries if e.get("record_type") == "open"), None)
+        close_entry = next((e for e in entries if e.get("record_type") == "close"), None)
+
+        assert open_entry is not None, "Expected an 'open' journal entry"
+        assert close_entry is not None, "Expected a 'close' journal entry"
+        assert open_entry["trade_id"] == close_entry["trade_id"], (
+            f"trade_id mismatch: open={open_entry['trade_id']} close={close_entry['trade_id']}"
+        )
+
+    # -----------------------------------------------------------------------
+    # close record has record_type
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_close_entry_has_record_type(self, orch, tmp_path):
+        """Every _journal_closed_trade call must produce a record_type='close' entry."""
+        from ozymandias.core.state_manager import ExitTargets, TradeIntention
+
+        pos = Position(
+            symbol="TSLA", shares=5.0, avg_cost=200.0,
+            entry_date=datetime.now(timezone.utc).isoformat(),
+            intention=TradeIntention(
+                strategy="momentum", direction="long",
+                exit_targets=ExitTargets(stop_loss=185.0, profit_target=220.0),
+            ),
+        )
+        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
+
+        from ozymandias.execution.fill_protection import StateChange
+        change = StateChange(
+            order_id="ord_jl_003", symbol="TSLA",
+            old_status="PENDING", new_status="FILLED",
+            fill_qty=5.0, fill_price=215.0, side="sell", change_type="fill",
+        )
+        await orch._journal_closed_trade(change)
+
+        entries = _read_journal(tmp_path)
+        close_entries = [e for e in entries if e.get("record_type") == "close"]
+        assert len(close_entries) == 1
+        assert close_entries[0]["symbol"] == "TSLA"
+        assert close_entries[0]["exit_reason"] in ("target", "stop", "strategy")
+
+    # -----------------------------------------------------------------------
+    # snapshot record on profit trigger
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_snapshot_written_on_profit_trigger(self, orch, tmp_path):
+        """_check_triggers writes a record_type='snapshot' entry when profit threshold fires."""
+        now = datetime.now(timezone.utc).isoformat()
+        pos = Position(
+            symbol="HAL", shares=100, avg_cost=33.00, entry_date=now,
+            intention=TradeIntention(
+                direction="long",
+                exit_targets=ExitTargets(profit_target=35.00, stop_loss=31.50),
+            ),
+        )
+        await _set_portfolio(orch, [pos])
+        orch._trigger_state.last_claude_call_utc = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        )
+        # Seed a trade_id so the snapshot can carry it
+        orch._entry_contexts["HAL"] = {"trade_id": "test-trade-id-hal"}
+        orch._latest_indicators = {"HAL": {"price": 33.51}}  # +1.55% > 1.5% threshold
+
+        triggers = await orch._check_triggers()
+        assert "position_in_profit:HAL" in triggers
+
+        entries = _read_journal(tmp_path)
+        snap = next((e for e in entries if e.get("record_type") == "snapshot"), None)
+        assert snap is not None, "Expected a 'snapshot' journal entry on profit trigger"
+        assert snap["symbol"] == "HAL"
+        assert snap["trigger"] == "position_in_profit"
+        assert snap["trade_id"] == "test-trade-id-hal"
+        assert snap["unrealized_pnl_pct"] > 0
+        assert abs(snap["current_price"] - 33.51) < 0.01
+        assert abs(snap["stop_price"] - 31.50) < 0.01
+        assert abs(snap["target_price"] - 35.00) < 0.01
+
+    @pytest.mark.asyncio
+    async def test_no_snapshot_when_profit_trigger_does_not_fire(self, orch, tmp_path):
+        """No snapshot is written when gain is below the profit threshold."""
+        now = datetime.now(timezone.utc).isoformat()
+        pos = Position(
+            symbol="HAL", shares=100, avg_cost=33.00, entry_date=now,
+            intention=TradeIntention(
+                direction="long",
+                exit_targets=ExitTargets(profit_target=35.00, stop_loss=31.50),
+            ),
+        )
+        await _set_portfolio(orch, [pos])
+        orch._trigger_state.last_claude_call_utc = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        )
+        orch._latest_indicators = {"HAL": {"price": 33.30}}  # +0.91% — below threshold
+
+        await orch._check_triggers()
+
+        entries = _read_journal(tmp_path)
+        assert not any(e.get("record_type") == "snapshot" for e in entries)
+
+    # -----------------------------------------------------------------------
+    # review record on position review
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_review_entry_written_on_position_review(self, orch, tmp_path):
+        """_apply_position_reviews writes a record_type='review' entry for each matched position."""
+        from ozymandias.core.state_manager import ExitTargets, TradeIntention
+
+        pos = Position(
+            symbol="AMZN", shares=8.0, avg_cost=180.0,
+            entry_date=datetime.now(timezone.utc).isoformat(),
+            intention=TradeIntention(
+                strategy="swing", direction="long",
+                exit_targets=ExitTargets(stop_loss=172.0, profit_target=196.0),
+            ),
+        )
+        portfolio = PortfolioState(positions=[pos])
+        orch._entry_contexts["AMZN"] = {"trade_id": "test-trade-id-amzn"}
+        orch._latest_indicators = {"AMZN": {"price": 187.0}}
+
+        reviews = [{
+            "symbol": "AMZN",
+            "action": "hold",
+            "updated_reasoning": "thesis intact, hold",
+            "adjusted_targets": {"stop_loss": 175.0},
+        }]
+        await orch._apply_position_reviews(portfolio, reviews)
+
+        entries = _read_journal(tmp_path)
+        review_entries = [e for e in entries if e.get("record_type") == "review"]
+        assert len(review_entries) == 1
+        r = review_entries[0]
+        assert r["symbol"] == "AMZN"
+        assert r["action"] == "hold"
+        assert r["note"] == "thesis intact, hold"
+        assert r["trade_id"] == "test-trade-id-amzn"
+        assert r["current_price"] == 187.0
+        assert r["unrealized_pnl_pct"] > 0          # price > avg_cost
+        assert abs(r["current_stop"] - 172.0) < 0.01  # BEFORE adjustment
+        assert r["adjusted_targets"]["stop_loss"] == 175.0
+
+    @pytest.mark.asyncio
+    async def test_review_entry_written_for_every_matched_symbol(self, orch, tmp_path):
+        """A review entry is written for each position symbol that appears in reviews."""
+        from ozymandias.core.state_manager import ExitTargets, TradeIntention
+
+        positions = [
+            Position(
+                symbol=sym, shares=10.0, avg_cost=100.0,
+                entry_date=datetime.now(timezone.utc).isoformat(),
+                intention=TradeIntention(
+                    strategy="swing", direction="long",
+                    exit_targets=ExitTargets(stop_loss=90.0, profit_target=115.0),
+                ),
+            )
+            for sym in ("AAPL", "MSFT")
+        ]
+        portfolio = PortfolioState(positions=positions)
+        orch._latest_indicators = {"AAPL": {"price": 102.0}, "MSFT": {"price": 98.0}}
+
+        reviews = [
+            {"symbol": "AAPL", "action": "hold", "updated_reasoning": "ok"},
+            {"symbol": "MSFT", "action": "hold", "updated_reasoning": "ok"},
+        ]
+        await orch._apply_position_reviews(portfolio, reviews)
+
+        entries = _read_journal(tmp_path)
+        review_symbols = {e["symbol"] for e in entries if e.get("record_type") == "review"}
+        assert review_symbols == {"AAPL", "MSFT"}
+
+    @pytest.mark.asyncio
+    async def test_review_entry_not_written_for_unmatched_symbol(self, orch, tmp_path):
+        """No review entry is written when the review symbol has no open position."""
+        portfolio = PortfolioState(positions=[])
+        reviews = [{"symbol": "FAKE", "action": "hold", "updated_reasoning": "ghost"}]
+        await orch._apply_position_reviews(portfolio, reviews)
+
+        entries = _read_journal(tmp_path)
+        assert not any(e.get("record_type") == "review" for e in entries)

@@ -81,7 +81,7 @@
     "strategy_params": {
       "momentum": {
         "min_vol_regime_ratio": 0.85,
-        "rsi_entry_min": 45,
+        "rsi_entry_min": 60,
         "rsi_entry_max": 65,
         "rsi_max_absolute": 78,
         "rsi_slope_threshold": 2.0,

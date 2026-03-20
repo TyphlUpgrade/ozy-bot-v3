@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,6 +29,7 @@ from ozymandias.core.reasoning_cache import ReasoningCache
 from ozymandias.core.state_manager import (
     OrderRecord,
     PortfolioState,
+    STATE_DIR,
     StateManager,
     WatchlistState,
 )
@@ -58,6 +60,19 @@ _CONTEXT_SYMBOLS = [
     "SPY", "QQQ", "IWM",                           # broad market
     "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLC",  # sectors
 ]
+
+
+# ---------------------------------------------------------------------------
+# Emergency signal files
+# ---------------------------------------------------------------------------
+# Create either file to trigger the corresponding action on the next fast-loop
+# tick (~5-15 seconds). Both files are deleted immediately after processing.
+# Designed for Discord integration, CLI scripts, or manual operator intervention.
+#
+#   touch ozymandias/state/EMERGENCY_EXIT      → liquidate all positions, bot keeps running
+#   touch ozymandias/state/EMERGENCY_SHUTDOWN  → graceful bot shutdown
+EMERGENCY_EXIT_SIGNAL     = STATE_DIR / "EMERGENCY_EXIT"
+EMERGENCY_SHUTDOWN_SIGNAL = STATE_DIR / "EMERGENCY_SHUTDOWN"
 
 
 # ---------------------------------------------------------------------------
@@ -285,11 +300,31 @@ class Orchestrator:
             log.info("No fresh cache — Claude will be called on first trigger")
 
         # -- Broker -----------------------------------------------------------
-        api_key, secret_key = self._load_credentials()
+        try:
+            api_key, secret_key = self._load_credentials()
+        except Exception as exc:
+            log.critical(
+                "STARTUP FAILED — cannot load credentials: %s\n"
+                "Check that the credentials file exists and the key file is correct.",
+                exc,
+            )
+            raise
+
         paper = self._config.broker.environment == "paper"
         self._broker = AlpacaBroker(api_key=api_key, secret_key=secret_key, paper=paper)
 
-        acct = await self._broker.get_account()
+        try:
+            acct = await self._broker.get_account()
+        except Exception as exc:
+            log.critical(
+                "STARTUP FAILED — broker connection rejected: %s\n"
+                "Check that your Alpaca API key and secret are valid and match the "
+                "environment (%s).",
+                exc,
+                "paper" if paper else "live",
+            )
+            raise
+
         self._last_known_equity = acct.equity
         log.info(
             "Broker connected [%s] — equity=$%.2f  buying_power=$%.2f  "
@@ -299,7 +334,11 @@ class Orchestrator:
             acct.pdt_flag, acct.daytrade_count,
         )
 
-        hours = await self._broker.get_market_hours()
+        try:
+            hours = await self._broker.get_market_hours()
+        except Exception as exc:
+            log.critical("STARTUP FAILED — could not fetch market hours: %s", exc)
+            raise
         log.info(
             "Market: is_open=%s  session=%s  next_open=%s  next_close=%s",
             hours.is_open, hours.session, hours.next_open, hours.next_close,
@@ -553,6 +592,7 @@ class Orchestrator:
         for pos in portfolio.positions:
             if pos.intention.entry_signals or pos.intention.entry_conviction:
                 self._entry_contexts[pos.symbol] = {
+                    "trade_id": str(uuid.uuid4()),
                     "signals": pos.intention.entry_signals,
                     "claude_conviction": pos.intention.entry_conviction,
                     "composite_score": pos.intention.entry_score,
@@ -625,9 +665,11 @@ class Orchestrator:
         concurrently via asyncio.TaskGroup.
 
         Handles KeyboardInterrupt / SIGINT for graceful shutdown.
-        """
-        setup_logging()
 
+        Logging must be configured by the caller (main.py) before run() is
+        invoked. setup_logging() is NOT called here to avoid creating a second
+        orphaned session log file when launched via the normal entry point.
+        """
         await self._startup()
         await self.startup_reconciliation()
         if self._dry_run:
@@ -670,12 +712,170 @@ class Orchestrator:
     # Fast loop
     # -----------------------------------------------------------------------
 
+    async def _emergency_exit_all(self) -> None:
+        """Aggressively liquidate every open position as fast as possible.
+
+        Called when EMERGENCY_EXIT signal file is detected. Bot continues
+        running after liquidation so normal monitoring resumes.
+
+        Three-phase approach:
+        1. Cancel all pending orders — clears any blocking limit orders so
+           market exits can be placed without interference.
+        2. Place market exits for every local position.
+        3. Poll broker every 2 seconds for up to 60 seconds to verify
+           positions actually close. Logs CRITICAL for any that don't,
+           so the operator knows manual intervention is needed.
+        """
+        portfolio = await self._state_manager.load_portfolio()
+        if not portfolio.positions:
+            log.warning("EMERGENCY EXIT: no open positions to close")
+            return
+
+        symbols = [p.symbol for p in portfolio.positions]
+        log.critical(
+            "EMERGENCY EXIT: liquidating %d position(s) — %s",
+            len(portfolio.positions), symbols,
+        )
+
+        # -- Phase 1: cancel all pending orders --------------------------------
+        # Any open limit (buy or sell) could block the market exit or leave the
+        # account in an unexpected state. Cancel everything unconditionally.
+        pending = self._fill_protection.get_pending_orders()
+        if pending:
+            log.critical(
+                "EMERGENCY EXIT: cancelling %d pending order(s) before placing exits",
+                len(pending),
+            )
+        for order in pending:
+            try:
+                cancel_result = await self._broker.cancel_order(order.order_id)
+                await self._fill_protection.handle_cancel_result(
+                    order.order_id, cancel_result
+                )
+                log.critical(
+                    "EMERGENCY EXIT: cancelled order %s for %s (success=%s)",
+                    order.order_id, order.symbol, cancel_result.success,
+                )
+            except Exception as exc:
+                log.error(
+                    "EMERGENCY EXIT: failed to cancel order %s for %s: %s",
+                    order.order_id, order.symbol, exc,
+                )
+
+        # -- Phase 2: place market exits for every position --------------------
+        now_iso = datetime.now(timezone.utc).isoformat()
+        exits_placed: list[str] = []
+        for pos in portfolio.positions:
+            symbol = pos.symbol
+            exit_side = EXIT_SIDE[pos.intention.direction]
+            exit_order = Order(
+                symbol=symbol,
+                side=exit_side,
+                quantity=pos.shares,
+                order_type="market",
+                time_in_force="day",
+            )
+            try:
+                result = await self._broker.place_order(exit_order)
+                order_record = OrderRecord(
+                    order_id=result.order_id,
+                    symbol=symbol,
+                    side=exit_side,
+                    quantity=pos.shares,
+                    order_type="market",
+                    limit_price=None,
+                    status="PENDING",
+                    created_at=now_iso,
+                    last_checked_at=now_iso,
+                )
+                await self._fill_protection.record_order(order_record)
+                self._pending_exit_hints[symbol] = "emergency_exit"
+                exits_placed.append(symbol)
+                log.critical(
+                    "EMERGENCY EXIT: market order placed — %s  qty=%.2f  order_id=%s",
+                    symbol, pos.shares, result.order_id,
+                )
+            except Exception as exc:
+                log.error(
+                    "EMERGENCY EXIT: failed to place exit for %s: %s", symbol, exc
+                )
+
+        if not exits_placed:
+            log.critical("EMERGENCY EXIT: no exit orders placed — manual action required")
+            return
+
+        # -- Phase 3: poll broker until all positions confirm closed -----------
+        # Market orders on liquid equities fill in milliseconds, but we verify
+        # for up to 60 seconds in case of degraded broker connectivity.
+        poll_interval_sec = 2
+        poll_timeout_sec = 60
+        deadline = time.monotonic() + poll_timeout_sec
+        remaining = set(exits_placed)
+
+        log.critical(
+            "EMERGENCY EXIT: monitoring fills for %s (timeout=%ds)",
+            list(remaining), poll_timeout_sec,
+        )
+        while remaining and time.monotonic() < deadline:
+            await asyncio.sleep(poll_interval_sec)
+            try:
+                broker_positions = await self._broker.get_positions()
+                open_symbols = {bp.symbol for bp in broker_positions}
+                newly_filled = remaining - open_symbols
+                for sym in newly_filled:
+                    log.critical("EMERGENCY EXIT: confirmed closed — %s", sym)
+                remaining -= newly_filled
+            except Exception as exc:
+                log.error("EMERGENCY EXIT: broker poll error: %s", exc)
+
+        if remaining:
+            log.critical(
+                "EMERGENCY EXIT INCOMPLETE: %d position(s) still open after %ds — "
+                "MANUAL ACTION REQUIRED: %s",
+                len(remaining), poll_timeout_sec, list(remaining),
+            )
+
+    async def _check_emergency_signals(self) -> None:
+        """Check for operator signal files and act on them.
+
+        Called at the top of every fast-loop iteration so it fires regardless
+        of market hours. Signal files are deleted immediately after detection
+        so a single touch triggers exactly one action.
+        """
+        if EMERGENCY_SHUTDOWN_SIGNAL.exists():
+            log.critical(
+                "EMERGENCY SHUTDOWN signal detected — initiating graceful shutdown"
+            )
+            try:
+                EMERGENCY_SHUTDOWN_SIGNAL.unlink()
+            except OSError:
+                pass
+            await self._shutdown()
+            return
+
+        if EMERGENCY_EXIT_SIGNAL.exists():
+            log.critical("EMERGENCY EXIT signal detected — liquidating all positions")
+            try:
+                EMERGENCY_EXIT_SIGNAL.unlink()
+            except OSError:
+                pass
+            try:
+                await self._emergency_exit_all()
+            except Exception as exc:
+                log.error("EMERGENCY EXIT failed: %s", exc, exc_info=True)
+
     async def _fast_loop(self) -> None:
         """
         Fast loop wrapper — runs _fast_loop_cycle() on every tick.
         Never raises; errors are logged and the loop continues.
         """
         while not self._stopping:
+            try:
+                await self._check_emergency_signals()
+            except Exception as exc:
+                log.error("Emergency signal check error: %s", exc, exc_info=True)
+            if self._stopping:
+                break
             try:
                 await self._fast_loop_cycle()
             except Exception as exc:
@@ -848,11 +1048,15 @@ class Orchestrator:
         pending = self._pending_intentions.pop(symbol, {})
 
         # Move signal context into entry_contexts for use when the position closes.
+        # Also generate a stable trade_id here so all journal records for this
+        # trade (open, snapshot, review, close) can be correlated by trade_id.
         if pending:
             self._entry_contexts[symbol] = {
+                "trade_id": str(uuid.uuid4()),
                 "signals": pending.pop("_signals", {}),
                 "claude_conviction": pending.pop("_claude_conviction", 0.0),
                 "composite_score": pending.pop("_composite_score", 0.0),
+                "position_size_pct": pending.pop("_position_size_pct", 0.0),
             }
 
         try:
@@ -880,11 +1084,12 @@ class Orchestrator:
             entry_conviction=self._entry_contexts.get(symbol, {}).get("claude_conviction", 0.0),
             entry_score=self._entry_contexts.get(symbol, {}).get("composite_score", 0.0),
         )
+        entry_date = datetime.now(timezone.utc).isoformat()
         portfolio.positions.append(Position(
             symbol=symbol,
             shares=change.fill_qty,  # always positive; direction field carries the sign
             avg_cost=change.fill_price if change.fill_price > 0 else 0.0,
-            entry_date=datetime.now(timezone.utc).isoformat(),
+            entry_date=entry_date,
             intention=intention,
         ))
         await self._state_manager.save_portfolio(portfolio)
@@ -896,6 +1101,31 @@ class Orchestrator:
             pending.get("stop", 0.0), pending.get("target", 0.0),
             pending.get("strategy", "unknown"), pending.get("direction", "long"),
         )
+
+        # Write the "open" journal record. Omitted for broker-adopted positions
+        # (pending is empty) because we lack entry context in that case.
+        trade_id = self._entry_contexts.get(symbol, {}).get("trade_id")
+        if trade_id:
+            ctx = self._entry_contexts[symbol]
+            await self._trade_journal.append({
+                "record_type": "open",
+                "trade_id": trade_id,
+                "symbol": symbol,
+                "strategy": pending.get("strategy", "unknown"),
+                "direction": pending.get("direction", "long"),
+                "entry_time": entry_date,
+                "entry_price": change.fill_price if change.fill_price > 0 else 0.0,
+                "shares": change.fill_qty,
+                "stop_price": pending.get("stop", 0.0),
+                "target_price": pending.get("target", 0.0),
+                "signals_at_entry": ctx.get("signals", {}),
+                "claude_conviction": ctx.get("claude_conviction", 0.0),
+                "composite_score": ctx.get("composite_score", 0.0),
+                "position_size_pct": ctx.get("position_size_pct", 0.0),
+                "source": "live",
+                "prompt_version": self._config.claude.prompt_version,
+                "bot_version": self._config.claude.model,
+            })
 
     async def _journal_closed_trade(self, change, exit_reason_hint: str | None = None) -> None:
         """Write a trade journal entry and remove the position from the portfolio.
@@ -970,6 +1200,8 @@ class Orchestrator:
             except Exception:
                 hold_duration_min = None
             await self._trade_journal.append({
+                "record_type": "close",
+                "trade_id": ctx.get("trade_id"),
                 "symbol": symbol,
                 "strategy": position.intention.strategy,
                 "direction": position.intention.direction,
@@ -986,6 +1218,7 @@ class Orchestrator:
                 "signals_at_entry": signals_at_entry,
                 "claude_conviction": claude_conviction,
                 "composite_score": composite_score,
+                "position_size_pct": ctx.get("position_size_pct", 0.0),
                 "source": "live",
                 "prompt_version": self._config.claude.prompt_version,
                 "bot_version": self._config.claude.model,
@@ -1359,9 +1592,12 @@ class Orchestrator:
                     "stop_price": pos.intention.exit_targets.stop_loss,
                     "target_price": pos.intention.exit_targets.profit_target,
                     "exit_reason": "external_close",
+                    "record_type": "close",
+                    "trade_id": ctx.get("trade_id"),
                     "signals_at_entry": ctx.get("signals", {}),
                     "claude_conviction": ctx.get("claude_conviction", 0.0),
                     "composite_score": ctx.get("composite_score", 0.0),
+                    "position_size_pct": ctx.get("position_size_pct", 0.0),
                     "source": "live",
                     "prompt_version": self._config.claude.prompt_version,
                     "bot_version": self._config.claude.model,
@@ -1409,9 +1645,11 @@ class Orchestrator:
                 pending = self._pending_intentions.pop(bp.symbol, {})
                 if pending:
                     self._entry_contexts[bp.symbol] = {
+                        "trade_id": str(uuid.uuid4()),
                         "signals": pending.pop("_signals", {}),
                         "claude_conviction": pending.pop("_claude_conviction", 0.0),
                         "composite_score": pending.pop("_composite_score", 0.0),
+                        "position_size_pct": pending.pop("_position_size_pct", 0.0),
                     }
                 intention = TradeIntention(
                     strategy=pending.get("strategy", "unknown"),
@@ -1987,6 +2225,7 @@ class Orchestrator:
             "_signals": dict(self._latest_indicators.get(symbol, {})),
             "_claude_conviction": float(top.ai_conviction),
             "_composite_score": float(top.composite_score),
+            "_position_size_pct": float(top.position_size_pct),
         }
 
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -2302,6 +2541,21 @@ class Orchestrator:
             last_trigger = ts.last_profit_trigger_gain.get(pos.symbol, 0.0)
             if gain_pct >= last_trigger + profit_threshold:
                 triggers.append(f"position_in_profit:{pos.symbol}")
+                await self._trade_journal.append({
+                    "record_type": "snapshot",
+                    "trade_id": self._entry_contexts.get(pos.symbol, {}).get("trade_id"),
+                    "symbol": pos.symbol,
+                    "trigger": "position_in_profit",
+                    "unrealized_pnl_pct": round(gain_pct * 100, 4),
+                    "current_price": current,
+                    "stop_price": pos.intention.exit_targets.stop_loss,
+                    "target_price": pos.intention.exit_targets.profit_target,
+                    "strategy": pos.intention.strategy,
+                    "direction": pos.intention.direction,
+                    "source": "live",
+                    "prompt_version": self._config.claude.prompt_version,
+                    "bot_version": self._config.claude.model,
+                })
 
         # 5. Market session transition (open at 9:30 ET, approaching close at 3:30 ET)
         current_session = get_current_session()
@@ -2677,7 +2931,39 @@ class Orchestrator:
             for pos in portfolio.positions:
                 if pos.symbol != symbol:
                     continue
-                note = review.get("updated_reasoning") or review.get("notes", "")
+
+                # Journal this review event before any mutations so the record
+                # captures the state Claude reasoned about (current stop/target
+                # before adjustment) plus what Claude recommended.
+                _review_price = getattr(self, "_latest_indicators", {}).get(symbol, {}).get("price")
+                _pos_is_short = is_short(pos.intention.direction)
+                if _review_price and pos.avg_cost > 0:
+                    _gain = (
+                        (pos.avg_cost - _review_price) / pos.avg_cost
+                        if _pos_is_short
+                        else (_review_price - pos.avg_cost) / pos.avg_cost
+                    )
+                    _unrealized_pnl_pct = round(_gain * 100, 4)
+                else:
+                    _unrealized_pnl_pct = None
+                await self._trade_journal.append({
+                    "record_type": "review",
+                    "trade_id": self._entry_contexts.get(symbol, {}).get("trade_id"),
+                    "symbol": symbol,
+                    "strategy": pos.intention.strategy,
+                    "direction": pos.intention.direction,
+                    "action": action,
+                    "note": review.get("updated_reasoning") or review.get("notes", ""),
+                    "current_price": _review_price,
+                    "unrealized_pnl_pct": _unrealized_pnl_pct,
+                    "current_stop": pos.intention.exit_targets.stop_loss,
+                    "current_target": pos.intention.exit_targets.profit_target,
+                    "adjusted_targets": review.get("adjusted_targets"),
+                    "source": "live",
+                    "prompt_version": self._config.claude.prompt_version,
+                    "bot_version": self._config.claude.model,
+                })
+
                 if note:
                     pos.intention.review_notes.append(f"[{now_iso}] {note}")
                     changed = True
@@ -2687,8 +2973,33 @@ class Orchestrator:
                     pos.intention.exit_targets.profit_target = float(adj["profit_target"])
                     changed = True
                 if adj.get("stop_loss"):
-                    pos.intention.exit_targets.stop_loss = float(adj["stop_loss"])
-                    changed = True
+                    new_stop = float(adj["stop_loss"])
+                    # Guard: reject a stop adjustment that would put the stop on the
+                    # wrong side of current price — it would trigger an immediate exit
+                    # on the next fast-loop cycle rather than protecting future gains.
+                    # This happened with XOM when Claude raised the stop to $162 while
+                    # price was $161.25, forcing an instant exit at +1.7%.
+                    _cur = _review_price  # already fetched above; None if unavailable
+                    # is_short() matches "short" only; direction field may also be
+                    # "sell_short" depending on path, so check both representations.
+                    _is_short_dir = _pos_is_short or pos.intention.direction == "sell_short"
+                    _would_trigger = (
+                        _cur is not None and (
+                            (not _is_short_dir and new_stop >= _cur)
+                            or (_is_short_dir and new_stop <= _cur)
+                        )
+                    )
+                    if _would_trigger:
+                        log.warning(
+                            "Stop adjustment rejected for %s: new_stop=%.4f would "
+                            "immediately trigger at current_price=%.4f — keeping "
+                            "existing stop=%.4f",
+                            symbol, new_stop, _cur,
+                            pos.intention.exit_targets.stop_loss,
+                        )
+                    else:
+                        pos.intention.exit_targets.stop_loss = new_stop
+                        changed = True
                 # Claude recommends exiting — place a market exit order immediately.
                 # thesis_intact=False is a hard signal; action="exit" is sufficient.
                 if action == "exit":

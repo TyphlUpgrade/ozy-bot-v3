@@ -659,3 +659,45 @@ Read the relevant phase section before modifying or debugging any module built i
 - **Impl:** `_medium_try_entry` sizing block replaced. Old: `calculate_position_size(symbol, price, atr, equity)` with `risk_per_trade_pct=0.01` hardcoded default — ignored `position_size_pct` entirely. New: `effective_pct = min(top.position_size_pct, cfg.risk.max_position_pct)`; `target_qty = int(equity × effective_pct / price)`. TA scale factor applied to `target_qty`; ATR cap remains as a hard risk ceiling. `calculate_position_size` no longer called from this path.
 - **Why:** ATR formula with 1% risk on a $30k account always produced ~$4-5k positions regardless of Claude's conviction level — positions were uniformly near the 20% cap. Claude recommends 5%–20% based on setup quality; those recommendations were silently discarded. Now a 5% recommendation → ~$1,500 position; 15% → ~$4,500, correctly reflecting Claude's confidence. `max_position_pct` (config) clamps the effective percent so the ceiling remains operator-configurable.
 - **Tests updated:** `TestThesisChallenge` and `TestTASizeModifier` in `test_orchestrator.py` and `test_execution_fidelity.py` — removed stale `calculate_position_size = MagicMock(return_value=N)` lines; updated quantity assertions to derive from `equity × pct / price`.
+
+---
+
+### Operational Hardening (March 20)
+
+**RSI entry floor** · `config/config.json`, `strategies/momentum_strategy.py`
+- **Spec:** *(not defined)*
+- **Impl:** `rsi_entry_min: 60` added to `strategy_params.momentum`. Momentum long entries blocked when live RSI < 60. Raises `apply_entry_gate` rejection.
+- **Why:** Backtest of paper trades showed RSI 45–55 at entry → 17% win rate; RSI ≥ 65 → 37%. Old floor of 45 was letting low-momentum entries through. Integration test `_make_bars` tail pattern updated to produce RSI ≈ 71 to match new floor.
+
+**Trade journal lifecycle records** · `core/orchestrator.py`, `core/trade_journal.py`
+- **Spec:** *(not defined — spec specified only closed-trade records)*
+- **Impl:** `record_type` field added to all journal entries: `"open"` (written in `_register_opening_fill`), `"snapshot"` (written in `_check_triggers` on `position_in_profit`), `"review"` (written in `_apply_position_reviews`), `"close"` (existing path). All records for one trade share a `trade_id` UUID generated at fill time and stored in `_entry_contexts[symbol]["trade_id"]`. Adoption path (`_fast_step_position_sync`) and startup restore both generate a fresh UUID so restarted positions link their future records (but not to the original open, which predates the session). `position_size_pct` and `claude_conviction` written to `open` records. `trade_journal.py`: `if not record.get("trade_id")` replaces `if "trade_id" not in record` so explicitly-None trade_id (restarted positions) also gets a UUID.
+- **Why:** Journal only recorded close snapshots. Could not reconstruct how a trade evolved — entry signals, mid-trade reviews, profit snapshots — without cross-referencing logs.
+- **Tests:** `TestTradeJournalLifecycle` class (9 tests) in `test_orchestrator.py`.
+
+**Session-based logging** · `core/logger.py`, `tests/test_logger.py`
+- **Spec:** *(not defined)*
+- **Impl:** Complete rewrite of `logger.py`. Replaced two-file rotation (`current.log` / `previous.log`) with session files: each `setup_logging()` call creates `logs/session_YYYY-MM-DDTHH-MM-SSZ.log`. `current.log` symlink always points to the active session. `max_session_logs: int = 0` (default = unlimited, never auto-deletes). Pruning only occurs when explicitly configured with a non-zero value. `setup_logging()` call removed from `orch.run()` to prevent double session file per launch.
+- **Why:** Previous rotation overwrote `previous.log` on every restart — only two files ever existed. Comprehensive paper trading needed all session logs retained indefinitely.
+- **Tests:** `test_logger.py` fully rewritten — 19 tests covering session creation, symlink, pruning, format, and `get_logger`.
+
+**Graceful degradation on startup failure** · `core/orchestrator.py`, `main.py`
+- **Spec:** *(not defined)*
+- **Impl:** `_startup()` wraps `_load_credentials()`, `broker.get_account()`, and `broker.get_market_hours()` in separate try/except blocks; each logs CRITICAL with an operator-readable message before re-raising. `load_config()` in `_run()` similarly wrapped. `main()` adds `except Exception` catch after `KeyboardInterrupt`: prints `FATAL: {exc}` to stderr and calls `sys.exit(1)` instead of showing a raw Python traceback.
+- **Why:** Bot crashed with an unformatted Python traceback on bad API keys or missing credentials file. Operators need a readable error with actionable guidance.
+
+**Stop adjustment guard** · `core/orchestrator.py`
+- **Spec:** *(not defined)*
+- **Impl:** In `_apply_position_reviews`, before applying `adjusted_targets.stop_loss`, new stop is checked against current price from `_latest_indicators`. For longs: rejected if `new_stop >= current_price`. For shorts: rejected if `new_stop <= current_price` (checks both `"short"` and `"sell_short"` direction values). On rejection: WARNING logged with rejected value, current price, and kept value. Stop is left unchanged.
+- **Why:** XOM incident (March 20): Claude's position review raised stop from $158.50 → $162.00 while price was $161.25. Strategy exited immediately at +1.71% rather than letting the trade run. Second review in the same cycle then proposed $160.00 — too late.
+- **Tests:** 3 tests in `TestSlowLoopStateApplication`: long rejected, long accepted, short rejected.
+
+**Adoption path trade_id** · `core/orchestrator.py`
+- **Spec:** *(not defined)*
+- **Impl:** Both adoption paths now generate `"trade_id": str(uuid.uuid4())` in `_entry_contexts`: (1) startup restore loop (positions that survived a bot restart), (2) mid-session adoption in `_fast_step_position_sync` (broker positions without a pending intention). Previously both paths left `trade_id` absent → each snapshot/review/close for a restarted position generated its own UUID, producing unlinked records.
+- **Why:** Journal analysis after first paper session showed 5 different trade_ids for XOM across its reviews and close record — impossible to reconstruct the trade timeline.
+
+**Emergency exit and shutdown commands** · `core/orchestrator.py`, `ozymandias/scripts/emergency.py`
+- **Spec:** *(not defined)*
+- **Impl:** Two signal files: `state/EMERGENCY_EXIT` and `state/EMERGENCY_SHUTDOWN`. Both checked at the top of every `_fast_loop` iteration (before market-hours guard, so shutdown works outside market hours). `EMERGENCY_SHUTDOWN`: calls `_shutdown()` immediately. `EMERGENCY_EXIT`: three-phase aggressive liquidation — (1) cancel all pending orders via `fill_protection.get_pending_orders()` + `broker.cancel_order()`; (2) place market exit for every local position, tagged `"emergency_exit"` in journal; (3) poll `broker.get_positions()` every 2 seconds for up to 60 seconds, logging CRITICAL for confirmed closes and CRITICAL MANUAL ACTION REQUIRED for any that remain open. Signal files deleted immediately after detection. `scripts/emergency.py`: CLI trigger with confirmation prompt; subcommands `exit` and `shutdown`; `--yes/-y` flag skips prompt.
+- **Why:** No mechanism existed to liquidate all positions or stop the bot without killing the process. Designed with Discord integration in mind — Discord handler writes the signal file, bot acts within one fast-loop tick (~5–15 seconds).
