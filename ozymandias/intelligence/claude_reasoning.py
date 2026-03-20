@@ -271,6 +271,9 @@ class ClaudeReasoningEngine:
         watchlist: WatchlistState,
         market_data: dict,
         indicators: dict,
+        recommendation_outcomes: dict | None = None,
+        recent_executions: list | None = None,
+        execution_stats: dict | None = None,
     ) -> dict:
         """
         Build the structured input context sent to Claude each cycle.
@@ -291,8 +294,17 @@ class ClaudeReasoningEngine:
                          macro_events_today, trading_session, pdt_trades_remaining.
             indicators:  symbol → output dict from generate_signal_summary().
                          May also include a flat signals dict directly.
+            recommendation_outcomes: Phase 15 — dict of symbol → outcome tracking
+                         info from the orchestrator's _recommendation_outcomes store.
+                         Assembled into a sorted list for Claude's context.
+            recent_executions: Phase 15 — pre-computed list of recent close records
+                         (from TradeJournal.load_recent). Passed in rather than awaited
+                         here to keep this method sync.
+            execution_stats: Phase 15 — pre-computed session stats dict
+                         (from TradeJournal.compute_session_stats). Same rationale.
         """
         max_tier1 = self._claude_cfg.tier1_max_symbols
+        now_utc = datetime.now(timezone.utc)
 
         # --- Current positions (always Tier 1) ---
         position_entries: list[dict] = []
@@ -307,10 +319,9 @@ class ClaudeReasoningEngine:
             )
             entry_date_str = pos.intention.entry_date or pos.entry_date
             try:
-                from datetime import datetime, timezone as _tz
                 entry_dt = datetime.fromisoformat(entry_date_str)
                 hold_hours = round(
-                    (datetime.now(_tz.utc) - entry_dt).total_seconds() / 3600, 1
+                    (now_utc - entry_dt).total_seconds() / 3600, 1
                 )
             except Exception:
                 hold_hours = None
@@ -349,13 +360,14 @@ class ClaudeReasoningEngine:
 
         def _tier1_score(entry) -> float:
             ind = indicators.get(entry.symbol, {})
-            # Use raw signals when available so bearish short setups score on their
-            # actual short-direction strength.  WatchlistEntry has no direction field
-            # yet (added in Phase 15), so take max(long, short) — this correctly
-            # prioritises any strongly-directional setup regardless of which way it
-            # leans without requiring a schema change here.
             raw = ind.get("signals") or {}
             if raw:
+                # Phase 15: use direction-adjusted score when expected_direction is set;
+                # fall back to max(long, short) for "either" so any directional setup
+                # ranks appropriately regardless of bias.
+                ed = getattr(entry, "expected_direction", "either")
+                if ed != "either":
+                    return compute_composite_score(raw, direction=ed)
                 return max(
                     compute_composite_score(raw, direction="long"),
                     compute_composite_score(raw, direction="short"),
@@ -364,19 +376,97 @@ class ClaudeReasoningEngine:
 
         tier1_watch = sorted(all_tier1, key=_tier1_score, reverse=True)[:slots]
 
+        # Phase 15: build ta_readiness dict replacing technical_summary string.
+        # ta_readiness is a direct pass-through of indicators[symbol]["signals"]
+        # with a direction-adjusted composite_score added.
+        # _make_technical_summary is retained for run_position_review (not removed).
         watchlist_tier1: list[dict] = []
         for entry in tier1_watch:
             sym = entry.symbol
             sig_summary = indicators.get(sym, {})
-            signals = sig_summary.get("signals", sig_summary)
+            raw_signals = sig_summary.get("signals", {})
+            ed = getattr(entry, "expected_direction", "either")
+            # Direction-adjusted composite score: map "either" → "long" for scoring.
+            score_direction = ed if ed != "either" else "long"
+            direction_score = (
+                compute_composite_score(raw_signals, direction=score_direction)
+                if raw_signals
+                else float(sig_summary.get("composite_technical_score") or 0.0)
+            )
+            # ta_readiness: pass through all live signals + direction-adjusted composite_score
+            ta_readiness: dict = dict(raw_signals) if raw_signals else {}
+            ta_readiness["composite_score"] = round(direction_score, 4)
+
             watchlist_tier1.append({
                 "symbol": sym,
-                "latest_price": signals.get("price"),
-                "technical_summary": _make_technical_summary(signals),
-                "composite_score": sig_summary.get("composite_technical_score"),
+                "latest_price": raw_signals.get("price") if raw_signals else sig_summary.get("price"),
+                "ta_readiness": ta_readiness,
                 "strategy": entry.strategy,
                 "reason": entry.reason,
+                "expected_direction": ed,
             })
+
+        # --- Phase 15: recommendation_outcomes context list ---
+        max_age_min = self._claude_cfg.recommendation_outcome_max_age_min
+        _outcomes_raw = recommendation_outcomes or {}
+        outcomes_list: list[dict] = []
+        for symbol, rec in _outcomes_raw.items():
+            stage = rec.get("stage", "")
+            attempt_ts = rec.get("attempt_time_utc")
+            age_min = 0.0
+            if attempt_ts:
+                try:
+                    dt = datetime.fromisoformat(attempt_ts)
+                    age_min = (now_utc - dt).total_seconds() / 60
+                except Exception:
+                    age_min = 0.0
+            if stage in ("filled", "cancelled") and age_min > max_age_min:
+                continue
+            entry_dict = {
+                "symbol": symbol,
+                "stage": stage,
+                "age_min": round(age_min, 1),
+            }
+            if rec.get("stage_detail"):
+                entry_dict["stage_detail"] = rec["stage_detail"]
+            if stage == "ranker_rejected":
+                entry_dict["rejection_count"] = rec.get("rejection_count", 1)
+                entry_dict["claude_entry_target"] = rec.get("claude_entry_target", 0.0)
+            elif stage == "order_pending":
+                entry_dict["claude_entry_target"] = rec.get("claude_entry_target", 0.0)
+                ind_entry = indicators.get(symbol, {})
+                sigs = ind_entry.get("signals", ind_entry)
+                current_price = sigs.get("price")
+                if current_price is not None:
+                    entry_dict["current_price"] = current_price
+                    target = rec.get("claude_entry_target", 0.0)
+                    if target and target > 0:
+                        entry_dict["drift_pct"] = round(
+                            (current_price - target) / target * 100, 2
+                        )
+            elif stage in ("conditions_waiting", "gate_expired"):
+                entry_dict["claude_entry_target"] = rec.get("claude_entry_target", 0.0)
+            outcomes_list.append(entry_dict)
+
+        outcomes_list.sort(key=lambda x: x.get("age_min", 0))
+        outcomes_list = outcomes_list[:15]  # cap at 15
+
+        # --- Phase 15: recent_executions context list ---
+        _recent_execs = recent_executions or []
+        recent_executions_context: list[dict] = []
+        max_execs = self._claude_cfg.recent_executions_count
+        for rec in _recent_execs[:max_execs]:
+            exec_entry: dict = {
+                "symbol": rec.get("symbol", ""),
+                "direction": rec.get("direction", "long"),
+                "entry_price": rec.get("entry_price", 0.0),
+                "exit_price": rec.get("exit_price", 0.0),
+                "pnl_pct": rec.get("pnl_pct", 0.0),
+                "strategy": rec.get("strategy", ""),
+                "claude_conviction": rec.get("claude_conviction", 0.0),
+                "duration_min": int(rec.get("hold_duration_min", 0) or 0),
+            }
+            recent_executions_context.append(exec_entry)
 
         context: dict[str, Any] = {
             "portfolio": {
@@ -386,6 +476,9 @@ class ClaudeReasoningEngine:
             },
             "watchlist_tier1": watchlist_tier1,
             "market_context": market_data,
+            "recommendation_outcomes": outcomes_list,
+            "recent_executions": recent_executions_context,
+            "execution_stats": execution_stats or {},
         }
 
         # --- Token guard: trim watchlist until context fits within budget ---
@@ -640,6 +733,9 @@ class ClaudeReasoningEngine:
         indicators: dict,
         trigger: str = "manual",
         skip_cache: bool = False,
+        recommendation_outcomes: dict | None = None,
+        recent_executions: list | None = None,
+        execution_stats: dict | None = None,
     ) -> Optional[ReasoningResult]:
         """
         Full reasoning cycle: check cache → assemble context → call Claude
@@ -661,7 +757,10 @@ class ClaudeReasoningEngine:
                 return _result_from_raw_reasoning(cached["parsed_response"])
 
         context = self.assemble_reasoning_context(
-            portfolio, watchlist, market_data, indicators
+            portfolio, watchlist, market_data, indicators,
+            recommendation_outcomes=recommendation_outcomes,
+            recent_executions=recent_executions,
+            execution_stats=execution_stats,
         )
         context_json = json.dumps(context, default=str, indent=2)
         template = self._load_prompt("reasoning.txt")

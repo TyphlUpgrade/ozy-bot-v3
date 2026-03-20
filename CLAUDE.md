@@ -106,7 +106,7 @@ Features not described in the spec may be requested. When implementing them, fol
 All 10 spec phases complete per `ozymandias_v3_spec_revised.md`. Post-MVP phases (11–18) are addressing architectural gaps discovered during paper trading.
 
 Last spec phase completed: Phase 10 (March 15)
-Last post-MVP phase completed: Phase 16 + post-16 paper-trading fixes (March 19–20)
+Last post-MVP phase completed: Phase 15 — Context Enrichment (March 20)
 
 ### Completed post-MVP work
 - **Anti-bias hardening** (March 15): conviction sanity floor, `rejected_opportunities` logging,
@@ -173,18 +173,14 @@ Last post-MVP phase completed: Phase 16 + post-16 paper-trading fixes (March 19�
     confirm fills, logs CRITICAL if any remain open. Trigger via `python -m ozymandias.scripts.emergency exit|shutdown`
     or `touch state/EMERGENCY_EXIT`. Designed for future Discord integration.
 
-### Post-MVP Roadmap: Phases 15–18
+- **Phase 15 — Context Enrichment** (March 20): `RankResult` wraps ranker output with rejections;
+  `_recommendation_outcomes` tracker in orchestrator; `WatchlistEntry.expected_direction`;
+  `ta_readiness` dict replaces `technical_summary` string in tier-1 context (direction-adjusted
+  composite score); `TradeJournal.load_recent` + `compute_session_stats`; `recent_executions` and
+  `execution_stats` passed to Claude each cycle; prompt v3.5.0; 50 new tests.
 
-**Implementation order: 15 → 17 → 18.** Phase 16 is complete. Phase 15 can now be implemented:
-its `ta_readiness` dict is a pass-through of `indicators[symbol]["signals"]` — all Phase 16
-signals appear in Claude's context automatically.
+### Post-MVP Roadmap: Phases 17–18
 
-- **Phase 15 — Context Enrichment** *(next)*:
-  see `phases/15_context_enrichment.md`
-  - *Additions:* `ta_readiness` structured dict (replaces `technical_summary` string) exposes all
-    Phase 16 signals to Claude; execution statistics digest for conviction calibration; watchlist
-    `expected_direction` tagging with direction-adjusted composite scores; pending entry visibility;
-    session execution history
 - **Phase 17 — Context Compression**: see `phases/17_context_compression.md`
 - **Phase 18 — Watchlist Intelligence**: see `phases/18_watchlist_intelligence.md`
   - Dynamic universe (Yahoo Finance screener + Wikipedia indices), RVOL-ranked candidates,

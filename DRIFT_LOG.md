@@ -662,6 +662,49 @@ Read the relevant phase section before modifying or debugging any module built i
 
 ---
 
+### Phase 15 — Context Enrichment (March 20)
+
+**`RankResult` dataclass** · *(not in spec)* · `intelligence/opportunity_ranker.py`
+- **Spec:** `rank_opportunities` returns `list[ScoredOpportunity]`
+- **Impl:** New `RankResult` dataclass wraps `candidates: list[ScoredOpportunity]` and `rejections: list[tuple[str, str]]`. `rank_opportunities` now returns `RankResult`. Call sites unwrap `.candidates`; the orchestrator iterates `.rejections` to populate `_recommendation_outcomes`.
+- **Why:** Callers needed access to the reason string for every hard-filter rejection without a second API call. Wrapping in a named dataclass avoids breaking existing call sites that only need candidates.
+
+**`_recommendation_outcomes` tracker** · `phases/15_context_enrichment.md §2` · `core/orchestrator.py`
+- **Spec:** In-memory `dict[str, dict]` tracking pipeline stage for each Claude-recommended symbol. States: `ranker_rejected`, `conditions_waiting`, `gate_expired`, `order_pending`, `filled`, `cancelled`. Purged daily at slow-loop start.
+- **Impl:** As specified. Populated from `rank_result.rejections` (ranker_rejected), `_medium_try_entry` on defer (conditions_waiting), expiry (gate_expired), and after `broker.place_order()` (order_pending). Updated in `_dispatch_confirmed_fill` (filled) and `_fast_step_poll_and_reconcile` on cancel/reject changes (cancelled). Session-veto symbols not recorded. Entries purged at each slow-loop cycle start using `recommendation_outcome_max_age_min` config.
+
+**`WatchlistEntry.expected_direction`** · `phases/15_context_enrichment.md §1` · `core/state_manager.py`
+- **Spec:** *(not defined — Phase 15 addition)*
+- **Impl:** `expected_direction: str = "either"` added to `WatchlistEntry` dataclass. Sentinel value `"either"` is never passed to `compute_composite_score` — callers map `"either"` → `"long"`. Loaded from JSON via `d.get("expected_direction", "either")` for backward compatibility.
+- **`_apply_watchlist_changes`** extracts `expected_direction` from Claude's add items and passes it to `WatchlistEntry`. Watchlist pruning (`_prune_score`) uses direction-adjusted score when `expected_direction != "either"`.
+
+**`ta_readiness` dict in context** · `phases/15_context_enrichment.md §3` · `intelligence/claude_reasoning.py`
+- **Spec:** Structured dict replacing `technical_summary` string in tier-1 watchlist context. Direct pass-through of `indicators[symbol]["signals"]` + direction-adjusted `composite_score`.
+- **Impl:** Each tier-1 entry now has `ta_readiness` (all signal key/values from `signals` dict + `composite_score` computed with direction). `technical_summary` string retained for `run_position_review` path only (not removed). `_tier1_score` sort key updated to use direction-adjusted score when `expected_direction != "either"`.
+
+**`TradeJournal.load_recent` / `compute_session_stats`** · `phases/15_context_enrichment.md §4` · `core/trade_journal.py`
+- **Spec:** *(not defined — Phase 15 addition)*
+- **Impl:** `load_recent(n: int) -> list[dict]` — acquires lock, reads all lines, filters for close records (`record_type == "close"` or absent) with `entry_price > 0`, returns last n in reverse-chronological order. `compute_session_stats(min_trades: int = 3) -> dict` — calls `load_recent(20)`, computes overall/short/high-conviction win rates and avg win/loss; omits `short_win_rate_pct` when no short trades, omits `high_conviction_win_rate_pct` when < 3 high-conviction trades. Both methods are async with lock safety.
+
+**`assemble_reasoning_context` extended** · `phases/15_context_enrichment.md §5` · `intelligence/claude_reasoning.py`
+- **Spec:** Add `recommendation_outcomes`, `entry_defer_counts`, `recent_executions`, `execution_stats` to context. Async work done upstream; `assemble_reasoning_context` remains sync.
+- **Impl:** 3 new optional parameters added (`recommendation_outcomes`, `recent_executions`, `execution_stats` — all default `None`). `entry_defer_counts` parameter dropped: the orchestrator already bakes defer counts into `stage_detail` strings before calling `assemble_reasoning_context`, making the parameter redundant. `_run_claude_cycle` in orchestrator pre-computes `recent_executions = await _trade_journal.load_recent(...)` and `execution_stats = await _trade_journal.compute_session_stats(...)` before calling `run_reasoning_cycle`. `recommendation_outcomes` assembled inside `assemble_reasoning_context`; age-filtered to `recommendation_outcome_max_age_min` minutes, capped at 15 entries, sorted ascending by age. Post-implementation audit removed a duplicate dead loop in the `recommendation_outcomes` assembly (first pass built `entry_dict` but never appended; second pass was the real implementation). Dead loop removed March 20.
+
+**`ClaudeConfig` additions** · `core/config.py`, `config/config.json`
+- **Spec:** *(not defined)*
+- **Impl:** 3 new fields: `recommendation_outcome_max_age_min: int = 60`, `recent_executions_count: int = 5`, `execution_stats_min_trades: int = 3`. Used by `_run_claude_cycle` to parameterize how much history is passed to Claude.
+
+**Prompt v3.5.0** · `config/prompts/v3.5.0/reasoning.txt`
+- **Spec:** New versioned prompt directory with Phase 15 context fields documented.
+- **Impl:** Forked from v3.4.0. Added `CONTEXT FIELDS (Phase 15 additions):` section documenting `recommendation_outcomes`, `recent_executions`, `ta_readiness`, `execution_stats`, and `expected_direction`. Updated `watchlist_changes.add` format from plain string array to dict array with `expected_direction` field. `ClaudeConfig.prompt_version` default updated to `"v3.5.0"`.
+
+**New tests** · `ozymandias/tests/test_context_enrichment.py`
+- 50 new tests across 8 classes: `TestRankResult`, `TestRecommendationOutcomesLifecycle`, `TestRecommendationOutcomesContextAssembly`, `TestTradeJournalLoadRecent`, `TestComputeSessionStats`, `TestTaReadiness`, `TestWatchlistEntryExpectedDirection`, `TestBackwardCompat`.
+- `test_opportunity_ranker.py`: `_rank()` helper updated to unwrap `.candidates`; `TestSessionVeto` refactored with `_rank_candidates()` helper.
+- `test_orchestrator.py`: `_make_ranked()` and `_medium_loop_mocks()` updated to return `RankResult(candidates=..., rejections=[])`.
+
+---
+
 ### Operational Hardening (March 20)
 
 **RSI entry floor** · `config/config.json`, `strategies/momentum_strategy.py`

@@ -39,11 +39,14 @@
   "claude": {
     "model": "claude-sonnet-4-20250514",
     "max_tokens_per_cycle": 4096,
-    "prompt_version": "v3.4.0",
+    "prompt_version": "v3.5.0",
     "tier1_max_symbols": 12,
     "tier2_max_symbols": 28,
     "news_max_age_hours": 168,
-    "news_max_items_per_symbol": 3
+    "news_max_items_per_symbol": 3,
+    "recommendation_outcome_max_age_min": 60,
+    "recent_executions_count": 5,
+    "execution_stats_min_trades": 3
   },
   "ai_fallback": {
     "enabled": true,

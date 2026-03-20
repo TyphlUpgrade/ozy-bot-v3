@@ -67,6 +67,19 @@ class ScoredOpportunity:
 
 
 @dataclass
+class RankResult:
+    """Return type of rank_opportunities (Phase 15).
+
+    Extension point: add new result fields here; callers that only use
+    .candidates continue to work unchanged.
+    """
+    candidates: list[ScoredOpportunity]
+    # (symbol, reason_string) tuples for every hard-filter rejection.
+    # Populated inside rank_opportunities from apply_hard_filters results.
+    rejections: list[tuple[str, str]]
+
+
+@dataclass
 class ExitAction:
     """A prioritised hold / exit / adjust recommendation for an open position."""
     symbol: str
@@ -515,7 +528,7 @@ class OpportunityRanker:
         market_hours_fn=None,
         orders: list | None = None,
         strategy_lookup: dict | None = None,
-    ) -> list[ScoredOpportunity]:
+    ) -> RankResult:
         """
         Full ranking pipeline:
         1. Extract candidates from Claude's reasoning output.
@@ -523,6 +536,11 @@ class OpportunityRanker:
         3. Apply hard filters.
         4. Score remaining candidates.
         5. Sort by composite score descending.
+
+        Returns RankResult with .candidates (scored/sorted) and .rejections
+        (list of (symbol, reason) tuples for all hard-filter rejections).
+        Session-veto skips are NOT included in rejections — only hard-filter
+        failures that reach apply_hard_filters are recorded.
 
         Parameters
         ----------
@@ -538,6 +556,7 @@ class OpportunityRanker:
         # To add a new direction value, it flows automatically — no changes here.
         session_veto: set[str] = set(reasoning_result.session_veto or [])
         scored: list[ScoredOpportunity] = []
+        rejections: list[tuple[str, str]] = []
         for opp in reasoning_result.new_opportunities:
             symbol = opp.get("symbol", "?")
             # Session veto: drop opportunities whose direction Claude has assessed
@@ -564,6 +583,7 @@ class OpportunityRanker:
                 # reasoning result is stale — log at DEBUG to avoid repetitive INFO spam.
                 level = logging.DEBUG if "already open in portfolio" in reason else logging.INFO
                 logger.log(level, "Hard filter rejected %s: %s", symbol, reason)
+                rejections.append((symbol, reason))
                 continue
             scored.append(
                 self.score_opportunity(opp, technical_signals, account_info, portfolio)
@@ -571,11 +591,12 @@ class OpportunityRanker:
 
         scored.sort(key=lambda s: s.composite_score, reverse=True)
         logger.info(
-            "rank_opportunities: %d candidates, %d passed filters",
+            "rank_opportunities: %d candidates, %d passed filters, %d rejected",
             len(reasoning_result.new_opportunities),
             len(scored),
+            len(rejections),
         )
-        return scored
+        return RankResult(candidates=scored, rejections=rejections)
 
     def rank_exit_actions(
         self,

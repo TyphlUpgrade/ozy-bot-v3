@@ -33,6 +33,7 @@ from ozymandias.core.state_manager import (
     WatchlistState,
 )
 from ozymandias.execution.broker_interface import AccountInfo, MarketHours, OrderStatus
+from ozymandias.intelligence.opportunity_ranker import RankResult
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +614,7 @@ class TestFastLoopErrorIsolation:
 class TestMediumLoopOneEntryPerCycle:
 
     def _make_ranked(self):
-        from ozymandias.intelligence.opportunity_ranker import ScoredOpportunity
+        from ozymandias.intelligence.opportunity_ranker import ScoredOpportunity, RankResult
         opp = lambda sym, score: ScoredOpportunity(
             symbol=sym, action="buy", strategy="momentum",
             composite_score=score, ai_conviction=0.7, technical_score=0.6,
@@ -621,7 +622,9 @@ class TestMediumLoopOneEntryPerCycle:
             suggested_entry=200.0, suggested_exit=220.0, suggested_stop=190.0,
             position_size_pct=0.08, reasoning="test",
         )
-        return [opp("AAPL", 0.8), opp("TSLA", 0.7), opp("NVDA", 0.6)]
+        candidates = [opp("AAPL", 0.8), opp("TSLA", 0.7), opp("NVDA", 0.6)]
+        # Phase 15: rank_opportunities returns RankResult; wrap candidates here.
+        return RankResult(candidates=candidates, rejections=[])
 
     def _run_medium_cycle(self, orch, ranked, fake_try_entry):
         """Helper: run one _medium_loop_cycle with patched deps."""
@@ -1970,7 +1973,7 @@ class TestPortfolioCashSync:
             equity=100_000.0, buying_power=broker_bp, cash=broker_cash,
             currency="USD", pdt_flag=False, daytrade_count=0, account_id="test",
         ))
-        orch._ranker.rank_opportunities = MagicMock(return_value=[])
+        orch._ranker.rank_opportunities = MagicMock(return_value=RankResult(candidates=[], rejections=[]))
         orch._broker.get_open_orders = AsyncMock(return_value=[])
         orch._broker.get_positions = AsyncMock(return_value=[])
         # Pre-seed indicators so the slow-loop trigger (indicators_were_empty) won't fire

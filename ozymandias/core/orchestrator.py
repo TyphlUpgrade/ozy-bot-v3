@@ -45,7 +45,7 @@ from ozymandias.intelligence.claude_reasoning import (
     ReasoningResult,
     _result_from_raw_reasoning,
 )
-from ozymandias.intelligence.opportunity_ranker import OpportunityRanker, evaluate_entry_conditions
+from ozymandias.intelligence.opportunity_ranker import OpportunityRanker, RankResult, evaluate_entry_conditions
 from ozymandias.intelligence.technical_analysis import compute_composite_score, generate_signal_summary
 from ozymandias.strategies.base_strategy import Strategy, get_strategy
 
@@ -233,6 +233,15 @@ class Orchestrator:
         # is dropped (gate cleared) when count reaches max_entry_defer_cycles.
         # Cleared with _cycle_consumed_symbols on each successful Claude call.
         self._entry_defer_counts: dict[str, int] = {}
+
+        # Phase 15: unified recommendation outcome tracker.
+        # symbol → {claude_entry_target, attempt_time_utc, stage, stage_detail,
+        #            rejection_count, order_id}
+        # Populated by the ranker hard-filter path, entry-conditions gate, order
+        # placement, fill detection, and cancel detection.
+        # Purged daily (stale entries removed at slow-loop cycle start).
+        # In-memory only — no state file persistence; cleared on restart (acceptable).
+        self._recommendation_outcomes: dict[str, dict] = {}
 
         # Shutdown flag — set by _shutdown(), checked by loops
         self._stopping = False
@@ -955,6 +964,10 @@ class Orchestrator:
             )
             if change.change_type == "fill":
                 await self._dispatch_confirmed_fill(change)
+            elif change.change_type in ("cancel", "partial_then_cancel", "reject"):
+                # Phase 15: mark cancelled/rejected entries in recommendation outcomes.
+                if change.symbol in self._recommendation_outcomes:
+                    self._recommendation_outcomes[change.symbol]["stage"] = "cancelled"
 
         # Also poll any locally-tracked orders not in broker's open list
         orders_state = await self._state_manager.load_orders()
@@ -976,6 +989,10 @@ class Orchestrator:
                         )
                         if change.change_type == "fill":
                             await self._dispatch_confirmed_fill(change)
+                        elif change.change_type in ("cancel", "partial_then_cancel", "reject"):
+                            # Phase 15: mark cancelled in recommendation outcomes.
+                            if change.symbol in self._recommendation_outcomes:
+                                self._recommendation_outcomes[change.symbol]["stage"] = "cancelled"
                 except Exception as exc:
                     log.warning("Failed to poll order %s: %s", order.order_id, exc)
 
@@ -1030,6 +1047,9 @@ class Orchestrator:
             await self._journal_closed_trade(change, exit_reason_hint=hint)
         else:
             await self._register_opening_fill(change)
+            # Phase 15: mark recommendation as filled on confirmed opening fill.
+            if change.symbol in self._recommendation_outcomes:
+                self._recommendation_outcomes[change.symbol]["stage"] = "filled"
 
     async def _register_opening_fill(self, change) -> None:
         """Create a local portfolio position when an opening fill is confirmed.
@@ -1853,7 +1873,7 @@ class Orchestrator:
             portfolio.buying_power = acct.buying_power
             await self._state_manager.save_portfolio(portfolio)
 
-        ranked = self._ranker.rank_opportunities(
+        rank_result = self._ranker.rank_opportunities(
             reasoning_result,
             indicators,
             acct,
@@ -1863,6 +1883,24 @@ class Orchestrator:
             orders=orders_state.orders,
             strategy_lookup=self._strategy_lookup,
         )
+        ranked = rank_result.candidates
+
+        # Phase 15: record hard-filter rejections in _recommendation_outcomes.
+        # Session-veto symbols and already-open duplicates are not recorded (spec §1).
+        for symbol, reason in rank_result.rejections:
+            # Skip symbols that are already in the portfolio (expected every cycle
+            # on stale recommendations while a position is held — not useful noise).
+            if "already open in portfolio" in reason:
+                continue
+            existing = self._recommendation_outcomes.get(symbol, {})
+            self._recommendation_outcomes[symbol] = {
+                "claude_entry_target": existing.get("claude_entry_target", 0.0),
+                "attempt_time_utc": existing.get("attempt_time_utc") or datetime.now(timezone.utc).isoformat(),
+                "stage": "ranker_rejected",
+                "stage_detail": reason,
+                "rejection_count": existing.get("rejection_count", 0) + 1,
+                "order_id": None,
+            }
 
         log.info(
             "Medium loop: ranker returned %d opportunity/ies (from %d Claude candidates)",
@@ -1999,11 +2037,31 @@ class Orchestrator:
                     # for the remainder of the current reasoning cycle. The ranker rebuilds
                     # from fresh reasoning on the next Claude cycle, resetting defer_count.
                     top.entry_conditions = {}
+                    # Phase 15: record gate expiry
+                    self._recommendation_outcomes[symbol] = {
+                        **self._recommendation_outcomes.get(symbol, {}),
+                        "stage": "gate_expired",
+                        "stage_detail": (
+                            f"gate cleared after {self._config.scheduler.max_entry_defer_cycles} misses"
+                        ),
+                    }
                 else:
                     log.info(
                         "Entry conditions not met for %s: %s — defer %d/%d",
                         symbol, conds_reason, count, max_defers,
                     )
+                    # Phase 15: record conditions_waiting
+                    self._recommendation_outcomes[symbol] = {
+                        **self._recommendation_outcomes.get(symbol, {}),
+                        "stage": "conditions_waiting",
+                        "stage_detail": (
+                            f"defer_count={count}, conditions={top.entry_conditions}"
+                        ),
+                        "attempt_time_utc": (
+                            self._recommendation_outcomes.get(symbol, {}).get("attempt_time_utc")
+                            or datetime.now(timezone.utc).isoformat()
+                        ),
+                    }
                 return False
 
         entry_direction = direction_from_action(top.action)
@@ -2242,6 +2300,17 @@ class Orchestrator:
             last_checked_at=now_iso,
         )
         await self._fill_protection.record_order(record)
+        # Phase 15: record order_pending outcome.
+        self._recommendation_outcomes[symbol] = {
+            **self._recommendation_outcomes.get(symbol, {}),
+            "stage": "order_pending",
+            "order_id": result.order_id,
+            "claude_entry_target": top.suggested_entry,
+            "attempt_time_utc": (
+                self._recommendation_outcomes.get(symbol, {}).get("attempt_time_utc")
+                or datetime.now(timezone.utc).isoformat()
+            ),
+        }
         # Order placed — clear any accumulated defer count for this symbol.
         self._entry_defer_counts.pop(symbol, None)
         if use_market:
@@ -2690,6 +2759,27 @@ class Orchestrator:
         updates state accordingly. On API failure, enters quantitative-only
         mode with exponential backoff.
         """
+        # Phase 15: purge stale recommendation outcome entries (date != today UTC).
+        today_utc = datetime.now(timezone.utc).date()
+        stale_symbols: list[str] = []
+        for sym, rec in list(self._recommendation_outcomes.items()):
+            ts = rec.get("attempt_time_utc")
+            if not ts:
+                continue
+            try:
+                entry_date = datetime.fromisoformat(ts).date()
+            except Exception:
+                continue
+            if entry_date != today_utc:
+                stale_symbols.append(sym)
+        for sym in stale_symbols:
+            del self._recommendation_outcomes[sym]
+        if stale_symbols:
+            log.debug(
+                "Slow loop: purged %d stale recommendation outcome(s): %s",
+                len(stale_symbols), stale_symbols,
+            )
+
         portfolio = await self._state_manager.load_portfolio()
         watchlist = await self._state_manager.load_watchlist()
         orders_state = await self._state_manager.load_orders()
@@ -2726,6 +2816,14 @@ class Orchestrator:
             market_data["trading_session"],
         )
 
+        # Phase 15: pre-compute execution history before the (sync) assemble_reasoning_context call.
+        recent_executions = await self._trade_journal.load_recent(
+            self._config.claude.recent_executions_count
+        )
+        execution_stats = await self._trade_journal.compute_session_stats(
+            min_trades=self._config.claude.execution_stats_min_trades
+        )
+
         try:
             result = await self._claude.run_reasoning_cycle(
                 portfolio=portfolio,
@@ -2734,6 +2832,9 @@ class Orchestrator:
                 indicators=indicators,
                 trigger=trigger_name,
                 skip_cache=True,   # slow loop always wants a fresh call
+                recommendation_outcomes=self._recommendation_outcomes,
+                recent_executions=recent_executions,
+                execution_stats=execution_stats,
             )
         except Exception as exc:
             self._handle_claude_failure(exc)
@@ -2841,11 +2942,15 @@ class Orchestrator:
                 reason = "Added by Claude"
                 tier = 1
                 strategy = "both"
+                expected_direction = "either"
             else:
                 symbol = item.get("symbol", "").upper()
                 reason = item.get("reason", "Added by Claude")
                 tier = item.get("priority_tier", 1)
                 strategy = item.get("strategy", "both")
+                # Phase 15: extract expected_direction from Claude's add-item dict.
+                # Default "either" when absent for backward compatibility.
+                expected_direction = item.get("expected_direction", "either")
             if not symbol or symbol in existing_symbols:
                 continue
             if symbol in _INDEX_BLACKLIST or symbol.startswith("^"):
@@ -2857,10 +2962,11 @@ class Orchestrator:
                 reason=reason,
                 priority_tier=tier,
                 strategy=strategy,
+                expected_direction=expected_direction,
             ))
             existing_symbols.add(symbol)
             added += 1
-            log.info("Watchlist: added %s (tier=%s)", symbol, tier)
+            log.info("Watchlist: added %s (tier=%s direction=%s)", symbol, tier, expected_direction)
 
         if remove_list:
             before = len(watchlist.entries)
@@ -2874,8 +2980,9 @@ class Orchestrator:
         # Hard size cap — prune lowest-scoring entries beyond the limit.
         # Open positions are always protected; entries with no recent TA data
         # (score=0.0) are pruned first, followed by weakest-signal entries.
-        # Phase 18 will replace this with direction-aware scoring once
-        # expected_direction is added to WatchlistEntry.
+        # Phase 15: direction-aware scoring — symbols with an expected_direction use
+        # the direction-adjusted composite score so a short-thesis symbol is not
+        # evicted because its long score is weak.
         max_entries = self._config.claude.watchlist_max_entries
         if len(watchlist.entries) > max_entries:
             # Newly-added symbols are protected for this cycle: they haven't been
@@ -2891,6 +2998,10 @@ class Orchestrator:
                 ind = self._latest_indicators.get(e.symbol, {})
                 raw = ind.get("signals") or {}
                 if raw:
+                    ed = getattr(e, "expected_direction", "either")
+                    if ed != "either":
+                        # Direction-adjusted: use thesis direction for scoring.
+                        return compute_composite_score(raw, direction=ed)
                     return max(
                         compute_composite_score(raw, direction="long"),
                         compute_composite_score(raw, direction="short"),

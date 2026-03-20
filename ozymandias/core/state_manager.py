@@ -90,6 +90,11 @@ class WatchlistEntry:
     priority_tier: int = 2            # 1 = active candidate, 2 = monitoring, 3 = cooling off
     strategy: str = "both"            # "momentum" | "swing" | "both"
     removal_candidate: bool = False
+    # Phase 15: directional thesis assigned when adding to watchlist.
+    # Affects direction-adjusted composite scoring and pruning.
+    # "long" | "short" | "either" (default — no directional bias)
+    # Never passed directly to compute_composite_score; callers map "either" → "long".
+    expected_direction: str = "either"
 
 
 @dataclass
@@ -178,6 +183,7 @@ def _from_dict_watchlist_entry(d: dict) -> WatchlistEntry:
         priority_tier=d.get("priority_tier", 2),
         strategy=d.get("strategy", "both"),
         removal_candidate=d.get("removal_candidate", False),
+        expected_direction=d.get("expected_direction", "either"),
     )
 
 

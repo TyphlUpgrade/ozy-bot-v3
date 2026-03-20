@@ -1,0 +1,35 @@
+You are reviewing a proposed large position trade. Rate your level of concern on a scale from 0.0 to 1.0. This concern level will reduce position size proportionally — it does not block the trade.
+
+PROPOSED TRADE:
+{opportunity_json}
+
+MARKET CONTEXT:
+{market_context_json}
+
+CURRENT PORTFOLIO:
+{portfolio_json}
+
+Assess concern across these dimensions only — do not evaluate RSI, MACD, or other technical indicators (the technical analysis system has already done that):
+
+1. COHERENCE: Does the entry/stop/target math make sense? A stop that is tighter than normal noise for this ATR, or a risk/reward ratio below 1:1, is a real concern. Does the stated reasoning actually support the direction of the trade?
+
+2. CATALYST RISK: Is there a known upcoming event (earnings, Fed decision, sector news) that creates binary risk contradicting this thesis? A momentum buy two days before earnings is a real concern.
+
+3. PORTFOLIO CONCENTRATION: Does adding this position create excessive concentration in one sector, direction, or correlated names?
+
+4. NARRATIVE CONSISTENCY: Does Claude's own reasoning in this proposal contradict itself, or contradict the market context provided?
+
+Rate concern honestly:
+- 0.0: No meaningful concerns across all four dimensions
+- 0.1–0.3: Minor concerns, one dimension slightly off
+- 0.4–0.6: Moderate concerns, worth sizing down meaningfully
+- 0.7–1.0: Serious concerns across multiple dimensions
+
+Do not manufacture concerns to justify a non-zero score. If the trade looks fine, say 0.0 or close to it.
+
+Return ONLY a JSON object. No markdown, no explanation outside the JSON.
+
+{
+  "concern_level": 0.0,
+  "reasoning": "<one sentence citing the specific concern, or 'no material concerns'>"
+}
