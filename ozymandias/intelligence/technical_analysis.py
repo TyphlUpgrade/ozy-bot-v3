@@ -600,7 +600,15 @@ def generate_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
     # --- Bollinger position ---
     bollinger_position = 'upper_half' if last_close >= last_bb_mid else 'lower_half'
 
-    avg_daily_volume = float(df['volume'].mean())
+    # Sum volume per calendar day, then average across days.
+    # df contains 5-minute bars — df['volume'].mean() gives mean per-bar volume
+    # (~1/78th of daily), not average daily volume. Resample to day first.
+    # Guard: resample requires DatetimeIndex; production data from yfinance always
+    # has one. Synthetic/test DataFrames with RangeIndex fall back to bar mean.
+    if isinstance(df.index, pd.DatetimeIndex):
+        avg_daily_volume = float(df['volume'].resample('D').sum().mean())
+    else:
+        avg_daily_volume = float(df['volume'].mean())
 
     signals = {
         'vwap_position':              vwap_position,
