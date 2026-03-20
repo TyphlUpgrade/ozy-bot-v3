@@ -1239,6 +1239,7 @@ class Orchestrator:
                 "claude_conviction": claude_conviction,
                 "composite_score": composite_score,
                 "position_size_pct": ctx.get("position_size_pct", 0.0),
+                "peak_unrealized_pct": ctx.get("peak_unrealized_pct", 0.0),
                 "source": "live",
                 "prompt_version": self._config.claude.prompt_version,
                 "bot_version": self._config.claude.model,
@@ -1618,6 +1619,7 @@ class Orchestrator:
                     "claude_conviction": ctx.get("claude_conviction", 0.0),
                     "composite_score": ctx.get("composite_score", 0.0),
                     "position_size_pct": ctx.get("position_size_pct", 0.0),
+                    "peak_unrealized_pct": ctx.get("peak_unrealized_pct", 0.0),
                     "source": "live",
                     "prompt_version": self._config.claude.prompt_version,
                     "bot_version": self._config.claude.model,
@@ -2605,6 +2607,12 @@ class Orchestrator:
                 gain_pct = (pos.avg_cost - current) / pos.avg_cost
             else:
                 gain_pct = (current - pos.avg_cost) / pos.avg_cost
+            # Always update peak unrealized — even when below the trigger threshold.
+            ctx = self._entry_contexts.setdefault(pos.symbol, {})
+            prev_peak = ctx.get("peak_unrealized_pct", 0.0)
+            if gain_pct * 100 > prev_peak:
+                ctx["peak_unrealized_pct"] = round(gain_pct * 100, 4)
+
             if gain_pct < profit_threshold:
                 continue
             last_trigger = ts.last_profit_trigger_gain.get(pos.symbol, 0.0)
@@ -2616,6 +2624,7 @@ class Orchestrator:
                     "symbol": pos.symbol,
                     "trigger": "position_in_profit",
                     "unrealized_pnl_pct": round(gain_pct * 100, 4),
+                    "peak_unrealized_pct": ctx.get("peak_unrealized_pct", round(gain_pct * 100, 4)),
                     "current_price": current,
                     "stop_price": pos.intention.exit_targets.stop_loss,
                     "target_price": pos.intention.exit_targets.profit_target,
