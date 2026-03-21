@@ -179,15 +179,20 @@ Last post-MVP phase completed: Phase 15 — Context Enrichment (March 20)
   composite score); `TradeJournal.load_recent` + `compute_session_stats`; `recent_executions` and
   `execution_stats` passed to Claude each cycle; prompt v3.5.0; 50 new tests.
 
-### Post-MVP Roadmap: Phases 17–18
+### Post-MVP Roadmap: Phases 17–19
 
-- **Phase 17 — Context Compression**: see `phases/17_context_compression.md`
+- **Phase 17 — Trigger Responsiveness & Data Freshness**: see `phases/17_trigger_responsiveness.md`
+  - Parallel medium loop fetch, medium-loop-gated slow loop, bidirectional macro/sector triggers,
+    adaptive reasoning cache TTL
 - **Phase 18 — Watchlist Intelligence**: see `phases/18_watchlist_intelligence.md`
   - Dynamic universe (Yahoo Finance screener + Wikipedia indices), RVOL-ranked candidates,
     Brave Search tool use for Claude to research catalysts at watchlist build time
   - `scripts/reset_watchlist.py`: CLI tool to replace or clear `watchlist.json` without running
     the bot. Interface: positional symbol args + `--empty` flag + `--dry-run` preview.
     Must use StateManager for atomic writes and schema validation.
+- **Phase 19 — Context Compression**: see `phases/19_context_compression.md`
+  - Haiku pre-screener ranks all watchlist candidates before strategic reasoning context assembly;
+    most valuable after Phase 18 populates a large, diverse tier1/tier2 candidate pool
 
 ## Spec Drift Log
 See `DRIFT_LOG.md`. Read the relevant phase section of DRIFT_LOG.md before modifying or debugging any module built in a previous phase.

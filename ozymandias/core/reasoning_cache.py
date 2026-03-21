@@ -104,13 +104,22 @@ class ReasoningCache:
     # Startup reuse
     # ------------------------------------------------------------------
 
-    def load_latest_if_fresh(self) -> Optional[dict]:
+    def load_latest_if_fresh(self, max_age_min: int | None = None) -> Optional[dict]:
         """
         Return the most recent cached response if it is from today and
-        less than REUSE_MAX_AGE_MINUTES old. Returns None otherwise.
+        less than the configured max age (minutes) old. Returns None otherwise.
+
+        Parameters
+        ----------
+        max_age_min:
+            Override the default REUSE_MAX_AGE_MINUTES for this call.
+            Used by the adaptive cache TTL (Fix 4 / Phase 17) to shorten
+            the reuse window during high-stress or panic market regimes.
+            When None, uses REUSE_MAX_AGE_MINUTES (60 min).
         """
         now = _utcnow()
         today = _session_date(now)
+        effective_max = max_age_min if max_age_min is not None else REUSE_MAX_AGE_MINUTES
         candidates = []
 
         for path in self._dir.glob("reasoning_*.json"):
@@ -120,7 +129,7 @@ class ReasoningCache:
             if _session_date(ts) != today:
                 continue
             age_minutes = (now - ts).total_seconds() / 60
-            if age_minutes <= REUSE_MAX_AGE_MINUTES:
+            if age_minutes <= effective_max:
                 candidates.append((ts, path))
 
         if not candidates:

@@ -57,9 +57,73 @@ ET = ZoneInfo("America/New_York")
 # Results go into _market_context_indicators only — never into _latest_indicators
 # (no entry pipeline contamination).
 _CONTEXT_SYMBOLS = [
-    "SPY", "QQQ", "IWM",                           # broad market
-    "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLC",  # sectors
+    "SPY", "QQQ", "IWM",                                # broad market
+    "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLC",  # SPDR sectors
+    "ITA",                                               # Aerospace & Defense (iShares)
+    "XBI",                                               # Biotechnology (SPDR S&P Biotech)
 ]
+
+# Sector membership map: symbol → sector ETF tracked in _CONTEXT_SYMBOLS.
+# Used by the sector_move trigger to detect portfolio exposure per sector.
+# Extension point: to register a new symbol's sector, add one entry here.
+# Symbols absent from this map degrade gracefully: their sector ETF fires
+# at the base threshold rather than the tightened exposure threshold.
+# Note: COIN and similar crypto-adjacent names have no clean ETF mapping
+# and are intentionally left unmapped.
+_SECTOR_MAP: dict[str, str] = {
+    # Energy (XLE)
+    "XLE": "XLE", "XOM": "XLE", "CVX": "XLE", "COP": "XLE",
+    "EOG": "XLE", "OXY": "XLE", "SLB": "XLE", "HAL": "XLE",
+    "BKR": "XLE", "DVN": "XLE", "FANG": "XLE", "MRO": "XLE",
+    "MPC": "XLE", "VLO": "XLE", "PSX": "XLE",
+    # Financials (XLF)
+    "XLF": "XLF", "JPM": "XLF", "BAC": "XLF", "WFC": "XLF",
+    "GS": "XLF", "MS": "XLF", "C": "XLF", "AXP": "XLF",
+    "BLK": "XLF", "BX": "XLF", "KKR": "XLF", "SCHW": "XLF",
+    "IBKR": "XLF", "COF": "XLF", "KRE": "XLF", "MA": "XLF", "V": "XLF",
+    # Technology (XLK)
+    "XLK": "XLK", "NVDA": "XLK", "AAPL": "XLK", "MSFT": "XLK",
+    "AMD": "XLK", "AVGO": "XLK", "QCOM": "XLK", "INTC": "XLK",
+    "ARM": "XLK", "MRVL": "XLK", "MU": "XLK", "SMCI": "XLK",
+    "AMAT": "XLK", "LRCX": "XLK", "KLAC": "XLK", "ASML": "XLK",
+    "SMH": "XLK", "SOXX": "XLK",
+    "PLTR": "XLK", "NOW": "XLK", "ORCL": "XLK", "DELL": "XLK",
+    "CRWD": "XLK", "PANW": "XLK", "ZS": "XLK", "FTNT": "XLK",
+    "NET": "XLK", "DDOG": "XLK", "SNOW": "XLK", "MDB": "XLK",
+    # Consumer Discretionary (XLY)
+    "XLY": "XLY", "TSLA": "XLY", "AMZN": "XLY", "RIVN": "XLY",
+    "NIO": "XLY", "XPEV": "XLY", "LI": "XLY",
+    "GM": "XLY", "F": "XLY",
+    "HD": "XLY", "LOW": "XLY", "TGT": "XLY", "WMT": "XLY",
+    "CMG": "XLY", "MCD": "XLY",
+    "BKNG": "XLY", "ABNB": "XLY", "UBER": "XLY", "LYFT": "XLY",
+    "DKNG": "XLY", "MGM": "XLY", "LVS": "XLY", "WYNN": "XLY",
+    "NKE": "XLY",
+    # Healthcare / large pharma (XLV) — managed care + large-cap pharma
+    "XLV": "XLV", "UNH": "XLV", "JNJ": "XLV", "MRK": "XLV",
+    "PFE": "XLV", "ABBV": "XLV", "BMY": "XLV",
+    "LLY": "XLV", "NVO": "XLV",   # GLP-1 names trade on pharma/obesity thesis
+    # Biotechnology (XBI) — pure biotech; moves sharply on FDA news and trial readouts
+    "XBI": "XBI", "GILD": "XBI", "BIIB": "XBI", "REGN": "XBI",
+    "VRTX": "XBI", "MRNA": "XBI", "NVAX": "XBI", "INCY": "XBI",
+    "HIMS": "XBI", "RXRX": "XBI", "EXAS": "XBI", "ARKG": "XBI",
+    # Industrials (XLI) — broad industrial/machinery names
+    "XLI": "XLI", "CAT": "XLI", "DE": "XLI", "HON": "XLI", "ETN": "XLI",
+    # Aerospace & Defense (ITA) — defense-specific ETF; more sensitive than XLI
+    # to geopolitical events, budget resolutions, and contract awards
+    "ITA": "ITA", "LMT": "ITA", "RTX": "ITA", "NOC": "ITA", "GD": "ITA",
+    "BA": "ITA", "GE": "ITA", "AXON": "ITA", "RKLB": "ITA", "KTOS": "ITA",
+    "HII": "ITA", "L3H": "ITA",
+    # Communications (XLC)
+    "XLC": "XLC", "META": "XLC", "GOOGL": "XLC", "GOOG": "XLC",
+    "NFLX": "XLC", "DIS": "XLC", "SPOT": "XLC", "ROKU": "XLC",
+    "RBLX": "XLC", "EA": "XLC", "TTWO": "XLC",
+}
+
+# Sector ETFs tracked for sector_move triggers — subset of _CONTEXT_SYMBOLS
+# excluding the three broad-market indices (handled by market_move triggers).
+# Extension point: to add a new sector, add its ETF to _CONTEXT_SYMBOLS and here.
+_CONTEXT_SECTOR_ETFS: list[str] = ["XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLC", "ITA", "XBI"]
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +178,14 @@ class SlowLoopTriggerState:
     # Trigger fires when gain_pct >= last value + position_profit_trigger_pct.
     # Updated after each successful Claude call; cleared when a position closes.
     last_profit_trigger_gain: dict[str, float] = field(default_factory=dict)
+    # Phase 17: price baseline anchored to the last successful Claude call (not reset each cycle).
+    # Used by macro_move and sector_move triggers so that sustained index/sector moves always fire
+    # even when last_prices is updated each tick. Separate from last_prices which resets per eval.
+    last_claude_call_prices: dict[str, float] = field(default_factory=dict)
+    # Phase 17: RSI extreme trigger re-arm tracking.
+    # Once fired, the trigger cannot re-fire until RSI recovers by macro_rsi_rearm_band points.
+    rsi_extreme_fired_low: bool = False    # True after panic trigger fires; cleared when RSI recovers above threshold + band
+    rsi_extreme_fired_high: bool = False   # True after euphoria trigger fires; cleared when RSI falls below threshold - band
 
 
 # ---------------------------------------------------------------------------
@@ -193,9 +265,26 @@ class Orchestrator:
         # Latest market context from slow loop — consumed by thesis challenge in medium loop
         self._latest_market_context: dict = {}
 
+        # TA results for watchlist + position symbols.
+        # Updated each medium cycle; consumed by fast loop quant overrides and ranker.
+        # Initialized empty; populated after first medium loop cycle.
+        self._latest_indicators: dict = {}
+
         # TA results for context instruments (SPY, QQQ, sector ETFs).
         # Updated each medium cycle; consumed by _build_market_context for Claude calls.
         self._market_context_indicators: dict = {}
+
+        # Phase 17: merged dict of _latest_indicators + _market_context_indicators.
+        # Set once at the end of each medium loop cycle. Consumed by:
+        #   - _check_triggers (macro/sector move baseline)
+        #   - Phase 19 ContextCompressor (_build_all_candidates)
+        # Initialized empty; populated after first medium loop cycle completes.
+        self._all_indicators: dict = {}
+
+        # Phase 17: UTC timestamp of the last completed medium loop cycle.
+        # Used by the medium-loop gate in _slow_loop_cycle to prevent Claude from
+        # firing on stale indicators (Fix 3). None until the first cycle completes.
+        self._last_medium_loop_completed_utc: Optional[datetime] = None
 
         # Count of override exits since last Claude call (feeds trigger state)
         self._override_exit_count: int = 0
@@ -1753,7 +1842,8 @@ class Orchestrator:
         One medium loop tick. Steps:
         1. Fetch latest bars for Tier 1 watchlist symbols + open positions.
         2. Run TA on all fetched data; cache indicators for fast loop.
-        3. Detect entry signals via active strategies.
+        3. Load Claude reasoning cache; all entry opportunities originate here.
+           (Strategy.generate_signals() is defined but not wired — see base_strategy.py.)
         4. Re-rank opportunity queue using cached Claude reasoning + fresh TA.
         5. Execute top opportunity (one per cycle) if risk-validated.
         6. Re-evaluate open positions; exit if strategy recommends it.
@@ -1778,21 +1868,38 @@ class Orchestrator:
             log.debug("Medium loop: no symbols to scan")
             return
 
-        # -- Step 2: fetch bars + run TA -------------------------------------
+        # -- Step 2: fetch bars + run TA (parallel) --------------------------
+        # All watchlist + position symbols fetched concurrently, bounded by
+        # medium_loop_scan_concurrency (default 10). generate_signal_summary is
+        # CPU-bound (pure pandas/numpy) — wrapped in asyncio.to_thread so it
+        # does not block the event loop during TA computation.
         indicators: dict[str, dict] = {}  # symbol → full generate_signal_summary() output
         bars: dict[str, object] = {}      # symbol → DataFrame
 
-        for symbol in scan_symbols:
-            try:
-                df = await self._data_adapter.fetch_bars(symbol, interval="5m", period="5d")
+        semaphore = asyncio.Semaphore(self._config.scheduler.medium_loop_scan_concurrency)
+
+        async def _fetch_one(sym: str):
+            async with semaphore:
+                df = await self._data_adapter.fetch_bars(sym, interval="5m", period="5d")
                 if df is None or df.empty:
-                    log.warning("Medium loop: no bars returned for %s", symbol)
-                    continue
-                summary = generate_signal_summary(symbol, df)
-                indicators[symbol] = summary
-                bars[symbol] = df
-            except Exception as exc:
-                log.warning("Medium loop: TA failed for %s: %s", symbol, exc)
+                    log.warning("Medium loop: no bars returned for %s", sym)
+                    return sym, None, None
+                summary = await asyncio.to_thread(generate_signal_summary, sym, df)
+                return sym, df, summary
+
+        fetch_results = await asyncio.gather(
+            *[_fetch_one(s) for s in scan_symbols],
+            return_exceptions=True,
+        )
+        for item in fetch_results:
+            if isinstance(item, Exception):
+                log.warning("Medium loop: TA failed: %s", item)
+                continue
+            sym, df, summary = item
+            if summary is None:
+                continue
+            indicators[sym] = summary
+            bars[sym] = df
 
         if not indicators:
             log.warning("Medium loop: TA produced no results — all fetches failed")
@@ -1803,7 +1910,7 @@ class Orchestrator:
 
         # Cache indicators for the fast loop (quant overrides).
         # Track whether this is the first population so we can fire Claude immediately.
-        indicators_were_empty = not getattr(self, "_latest_indicators", {})
+        indicators_were_empty = not self._latest_indicators
         self._latest_indicators = {
             sym: {
                 **v["signals"],
@@ -1815,20 +1922,43 @@ class Orchestrator:
 
         log.debug("Medium loop: scanned %d symbol(s)", len(indicators))
 
-        # -- Context instruments: best-effort macro data for Claude -----------
+        # -- Context instruments: best-effort macro data for Claude (parallel) -
         # Fetch TA for SPY, QQQ, sector ETFs not already in the main scan.
         # Failures are silently skipped — this data is informational only.
-        for ctx_sym in _CONTEXT_SYMBOLS:
-            if ctx_sym in indicators:
-                # Already fetched as a watchlist/position symbol — reuse the result.
-                self._market_context_indicators[ctx_sym] = indicators[ctx_sym]
+        # Uses the same semaphore so combined concurrency stays within the limit.
+        ctx_needed = [s for s in _CONTEXT_SYMBOLS if s not in indicators]
+        ctx_already = [s for s in _CONTEXT_SYMBOLS if s in indicators]
+        for sym in ctx_already:
+            self._market_context_indicators[sym] = indicators[sym]
+
+        async def _fetch_ctx(sym: str):
+            async with semaphore:
+                df = await self._data_adapter.fetch_bars(sym, interval="5m", period="5d")
+                if df is None or df.empty:
+                    return sym, None
+                summary = await asyncio.to_thread(generate_signal_summary, sym, df)
+                return sym, summary
+
+        ctx_results = await asyncio.gather(
+            *[_fetch_ctx(s) for s in ctx_needed],
+            return_exceptions=True,
+        )
+        for item in ctx_results:
+            if isinstance(item, Exception):
+                log.debug("Medium loop: context fetch failed: %s", item)
                 continue
-            try:
-                df = await self._data_adapter.fetch_bars(ctx_sym, interval="5m", period="5d")
-                if df is not None and not df.empty:
-                    self._market_context_indicators[ctx_sym] = generate_signal_summary(ctx_sym, df)
-            except Exception as exc:
-                log.debug("Medium loop: context fetch skipped for %s: %s", ctx_sym, exc)
+            sym, summary = item
+            if summary is not None:
+                self._market_context_indicators[sym] = summary
+
+        # Phase 17: merge watchlist + context indicators into _all_indicators.
+        # Consumed by _check_triggers (macro/sector baseline) and Phase 19 compressor.
+        self._all_indicators = {**self._latest_indicators, **self._market_context_indicators}
+
+        # Phase 17 (Fix 3): stamp completion time so the slow loop medium-loop gate passes.
+        # Must be set before the immediate slow-loop call below so that the gate does not
+        # block the very first Claude call on startup.
+        self._last_medium_loop_completed_utc = datetime.now(timezone.utc)
 
         # Fire the slow loop immediately the first time indicators are populated.
         # This gets Claude's assessment within seconds of startup rather than waiting
@@ -1841,7 +1971,10 @@ class Orchestrator:
                 log.error("Immediate slow loop cycle after indicator seed failed: %s", exc, exc_info=True)
 
         # -- Step 3: load Claude reasoning result for ranking -----------------
-        cached_raw = self._reasoning_cache.load_latest_if_fresh()
+        # Phase 17 (Fix 4): use adaptive cache TTL based on current market regime.
+        cached_raw = self._reasoning_cache.load_latest_if_fresh(
+            max_age_min=self._compute_cache_max_age()
+        )
         if cached_raw:
             parsed = cached_raw.get("parsed_response") or {}
             reasoning_result = _result_from_raw_reasoning(parsed)
@@ -2504,9 +2637,21 @@ class Orchestrator:
 
         # Guard: don't call Claude until the medium loop has computed indicators at
         # least once. Without TA data the context is empty and Claude rejects everything.
-        if not getattr(self, "_latest_indicators", {}):
+        if not self._latest_indicators:
             log.debug("Slow loop: no indicator data yet — waiting for first medium loop cycle")
             return
+
+        # Phase 17 (Fix 3): medium-loop gate — only fire when a new medium loop cycle
+        # has completed since the last Claude call. This prevents Claude from reasoning
+        # on the same stale indicators twice in a row (e.g. when a trigger fires faster
+        # than the medium loop interval). If we have never called Claude, always proceed.
+        if self._trigger_state.last_claude_call_utc is not None:
+            last_medium = self._last_medium_loop_completed_utc
+            if last_medium is None or last_medium <= self._trigger_state.last_claude_call_utc:
+                log.debug(
+                    "Slow loop: no new medium loop cycle since last Claude call — skipping"
+                )
+                return
 
         # Guard: never fire two concurrent Claude calls
         if self._trigger_state.claude_call_in_flight:
@@ -2560,24 +2705,41 @@ class Orchestrator:
             if elapsed_min >= self._config.claude.max_reasoning_interval_min:
                 triggers.append("time_ceiling")
 
-        # 2. Price move: any Tier 1 symbol or position moved >2% since last eval
+        # 2. Price move: any Tier 1 symbol, open position, or macro index moved
+        #    beyond threshold since last eval. Threshold read from config
+        #    (slow_loop_price_move_threshold_pct). SPY/QQQ/IWM included for
+        #    macro awareness even though they are not entry candidates.
+        #    Phase 17: uses self._all_indicators (set by medium loop) for a
+        #    single merged lookup across watchlist + context symbols.
+        price_move_threshold = self._config.scheduler.slow_loop_price_move_threshold_pct / 100
         watchlist = await self._state_manager.load_watchlist()
         portfolio = await self._state_manager.load_portfolio()
         tracked = {e.symbol for e in watchlist.entries if e.priority_tier == 1}
         tracked |= {p.symbol for p in portfolio.positions}
-        indicators = getattr(self, "_latest_indicators", {})
+        tracked |= {"SPY", "QQQ", "IWM"}
+        # Use the medium-loop-cached merged dict; fall back to on-demand merge for
+        # tests or early startup cycles where the medium loop hasn't run yet.
+        all_ind = self._all_indicators or {
+            **self._latest_indicators,
+            **self._market_context_indicators,
+        }
         for symbol in tracked:
-            current_price = indicators.get(symbol, {}).get("price")
+            current_price = all_ind.get(symbol, {}).get("price")
+            if current_price is None:
+                # Fallback: try nested signals dict (context symbol format differs)
+                sig = all_ind.get(symbol, {}).get("signals", {})
+                current_price = sig.get("price")
             if current_price is None:
                 continue
             last_price = ts.last_prices.get(symbol)
-            if last_price and abs(current_price - last_price) / last_price > 0.02:
+            if last_price and abs(current_price - last_price) / last_price > price_move_threshold:
                 triggers.append(f"price_move:{symbol}")
 
         # 3. Position approaching target (within 1% of profit target or stop loss)
+        position_indicators = self._latest_indicators
         for pos in portfolio.positions:
             targets = pos.intention.exit_targets
-            current = indicators.get(pos.symbol, {}).get("price")
+            current = position_indicators.get(pos.symbol, {}).get("price")
             if current is None:
                 continue
             if targets.profit_target > 0:
@@ -2600,7 +2762,7 @@ class Orchestrator:
         # Direction-aware: shorts profit when price falls below avg_cost.
         profit_threshold = self._config.scheduler.position_profit_trigger_pct
         for pos in portfolio.positions:
-            current = indicators.get(pos.symbol, {}).get("price")
+            current = position_indicators.get(pos.symbol, {}).get("price")
             if current is None or pos.avg_cost <= 0:
                 continue
             if is_short(pos.intention.direction):
@@ -2662,17 +2824,99 @@ class Orchestrator:
 
         # 7. Indicators seeded for the first time — fire once after the first medium
         #    loop cycle so Claude always has real TA data on its first call.
-        if not ts.indicators_seeded and getattr(self, "_latest_indicators", {}):
+        if not ts.indicators_seeded and self._all_indicators:
             triggers.append("indicators_ready")
             ts.indicators_seeded = True
+            # Phase 17: seed last_claude_call_prices from the current snapshot so that
+            # macro_move / sector_move have a valid baseline from the first call forward.
+            for sym, ind in all_ind.items():
+                price = ind.get("price") or ind.get("signals", {}).get("price")
+                if price is not None:
+                    ts.last_claude_call_prices[sym] = price
+
+        # Phase 17 (Fix 2): Macro move trigger --------------------------------
+        # Fires when any SPY/QQQ/IWM index moves beyond macro_move_trigger_pct (1%)
+        # from its price at the time of the last Claude call. Uses a separate
+        # last_claude_call_prices baseline (not last_prices, which resets each tick)
+        # so sustained intraday moves always fire even when last_prices catches up.
+        if ts.last_claude_call_prices:
+            macro_move_threshold = self._config.scheduler.macro_move_trigger_pct / 100
+            for sym in self._config.scheduler.macro_move_symbols:
+                ind = all_ind.get(sym, {})
+                current_price = ind.get("price") or ind.get("signals", {}).get("price")
+                if current_price is None:
+                    continue
+                baseline = ts.last_claude_call_prices.get(sym)
+                if baseline and abs(current_price - baseline) / baseline > macro_move_threshold:
+                    triggers.append(f"market_move:{sym}")
+
+        # Phase 17 (Fix 2): Sector move trigger --------------------------------
+        # Fires when a sector ETF moves beyond sector_move_trigger_pct (1.5%) from its
+        # price at the last Claude call. When the portfolio has open exposure to a sector
+        # (i.e. we hold a position in a symbol that maps to that ETF), the threshold is
+        # tightened by sector_exposure_threshold_factor (0.7 → 1.05% instead of 1.5%).
+        if ts.last_claude_call_prices:
+            sector_move_threshold = self._config.scheduler.sector_move_trigger_pct / 100
+            sector_factor = self._config.scheduler.sector_exposure_threshold_factor
+            # Determine which sector ETFs the portfolio has exposure to.
+            # _SECTOR_MAP[symbol] → sector ETF. Symbols absent from the map degrade
+            # gracefully (base threshold used, not tightened threshold).
+            exposed_sectors = {
+                _SECTOR_MAP[pos.symbol]
+                for pos in portfolio.positions
+                if pos.symbol in _SECTOR_MAP
+            }
+            for etf in _CONTEXT_SECTOR_ETFS:
+                # Skip if this ETF is a held position — price_move already covers it.
+                if etf in {pos.symbol for pos in portfolio.positions}:
+                    continue
+                ind = all_ind.get(etf, {})
+                current_price = ind.get("price") or ind.get("signals", {}).get("price")
+                if current_price is None:
+                    continue
+                baseline = ts.last_claude_call_prices.get(etf)
+                if not baseline:
+                    continue
+                threshold = (
+                    sector_move_threshold * sector_factor
+                    if etf in exposed_sectors
+                    else sector_move_threshold
+                )
+                if abs(current_price - baseline) / baseline > threshold:
+                    triggers.append(f"sector_move:{etf}")
+
+        # Phase 17 (Fix 2): Market RSI extreme trigger -------------------------
+        # Fires when SPY RSI crosses into panic (< macro_rsi_panic_threshold) or
+        # euphoria (> macro_rsi_euphoria_threshold) territory. Re-arm band prevents
+        # rapid re-firing: once triggered, RSI must recover by macro_rsi_rearm_band
+        # points before the trigger can fire again.
+        # Note: the TA module key is "rsi" (not "rsi_14" as spec draft said).
+        spy_sig = all_ind.get("SPY", {})
+        spy_rsi = (spy_sig.get("signals") or spy_sig).get("rsi")
+        if spy_rsi is not None:
+            cfg_s = self._config.scheduler
+            # Panic (low RSI): market selloff
+            if spy_rsi < cfg_s.macro_rsi_panic_threshold and not ts.rsi_extreme_fired_low:
+                triggers.append("market_rsi_extreme")
+                ts.rsi_extreme_fired_low = True
+            elif spy_rsi > cfg_s.macro_rsi_panic_threshold + cfg_s.macro_rsi_rearm_band:
+                ts.rsi_extreme_fired_low = False  # re-arm when RSI recovers
+            # Euphoria (high RSI): market overheating
+            if spy_rsi > cfg_s.macro_rsi_euphoria_threshold and not ts.rsi_extreme_fired_high:
+                triggers.append("market_rsi_extreme")
+                ts.rsi_extreme_fired_high = True
+            elif spy_rsi < cfg_s.macro_rsi_euphoria_threshold - cfg_s.macro_rsi_rearm_band:
+                ts.rsi_extreme_fired_high = False  # re-arm when RSI normalises
 
         return triggers
 
     async def _update_trigger_prices(self) -> None:
         """Snapshot current prices into last_prices for next trigger comparison."""
-        indicators = getattr(self, "_latest_indicators", {})
-        for symbol, ind in indicators.items():
+        # Phase 17: use self._all_indicators (already merged by medium loop).
+        for symbol, ind in self._all_indicators.items():
             price = ind.get("price")
+            if price is None:
+                price = ind.get("signals", {}).get("price")
             if price is not None:
                 self._trigger_state.last_prices[symbol] = price
 
@@ -2706,7 +2950,7 @@ class Orchestrator:
         )
         market_breadth = f"{bullish_count}/{len(_CONTEXT_SYMBOLS)} context instruments bullish-aligned"
 
-        _SECTOR_ETFS = {
+        _SECTOR_ETF_NAMES = {
             "XLK": "Technology",
             "XLF": "Financials",
             "XLE": "Energy",
@@ -2714,9 +2958,11 @@ class Orchestrator:
             "XLI": "Industrials",
             "XLY": "Consumer Discretionary",
             "XLC": "Communication Services",
+            "ITA": "Aerospace & Defense",
+            "XBI": "Biotechnology",
         }
         sector_performance = []
-        for etf, sector in _SECTOR_ETFS.items():
+        for etf, sector in _SECTOR_ETF_NAMES.items():
             ind = ctx.get(etf)
             if not ind:
                 continue
@@ -2858,6 +3104,11 @@ class Orchestrator:
         self._degradation.claude_backoff_until_utc = None
         self._trigger_state.last_claude_call_utc = datetime.now(timezone.utc)
         self._trigger_state.last_override_exit_count = self._override_exit_count
+        # Phase 17 (Fix 2): snapshot prices anchored to this call for macro/sector move triggers.
+        for sym, ind in self._all_indicators.items():
+            price = ind.get("price") or ind.get("signals", {}).get("price")
+            if price is not None:
+                self._trigger_state.last_claude_call_prices[sym] = price
         # Fresh reasoning arrived — unlock all consumed symbols and reset defer counts
         # so new opportunities from this cycle can be entered on a clean slate.
         self._cycle_consumed_symbols.clear()
@@ -2899,6 +3150,31 @@ class Orchestrator:
             len(remove_list),
             len(result.position_reviews),
         )
+
+    def _compute_cache_max_age(self) -> int:
+        """
+        Phase 17 (Fix 4): Adaptive reasoning cache TTL based on SPY RSI regime.
+
+        Returns the cache max-age in minutes for the current market environment:
+        - Panic (SPY RSI ≤ cache_panic_rsi_low):    shorter TTL → Claude re-reasons sooner
+        - Stress (SPY RSI ≤ cache_stress_rsi_low):  medium TTL
+        - Euphoria (SPY RSI ≥ cache_euphoria_rsi_high): shorter TTL → Claude reassesses risk
+        - Normal: default TTL (cache_max_age_default_min, 60 min)
+
+        Falls back to cache_max_age_default_min when SPY RSI is unavailable.
+        """
+        cfg = self._config.claude
+        spy_ind = self._market_context_indicators.get("SPY", {})
+        spy_rsi = (spy_ind.get("signals") or spy_ind).get("rsi")
+        if spy_rsi is None:
+            return cfg.cache_max_age_default_min
+        if spy_rsi <= cfg.cache_panic_rsi_low:
+            return cfg.cache_max_age_panic_min
+        if spy_rsi <= cfg.cache_stress_rsi_low:
+            return cfg.cache_max_age_stressed_min
+        if spy_rsi >= cfg.cache_euphoria_rsi_high:
+            return cfg.cache_max_age_euphoria_min
+        return cfg.cache_max_age_default_min
 
     def _handle_claude_failure(self, exc: Exception) -> None:
         """Enter quantitative-only mode; schedule exponential backoff retry."""

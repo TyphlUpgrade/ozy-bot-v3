@@ -744,3 +744,42 @@ Read the relevant phase section before modifying or debugging any module built i
 - **Spec:** *(not defined)*
 - **Impl:** Two signal files: `state/EMERGENCY_EXIT` and `state/EMERGENCY_SHUTDOWN`. Both checked at the top of every `_fast_loop` iteration (before market-hours guard, so shutdown works outside market hours). `EMERGENCY_SHUTDOWN`: calls `_shutdown()` immediately. `EMERGENCY_EXIT`: three-phase aggressive liquidation — (1) cancel all pending orders via `fill_protection.get_pending_orders()` + `broker.cancel_order()`; (2) place market exit for every local position, tagged `"emergency_exit"` in journal; (3) poll `broker.get_positions()` every 2 seconds for up to 60 seconds, logging CRITICAL for confirmed closes and CRITICAL MANUAL ACTION REQUIRED for any that remain open. Signal files deleted immediately after detection. `scripts/emergency.py`: CLI trigger with confirmation prompt; subcommands `exit` and `shutdown`; `--yes/-y` flag skips prompt.
 - **Why:** No mechanism existed to liquidate all positions or stop the bot without killing the process. Designed with Discord integration in mind — Discord handler writes the signal file, bot acts within one fast-loop tick (~5–15 seconds).
+
+---
+
+### Phase 17 — Trigger Responsiveness & Data Freshness (March 20)
+
+**Fix 1: Parallel medium loop fetch** · `core/orchestrator.py` — `_medium_loop_cycle()`
+- **Spec:** Serial `for symbol in scan_symbols` loop
+- **Impl:** Replaced with `asyncio.gather` bounded by `asyncio.Semaphore(medium_loop_scan_concurrency)`. `generate_signal_summary` wrapped in `asyncio.to_thread` (CPU-bound TA computation no longer blocks the event loop). Context symbol fetch (`_CONTEXT_SYMBOLS`) parallelized separately using the same semaphore. `_last_medium_loop_completed_utc` (Optional[datetime]) stamped at the end of each cycle. `self._all_indicators` (merged dict of `_latest_indicators + _market_context_indicators`) set once per cycle — consumed by `_check_triggers` and available for Phase 19 compressor. `self._latest_indicators` initialized to `{}` in `__init__` (was previously lazy-set in first medium loop cycle; now safe to read at any time without `getattr`).
+- **New config keys:** `SchedulerConfig.medium_loop_scan_concurrency: int = 10`
+- **Why:** Serial yfinance fetches at 120s interval meant real refresh was slower than the interval implied. With 20+ symbols plus 10 context ETFs, serial fetching consumed the full interval.
+
+**Fix 2: Macro/sector/RSI extreme triggers** · `core/orchestrator.py` — `_check_triggers()`
+- **Spec:** *(not defined)*
+- **Impl:** Three new triggers added to `_check_triggers()`:
+  1. `market_move:{sym}` — SPY/QQQ/IWM moves >1% (configurable) from `last_claude_call_prices` baseline. Fires Claude even during quiet per-stock periods when broad market breaks.
+  2. `sector_move:{etf}` — sector ETF moves >1.5% (configurable) from last call. Threshold tightened to `1.5% × sector_exposure_threshold_factor (0.7)` = 1.05% when portfolio has open exposure to that sector (via `_SECTOR_MAP`). Directly-held ETF positions skip (covered by `price_move`).
+  3. `market_rsi_extreme` — SPY RSI crosses below `macro_rsi_panic_threshold` (25) or above `macro_rsi_euphoria_threshold` (72). Single trigger name regardless of direction. Re-arm band (`macro_rsi_rearm_band = 5`) prevents rapid re-firing; `rsi_extreme_fired_low/high` flags in `SlowLoopTriggerState`. RSI key is `"rsi"` (not `"rsi_14"` as spec draft said — TA module uses `"rsi"`).
+- **`_SECTOR_MAP`**: module-level constant mapping stock/ETF symbols → sector ETF (e.g. `"NVDA": "XLK"`). Used for exposure detection in sector_move trigger. Replaces the local `_SECTOR_ETFS` dict that was previously in `_build_market_context`; `_build_market_context` now uses a local `_SECTOR_ETF_NAMES` dict (ETF → display name) since `_SECTOR_MAP` serves a different purpose.
+- **`SlowLoopTriggerState` new fields:** `last_claude_call_prices: dict[str, float]` (baseline snapshotted at each successful Claude call + seeded on `indicators_ready`), `rsi_extreme_fired_low: bool`, `rsi_extreme_fired_high: bool`.
+- **New config keys** in `SchedulerConfig`: `macro_move_trigger_pct`, `macro_move_symbols`, `sector_move_trigger_pct`, `sector_exposure_threshold_factor`, `macro_rsi_panic_threshold`, `macro_rsi_euphoria_threshold`, `macro_rsi_rearm_band`.
+
+**Fix 3: Medium-loop-gated slow loop** · `core/orchestrator.py` — `_slow_loop_cycle()`
+- **Spec:** *(not defined)*
+- **Impl:** Guard added to `_slow_loop_cycle` after existing guards: if `last_claude_call_utc is not None` AND `_last_medium_loop_completed_utc is None or ≤ last_claude_call_utc`, skip. This prevents Claude from reasoning on identical indicators twice in a row. Gate is bypassed when `last_claude_call_utc is None` (first call ever) — `indicators_ready` trigger already ensures TA data exists.
+- **Test impact:** Integration tests and `TestDegradation` that seed `_latest_indicators` directly and backdate `last_claude_call_utc` needed `_last_medium_loop_completed_utc` seeded in their fixtures (2 fixtures updated).
+
+**Fix 4: Adaptive reasoning cache TTL** · `core/reasoning_cache.py`, `core/orchestrator.py`
+- **Spec:** *(not defined)*
+- **Impl:** `load_latest_if_fresh(max_age_min: int | None = None)` — optional override parameter. `effective_max = max_age_min if max_age_min is not None else REUSE_MAX_AGE_MINUTES`. New method `_compute_cache_max_age()` on `Orchestrator`: reads SPY RSI from `_market_context_indicators`; returns panic (10 min), stressed (20 min), euphoria (15 min), or default (60 min) TTL. Medium loop Step 3 passes `max_age_min=self._compute_cache_max_age()` to `load_latest_if_fresh`.
+- **RSI lookup:** `(spy_ind.get("signals") or spy_ind).get("rsi")` — handles both nested (`signals.rsi`) and flat (`rsi`) indicator formats from `_market_context_indicators`.
+- **New config keys** in `ClaudeConfig`: `cache_max_age_default_min`, `cache_max_age_stressed_min`, `cache_max_age_panic_min`, `cache_max_age_euphoria_min`, `cache_stress_rsi_low`, `cache_panic_rsi_low`, `cache_euphoria_rsi_high`.
+
+**`_all_indicators` instance attribute** · `core/orchestrator.py`
+- **Spec:** *(not defined in Phase 17 spec — called out as a Phase 19 prerequisite)*
+- **Impl:** `self._all_indicators: dict = {}` initialized in `__init__`. Set at the end of each `_medium_loop_cycle` as `{**self._latest_indicators, **self._market_context_indicators}`. Used by `_check_triggers` as the merged price/indicator lookup for all trigger types; falls back to on-demand merge when `_all_indicators` is empty (guards test compatibility for tests that seed `_latest_indicators` directly).
+
+**New tests** · `ozymandias/tests/test_trigger_responsiveness.py`
+- 29 tests across 5 classes: `TestParallelMediumLoop` (Fix 1), `TestMacroMoveTrigger` (Fix 2 macro), `TestSectorMoveTrigger` (Fix 2 sector), `TestRsiExtremeTrigger` (Fix 2 RSI), `TestMediumLoopGate` (Fix 3), `TestAdaptiveCacheTtl` (Fix 4).
+

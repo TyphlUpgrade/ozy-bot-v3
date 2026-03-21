@@ -19,6 +19,7 @@ cryptography>=42.0
 
 # Utilities
 python-dateutil>=2.8
+lxml>=4.9          # HTML parser for pd.read_html (Phase 18 Wikipedia universe fetch)
 
 # Testing
 pytest>=8.0

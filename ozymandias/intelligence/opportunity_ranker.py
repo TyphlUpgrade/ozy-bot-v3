@@ -38,7 +38,7 @@ _W_RISK = 0.20
 _W_LIQ = 0.15
 
 _MAX_POSITIONS = 8
-_MIN_AVG_DAILY_VOLUME = 100_000
+_MIN_AVG_DAILY_DOLLAR_VOLUME = 10_000_000  # $10M/day — prevents slippage on thin names
 _MAX_REWARD_RISK_RATIO = 5.0
 
 
@@ -249,7 +249,7 @@ class OpportunityRanker:
         self._w_risk = float(cfg.get("w_risk", _W_RISK))
         self._w_liq = float(cfg.get("w_liq", _W_LIQ))
         self._max_positions = int(cfg.get("max_positions", _MAX_POSITIONS))
-        self._min_volume = float(cfg.get("min_avg_daily_volume", _MIN_AVG_DAILY_VOLUME))
+        self._min_dollar_volume = float(cfg.get("min_avg_daily_dollar_volume", _MIN_AVG_DAILY_DOLLAR_VOLUME))
         self._min_conviction = float(cfg.get("min_conviction_threshold", 0.10))  # sanity floor
         self._min_technical_score = float(cfg.get("min_technical_score", 0.30))  # TA quality floor
         # Symbols that may appear on the watchlist for market context but must never be entered.
@@ -500,17 +500,23 @@ class OpportunityRanker:
         #     The day trade occurs only when the position is closed same-day.
         #     PDT gating happens in validate_entry at close time.)
 
-        # 7. Average daily volume
-        # avg_daily_volume lives inside the nested "signals" sub-dict of the summary output.
+        # 7. Average daily dollar volume (shares × price).
+        # Expressed in dollars so the floor is meaningful across all price ranges —
+        # a $10 stock at 100k shares/day ($1M) is far thinner than a $200 stock
+        # at the same share count ($20M). avg_daily_volume lives inside the nested
+        # "signals" sub-dict; price is also in signals.
         sig_summary = (technical_signals or {}).get(symbol, {})
         nested = sig_summary.get("signals", {})
         avg_vol = nested.get("avg_daily_volume") or opportunity.get("avg_daily_volume")
-        if avg_vol is not None and avg_vol < self._min_volume:
-            return (
-                False,
-                f"{symbol}: avg daily volume {avg_vol:,.0f} < "
-                f"minimum {self._min_volume:,.0f}",
-            )
+        price = nested.get("price") or opportunity.get("suggested_entry") or 0.0
+        if avg_vol is not None and price and price > 0:
+            avg_dollar_vol = avg_vol * price
+            if avg_dollar_vol < self._min_dollar_volume:
+                return (
+                    False,
+                    f"{symbol}: avg daily dollar volume ${avg_dollar_vol:,.0f} "
+                    f"< minimum ${self._min_dollar_volume:,.0f}",
+                )
 
         return True, ""
 

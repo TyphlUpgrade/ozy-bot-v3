@@ -61,6 +61,16 @@ class SchedulerConfig:
     bars_cache_ttl_sec: int = 110                    # yfinance bars cache TTL; must be < medium_loop_sec to ensure fresh bars every cycle (medium_loop_sec=120)
     max_entry_defer_cycles: int = 5                  # drop a deferred opportunity after this many consecutive entry_conditions misses; prevents indefinite deferral on stale Claude thesis
     position_profit_trigger_pct: float = 0.015       # fire a Claude position review when unrealised gain exceeds this fraction of avg_cost; re-arms each time gain grows by another interval
+    # Phase 17 — parallel medium loop fetch
+    medium_loop_scan_concurrency: int = 10           # max concurrent yfinance + TA worker tasks in the medium loop; balances throughput vs rate-limit pressure
+    # Phase 17 — macro/sector move triggers
+    macro_move_trigger_pct: float = 1.0              # SPY/QQQ/IWM move threshold (%) anchored to last Claude call; fires market_move trigger
+    macro_move_symbols: list = field(default_factory=lambda: ["SPY", "QQQ", "IWM"])  # broad-market indices monitored for macro_move trigger
+    sector_move_trigger_pct: float = 1.5             # sector ETF move threshold (%) anchored to last Claude call; fires sector_move trigger
+    sector_exposure_threshold_factor: float = 0.7   # sector_move only fires when portfolio has ≥ this fraction of max_concurrent_positions in the sector
+    macro_rsi_panic_threshold: int = 25              # SPY RSI ≤ this fires market_rsi_extreme:panic trigger (market selloff)
+    macro_rsi_euphoria_threshold: int = 72           # SPY RSI ≥ this fires market_rsi_extreme:euphoria trigger (overheating)
+    macro_rsi_rearm_band: int = 5                    # RSI must recover by this many points before the extreme trigger can re-fire
 
 
 @dataclass
@@ -93,6 +103,14 @@ class ClaudeConfig:
     recent_executions_count: int = 5
     # Phase 15: minimum trades required before compute_session_stats returns non-empty stats
     execution_stats_min_trades: int = 3
+    # Phase 17 — adaptive reasoning cache TTL (minutes) by market regime
+    cache_max_age_default_min: int = 60    # normal market conditions
+    cache_max_age_stressed_min: int = 20   # SPY RSI in stress zone (≤ cache_stress_rsi_low)
+    cache_max_age_panic_min: int = 10      # SPY RSI in panic zone (≤ cache_panic_rsi_low)
+    cache_max_age_euphoria_min: int = 15   # SPY RSI in euphoria zone (≥ cache_euphoria_rsi_high)
+    cache_stress_rsi_low: int = 30         # SPY RSI floor for stress regime
+    cache_panic_rsi_low: int = 25          # SPY RSI floor for panic regime
+    cache_euphoria_rsi_high: int = 72      # SPY RSI ceiling for euphoria regime
 
 
 @dataclass

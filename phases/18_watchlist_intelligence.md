@@ -39,6 +39,8 @@ ndx100 = pd.read_html(
 
 Wrap in `asyncio.to_thread`. Cache result with a 24-hour TTL — index constituents change quarterly, not intraday. On failure, return `[]`.
 
+**Dependency note:** `pd.read_html` requires an HTML parser. Add `lxml>=4.9` to `requirements.txt` — it is not currently listed. Without it, Source B raises `ImportError` at runtime and silently always returns `[]` (the try/except catches it). Source A is unaffected.
+
 **`get_universe() -> list[str]`:**
 
 Runs both sources concurrently via `asyncio.gather`. Merges results (Source A first — today's active names take precedence). Dedup preserving order. Filter: remove symbols from `config.ranker.no_entry_symbols`. Clean any symbols with non-alphabetic characters (`.`, `-`, spaces — ETF classes and foreign listings that Alpaca won't trade). Return the merged list.
@@ -62,7 +64,7 @@ def __init__(self, data_adapter: DataAdapter, config: "UniverseScannerConfig") -
 1. Call `UniverseFetcher.get_universe()` to get the live symbol list.
 2. Remove symbols in `exclude` (already on watchlist) and `blacklist` (no-entry list).
 3. Fetch `5m/5d` bars for all remaining symbols using `asyncio.gather` with `asyncio.Semaphore(config.scan_concurrency)`. This reuses `data_adapter.fetch_bars` — the 5-min cache means symbols already fetched by the medium loop are free hits.
-4. Run `generate_signal_summary` on each successful DataFrame.
+4. Run `generate_signal_summary` on each successful DataFrame, wrapped in `asyncio.to_thread` — the function is CPU-bound and must not block the event loop.
 5. Filter: drop symbols where `bars_available < 5` or `volume_ratio < config.min_rvol_for_candidate`.
 6. Sort by `volume_ratio` descending — RVOL is direction-neutral and surfaces what is genuinely active today regardless of direction.
 7. For the top `min(n * 2, 60)` symbols after RVOL sort: fetch news via `data_adapter.fetch_news(symbol, max_items=2)` and earnings calendar via `_fetch_earnings_calendar(symbol)` (see below). Run both concurrently per symbol.
@@ -104,7 +106,10 @@ New module. `SearchAdapter` wraps the Brave Search API.
 class SearchAdapter:
     def __init__(self, api_key: str | None) -> None:
         self._api_key = api_key
-        self._enabled = bool(api_key)
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._api_key)
 
     async def search(self, query: str, n_results: int = 5) -> list[dict]:
         """
@@ -120,7 +125,7 @@ Wrap HTTP call in `asyncio.to_thread` using `urllib.request` (no new dependencie
 
 On any exception (network error, bad API key, rate limit): log WARNING and return `[]`. The adapter never raises — a failed search degrades gracefully to Claude reasoning without search results.
 
-**API key:** read from `credentials.enc` (existing credentials system) under key `brave_search_api_key`. If absent, `SearchAdapter` is instantiated with `api_key=None` and silently disabled. Log a one-time INFO at startup: "Brave Search not configured — watchlist build will use screener data only."
+**API key:** `_load_credentials` in `orchestrator.py` must be extended to inject `brave_search_api_key` from the credentials file into `os.environ["BRAVE_SEARCH_API_KEY"]` — consistent with how `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` are handled. `SearchAdapter` reads the key from `os.environ.get("BRAVE_SEARCH_API_KEY")` at instantiation time. If absent, it is instantiated with `api_key=None` and silently disabled. Log a one-time INFO at startup: "Brave Search not configured — watchlist build will use screener data only."
 
 ---
 
@@ -149,7 +154,7 @@ Multi-turn conversation loop:
    - If `response.stop_reason != "tool_use"`: extract text from the last content block and return it.
    - For each `tool_use` block in `response.content`: call `await tool_executor(block.name, block.input)`, collect results.
    - Append assistant message and tool results to `messages`.
-4. If rounds exhausted: force a final call with `tools=[]` and `tool_choice={"type": "none"}` to get a text response. Log WARNING "Tool use rounds exhausted — forcing final response."
+4. If rounds exhausted: force a final call with `tools=[]` and `tool_choice={"type": "none"}` to get a text response. Log WARNING "Tool use rounds exhausted — forcing final response." Note: `tool_choice={"type": "none"}` is supported in the Anthropic API as of Claude 3.7+ / 4.x — it explicitly disables tool selection on the forced final call.
 
 All retry/fallback logic from `call_claude` applies: same circuit breaker, same error handling. The method is self-contained — the rest of the system doesn't know tool use happened.
 
@@ -214,18 +219,20 @@ ctx = {
 }
 ```
 
-If `search_adapter` is provided and `search_adapter._enabled`:
-- Use `call_claude_with_tools(template, ctx, tools=[_WEB_SEARCH_TOOL], tool_executor=...)`
+If `search_adapter` is provided and `search_adapter.enabled`:
+- Use `call_claude_with_tools(template, ctx, tools=[_WEB_SEARCH_TOOL], tool_executor=..., max_tool_rounds=self._cfg.search.max_searches_per_build)`
 Else:
 - Use `call_claude(template, ctx)` (existing behavior — no tools offered)
+
+Note: `self._cfg.search` refers to the `SearchConfig` instance on the top-level `Config`. `ClaudeReasoning` already holds a reference to the full config; add `self._search_cfg = config.search` in `__init__` alongside the existing `self._claude_cfg`.
 
 This means: if no API key is configured, the behavior is identical to today. Graceful degradation is complete.
 
 ---
 
-## 6. New Prompt Template (`config/prompts/v3.4.0/watchlist.txt`)
+## 6. New Prompt Template (`config/prompts/v3.6.0/watchlist.txt`)
 
-Create `config/prompts/v3.4.0/` by copying all files from `v3.3.0/`. Update `watchlist.txt`:
+Create `config/prompts/v3.6.0/` by copying all files from `v3.5.0/`. Update `watchlist.txt` with the candidates-aware template below:
 
 ```
 You are the watchlist manager for the Ozymandias trading system.
@@ -254,7 +261,7 @@ INSTRUCTIONS:
 [rest of existing tier assignment rules and format unchanged]
 ```
 
-Update `config.json`: `claude.prompt_version` → `"v3.4.0"`.
+Update `config.json`: `claude.prompt_version` → `"v3.6.0"`.
 
 ---
 
@@ -266,7 +273,10 @@ Update `config.json`: `claude.prompt_version` → `"v3.4.0"`.
 @dataclass
 class UniverseScannerConfig:
     enabled: bool = True
-    scan_concurrency: int = 20          # parallel yfinance fetches
+    scan_concurrency: int = 20          # parallel yfinance fetches for universe scan;
+                                        # intentionally higher than medium loop's
+                                        # medium_loop_scan_concurrency (10) — the universe
+                                        # scan covers 75+ symbols and is less latency-sensitive
     max_candidates: int = 50            # top N by RVOL sent to Claude
     min_rvol_for_candidate: float = 0.8 # drop stale/inactive symbols
     cache_ttl_min: int = 60             # reuse scan result within same session
@@ -291,7 +301,7 @@ Add both to the top-level `Config` dataclass. Add corresponding `universe_scanne
 In `__init__`:
 ```python
 self._universe_scanner = UniverseScanner(self._data_adapter, self._config.universe_scanner)
-self._search_adapter = SearchAdapter(api_key=self._credentials.get("brave_search_api_key"))
+self._search_adapter = SearchAdapter(api_key=os.environ.get("BRAVE_SEARCH_API_KEY"))
 self._last_universe_scan: list[dict] = []
 self._last_universe_scan_time: float = 0.0
 ```
@@ -299,10 +309,13 @@ self._last_universe_scan_time: float = 0.0
 In the slow loop, before calling `run_watchlist_build` (triggered by `watchlist_small`):
 
 ```python
+# Load watchlist unconditionally — needed for run_watchlist_build regardless
+# of whether the universe scanner fires or the cache is still fresh.
+watchlist = await self._state_manager.load_watchlist()
+
 if self._config.universe_scanner.enabled:
     cache_age_min = (time.monotonic() - self._last_universe_scan_time) / 60
     if cache_age_min > self._config.universe_scanner.cache_ttl_min or not self._last_universe_scan:
-        watchlist = await self._state_manager.load_watchlist()
         existing = {e.symbol for e in watchlist.entries}
         blacklist = set(self._config.ranker.no_entry_symbols)
         self._last_universe_scan = await self._universe_scanner.get_top_candidates(
@@ -356,7 +369,7 @@ result = await self._claude.run_watchlist_build(
 - Result count capped at `n_results`
 
 **`tests/test_watchlist_build_tool_use.py`:**
-- When `search_adapter._enabled=True`: `call_claude_with_tools` is used, not `call_claude`
+- When `search_adapter.enabled=True`: `call_claude_with_tools` is used, not `call_claude`
 - When `search_adapter` is `None`: `call_claude` is used (existing behavior)
 - Tool executor returns search results as a string
 - Tool executor returns "No results returned." when `search()` returns `[]`
@@ -382,5 +395,5 @@ result = await self._claude.run_watchlist_build(
 - `run_watchlist_build` with a configured Brave API key calls `call_claude_with_tools` and the search tool is exercised (visible in reasoning cache as a multi-turn exchange)
 - `run_watchlist_build` with no Brave API key behaves identically to pre-Phase-18 (no regression)
 - Claude's watchlist build output in a paper session names at least some symbols sourced from the candidates list (visible in watchlist state `reason` fields referencing RVOL or news)
-- `config.json` updated: `prompt_version = "v3.4.0"`, `universe_scanner` and `search` sections present
-- DRIFT_LOG.md has a Phase 18 entry covering: `UniverseFetcher`, `UniverseScanner`, `SearchAdapter`, `call_claude_with_tools`, `run_watchlist_build` signature change, prompt version bump to v3.4.0
+- `config.json` updated: `prompt_version = "v3.6.0"`, `universe_scanner` and `search` sections present
+- DRIFT_LOG.md has a Phase 18 entry covering: `UniverseFetcher`, `UniverseScanner`, `SearchAdapter`, `call_claude_with_tools`, `run_watchlist_build` signature change, prompt version bump to v3.6.0

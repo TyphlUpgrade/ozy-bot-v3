@@ -21,7 +21,7 @@
     "max_risk_per_trade_pct": 0.02
   },
   "scheduler": {
-    "bypass_market_hours": false,
+    "bypass_market_hours": true,
     "fast_loop_sec": 10,
     "medium_loop_sec": 120,
     "slow_loop_check_sec": 60,
@@ -34,7 +34,15 @@
     "min_hold_before_override_min": 5,
     "bars_cache_ttl_sec": 110,
     "max_entry_defer_cycles": 5,
-    "position_profit_trigger_pct": 0.015
+    "position_profit_trigger_pct": 0.015,
+    "medium_loop_scan_concurrency": 10,
+    "macro_move_trigger_pct": 1.0,
+    "macro_move_symbols": ["SPY", "QQQ", "IWM"],
+    "sector_move_trigger_pct": 1.5,
+    "sector_exposure_threshold_factor": 0.7,
+    "macro_rsi_panic_threshold": 25,
+    "macro_rsi_euphoria_threshold": 72,
+    "macro_rsi_rearm_band": 5
   },
   "claude": {
     "model": "claude-sonnet-4-20250514",
@@ -46,7 +54,14 @@
     "news_max_items_per_symbol": 3,
     "recommendation_outcome_max_age_min": 60,
     "recent_executions_count": 5,
-    "execution_stats_min_trades": 3
+    "execution_stats_min_trades": 3,
+    "cache_max_age_default_min": 60,
+    "cache_max_age_stressed_min": 20,
+    "cache_max_age_panic_min": 10,
+    "cache_max_age_euphoria_min": 15,
+    "cache_stress_rsi_low": 30,
+    "cache_panic_rsi_low": 25,
+    "cache_euphoria_rsi_high": 72
   },
   "ai_fallback": {
     "enabled": true,
@@ -71,6 +86,7 @@
     "max_entry_drift_pct": 0.015,
     "max_adverse_drift_pct": 0.020,
     "min_technical_score": 0.30,
+    "min_avg_daily_dollar_volume": 10000000,
     "ta_size_factor_min": 0.60,
     "no_entry_symbols": [
       "SPY", "QQQ", "IWM", "DIA",

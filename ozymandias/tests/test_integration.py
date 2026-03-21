@@ -251,6 +251,9 @@ class TestFullCycle:
     def market_open(self, orch):
         """Patch is_market_open to True and seed indicators so guards don't short-circuit."""
         orch._latest_indicators = {"NVDA": {"price": 875.0}}
+        # Phase 17: seed _last_medium_loop_completed_utc so the medium-loop gate passes
+        # when last_claude_call_utc is backdated in individual tests.
+        orch._last_medium_loop_completed_utc = datetime.now(timezone.utc)
         with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
             yield
 
@@ -607,6 +610,8 @@ class TestDegradation:
     def seed_indicators(self, orch):
         """Seed _latest_indicators so the slow loop's indicator guard doesn't short-circuit."""
         orch._latest_indicators = {"TEST": {"price": 100.0}}
+        # Phase 17: seed _last_medium_loop_completed_utc so the medium-loop gate passes.
+        orch._last_medium_loop_completed_utc = datetime.now(timezone.utc)
 
     @pytest.mark.asyncio
     async def test_claude_failure_sets_degradation_flag(self, orch):

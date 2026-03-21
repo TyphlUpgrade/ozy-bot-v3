@@ -4,13 +4,21 @@ strategies/base_strategy.py
 Abstract base class for all trading strategies, shared data types, and the
 strategy registry.
 
-Signal flow::
+Architecture note — entry pipeline
+------------------------------------
+All entry opportunities originate from Claude's ``new_opportunities`` output in
+the slow-loop reasoning cache.  The strategy layer's production role is:
 
-    indicators (nested signals sub-dict from generate_signal_summary())
-        ↓
-    Strategy.generate_signals()   → list[Signal]    (entry candidates)
-    Strategy.evaluate_position()  → PositionEval    (hold / scale / exit decision)
-    Strategy.suggest_exit()       → ExitSuggestion  (specific exit order params)
+  1. ``apply_entry_gate()`` — TA veto on Claude's recommendations before scoring.
+  2. ``evaluate_position()`` — hold/scale/exit decisions on open positions.
+  3. ``suggest_exit()``      — specific exit order parameters.
+
+``generate_signals()`` is defined here as an extension point for autonomous
+TA-based entry generation but is **not currently wired into the medium loop**.
+If a future phase adds TA signal generation as a supplementary entry source,
+the wiring point is ``_medium_loop_cycle`` Step 3 in ``orchestrator.py``.
+Until then, strategies that do not wish to implement it may rely on the default
+no-op return.
 
 Orchestrator note: strategies receive the *nested* signals sub-dict from
 ``generate_signal_summary()['signals']``, not the full output dict.  This is
@@ -38,7 +46,10 @@ log = logging.getLogger(__name__)
 class Signal:
     """An entry signal produced by a strategy for a specific symbol."""
     symbol: str
-    direction: str          # "long" (only direction currently supported)
+    direction: str          # "long" | "short" — both supported by the type;
+                            # current generate_signals() implementations are
+                            # long-only. If short signal generation is added,
+                            # stops and targets must be inverted accordingly.
     strength: float         # 0.0 – 1.0
     entry_price: float      # suggested entry (typically latest close)
     stop_price: float       # stop-loss price
@@ -75,8 +86,12 @@ class Strategy(ABC):
     """
     Common interface for all trading strategy implementations.
 
-    Subclasses must implement :meth:`generate_signals`,
-    :meth:`evaluate_position`, and :meth:`suggest_exit`.
+    Subclasses must implement :meth:`apply_entry_gate`, :meth:`evaluate_position`,
+    and :meth:`suggest_exit`.  These three methods are the active production path.
+
+    :meth:`generate_signals` is an optional extension point for autonomous TA-based
+    entry generation.  It is not called by the orchestrator today — see module
+    docstring for the wiring note.  The default implementation returns ``[]``.
 
     Parameters are stored in ``self._params`` and can be updated at runtime
     via :meth:`set_parameters`.
@@ -94,7 +109,6 @@ class Strategy(ABC):
     # Abstract methods
     # ------------------------------------------------------------------
 
-    @abstractmethod
     async def generate_signals(
         self,
         symbol: str,
@@ -105,6 +119,16 @@ class Strategy(ABC):
         Produce entry signals for *symbol* given current OHLCV data and
         technical indicators.
 
+        **Not currently called by the orchestrator.** Entry opportunities come
+        exclusively from Claude's reasoning cache.  This method is an extension
+        point: if a future phase wires autonomous TA signal generation into the
+        medium loop, override this method in the strategy subclass.  The default
+        returns an empty list (no signals), which is the correct no-op behaviour
+        for strategies that rely solely on Claude-directed entries.
+
+        If short signal generation is added, stop/target calculations must be
+        direction-aware (stops above entry for shorts, targets below).
+
         Parameters
         ----------
         symbol:
@@ -114,6 +138,7 @@ class Strategy(ABC):
         indicators:
             Nested signals sub-dict from ``generate_signal_summary()['signals']``.
         """
+        return []
 
     @abstractmethod
     async def evaluate_position(

@@ -28,7 +28,7 @@ ET = ZoneInfo("America/New_York")
 _VWAP_VOLUME_RATIO_THRESHOLD: float = 1.3
 _MOMENTUM_SCORE_STRONG_THRESHOLD: float = 1.5
 _ATR_TRAILING_STOP_MULTIPLIER: float = 2.0
-_MIN_AVG_DAILY_VOLUME: int = 100_000
+_MIN_AVG_DAILY_DOLLAR_VOLUME: int = 10_000_000  # configured in config.json ranker.min_avg_daily_dollar_volume
 
 
 def _et_date_str(date_str: str) -> date | None:
@@ -200,12 +200,14 @@ class RiskManager:
                     f"${committed:,.2f} in pending orders)"
                 )
 
-        # 8. Minimum average daily volume
-        if avg_daily_volume is not None and avg_daily_volume < _MIN_AVG_DAILY_VOLUME:
-            return False, (
-                f"{symbol} avg daily volume {avg_daily_volume:,.0f} "
-                f"< {_MIN_AVG_DAILY_VOLUME:,} share minimum"
-            )
+        # 8. Minimum average daily dollar volume (ticker-agnostic liquidity check)
+        if avg_daily_volume is not None and price > 0:
+            avg_dollar_vol = avg_daily_volume * price
+            if avg_dollar_vol < _MIN_AVG_DAILY_DOLLAR_VOLUME:
+                return False, (
+                    f"{symbol} avg daily dollar volume ${avg_dollar_vol:,.0f} "
+                    f"< ${_MIN_AVG_DAILY_DOLLAR_VOLUME:,} minimum"
+                )
 
         return True, "All risk checks passed"
 
