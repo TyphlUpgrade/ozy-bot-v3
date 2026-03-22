@@ -229,6 +229,10 @@ class Strategy(ABC):
         trigger an exit for this strategy's positions.  The default returns
         all known signals so that any new strategy is safe by default.
 
+        Signal names are direction-agnostic: RiskManager inverts the signal
+        logic based on position direction (e.g. "vwap_crossover" fires on
+        price-below-VWAP for longs, price-above-VWAP for shorts).
+
         Known signal names (from RiskManager.evaluate_overrides):
             "vwap_crossover", "roc_deceleration", "momentum_score_flip",
             "atr_trailing_stop", "rsi_divergence"
@@ -240,6 +244,22 @@ class Strategy(ABC):
             "atr_trailing_stop",
             "rsi_divergence",
         })
+
+    def override_atr_multiplier(self) -> float:
+        """ATR trailing stop multiplier for quant override exits.
+
+        Reads override_atr_multiplier from strategy params; defaults to 2.0.
+        Extension point: add to _DEFAULT_PARAMS and config.json strategy_params.
+        """
+        return float(self._params.get("override_atr_multiplier", 2.0))
+
+    def override_vwap_volume_threshold(self) -> float:
+        """Volume ratio floor for VWAP crossover override exit.
+
+        Reads override_vwap_volume_threshold from strategy params; defaults to 1.3.
+        Extension point: add to _DEFAULT_PARAMS and config.json strategy_params.
+        """
+        return float(self._params.get("override_vwap_volume_threshold", 1.3))
 
     def get_parameters(self) -> dict[str, Any]:
         """Return a copy of the current strategy parameters."""

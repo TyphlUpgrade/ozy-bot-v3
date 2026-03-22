@@ -94,6 +94,11 @@ class MomentumStrategy(Strategy):
         # accumulation/reclaim setups (price dipped below VWAP but volume and MACD
         # diverge bullishly, signalling a push back through).  Set to 0 to disable.
         "vwap_reclaim_min_rvol": 1.8,
+        # Quant override exit thresholds (read by base_strategy.py accessors).
+        # override_atr_multiplier: ATR ×mult drop (long) or rise (short) triggers exit.
+        # override_vwap_volume_threshold: volume ratio floor for VWAP crossover signal.
+        "override_atr_multiplier": 2.0,
+        "override_vwap_volume_threshold": 1.3,
     }
 
     def applicable_override_signals(self) -> frozenset[str]:

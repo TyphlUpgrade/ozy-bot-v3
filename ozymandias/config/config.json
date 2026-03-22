@@ -106,14 +106,18 @@
         "rsi_slope_threshold": 2.0,
         "block_bearish_aligned": true,
         "min_rvol_for_entry": 1.0,
-        "require_vwap_gate": true
+        "require_vwap_gate": true,
+        "override_atr_multiplier": 2.0,
+        "override_vwap_volume_threshold": 1.3
       },
       "swing": {
         "target_atr_multiplier": 5.0,
         "min_signals_for_entry": 5,
         "min_rvol_for_entry": 0.8,
         "block_bearish_trend": true,
-        "rsi_slope_min_for_entry": 0.5
+        "rsi_slope_min_for_entry": 0.5,
+        "override_atr_multiplier": 3.0,
+        "override_vwap_volume_threshold": 1.5
       }
     }
   },

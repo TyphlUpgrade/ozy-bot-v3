@@ -80,6 +80,11 @@ class SwingStrategy(Strategy):
         # For shorts, the condition is inverted: slope must be <= -rsi_slope_min_for_entry.
         # Replaces the former 2-bar rsi_turning check with a 5-bar velocity measure.
         "rsi_slope_min_for_entry": 0.5,
+        # Quant override exit thresholds (read by base_strategy.py accessors).
+        # Wider than momentum: 3× ATR and 1.5 vol threshold prevent intraday noise from
+        # exiting multi-day swing positions. Set in config.json strategy_params.swing.
+        "override_atr_multiplier": 3.0,
+        "override_vwap_volume_threshold": 1.5,
     }
 
     def applicable_override_signals(self) -> frozenset[str]:
@@ -91,7 +96,7 @@ class SwingStrategy(Strategy):
 
         No override signals are active for swing by default. To add catastrophic
         loss protection via ATR trailing stop, add "atr_trailing_stop" here and
-        widen _ATR_TRAILING_STOP_MULTIPLIER in risk_manager.py for swing positions.
+        set override_atr_multiplier in config.json strategy_params.swing.
         """
         return frozenset()
 
