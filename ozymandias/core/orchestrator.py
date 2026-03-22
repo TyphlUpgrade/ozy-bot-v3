@@ -1289,6 +1289,9 @@ class Orchestrator:
                     exit_reason = "strategy"
 
             ctx = self._entry_contexts.pop(symbol, {})
+            # Capture live TA indicators at exit time for threshold tuning.
+            # These are the fast-loop cached values — same data the override logic uses.
+            signals_at_exit = dict(getattr(self, "_latest_indicators", {}).get(symbol, {}))
             # Fall back to TradeIntention fields if in-memory context was lost (e.g. restart).
             signals_at_entry = (
                 ctx.get("signals")
@@ -1325,6 +1328,7 @@ class Orchestrator:
                 "target_price": target,
                 "exit_reason": exit_reason,
                 "signals_at_entry": signals_at_entry,
+                "signals_at_exit": signals_at_exit or None,
                 "claude_conviction": claude_conviction,
                 "composite_score": composite_score,
                 "position_size_pct": ctx.get("position_size_pct", 0.0),
@@ -1350,206 +1354,23 @@ class Orchestrator:
         except Exception as exc:
             log.error("_journal_closed_trade failed for %s: %s", symbol, exc, exc_info=True)
 
-    async def _fast_step_quant_overrides(self) -> None:
-        """
-        Step 3: For each open position, evaluate quantitative override signals.
-        If triggered, place a market exit order immediately.
-        """
-        portfolio = await self._state_manager.load_portfolio()
-        if not portfolio.positions:
-            return
+    async def _place_override_exit(self, position, exit_hint: str) -> None:
+        """Place a market exit order for a position flagged by a quant override or hard stop.
 
-        orders_state = await self._state_manager.load_orders()
-
-        for position in portfolio.positions:
-            symbol = position.symbol
-
-            # Short positions have their own fast-loop exit logic below.
-            if is_short(position.intention.direction):
-                await self._fast_step_short_exits(position)
-                continue
-
-            # Resolve which override signals apply to this position's strategy.
-            # Each strategy declares its applicable signals via applicable_override_signals().
-            # Fall back to the first active strategy if the original is no longer loaded.
-            target_name = position.intention.strategy
-            matching = [
-                s for s in self._strategies
-                if type(s).__name__.replace("Strategy", "").lower() == target_name
-            ]
-            strategy_for_position = (matching or self._strategies)[0] if (matching or self._strategies) else None
-            allow_signals = (
-                strategy_for_position.applicable_override_signals()
-                if strategy_for_position is not None else None
-            )
-
-            # If the strategy declares no applicable signals, skip override evaluation entirely.
-            if allow_signals is not None and not allow_signals:
-                log.debug(
-                    "Override check skipped for %s — %s strategy has no applicable override signals",
-                    symbol, target_name,
-                )
-                continue
-
-            # Enforce minimum hold time before overrides can fire.
-            # This prevents stale indicators (computed before entry) from triggering
-            # an immediate exit on the same fast loop tick that registered the fill.
-            min_hold_sec = self._config.scheduler.min_hold_before_override_min * 60
-            entry_ts = self._position_entry_times.get(symbol)
-            held_sec = (time.monotonic() - entry_ts) if entry_ts is not None else 0.0
-            if held_sec < min_hold_sec:
-                log.debug(
-                    "Override check skipped for %s — %s",
-                    symbol,
-                    f"held {held_sec:.0f}s < min {min_hold_sec:.0f}s"
-                    if entry_ts is not None
-                    else "no entry time recorded (reconciled/adopted position)",
-                )
-                continue
-
-            # We need current indicators — use cached TA data if available.
-            # In the fast loop we reuse the most recent indicator data computed
-            # by the medium loop (stored in _latest_indicators). If not yet
-            # computed, skip override checks for this symbol.
-            indicators = getattr(self, "_latest_indicators", {}).get(symbol)
-            if indicators is None:
-                log.debug(
-                    "No indicators cached for %s — skipping override check", symbol
-                )
-                continue
-
-            # Update intraday high
-            current_price = indicators.get("price")
-            if current_price is not None:
-                prev_high = self._intraday_highs.get(symbol, 0.0)
-                self._intraday_highs[symbol] = max(prev_high, current_price)
-
-            intraday_high = self._intraday_highs.get(symbol, current_price or 0.0)
-
-            should_exit, triggered_signals = self._risk_manager.evaluate_overrides(
-                position, indicators, intraday_high, allow_signals=allow_signals
-            )
-
-            if not should_exit:
-                continue
-
-            log.warning(
-                "QUANT OVERRIDE EXIT — %s  signals=%s  price=%.4f",
-                symbol, triggered_signals, current_price or 0.0,
-            )
-
-            # Fill protection: only place if no pending order for this symbol
-            if not self._fill_protection.can_place_order(symbol):
-                log.warning(
-                    "Override exit for %s blocked — pending order already exists",
-                    symbol,
-                )
-                continue
-
-            # Place market exit order (buy to close short, sell to close long)
-            exit_side = EXIT_SIDE[position.intention.direction]
-            exit_order = Order(
-                symbol=symbol,
-                side=exit_side,
-                quantity=position.shares,
-                order_type="market",
-                time_in_force="day",
-            )
-            try:
-                result = await self._broker.place_order(exit_order)
-                now_iso = datetime.now(timezone.utc).isoformat()
-                order_record = OrderRecord(
-                    order_id=result.order_id,
-                    symbol=symbol,
-                    side=exit_side,
-                    quantity=position.shares,
-                    order_type="market",
-                    limit_price=None,
-                    status="PENDING",
-                    created_at=now_iso,
-                    last_checked_at=now_iso,
-                )
-                await self._fill_protection.record_order(order_record)
-                log.info(
-                    "Override exit order placed — %s  order_id=%s  qty=%.2f",
-                    symbol, result.order_id, position.shares,
-                )
-
-                # Tag exit reason for trade journal (consumed in _dispatch_confirmed_fill)
-                self._pending_exit_hints[symbol] = "quant_override"
-                # Increment override exit counter (feeds slow loop trigger)
-                self._override_exit_count += 1
-
-            except Exception as exc:
-                log.error("Failed to place override exit for %s: %s", symbol, exc)
-
-    async def _fast_step_short_exits(self, position) -> None:
-        """
-        Fast-loop exit coverage for short positions.
-
-        Three exit triggers (evaluated in priority order):
-          1. Hard stop from intention: price >= stop_loss → buy-to-cover immediately.
-          2. ATR trailing stop: price >= intraday_low + ATR × short_atr_stop_multiplier.
-          3. VWAP crossover: price crossed above VWAP with elevated volume (gated by config).
-
-        _intraday_lows tracks the running session minimum for each short symbol.
-        All orders go through the same fill protection and order record path as long exits.
+        Handles fill-protection check, order construction, record keeping,
+        pending exit hint tagging, and override counter increment. Shared by
+        both hard-stop and signal-triggered paths in _fast_step_quant_overrides.
         """
         symbol = position.symbol
 
-        indicators = getattr(self, "_latest_indicators", {}).get(symbol)
-        if indicators is None:
-            log.debug("No indicators for short exit check on %s — skipping", symbol)
-            return
-
-        current_price = indicators.get("price")
-        if current_price is None:
-            return
-
-        # Update intraday low (running minimum for this session)
-        prev_low = self._intraday_lows.get(symbol, current_price)
-        self._intraday_lows[symbol] = min(prev_low, current_price)
-        intraday_low = self._intraday_lows[symbol]
-
-        exit_reason: str | None = None
-
-        # 1. Hard stop from intention (highest priority)
-        stop_loss = position.intention.exit_targets.stop_loss
-        if stop_loss > 0 and current_price >= stop_loss:
-            exit_reason = f"hard stop hit: price {current_price:.4f} >= stop {stop_loss:.4f}"
-
-        # 2. ATR trailing stop
-        if exit_reason is None:
-            atr = float(indicators.get("atr_14") or 0.0)
-            if atr > 0:
-                trail_stop = intraday_low + atr * self._config.risk.short_atr_stop_multiplier
-                if current_price >= trail_stop:
-                    exit_reason = (
-                        f"ATR trail hit: price {current_price:.4f} >= "
-                        f"intraday_low {intraday_low:.4f} + ATR {atr:.4f} × "
-                        f"{self._config.risk.short_atr_stop_multiplier}"
-                    )
-
-        # 3. VWAP crossover exit
-        if exit_reason is None and self._config.risk.short_vwap_exit_enabled:
-            vwap_pos = indicators.get("vwap_position", "")
-            vol_ratio = float(indicators.get("volume_ratio") or 0.0)
-            threshold = self._config.risk.short_vwap_exit_volume_threshold
-            if vwap_pos == "above" and vol_ratio > threshold:
-                exit_reason = (
-                    f"VWAP crossover: price above VWAP, vol_ratio {vol_ratio:.2f} > {threshold:.2f}"
-                )
-
-        if exit_reason is None:
-            return
-
-        log.warning("SHORT EXIT TRIGGERED — %s  reason=%s", symbol, exit_reason)
-
         if not self._fill_protection.can_place_order(symbol):
-            log.warning("Short exit for %s blocked — pending order already exists", symbol)
+            log.warning(
+                "Override exit for %s blocked — pending order already exists (hint=%s)",
+                symbol, exit_hint,
+            )
             return
 
-        exit_side = EXIT_SIDE[position.intention.direction]   # buy to cover
+        exit_side = EXIT_SIDE[position.intention.direction]
         exit_order = Order(
             symbol=symbol,
             side=exit_side,
@@ -1573,14 +1394,132 @@ class Orchestrator:
             )
             await self._fill_protection.record_order(order_record)
             log.info(
-                "Short exit order placed — %s  order_id=%s  qty=%.2f",
-                symbol, result.order_id, position.shares,
+                "Override exit order placed — %s  order_id=%s  qty=%.2f  hint=%s",
+                symbol, result.order_id, position.shares, exit_hint,
             )
             # Tag exit reason for trade journal (consumed in _dispatch_confirmed_fill)
-            self._pending_exit_hints[symbol] = "short_protection"
+            self._pending_exit_hints[symbol] = exit_hint
+            # Increment override exit counter (feeds slow loop trigger)
             self._override_exit_count += 1
         except Exception as exc:
-            log.error("Failed to place short exit for %s: %s", symbol, exc)
+            log.error("Failed to place override exit for %s (hint=%s): %s", symbol, exit_hint, exc)
+
+    async def _fast_step_quant_overrides(self) -> None:
+        """
+        Step 3: For each open position, evaluate quantitative override signals.
+        If triggered, place a market exit order immediately.
+
+        Both long and short positions are handled in a single unified loop.
+        Signal semantics are direction-aware: the same signal names invert their
+        indicator logic for shorts (e.g. vwap_crossover fires on price-above-VWAP
+        for shorts, price-below-VWAP for longs).
+
+        Exit priority:
+          1. Hard stop (short-only): price >= stop_loss. Fires before min-hold guard
+             and before allow_signals gating — the hard stop is unconditional.
+          2. Signal-triggered exit: evaluated through evaluate_overrides() with
+             per-strategy allow_signals and threshold kwargs.
+
+        ``intraday_extremum`` is the session HIGH for longs and session LOW for
+        shorts, used by the ATR trailing stop signal.
+
+        ``_fast_step_short_exits`` was removed in Phase 18 refactor; all short
+        exit logic now runs through this method.
+        """
+        portfolio = await self._state_manager.load_portfolio()
+        if not portfolio.positions:
+            return
+
+        for position in portfolio.positions:
+            symbol = position.symbol
+            direction = position.intention.direction
+
+            # We need current indicators for all paths.
+            indicators = getattr(self, "_latest_indicators", {}).get(symbol)
+            if indicators is None:
+                log.debug("No indicators cached for %s — skipping override check", symbol)
+                continue
+
+            current_price = indicators.get("price")
+            if current_price is None:
+                continue
+
+            # Hard stop: short-only, fires before min-hold guard and allow_signals gate.
+            if self._risk_manager.check_hard_stop(position, indicators):
+                await self._place_override_exit(position, "hard_stop")
+                continue
+
+            # Resolve strategy for this position.
+            target_name = position.intention.strategy
+            matching = [
+                s for s in self._strategies
+                if type(s).__name__.replace("Strategy", "").lower() == target_name
+            ]
+            strategy_for_position = (matching or self._strategies)[0] if (matching or self._strategies) else None
+            allow_signals = (
+                strategy_for_position.applicable_override_signals()
+                if strategy_for_position is not None else None
+            )
+
+            # If the strategy declares no applicable signals, skip signal evaluation.
+            if allow_signals is not None and not allow_signals:
+                log.debug(
+                    "Override check skipped for %s — %s strategy has no applicable override signals",
+                    symbol, target_name,
+                )
+                continue
+
+            # Enforce minimum hold time before overrides can fire.
+            # This prevents stale indicators (computed before entry) from triggering
+            # an immediate exit on the same fast loop tick that registered the fill.
+            min_hold_sec = self._config.scheduler.min_hold_before_override_min * 60
+            entry_ts = self._position_entry_times.get(symbol)
+            held_sec = (time.monotonic() - entry_ts) if entry_ts is not None else 0.0
+            if held_sec < min_hold_sec:
+                log.debug(
+                    "Override check skipped for %s — %s",
+                    symbol,
+                    f"held {held_sec:.0f}s < min {min_hold_sec:.0f}s"
+                    if entry_ts is not None
+                    else "no entry time recorded (reconciled/adopted position)",
+                )
+                continue
+
+            # Track intraday extremum: session HIGH for longs, session LOW for shorts.
+            if is_short(direction):
+                prev = self._intraday_lows.get(symbol, current_price)
+                self._intraday_lows[symbol] = min(prev, current_price)
+                intraday_extremum = self._intraday_lows[symbol]
+            else:
+                prev_high = self._intraday_highs.get(symbol, 0.0)
+                self._intraday_highs[symbol] = max(prev_high, current_price)
+                intraday_extremum = self._intraday_highs[symbol]
+
+            # Per-strategy override thresholds.
+            atr_multiplier = strategy_for_position.override_atr_multiplier() if strategy_for_position else 2.0
+            vwap_threshold = strategy_for_position.override_vwap_volume_threshold() if strategy_for_position else 1.3
+
+            should_exit, triggered_signals = self._risk_manager.evaluate_overrides(
+                position, indicators, intraday_extremum,
+                allow_signals=allow_signals,
+                direction=direction,
+                atr_multiplier=atr_multiplier,
+                vwap_volume_threshold=vwap_threshold,
+            )
+
+            if not should_exit:
+                continue
+
+            log.warning(
+                "QUANT OVERRIDE EXIT — %s  signals=%s  direction=%s  price=%.4f  "
+                "atr=%.4f  intraday_extremum=%.4f  vwap_pos=%s  vol_ratio=%.2f",
+                symbol, triggered_signals, direction, current_price,
+                float(indicators.get("atr_14") or 0.0),
+                intraday_extremum,
+                indicators.get("vwap_position", "unknown"),
+                float(indicators.get("volume_ratio") or 0.0),
+            )
+            await self._place_override_exit(position, "quant_override")
 
     async def _fast_step_pdt_check(self) -> None:
         """
@@ -1856,6 +1795,7 @@ class Orchestrator:
             return
 
         # -- Step 1: gather symbols to scan ----------------------------------
+        _medium_loop_start = time.monotonic()
         watchlist = await self._state_manager.load_watchlist()
         portfolio = await self._state_manager.load_portfolio()
         orders_state = await self._state_manager.load_orders()
@@ -1954,6 +1894,12 @@ class Orchestrator:
         # Phase 17: merge watchlist + context indicators into _all_indicators.
         # Consumed by _check_triggers (macro/sector baseline) and Phase 19 compressor.
         self._all_indicators = {**self._latest_indicators, **self._market_context_indicators}
+
+        _medium_loop_elapsed = time.monotonic() - _medium_loop_start
+        log.info(
+            "Medium loop: TA complete — %d watchlist + %d context symbols  elapsed=%.1fs",
+            len(indicators), len(self._market_context_indicators), _medium_loop_elapsed,
+        )
 
         # Phase 17 (Fix 3): stamp completion time so the slow loop medium-loop gate passes.
         # Must be set before the immediate slow-loop call below so that the gate does not
@@ -2700,10 +2646,20 @@ class Orchestrator:
         # 1. Time ceiling: 60+ minutes since last Claude call
         if ts.last_claude_call_utc is None:
             triggers.append("no_previous_call")
+            log.debug("Trigger: no_previous_call FIRED (first call)")
         else:
             elapsed_min = (now - ts.last_claude_call_utc).total_seconds() / 60
             if elapsed_min >= self._config.claude.max_reasoning_interval_min:
                 triggers.append("time_ceiling")
+                log.debug(
+                    "Trigger: time_ceiling FIRED  elapsed=%.1fmin threshold=%.1fmin",
+                    elapsed_min, self._config.claude.max_reasoning_interval_min,
+                )
+            else:
+                log.debug(
+                    "Trigger: time_ceiling skip  elapsed=%.1fmin threshold=%.1fmin",
+                    elapsed_min, self._config.claude.max_reasoning_interval_min,
+                )
 
         # 2. Price move: any Tier 1 symbol, open position, or macro index moved
         #    beyond threshold since last eval. Threshold read from config
@@ -2733,7 +2689,12 @@ class Orchestrator:
                 continue
             last_price = ts.last_prices.get(symbol)
             if last_price and abs(current_price - last_price) / last_price > price_move_threshold:
+                pct_chg = (current_price - last_price) / last_price * 100
                 triggers.append(f"price_move:{symbol}")
+                log.debug(
+                    "Trigger: price_move:%s FIRED  price=%.4f last=%.4f chg=%.2f%% threshold=%.2f%%",
+                    symbol, current_price, last_price, pct_chg, price_move_threshold * 100,
+                )
 
         # 3. Position approaching target (within 1% of profit target or stop loss)
         position_indicators = self._latest_indicators
@@ -2746,14 +2707,26 @@ class Orchestrator:
                 pct_to_target = abs(current - targets.profit_target) / targets.profit_target
                 if pct_to_target <= 0.01:
                     triggers.append(f"near_target:{pos.symbol}")
+                    log.debug(
+                        "Trigger: near_target:%s FIRED  price=%.4f target=%.4f pct_away=%.2f%%",
+                        pos.symbol, current, targets.profit_target, pct_to_target * 100,
+                    )
             if targets.stop_loss > 0:
                 pct_to_stop = abs(current - targets.stop_loss) / targets.stop_loss
                 if pct_to_stop <= 0.01:
                     triggers.append(f"near_stop:{pos.symbol}")
+                    log.debug(
+                        "Trigger: near_stop:%s FIRED  price=%.4f stop=%.4f pct_away=%.2f%%",
+                        pos.symbol, current, targets.stop_loss, pct_to_stop * 100,
+                    )
 
         # 4. Override exit occurred since last Claude call
         if self._override_exit_count > ts.last_override_exit_count:
             triggers.append("override_exit")
+            log.debug(
+                "Trigger: override_exit FIRED  count=%d last_seen=%d",
+                self._override_exit_count, ts.last_override_exit_count,
+            )
 
         # 4b. Open position has reached a meaningful unrealised gain.
         # Fires when gain_pct crosses the configured threshold, then re-arms each time
@@ -2780,6 +2753,10 @@ class Orchestrator:
             last_trigger = ts.last_profit_trigger_gain.get(pos.symbol, 0.0)
             if gain_pct >= last_trigger + profit_threshold:
                 triggers.append(f"position_in_profit:{pos.symbol}")
+                log.debug(
+                    "Trigger: position_in_profit:%s FIRED  gain=%.2f%% last_trigger=%.2f%% interval=%.2f%%",
+                    pos.symbol, gain_pct * 100, last_trigger * 100, profit_threshold * 100,
+                )
                 await self._trade_journal.append({
                     "record_type": "snapshot",
                     "trade_id": self._entry_contexts.get(pos.symbol, {}).get("trade_id"),
@@ -2803,8 +2780,10 @@ class Orchestrator:
         if last_session != current_session.value:
             if current_session == Session.REGULAR_HOURS:
                 triggers.append("session_open")
+                log.debug("Trigger: session_open FIRED  prev_session=%s", last_session)
             elif current_session == Session.POST_MARKET and last_session == Session.REGULAR_HOURS:
                 triggers.append("session_close")
+                log.debug("Trigger: session_close FIRED")
             # Always update last_session regardless of whether we fire
             ts.last_session = current_session.value
 
@@ -2821,6 +2800,7 @@ class Orchestrator:
         # 6. Watchlist critically small
         if len(watchlist.entries) < 10:
             triggers.append("watchlist_small")
+            log.debug("Trigger: watchlist_small FIRED  size=%d", len(watchlist.entries))
 
         # 7. Indicators seeded for the first time — fire once after the first medium
         #    loop cycle so Claude always has real TA data on its first call.
@@ -2847,8 +2827,19 @@ class Orchestrator:
                 if current_price is None:
                     continue
                 baseline = ts.last_claude_call_prices.get(sym)
-                if baseline and abs(current_price - baseline) / baseline > macro_move_threshold:
-                    triggers.append(f"market_move:{sym}")
+                if baseline:
+                    pct_chg = (current_price - baseline) / baseline * 100
+                    if abs(pct_chg) / 100 > macro_move_threshold:
+                        triggers.append(f"market_move:{sym}")
+                        log.debug(
+                            "Trigger: market_move:%s FIRED  price=%.4f baseline=%.4f chg=%.2f%% threshold=%.2f%%",
+                            sym, current_price, baseline, pct_chg, macro_move_threshold * 100,
+                        )
+                    else:
+                        log.debug(
+                            "Trigger: market_move:%s skip  chg=%.2f%% threshold=%.2f%%",
+                            sym, pct_chg, macro_move_threshold * 100,
+                        )
 
         # Phase 17 (Fix 2): Sector move trigger --------------------------------
         # Fires when a sector ETF moves beyond sector_move_trigger_pct (1.5%) from its
@@ -2882,8 +2873,20 @@ class Orchestrator:
                     if etf in exposed_sectors
                     else sector_move_threshold
                 )
-                if abs(current_price - baseline) / baseline > threshold:
+                pct_chg = (current_price - baseline) / baseline * 100
+                if abs(pct_chg) / 100 > threshold:
                     triggers.append(f"sector_move:{etf}")
+                    log.debug(
+                        "Trigger: sector_move:%s FIRED  price=%.4f baseline=%.4f chg=%.2f%% "
+                        "threshold=%.2f%% exposed=%s",
+                        etf, current_price, baseline, pct_chg, threshold * 100,
+                        etf in exposed_sectors,
+                    )
+                else:
+                    log.debug(
+                        "Trigger: sector_move:%s skip  chg=%.2f%% threshold=%.2f%% exposed=%s",
+                        etf, pct_chg, threshold * 100, etf in exposed_sectors,
+                    )
 
         # Phase 17 (Fix 2): Market RSI extreme trigger -------------------------
         # Fires when SPY RSI crosses into panic (< macro_rsi_panic_threshold) or
@@ -2899,14 +2902,32 @@ class Orchestrator:
             if spy_rsi < cfg_s.macro_rsi_panic_threshold and not ts.rsi_extreme_fired_low:
                 triggers.append("market_rsi_extreme")
                 ts.rsi_extreme_fired_low = True
+                log.debug(
+                    "Trigger: market_rsi_extreme FIRED (panic)  spy_rsi=%.1f threshold=%.1f",
+                    spy_rsi, cfg_s.macro_rsi_panic_threshold,
+                )
             elif spy_rsi > cfg_s.macro_rsi_panic_threshold + cfg_s.macro_rsi_rearm_band:
+                if ts.rsi_extreme_fired_low:
+                    log.debug(
+                        "Trigger: market_rsi_extreme re-armed (panic)  spy_rsi=%.1f", spy_rsi,
+                    )
                 ts.rsi_extreme_fired_low = False  # re-arm when RSI recovers
             # Euphoria (high RSI): market overheating
             if spy_rsi > cfg_s.macro_rsi_euphoria_threshold and not ts.rsi_extreme_fired_high:
                 triggers.append("market_rsi_extreme")
                 ts.rsi_extreme_fired_high = True
+                log.debug(
+                    "Trigger: market_rsi_extreme FIRED (euphoria)  spy_rsi=%.1f threshold=%.1f",
+                    spy_rsi, cfg_s.macro_rsi_euphoria_threshold,
+                )
             elif spy_rsi < cfg_s.macro_rsi_euphoria_threshold - cfg_s.macro_rsi_rearm_band:
+                if ts.rsi_extreme_fired_high:
+                    log.debug(
+                        "Trigger: market_rsi_extreme re-armed (euphoria)  spy_rsi=%.1f", spy_rsi,
+                    )
                 ts.rsi_extreme_fired_high = False  # re-arm when RSI normalises
+        else:
+            log.debug("Trigger: market_rsi_extreme skip — SPY RSI unavailable")
 
         return triggers
 
@@ -3142,12 +3163,16 @@ class Orchestrator:
         if result.position_reviews:
             await self._apply_position_reviews(portfolio, result.position_reviews)
 
+        opp_symbols = [o.get("symbol") or o.get("ticker", "?") for o in result.new_opportunities]
         log.info(
-            "Slow loop: Claude cycle complete — %d new opportunities  "
-            "%d watchlist adds  %d removes  %d position reviews",
+            "Slow loop: Claude cycle complete — %d new opportunities %s  "
+            "%d watchlist adds %s  %d removes %s  %d position reviews",
             len(result.new_opportunities),
+            opp_symbols or "",
             actual_adds,
+            [e.get("symbol") for e in add_list[:actual_adds]] if actual_adds else "",
             len(remove_list),
+            remove_list or "",
             len(result.position_reviews),
         )
 
@@ -3366,8 +3391,13 @@ class Orchestrator:
                 # Apply adjusted targets if provided
                 adj = review.get("adjusted_targets") or {}
                 if adj.get("profit_target"):
+                    old_target = pos.intention.exit_targets.profit_target
                     pos.intention.exit_targets.profit_target = float(adj["profit_target"])
                     changed = True
+                    log.info(
+                        "Position review: %s target adjusted  %.4f → %.4f",
+                        symbol, old_target, pos.intention.exit_targets.profit_target,
+                    )
                 if adj.get("stop_loss"):
                     new_stop = float(adj["stop_loss"])
                     # Guard: reject a stop adjustment that would put the stop on the
@@ -3394,8 +3424,13 @@ class Orchestrator:
                             pos.intention.exit_targets.stop_loss,
                         )
                     else:
+                        old_stop = pos.intention.exit_targets.stop_loss
                         pos.intention.exit_targets.stop_loss = new_stop
                         changed = True
+                        log.info(
+                            "Position review: %s stop adjusted  %.4f → %.4f  price=%.4f",
+                            symbol, old_stop, new_stop, _cur or 0.0,
+                        )
                 # Claude recommends exiting — place a market exit order immediately.
                 # thesis_intact=False is a hard signal; action="exit" is sufficient.
                 if action == "exit":

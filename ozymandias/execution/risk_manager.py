@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from datetime import time as dtime
 
 from ozymandias.core.config import RiskConfig, SchedulerConfig
+from ozymandias.core.direction import is_short
 from ozymandias.core.market_hours import Session, get_current_session, is_last_five_minutes
 from ozymandias.core.state_manager import OrderRecord, PortfolioState, Position
 from ozymandias.execution.broker_interface import AccountInfo
@@ -25,9 +26,10 @@ log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
 
 # Override signal thresholds (per spec §4.7)
-_VWAP_VOLUME_RATIO_THRESHOLD: float = 1.3
+# _VWAP_VOLUME_RATIO_THRESHOLD and _ATR_TRAILING_STOP_MULTIPLIER removed —
+# now passed as kwargs from orchestrator using per-strategy values from
+# strategy.override_vwap_volume_threshold() and strategy.override_atr_multiplier().
 _MOMENTUM_SCORE_STRONG_THRESHOLD: float = 1.5
-_ATR_TRAILING_STOP_MULTIPLIER: float = 2.0
 _MIN_AVG_DAILY_DOLLAR_VOLUME: int = 10_000_000  # configured in config.json ranker.min_avg_daily_dollar_volume
 
 
@@ -291,46 +293,81 @@ class RiskManager:
     # Quantitative override signals
     # ------------------------------------------------------------------
 
-    def check_vwap_crossover(self, position: Position, indicators: dict) -> bool:
+    def check_vwap_crossover(
+        self,
+        position: Position,
+        indicators: dict,
+        *,
+        direction: str,
+        volume_threshold: float,
+    ) -> bool:
         """
-        Return True if price is below VWAP on above-average volume (ratio > 1.3).
+        Return True if price crossed VWAP on above-average volume.
 
+        Long fires when vwap_position == "below"; short fires when == "above".
         Because overrides run every fast-loop cycle (~10s), detecting "price is
-        currently below VWAP" is effectively equivalent to detecting a crossover
-        within one loop cycle.
+        currently on the adverse side of VWAP" is effectively equivalent to
+        detecting a crossover within one loop cycle.
         """
         vwap_pos = indicators.get("vwap_position", "at")
         vol_ratio = indicators.get("volume_ratio", 0.0)
-        triggered = vwap_pos == "below" and vol_ratio > _VWAP_VOLUME_RATIO_THRESHOLD
+        adverse_side = "above" if is_short(direction) else "below"
+        triggered = vwap_pos == adverse_side and vol_ratio > volume_threshold
         if triggered:
             log.info(
-                "Override check — VWAP crossover: %s below VWAP, volume_ratio=%.2f",
-                position.symbol, vol_ratio,
+                "Override check — VWAP crossover: %s %s VWAP, volume_ratio=%.2f (dir=%s)",
+                position.symbol, adverse_side, vol_ratio, direction,
             )
         return triggered
 
-    def check_rsi_divergence(self, position: Position, indicators: dict) -> bool:
+    def check_rsi_divergence(
+        self,
+        position: Position,
+        indicators: dict,
+        *,
+        direction: str,
+    ) -> bool:
         """
-        Return True if bearish RSI divergence is detected.
+        Return True if RSI divergence adverse to the position direction is detected.
+
+        Long fires on "bearish" divergence; short fires on "bullish" divergence.
 
         NOTE: This signal cannot trigger an exit alone — requires at least one
         other signal to also be active. Enforced in evaluate_overrides().
         """
-        return indicators.get("rsi_divergence") == "bearish"
+        adverse_divergence = "bullish" if is_short(direction) else "bearish"
+        return indicators.get("rsi_divergence") == adverse_divergence
 
-    def check_roc_deceleration(self, position: Position, indicators: dict) -> bool:
+    def check_roc_deceleration(
+        self,
+        position: Position,
+        indicators: dict,
+        *,
+        direction: str,
+    ) -> bool:
         """
-        Return True if 5-period ROC is decelerating while price still rising.
+        Return True if ROC is decelerating in the direction adverse to the position.
 
-        Delegates to the pre-computed ``roc_deceleration`` flag from
-        generate_signal_summary(), which checks: roc > 0 and roc < prev_roc.
+        Long uses the ``roc_deceleration`` flag (roc > 0 and roc < prev_roc).
+        Short uses the ``roc_negative_deceleration`` flag (roc < 0 and roc > prev_roc).
         """
+        if is_short(direction):
+            return bool(indicators.get("roc_negative_deceleration", False))
         return bool(indicators.get("roc_deceleration", False))
 
-    def check_momentum_score_flip(self, position: Position, indicators: dict) -> bool:
+    def check_momentum_score_flip(
+        self,
+        position: Position,
+        indicators: dict,
+        *,
+        direction: str,
+    ) -> bool:
         """
         Return True if the momentum score (roc_5 * volume_ratio) has flipped sign
-        after being strongly positive (> 1.5) or strongly negative (< -1.5).
+        after being strongly in the position's favour.
+
+        Long: fires when prev_score > +1.5 and current_score < 0.
+        Short: fires when prev_score < -1.5 and current_score > 0.
 
         Stores the previous score per symbol. Requires two consecutive calls to
         detect a flip; returns False on the first call for a given symbol.
@@ -346,15 +383,14 @@ class RiskManager:
         if prev_score is None:
             return False  # no prior data to compare against
 
-        flipped = (
-            prev_score > _MOMENTUM_SCORE_STRONG_THRESHOLD and current_score < 0
-        ) or (
-            prev_score < -_MOMENTUM_SCORE_STRONG_THRESHOLD and current_score > 0
-        )
+        if is_short(direction):
+            flipped = prev_score < -_MOMENTUM_SCORE_STRONG_THRESHOLD and current_score > 0
+        else:
+            flipped = prev_score > _MOMENTUM_SCORE_STRONG_THRESHOLD and current_score < 0
         if flipped:
             log.info(
-                "Override check — Momentum score flip: %s score %.2f → %.2f",
-                symbol, prev_score, current_score,
+                "Override check — Momentum score flip: %s score %.2f → %.2f (dir=%s)",
+                symbol, prev_score, current_score, direction,
             )
         return flipped
 
@@ -362,25 +398,57 @@ class RiskManager:
         self,
         position: Position,
         indicators: dict,
-        intraday_high: float,
+        intraday_extremum: float,
+        *,
+        direction: str,
+        atr_multiplier: float,
     ) -> bool:
         """
-        Return True if price has dropped more than 2x ATR(14) from the intraday high.
+        Return True if price has moved adversely more than atr_multiplier × ATR(14)
+        from the intraday extremum.
 
-        Requires ``indicators["price"]`` (current price) and ``indicators["atr_14"]``.
-        Returns False if either value is missing or ATR is zero.
+        Long: drop = intraday_HIGH − price > atr_multiplier × ATR.
+        Short: rise = price − intraday_LOW > atr_multiplier × ATR.
+
+        ``intraday_extremum`` is the session HIGH for longs and session LOW for shorts.
+        Caller (orchestrator) is responsible for tracking and passing the correct value.
+
+        Returns False if price or ATR is missing or ATR is zero.
         """
         price = indicators.get("price")
         atr = indicators.get("atr_14", 0.0)
         if price is None or atr <= 0:
             return False
-        drop = intraday_high - price
-        triggered = drop > _ATR_TRAILING_STOP_MULTIPLIER * atr
+        if is_short(direction):
+            move = price - intraday_extremum
+        else:
+            move = intraday_extremum - price
+        triggered = move > atr_multiplier * atr
         if triggered:
             log.info(
-                "Override check — ATR trailing stop: %s drop=%.2f > 2×ATR=%.2f "
-                "(high=%.2f price=%.2f)",
-                position.symbol, drop, atr, intraday_high, price,
+                "Override check — ATR trailing stop: %s move=%.2f > %.1f×ATR=%.2f "
+                "(extremum=%.2f price=%.2f dir=%s)",
+                position.symbol, move, atr_multiplier, atr,
+                intraday_extremum, price, direction,
+            )
+        return triggered
+
+    def check_hard_stop(self, position: Position, indicators: dict) -> bool:
+        """Short-only. Fires when price >= stop_loss. Bypasses allow_signals gating.
+
+        Long stops are managed by broker limit orders, not polled here.
+        """
+        if not is_short(position.intention.direction):
+            return False
+        stop_loss = position.intention.exit_targets.stop_loss
+        price = indicators.get("price")
+        if stop_loss <= 0 or price is None:
+            return False
+        triggered = price >= stop_loss
+        if triggered:
+            log.warning(
+                "Hard stop hit (short): %s price=%.4f >= stop=%.4f",
+                position.symbol, price, stop_loss,
             )
         return triggered
 
@@ -388,8 +456,12 @@ class RiskManager:
         self,
         position: Position,
         indicators: dict,
-        intraday_high: float,
+        intraday_extremum: float,
         allow_signals: frozenset[str] | None = None,
+        *,
+        direction: str | None = None,
+        atr_multiplier: float = 2.0,
+        vwap_volume_threshold: float = 1.3,
     ) -> tuple[bool, list[str]]:
         """
         Evaluate quantitative override signals and apply trigger logic.
@@ -401,29 +473,52 @@ class RiskManager:
 
         Parameters
         ----------
+        intraday_extremum:
+            Session HIGH for long positions; session LOW for shorts. Caller
+            (orchestrator) tracks and passes the correct value per direction.
         allow_signals:
             Optional set of signal names to evaluate. Signals not in this set
             are skipped regardless of their computed value. None means all signals
-            are evaluated (backward-compatible default). Pass the result of
-            ``strategy.applicable_override_signals()`` to restrict to the signals
-            relevant for the position's strategy type.
+            are evaluated. Pass ``strategy.applicable_override_signals()`` to
+            restrict to the signals relevant for the position's strategy type.
+        direction:
+            Position direction ("long"/"short"). Defaults to
+            ``position.intention.direction`` when None.
+        atr_multiplier:
+            ATR trailing stop multiplier. Pass ``strategy.override_atr_multiplier()``.
+        vwap_volume_threshold:
+            Volume ratio floor for VWAP crossover. Pass
+            ``strategy.override_vwap_volume_threshold()``.
 
         Returns:
             (should_exit: bool, triggered_signals: list[str])
         """
+        pos_direction = direction or position.intention.direction
+
         def _allowed(name: str) -> bool:
             return allow_signals is None or name in allow_signals
 
         triggered: list[str] = []
-        rsi_div_active = _allowed("rsi_divergence") and self.check_rsi_divergence(position, indicators)
+        rsi_div_active = _allowed("rsi_divergence") and self.check_rsi_divergence(
+            position, indicators, direction=pos_direction
+        )
 
-        if _allowed("vwap_crossover") and self.check_vwap_crossover(position, indicators):
+        if _allowed("vwap_crossover") and self.check_vwap_crossover(
+            position, indicators, direction=pos_direction, volume_threshold=vwap_volume_threshold
+        ):
             triggered.append("vwap_crossover")
-        if _allowed("roc_deceleration") and self.check_roc_deceleration(position, indicators):
+        if _allowed("roc_deceleration") and self.check_roc_deceleration(
+            position, indicators, direction=pos_direction
+        ):
             triggered.append("roc_deceleration")
-        if _allowed("momentum_score_flip") and self.check_momentum_score_flip(position, indicators):
+        if _allowed("momentum_score_flip") and self.check_momentum_score_flip(
+            position, indicators, direction=pos_direction
+        ):
             triggered.append("momentum_score_flip")
-        if _allowed("atr_trailing_stop") and self.check_atr_trailing_stop(position, indicators, intraday_high):
+        if _allowed("atr_trailing_stop") and self.check_atr_trailing_stop(
+            position, indicators, intraday_extremum,
+            direction=pos_direction, atr_multiplier=atr_multiplier,
+        ):
             triggered.append("atr_trailing_stop")
 
         # RSI divergence requires at least one other signal
@@ -433,8 +528,8 @@ class RiskManager:
         should_exit = len(triggered) > 0
         if should_exit:
             log.warning(
-                "Override exit triggered for %s: signals=%s",
-                position.symbol, triggered,
+                "Override exit triggered for %s: signals=%s direction=%s",
+                position.symbol, triggered, pos_direction,
             )
         return should_exit, triggered
 
