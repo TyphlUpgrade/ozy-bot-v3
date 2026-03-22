@@ -783,3 +783,62 @@ Read the relevant phase section before modifying or debugging any module built i
 **New tests** · `ozymandias/tests/test_trigger_responsiveness.py`
 - 29 tests across 5 classes: `TestParallelMediumLoop` (Fix 1), `TestMacroMoveTrigger` (Fix 2 macro), `TestSectorMoveTrigger` (Fix 2 sector), `TestRsiExtremeTrigger` (Fix 2 RSI), `TestMediumLoopGate` (Fix 3), `TestAdaptiveCacheTtl` (Fix 4).
 
+
+---
+
+### Direction-Aware Quant Overrides + Per-Strategy Thresholds (March 22, 2026)
+
+**`check_vwap_crossover()` signature** · *(not defined in spec)* · `execution/risk_manager.py`
+- **Spec:** *(not defined)*
+- **Impl:** Added `direction: str` and `volume_threshold: float` as required keyword-only args. Long fires on `vwap_position=="below"`, short fires on `"above"`. `volume_threshold` replaces removed module constant `_VWAP_VOLUME_RATIO_THRESHOLD`.
+- **Why:** Direction-aware inversion required to support short exits via the same code path as longs.
+
+**`check_roc_deceleration()` signature** · *(not defined in spec)* · `execution/risk_manager.py`
+- **Spec:** *(not defined)*
+- **Impl:** Added `direction: str` keyword-only arg. Long uses `roc_deceleration` flag; short uses `roc_negative_deceleration` flag.
+- **Why:** ROC deceleration semantics invert for shorts (negative ROC decelerating = bearish momentum exhausting).
+
+**`check_momentum_score_flip()` signature** · *(not defined in spec)* · `execution/risk_manager.py`
+- **Spec:** *(not defined)*
+- **Impl:** Added `direction: str` keyword-only arg. Long fires on prev > +1.5 → now < 0. Short fires on prev < -1.5 → now > 0. Previously both branches fired for all positions.
+- **Why:** Negative-to-positive flip is bullish recovery (bad exit for long). Direction-aware logic fires only the adverse flip per direction.
+
+**`check_atr_trailing_stop()` signature** · *(not defined in spec)* · `execution/risk_manager.py`
+- **Spec:** *(not defined)*
+- **Impl:** Parameter `intraday_high` renamed to `intraday_extremum`. Added `direction: str` and `atr_multiplier: float` as required keyword-only args. Long measures drop from HIGH; short measures rise from LOW.
+- **Why:** ATR trail for shorts uses intraday LOW as the reference, not intraday HIGH.
+
+**`check_hard_stop()` new method** · *(not defined in spec)* · `execution/risk_manager.py`
+- **Spec:** *(not defined)*
+- **Impl:** New method, short-only. Fires when `price >= stop_loss`. Bypasses `allow_signals` gating — the hard stop is unconditional for shorts. Long stops managed by broker limit orders.
+- **Why:** Hard stop needed at `RiskManager` level for testability; also moves the check into `_fast_step_quant_overrides` before the min-hold guard.
+
+**`evaluate_overrides()` signature** · *(not defined in spec)* · `execution/risk_manager.py`
+- **Spec:** *(not defined)*
+- **Impl:** `intraday_high` positional param renamed to `intraday_extremum`. Added optional kwargs: `direction`, `atr_multiplier`, `vwap_volume_threshold`. All `check_*` calls now pass these kwargs through.
+- **Why:** Per-strategy thresholds and direction-awareness needed; kwargs maintain backward compatibility (caller can omit for long/default behavior).
+
+**`_fast_step_short_exits()` removed** · *(not defined in spec)* · `core/orchestrator.py`
+- **Spec:** *(not defined)*
+- **Impl:** Method deleted. All logic merged into `_fast_step_quant_overrides()`. Hard stop fires first (before min-hold gate); VWAP/ATR/ROC signals go through the same allow_signals and min-hold path as longs.
+- **Why:** Separate short exits path had no strategy gating, no ROC/RSI divergence signals for shorts, and hardcoded thresholds.
+
+**`_place_override_exit()` new helper** · *(not defined in spec)* · `core/orchestrator.py`
+- **Spec:** *(not defined)*
+- **Impl:** Extracted order placement, fill protection, `record_order`, `_pending_exit_hints`, and `_override_exit_count` into a shared helper used by both hard stop and signal paths.
+- **Why:** DRY — previously duplicated across `_fast_step_quant_overrides` and `_fast_step_short_exits`.
+
+**`override_atr_multiplier()` / `override_vwap_volume_threshold()` new methods** · *(not defined in spec)* · `strategies/base_strategy.py`
+- **Spec:** *(not defined)*
+- **Impl:** Two concrete methods on `Strategy` ABC. Read from `_params` with defaults 2.0 and 1.3. Swing defaults to 3.0/1.5 (wider, prevents intraday noise exits on multi-day holds).
+- **Why:** Thresholds previously hardcoded as module constants in `risk_manager.py`; now per-strategy configurable via `config.json strategy_params`.
+
+**Deprecated config fields** · *(not defined in spec)* · `config/config.json` → `execution/risk_manager.py`
+- **Spec:** *(not defined)*
+- **Impl:** `short_vwap_exit_enabled` and `short_vwap_exit_volume_threshold` in `risk.` section are no longer read by any code path. `short_atr_stop_multiplier` also unused. VWAP threshold is now `strategy_params.{strategy}.override_vwap_volume_threshold`; ATR multiplier is `strategy_params.{strategy}.override_atr_multiplier`.
+- **Why:** Replaced by per-strategy threshold accessors.
+
+**`_pending_exit_hints` value `"short_protection"` replaced by `"hard_stop"`** · *(not defined in spec)* · `core/orchestrator.py`
+- **Spec:** *(not defined)*
+- **Impl:** Hard stop exits now tag `"hard_stop"` instead of `"short_protection"`. Signal-triggered short exits tag `"quant_override"` (same as longs). Old hint `"short_protection"` no longer emitted.
+- **Why:** More specific hint; separates hard stop (priority 1, no gates) from signal exits (evaluated through allow_signals path).
