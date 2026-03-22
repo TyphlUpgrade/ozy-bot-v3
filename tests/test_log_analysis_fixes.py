@@ -170,8 +170,8 @@ class TestExitReasonHint:
         assert call_args["exit_reason"] == "quant_override"
 
     @pytest.mark.asyncio
-    async def test_short_protection_exit_reason(self):
-        """Short protection hint → journal entry has exit_reason='short_protection'."""
+    async def test_hard_stop_exit_reason(self):
+        """Hard stop hint → journal entry has exit_reason='hard_stop'."""
         orch = _make_orch()
         position = _make_position("TSLA", direction="short", avg_cost=250.0,
                                   stop_loss=260.0, profit_target=230.0)
@@ -181,10 +181,10 @@ class TestExitReasonHint:
 
         # Mid-range price for short — would infer "strategy" without hint
         change = FillChange("TSLA", fill_price=248.0)
-        await orch._journal_closed_trade(change, exit_reason_hint="short_protection")
+        await orch._journal_closed_trade(change, exit_reason_hint="hard_stop")
 
         call_args = orch._trade_journal.append.call_args[0][0]
-        assert call_args["exit_reason"] == "short_protection"
+        assert call_args["exit_reason"] == "hard_stop"
 
     @pytest.mark.asyncio
     async def test_no_hint_falls_through_to_price_inference(self):

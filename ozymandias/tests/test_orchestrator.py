@@ -2574,6 +2574,7 @@ class TestShortEntryWiring:
     @pytest.mark.asyncio
     async def test_short_exit_is_buy_order(self, orch):
         """Short exit via VWAP crossover must place a 'buy' (buy-to-cover) order."""
+        import time as _time
         symbol = "TSLA"
         position = Position(
             symbol=symbol,
@@ -2587,13 +2588,17 @@ class TestShortEntryWiring:
             "price": 270.0,       # above entry — short is losing
             "vwap": 260.0,
             "vwap_position": "above",
-            "volume_ratio": 2.0,  # above short_vwap_exit_volume_threshold (1.3)
+            "volume_ratio": 2.0,  # above vwap_volume_threshold (1.3)
             "rsi": 65.0,
             "rsi_divergence": False,
             "roc_5": 0.04,
-            "atr_14": 5.0,
+            "roc_deceleration": False,
+            "roc_negative_deceleration": False,
+            "atr_14": 1000.0,     # large ATR → ATR trail won't fire
         }}
         orch._intraday_highs[symbol] = 272.0
+        # Satisfy min-hold guard (6 min ago — beyond 5-min default)
+        orch._position_entry_times[symbol] = _time.monotonic() - 360
 
         from ozymandias.execution.broker_interface import OrderResult
         orch._broker.place_order = AsyncMock(return_value=OrderResult(
@@ -2601,8 +2606,7 @@ class TestShortEntryWiring:
             submitted_at=datetime.now(timezone.utc),
         ))
 
-        # _fast_step_quant_overrides now delegates to _fast_step_short_exits for shorts.
-        # VWAP crossover conditions are met → buy-to-cover order placed.
+        # VWAP crossover for a short: price above VWAP with high volume → buy-to-cover.
         await orch._fast_step_quant_overrides()
         orch._broker.place_order.assert_called_once()
         call_args = orch._broker.place_order.call_args[0][0]

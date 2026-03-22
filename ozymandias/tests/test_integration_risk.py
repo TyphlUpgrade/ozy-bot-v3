@@ -223,7 +223,7 @@ class TestSignalSummaryToOverridePipeline:
         pos = _position()
         df = _intraday_ohlcv(40)
         signals = generate_signal_summary("AAPL", df)["signals"]
-        should_exit, triggered = rm.evaluate_overrides(pos, signals, intraday_high=120.0)
+        should_exit, triggered = rm.evaluate_overrides(pos, signals, 120.0)
         assert isinstance(should_exit, bool)
         assert isinstance(triggered, list)
 
@@ -259,8 +259,8 @@ class TestSignalSummaryToOverridePipeline:
         # Add price slightly above current VWAP (bullish)
         signals["price"] = float(df["close"].iloc[-1])
         # Seed momentum score as positive so flip check has prior data
-        rm.check_momentum_score_flip(pos, {"roc_5": 3.0, "volume_ratio": 1.0})
-        should_exit, triggered = rm.evaluate_overrides(pos, signals, intraday_high=signals["price"] + 1.0)
+        rm.check_momentum_score_flip(pos, {"roc_5": 3.0, "volume_ratio": 1.0}, direction="long")
+        should_exit, triggered = rm.evaluate_overrides(pos, signals, signals["price"] + 1.0)
         # Bullish data should not have VWAP below, high volume, or RSI divergence
         assert "vwap_crossover" not in triggered
         assert "rsi_divergence" not in triggered
@@ -278,7 +278,7 @@ class TestSignalSummaryToOverridePipeline:
 
         if signals["vwap_position"] == "below" and signals["volume_ratio"] > 1.3:
             should_exit, triggered = rm.evaluate_overrides(
-                pos, signals, intraday_high=float(df["close"].max())
+                pos, signals, float(df["close"].max())
             )
             assert "vwap_crossover" in triggered
         else:
@@ -397,7 +397,8 @@ class TestBrokerTypesWithRiskManager:
         # RiskManager override methods use Position (local state), not BrokerPosition
         rm = _rm()
         # Calling an override with Position (not BrokerPosition) is the correct pattern
-        result = rm.check_vwap_crossover(pos, {"vwap_position": "below", "volume_ratio": 1.5})
+        result = rm.check_vwap_crossover(pos, {"vwap_position": "below", "volume_ratio": 1.5},
+                                          direction="long", volume_threshold=1.3)
         assert isinstance(result, bool)
         # BrokerPosition has no role in override signal checks — it's used upstream
         # by the orchestrator to build Position + intraday_high, not passed to RM directly.

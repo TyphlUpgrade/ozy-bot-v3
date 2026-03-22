@@ -1,11 +1,11 @@
 """
 tests/test_short_protection.py
 ================================
-Unit tests for Phase 16 short position protection:
-  - ATR trailing stop (fast loop)
-  - VWAP crossover exit (fast loop)
-  - Hard stop from intention (fast loop)
-  - _intraday_lows tracking
+Unit tests for short position protection:
+  - Direction-aware ATR trailing stop (RiskManager level)
+  - Direction-aware VWAP crossover exit (RiskManager level)
+  - Hard stop from intention (RiskManager level)
+  - _intraday_lows tracking in _fast_step_quant_overrides
   - EOD forced close for momentum shorts (medium loop)
   - _recently_closed persistence and startup reload
   - ATR position size cap (_medium_try_entry)
@@ -55,6 +55,8 @@ def _make_orch():
     """Build a minimal orchestrator with mocked broker and state."""
     from ozymandias.core.config import Config
     from ozymandias.core.orchestrator import Orchestrator
+    from ozymandias.execution.pdt_guard import PDTGuard
+    from ozymandias.execution.risk_manager import RiskManager
 
     orch = Orchestrator.__new__(Orchestrator)
     orch._config = Config()
@@ -65,6 +67,7 @@ def _make_orch():
     orch._fill_protection.record_order = AsyncMock()
     orch._state_manager = MagicMock()
     orch._state_manager.load_portfolio = AsyncMock(return_value=PortfolioState())
+    orch._state_manager.load_orders = AsyncMock(return_value=MagicMock(orders=[]))
     orch._state_manager.save_portfolio = AsyncMock()
     orch._latest_indicators = {}
     orch._intraday_lows = {}
@@ -75,6 +78,8 @@ def _make_orch():
     orch._cycle_consumed_symbols = set()
     orch._trigger_state = MagicMock()
     orch._strategies = []
+    orch._position_entry_times = {}
+    orch._risk_manager = RiskManager(orch._config.risk, PDTGuard(orch._config.risk))
     from ozymandias.execution.broker_interface import OrderResult
     orch._broker.place_order.return_value = OrderResult(
         order_id="test-order-001",
@@ -84,58 +89,58 @@ def _make_orch():
     return orch
 
 
+def _make_rm():
+    """Build a minimal RiskManager for unit tests."""
+    from ozymandias.core.config import Config
+    from ozymandias.execution.pdt_guard import PDTGuard
+    from ozymandias.execution.risk_manager import RiskManager
+    cfg = Config()
+    return RiskManager(cfg.risk, PDTGuard(cfg.risk))
+
+
 # ---------------------------------------------------------------------------
-# _fast_step_short_exits — ATR trailing stop
+# RiskManager.check_atr_trailing_stop — short direction
 # ---------------------------------------------------------------------------
 
 class TestShortAtrTrailingStop:
-    @pytest.mark.asyncio
-    async def test_fires_when_price_breaches_trail_stop(self):
-        orch = _make_orch()
+    def test_fires_when_price_breaches_trail_stop(self):
+        rm = _make_rm()
         pos = _make_position(symbol="NVDA", direction="short")
-        orch._intraday_lows["NVDA"] = 200.0   # session low
         atr = 5.0
-        # trail stop = 200 + 5 * 2.0 = 210; current price 211 → breach
-        orch._latest_indicators["NVDA"] = {
-            "price": 211.0,
-            "atr_14": atr,
-            "vwap_position": "at",
-            "volume_ratio": 0.8,
-        }
-        await orch._fast_step_short_exits(pos)
-        orch._broker.place_order.assert_called_once()
-        order = orch._broker.place_order.call_args[0][0]
-        assert order.side == "buy"
-        assert order.symbol == "NVDA"
+        # intraday_low=200; trail stop = 200 + 5*2.0 = 210; price 211 → breach
+        assert rm.check_atr_trailing_stop(
+            pos, {"price": 211.0, "atr_14": atr}, 200.0,
+            direction="short", atr_multiplier=2.0,
+        ) is True
 
-    @pytest.mark.asyncio
-    async def test_does_not_fire_when_price_below_trail_stop(self):
-        orch = _make_orch()
+    def test_does_not_fire_when_price_below_trail_stop(self):
+        rm = _make_rm()
         pos = _make_position(symbol="NVDA", direction="short")
-        orch._intraday_lows["NVDA"] = 200.0
-        # trail stop = 200 + 5 * 2.0 = 210; current price 208 → no breach
-        orch._latest_indicators["NVDA"] = {
-            "price": 208.0,
-            "atr_14": 5.0,
-            "vwap_position": "at",
-            "volume_ratio": 0.8,
-        }
-        await orch._fast_step_short_exits(pos)
-        orch._broker.place_order.assert_not_called()
+        # intraday_low=200; trail stop = 210; price 208 → no breach
+        assert rm.check_atr_trailing_stop(
+            pos, {"price": 208.0, "atr_14": 5.0}, 200.0,
+            direction="short", atr_multiplier=2.0,
+        ) is False
 
     @pytest.mark.asyncio
     async def test_intraday_low_updated_each_cycle(self):
         orch = _make_orch()
         pos = _make_position(symbol="AMD", direction="short")
         orch._intraday_lows["AMD"] = 150.0
+        portfolio = PortfolioState(positions=[pos])
+        orch._state_manager.load_portfolio = AsyncMock(return_value=portfolio)
         # New lower price — intraday low should update downward
+        # Use a huge ATR so the ATR trail doesn't fire; only testing low tracking
         orch._latest_indicators["AMD"] = {
             "price": 145.0,
-            "atr_14": 2.0,
+            "atr_14": 1000.0,
             "vwap_position": "at",
             "volume_ratio": 0.8,
         }
-        await orch._fast_step_short_exits(pos)
+        # Seed entry time so min-hold check doesn't skip
+        import time as _time
+        orch._position_entry_times["AMD"] = _time.monotonic() - 9999.0
+        await orch._fast_step_quant_overrides()
         assert orch._intraday_lows["AMD"] == 145.0
 
     @pytest.mark.asyncio
@@ -143,124 +148,111 @@ class TestShortAtrTrailingStop:
         orch = _make_orch()
         pos = _make_position(symbol="AMD", direction="short")
         orch._intraday_lows["AMD"] = 140.0
-        # Price higher than current low — low should stay at 140
+        portfolio = PortfolioState(positions=[pos])
+        orch._state_manager.load_portfolio = AsyncMock(return_value=portfolio)
+        # Price is higher than current low — low should stay at 140
+        # Use a huge ATR so the ATR trail doesn't fire; only testing low tracking
         orch._latest_indicators["AMD"] = {
             "price": 155.0,
-            "atr_14": 2.0,
+            "atr_14": 1000.0,
             "vwap_position": "at",
             "volume_ratio": 0.8,
         }
-        # trail stop = 140 + 2*2.0 = 144; price 155 > 144 → fires, but low stays 140
-        await orch._fast_step_short_exits(pos)
+        import time as _time
+        orch._position_entry_times["AMD"] = _time.monotonic() - 9999.0
+        await orch._fast_step_quant_overrides()
         assert orch._intraday_lows["AMD"] == 140.0
 
 
 # ---------------------------------------------------------------------------
-# _fast_step_short_exits — VWAP crossover exit
+# RiskManager.check_vwap_crossover — short direction
 # ---------------------------------------------------------------------------
 
 class TestShortVwapCrossoverExit:
-    @pytest.mark.asyncio
-    async def test_fires_when_above_vwap_with_high_volume(self):
-        orch = _make_orch()
+    def test_fires_when_above_vwap_with_high_volume(self):
+        rm = _make_rm()
         pos = _make_position(symbol="TSLA", direction="short")
-        orch._latest_indicators["TSLA"] = {
-            "price": 270.0,
-            "atr_14": 100.0,  # large ATR → trail stop far away
-            "vwap_position": "above",
-            "volume_ratio": 2.0,  # above threshold (1.3)
-        }
-        await orch._fast_step_short_exits(pos)
-        orch._broker.place_order.assert_called_once()
-        order = orch._broker.place_order.call_args[0][0]
-        assert order.side == "buy"
+        assert rm.check_vwap_crossover(
+            pos, {"vwap_position": "above", "volume_ratio": 2.0},
+            direction="short", volume_threshold=1.3,
+        ) is True
 
-    @pytest.mark.asyncio
-    async def test_does_not_fire_when_vwap_exit_disabled(self):
-        orch = _make_orch()
-        orch._config.risk.short_vwap_exit_enabled = False
-        pos = _make_position(symbol="TSLA", direction="short")
-        orch._latest_indicators["TSLA"] = {
+    def test_swing_short_not_triggered_by_vwap_crossover(self):
+        """Swing strategy declares no override signals — evaluate_overrides fires nothing."""
+        rm = _make_rm()
+        pos = _make_position(symbol="TSLA", direction="short", strategy="swing")
+        indicators = {
             "price": 270.0,
             "atr_14": 100.0,
             "vwap_position": "above",
             "volume_ratio": 2.0,
+            "rsi_divergence": False,
+            "roc_deceleration": False,
+            "roc_negative_deceleration": False,
+            "roc_5": 0.5,
         }
-        await orch._fast_step_short_exits(pos)
-        orch._broker.place_order.assert_not_called()
+        should_exit, signals = rm.evaluate_overrides(
+            pos, indicators, 240.0,
+            allow_signals=frozenset(),  # swing has no signals
+            direction="short",
+            atr_multiplier=3.0,
+            vwap_volume_threshold=1.5,
+        )
+        assert not should_exit
+        assert signals == []
 
-    @pytest.mark.asyncio
-    async def test_does_not_fire_when_volume_below_threshold(self):
-        orch = _make_orch()
+    def test_does_not_fire_when_volume_below_threshold(self):
+        rm = _make_rm()
         pos = _make_position(symbol="TSLA", direction="short")
-        orch._latest_indicators["TSLA"] = {
-            "price": 270.0,
-            "atr_14": 100.0,
-            "vwap_position": "above",
-            "volume_ratio": 1.0,  # below threshold (1.3)
-        }
-        await orch._fast_step_short_exits(pos)
-        orch._broker.place_order.assert_not_called()
+        assert rm.check_vwap_crossover(
+            pos, {"vwap_position": "above", "volume_ratio": 1.0},
+            direction="short", volume_threshold=1.3,
+        ) is False
 
-    @pytest.mark.asyncio
-    async def test_does_not_fire_when_below_vwap(self):
-        orch = _make_orch()
+    def test_does_not_fire_when_below_vwap(self):
+        rm = _make_rm()
         pos = _make_position(symbol="TSLA", direction="short")
-        orch._latest_indicators["TSLA"] = {
-            "price": 240.0,
-            "atr_14": 100.0,
-            "vwap_position": "below",  # still below VWAP — short is working
-            "volume_ratio": 2.0,
-        }
-        await orch._fast_step_short_exits(pos)
-        orch._broker.place_order.assert_not_called()
+        # below VWAP = short is working = not adverse
+        assert rm.check_vwap_crossover(
+            pos, {"vwap_position": "below", "volume_ratio": 2.0},
+            direction="short", volume_threshold=1.3,
+        ) is False
 
 
 # ---------------------------------------------------------------------------
-# _fast_step_short_exits — hard stop from intention
+# RiskManager.check_hard_stop — short-only
 # ---------------------------------------------------------------------------
 
 class TestShortHardStop:
-    @pytest.mark.asyncio
-    async def test_fires_when_price_reaches_stop_loss(self):
-        orch = _make_orch()
+    def test_fires_when_price_reaches_stop_loss(self):
+        rm = _make_rm()
         pos = _make_position(symbol="AAPL", direction="short", stop_loss=265.0)
-        orch._latest_indicators["AAPL"] = {
-            "price": 266.0,  # above stop_loss
-            "atr_14": 100.0,
-            "vwap_position": "at",
-            "volume_ratio": 0.8,
-        }
-        await orch._fast_step_short_exits(pos)
-        orch._broker.place_order.assert_called_once()
-        order = orch._broker.place_order.call_args[0][0]
-        assert order.side == "buy"
+        assert rm.check_hard_stop(pos, {"price": 266.0}) is True
 
-    @pytest.mark.asyncio
-    async def test_does_not_fire_when_price_below_stop_loss(self):
-        orch = _make_orch()
+    def test_does_not_fire_when_price_below_stop_loss(self):
+        rm = _make_rm()
         pos = _make_position(symbol="AAPL", direction="short", stop_loss=265.0)
-        orch._latest_indicators["AAPL"] = {
-            "price": 260.0,  # below stop — short is profitable
-            "atr_14": 100.0,
-            "vwap_position": "at",
-            "volume_ratio": 0.8,
-        }
-        await orch._fast_step_short_exits(pos)
-        orch._broker.place_order.assert_not_called()
+        assert rm.check_hard_stop(pos, {"price": 260.0}) is False
+
+    def test_does_not_fire_for_long_position(self):
+        rm = _make_rm()
+        pos = _make_position(symbol="AAPL", direction="long", stop_loss=265.0)
+        assert rm.check_hard_stop(pos, {"price": 260.0}) is False
 
     @pytest.mark.asyncio
     async def test_fill_protection_blocks_exit(self):
         orch = _make_orch()
         orch._fill_protection.can_place_order = MagicMock(return_value=False)
         pos = _make_position(symbol="AAPL", direction="short", stop_loss=265.0)
+        portfolio = PortfolioState(positions=[pos])
+        orch._state_manager.load_portfolio = AsyncMock(return_value=portfolio)
         orch._latest_indicators["AAPL"] = {
             "price": 270.0,
             "atr_14": 100.0,
             "vwap_position": "at",
             "volume_ratio": 0.8,
         }
-        await orch._fast_step_short_exits(pos)
+        await orch._fast_step_quant_overrides()
         orch._broker.place_order.assert_not_called()
 
 

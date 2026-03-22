@@ -12,6 +12,7 @@ import pytest
 
 from ozymandias.core.config import RiskConfig, SchedulerConfig
 from ozymandias.core.state_manager import (
+    ExitTargets,
     OrderRecord,
     PortfolioState,
     Position,
@@ -369,66 +370,66 @@ class TestVwapCrossover:
         rm = _rm()
         pos = _position()
         indicators = {"vwap_position": "below", "volume_ratio": 1.5}
-        assert rm.check_vwap_crossover(pos, indicators) is True
+        assert rm.check_vwap_crossover(pos, indicators, direction="long", volume_threshold=1.3) is True
 
     def test_no_trigger_below_vwap_low_volume(self):
         rm = _rm()
         pos = _position()
         indicators = {"vwap_position": "below", "volume_ratio": 1.1}
-        assert rm.check_vwap_crossover(pos, indicators) is False
+        assert rm.check_vwap_crossover(pos, indicators, direction="long", volume_threshold=1.3) is False
 
     def test_no_trigger_above_vwap_high_volume(self):
         rm = _rm()
         pos = _position()
         indicators = {"vwap_position": "above", "volume_ratio": 2.0}
-        assert rm.check_vwap_crossover(pos, indicators) is False
+        assert rm.check_vwap_crossover(pos, indicators, direction="long", volume_threshold=1.3) is False
 
     def test_no_trigger_at_vwap(self):
         rm = _rm()
         pos = _position()
         indicators = {"vwap_position": "at", "volume_ratio": 2.0}
-        assert rm.check_vwap_crossover(pos, indicators) is False
+        assert rm.check_vwap_crossover(pos, indicators, direction="long", volume_threshold=1.3) is False
 
     def test_boundary_volume_ratio_not_triggered(self):
         # Exactly 1.3 is NOT > 1.3, so no trigger
         rm = _rm()
         pos = _position()
         indicators = {"vwap_position": "below", "volume_ratio": 1.3}
-        assert rm.check_vwap_crossover(pos, indicators) is False
+        assert rm.check_vwap_crossover(pos, indicators, direction="long", volume_threshold=1.3) is False
 
 
 class TestRsiDivergence:
     def test_bearish_divergence_detected(self):
         rm = _rm()
         pos = _position()
-        assert rm.check_rsi_divergence(pos, {"rsi_divergence": "bearish"}) is True
+        assert rm.check_rsi_divergence(pos, {"rsi_divergence": "bearish"}, direction="long") is True
 
     def test_no_divergence(self):
         rm = _rm()
         pos = _position()
-        assert rm.check_rsi_divergence(pos, {"rsi_divergence": False}) is False
+        assert rm.check_rsi_divergence(pos, {"rsi_divergence": False}, direction="long") is False
 
-    def test_bullish_divergence_not_an_exit_signal(self):
+    def test_bullish_divergence_not_an_exit_signal_for_longs(self):
         rm = _rm()
         pos = _position()
-        assert rm.check_rsi_divergence(pos, {"rsi_divergence": "bullish"}) is False
+        assert rm.check_rsi_divergence(pos, {"rsi_divergence": "bullish"}, direction="long") is False
 
 
 class TestRocDeceleration:
     def test_triggered_when_flag_true(self):
         rm = _rm()
         pos = _position()
-        assert rm.check_roc_deceleration(pos, {"roc_deceleration": True}) is True
+        assert rm.check_roc_deceleration(pos, {"roc_deceleration": True}, direction="long") is True
 
     def test_not_triggered_when_flag_false(self):
         rm = _rm()
         pos = _position()
-        assert rm.check_roc_deceleration(pos, {"roc_deceleration": False}) is False
+        assert rm.check_roc_deceleration(pos, {"roc_deceleration": False}, direction="long") is False
 
     def test_not_triggered_when_missing(self):
         rm = _rm()
         pos = _position()
-        assert rm.check_roc_deceleration(pos, {}) is False
+        assert rm.check_roc_deceleration(pos, {}, direction="long") is False
 
 
 class TestMomentumScoreFlip:
@@ -436,40 +437,48 @@ class TestMomentumScoreFlip:
         rm = _rm()
         pos = _position()
         # No prior history — should not trigger
-        assert rm.check_momentum_score_flip(pos, {"roc_5": 5.0, "volume_ratio": 2.0}) is False
+        assert rm.check_momentum_score_flip(pos, {"roc_5": 5.0, "volume_ratio": 2.0}, direction="long") is False
 
     def test_positive_to_negative_flip_triggers(self):
         rm = _rm()
         pos = _position()
         # First call: score = 5.0 * 1.5 = 7.5 (strongly positive)
-        rm.check_momentum_score_flip(pos, {"roc_5": 5.0, "volume_ratio": 1.5})
+        rm.check_momentum_score_flip(pos, {"roc_5": 5.0, "volume_ratio": 1.5}, direction="long")
         # Second call: score = -1.0 * 1.0 = -1.0 (negative)
-        assert rm.check_momentum_score_flip(pos, {"roc_5": -1.0, "volume_ratio": 1.0}) is True
+        assert rm.check_momentum_score_flip(pos, {"roc_5": -1.0, "volume_ratio": 1.0}, direction="long") is True
 
     def test_weakly_positive_to_negative_no_trigger(self):
         rm = _rm()
         pos = _position()
         # First call: score = 0.5 * 1.0 = 0.5 (NOT strongly positive)
-        rm.check_momentum_score_flip(pos, {"roc_5": 0.5, "volume_ratio": 1.0})
+        rm.check_momentum_score_flip(pos, {"roc_5": 0.5, "volume_ratio": 1.0}, direction="long")
         # Second call goes negative — but prior wasn't strong, so no trigger
-        assert rm.check_momentum_score_flip(pos, {"roc_5": -1.0, "volume_ratio": 1.0}) is False
+        assert rm.check_momentum_score_flip(pos, {"roc_5": -1.0, "volume_ratio": 1.0}, direction="long") is False
 
-    def test_negative_to_positive_flip_triggers(self):
+    def test_negative_to_positive_flip_triggers_for_shorts(self):
+        # For shorts: strongly negative score flipping positive = adverse momentum reversal
         rm = _rm()
         pos = _position()
-        # First call: score = -3.0 * 1.5 = -4.5 (strongly negative)
-        rm.check_momentum_score_flip(pos, {"roc_5": -3.0, "volume_ratio": 1.5})
-        # Second call positive
-        assert rm.check_momentum_score_flip(pos, {"roc_5": 1.0, "volume_ratio": 1.0}) is True
+        # First call: score = -3.0 * 1.5 = -4.5 (strongly negative, short working)
+        rm.check_momentum_score_flip(pos, {"roc_5": -3.0, "volume_ratio": 1.5}, direction="short")
+        # Second call positive (short losing its momentum)
+        assert rm.check_momentum_score_flip(pos, {"roc_5": 1.0, "volume_ratio": 1.0}, direction="short") is True
+
+    def test_negative_to_positive_flip_does_not_trigger_for_longs(self):
+        # For longs: negative-to-positive flip is GOOD news, should not exit
+        rm = _rm()
+        pos = _position()
+        rm.check_momentum_score_flip(pos, {"roc_5": -3.0, "volume_ratio": 1.5}, direction="long")
+        assert rm.check_momentum_score_flip(pos, {"roc_5": 1.0, "volume_ratio": 1.0}, direction="long") is False
 
     def test_per_symbol_state_independent(self):
         rm = _rm()
         pos_a = _position("AAPL")
         pos_b = _position("MSFT")
         # Seed AAPL strongly positive
-        rm.check_momentum_score_flip(pos_a, {"roc_5": 5.0, "volume_ratio": 2.0})
+        rm.check_momentum_score_flip(pos_a, {"roc_5": 5.0, "volume_ratio": 2.0}, direction="long")
         # MSFT has no prior — should not trigger even if score is negative
-        assert rm.check_momentum_score_flip(pos_b, {"roc_5": -1.0, "volume_ratio": 1.0}) is False
+        assert rm.check_momentum_score_flip(pos_b, {"roc_5": -1.0, "volume_ratio": 1.0}, direction="long") is False
 
 
 class TestAtrTrailingStop:
@@ -477,29 +486,29 @@ class TestAtrTrailingStop:
         rm = _rm()
         pos = _position()
         # high=100, price=90, atr=4. drop=10 > 2*4=8 → trigger
-        assert rm.check_atr_trailing_stop(pos, {"price": 90.0, "atr_14": 4.0}, 100.0) is True
+        assert rm.check_atr_trailing_stop(pos, {"price": 90.0, "atr_14": 4.0}, 100.0, direction="long", atr_multiplier=2.0) is True
 
     def test_no_trigger_when_drop_below_2x_atr(self):
         rm = _rm()
         pos = _position()
         # high=100, price=94, atr=4. drop=6 < 8 → no trigger
-        assert rm.check_atr_trailing_stop(pos, {"price": 94.0, "atr_14": 4.0}, 100.0) is False
+        assert rm.check_atr_trailing_stop(pos, {"price": 94.0, "atr_14": 4.0}, 100.0, direction="long", atr_multiplier=2.0) is False
 
     def test_exactly_2x_atr_no_trigger(self):
         rm = _rm()
         pos = _position()
         # drop == 2*atr → NOT strictly greater than → no trigger
-        assert rm.check_atr_trailing_stop(pos, {"price": 92.0, "atr_14": 4.0}, 100.0) is False
+        assert rm.check_atr_trailing_stop(pos, {"price": 92.0, "atr_14": 4.0}, 100.0, direction="long", atr_multiplier=2.0) is False
 
     def test_missing_price_returns_false(self):
         rm = _rm()
         pos = _position()
-        assert rm.check_atr_trailing_stop(pos, {"atr_14": 4.0}, 100.0) is False
+        assert rm.check_atr_trailing_stop(pos, {"atr_14": 4.0}, 100.0, direction="long", atr_multiplier=2.0) is False
 
     def test_zero_atr_returns_false(self):
         rm = _rm()
         pos = _position()
-        assert rm.check_atr_trailing_stop(pos, {"price": 90.0, "atr_14": 0.0}, 100.0) is False
+        assert rm.check_atr_trailing_stop(pos, {"price": 90.0, "atr_14": 0.0}, 100.0, direction="long", atr_multiplier=2.0) is False
 
 
 # ---------------------------------------------------------------------------
@@ -834,3 +843,250 @@ class TestShortEntryValidation:
         )
         assert not ok
         assert "concurrent" in msg.lower()
+
+
+# ===========================================================================
+# Direction-aware override signals
+# ===========================================================================
+
+def _short_position(symbol: str = "TSLA", stop_loss: float = 0.0) -> Position:
+    return Position(
+        symbol=symbol,
+        shares=10.0,
+        avg_cost=250.0,
+        entry_date="2026-03-10",
+        intention=TradeIntention(direction="short", strategy="momentum",
+                                 exit_targets=ExitTargets(stop_loss=stop_loss)),
+        position_id=f"pos_{symbol}",
+    )
+
+
+class TestDirectionAwareOverrides:
+    """check_* methods invert signal semantics for short positions."""
+
+    # --- check_vwap_crossover ---
+
+    def test_vwap_crossover_long_fires_below(self):
+        rm = _rm()
+        pos = _position()
+        indicators = {"vwap_position": "below", "volume_ratio": 2.0}
+        assert rm.check_vwap_crossover(pos, indicators, direction="long", volume_threshold=1.3) is True
+
+    def test_vwap_crossover_long_does_not_fire_above(self):
+        rm = _rm()
+        pos = _position()
+        indicators = {"vwap_position": "above", "volume_ratio": 2.0}
+        assert rm.check_vwap_crossover(pos, indicators, direction="long", volume_threshold=1.3) is False
+
+    def test_vwap_crossover_short_fires_above(self):
+        rm = _rm()
+        pos = _short_position()
+        indicators = {"vwap_position": "above", "volume_ratio": 2.0}
+        assert rm.check_vwap_crossover(pos, indicators, direction="short", volume_threshold=1.3) is True
+
+    def test_vwap_crossover_short_does_not_fire_below(self):
+        rm = _rm()
+        pos = _short_position()
+        indicators = {"vwap_position": "below", "volume_ratio": 2.0}
+        assert rm.check_vwap_crossover(pos, indicators, direction="short", volume_threshold=1.3) is False
+
+    def test_vwap_crossover_custom_threshold_respected(self):
+        rm = _rm()
+        pos = _short_position()
+        # volume_ratio=1.6, threshold=1.5 → fires
+        assert rm.check_vwap_crossover(pos, {"vwap_position": "above", "volume_ratio": 1.6},
+                                        direction="short", volume_threshold=1.5) is True
+        # volume_ratio=1.4, threshold=1.5 → does not fire
+        assert rm.check_vwap_crossover(pos, {"vwap_position": "above", "volume_ratio": 1.4},
+                                        direction="short", volume_threshold=1.5) is False
+
+    # --- check_roc_deceleration ---
+
+    def test_roc_deceleration_long_uses_roc_deceleration_flag(self):
+        rm = _rm()
+        pos = _position()
+        assert rm.check_roc_deceleration(pos, {"roc_deceleration": True}, direction="long") is True
+        assert rm.check_roc_deceleration(pos, {"roc_negative_deceleration": True}, direction="long") is False
+
+    def test_roc_deceleration_short_uses_roc_negative_deceleration_flag(self):
+        rm = _rm()
+        pos = _short_position()
+        assert rm.check_roc_deceleration(pos, {"roc_negative_deceleration": True}, direction="short") is True
+        assert rm.check_roc_deceleration(pos, {"roc_deceleration": True}, direction="short") is False
+
+    # --- check_rsi_divergence ---
+
+    def test_rsi_divergence_long_fires_on_bearish(self):
+        rm = _rm()
+        pos = _position()
+        assert rm.check_rsi_divergence(pos, {"rsi_divergence": "bearish"}, direction="long") is True
+        assert rm.check_rsi_divergence(pos, {"rsi_divergence": "bullish"}, direction="long") is False
+
+    def test_rsi_divergence_short_fires_on_bullish(self):
+        rm = _rm()
+        pos = _short_position()
+        assert rm.check_rsi_divergence(pos, {"rsi_divergence": "bullish"}, direction="short") is True
+        assert rm.check_rsi_divergence(pos, {"rsi_divergence": "bearish"}, direction="short") is False
+
+    # --- check_momentum_score_flip ---
+
+    def test_momentum_flip_long_fires_positive_to_negative(self):
+        rm = _rm()
+        pos = _position()
+        rm.check_momentum_score_flip(pos, {"roc_5": 5.0, "volume_ratio": 1.5}, direction="long")
+        assert rm.check_momentum_score_flip(pos, {"roc_5": -1.0, "volume_ratio": 1.0}, direction="long") is True
+
+    def test_momentum_flip_short_fires_negative_to_positive(self):
+        rm = _rm()
+        pos = _short_position()
+        rm.check_momentum_score_flip(pos, {"roc_5": -3.0, "volume_ratio": 1.5}, direction="short")
+        assert rm.check_momentum_score_flip(pos, {"roc_5": 1.0, "volume_ratio": 1.0}, direction="short") is True
+
+    def test_momentum_flip_long_does_not_fire_negative_to_positive(self):
+        rm = _rm()
+        pos = _position()
+        rm.check_momentum_score_flip(pos, {"roc_5": -3.0, "volume_ratio": 1.5}, direction="long")
+        assert rm.check_momentum_score_flip(pos, {"roc_5": 1.0, "volume_ratio": 1.0}, direction="long") is False
+
+    def test_momentum_flip_short_does_not_fire_positive_to_negative(self):
+        rm = _rm()
+        pos = _short_position()
+        rm.check_momentum_score_flip(pos, {"roc_5": 5.0, "volume_ratio": 1.5}, direction="short")
+        assert rm.check_momentum_score_flip(pos, {"roc_5": -1.0, "volume_ratio": 1.0}, direction="short") is False
+
+    # --- check_atr_trailing_stop ---
+
+    def test_atr_trailing_long_uses_intraday_high(self):
+        rm = _rm()
+        pos = _position()
+        # intraday_high=100, price=90, atr=4. drop=10 > 2×4=8 → trigger
+        assert rm.check_atr_trailing_stop(pos, {"price": 90.0, "atr_14": 4.0}, 100.0,
+                                           direction="long", atr_multiplier=2.0) is True
+
+    def test_atr_trailing_short_uses_intraday_low(self):
+        rm = _rm()
+        pos = _short_position()
+        # intraday_low=100, price=110, atr=4. rise=10 > 2×4=8 → trigger
+        assert rm.check_atr_trailing_stop(pos, {"price": 110.0, "atr_14": 4.0}, 100.0,
+                                           direction="short", atr_multiplier=2.0) is True
+
+    def test_atr_trailing_short_does_not_fire_when_price_below_low(self):
+        rm = _rm()
+        pos = _short_position()
+        # intraday_low=100, price=95 → price FELL below low (short still working)
+        assert rm.check_atr_trailing_stop(pos, {"price": 95.0, "atr_14": 4.0}, 100.0,
+                                           direction="short", atr_multiplier=2.0) is False
+
+    def test_atr_trailing_wider_multiplier_does_not_fire(self):
+        rm = _rm()
+        pos = _short_position()
+        # intraday_low=100, price=107, atr=4. rise=7 < 3×4=12 → no trigger
+        assert rm.check_atr_trailing_stop(pos, {"price": 107.0, "atr_14": 4.0}, 100.0,
+                                           direction="short", atr_multiplier=3.0) is False
+
+    # --- check_hard_stop ---
+
+    def test_hard_stop_fires_for_short_at_stop_loss(self):
+        rm = _rm()
+        pos = _short_position(stop_loss=265.0)
+        assert rm.check_hard_stop(pos, {"price": 266.0}) is True
+
+    def test_hard_stop_does_not_fire_for_short_below_stop(self):
+        rm = _rm()
+        pos = _short_position(stop_loss=265.0)
+        assert rm.check_hard_stop(pos, {"price": 260.0}) is False
+
+    def test_hard_stop_does_not_fire_for_long_position(self):
+        rm = _rm()
+        pos = _position()  # long
+        # Long positions have stop_loss managed by broker limit orders
+        assert rm.check_hard_stop(pos, {"price": 200.0}) is False
+
+    def test_hard_stop_no_fire_when_stop_loss_is_zero(self):
+        rm = _rm()
+        pos = _short_position(stop_loss=0.0)
+        assert rm.check_hard_stop(pos, {"price": 200.0}) is False
+
+    # --- evaluate_overrides with direction kwarg ---
+
+    def test_evaluate_overrides_short_direction_vwap_fires_above(self):
+        rm = _rm()
+        pos = _short_position()
+        indicators = {
+            "vwap_position": "above",  # short: above VWAP = adverse
+            "volume_ratio": 2.0,
+            "rsi_divergence": False,
+            "roc_deceleration": False,
+            "roc_negative_deceleration": False,
+            "roc_5": -1.0,
+            "price": 255.0,
+            "atr_14": 100.0,  # large ATR → ATR trail won't fire
+        }
+        should_exit, signals = rm.evaluate_overrides(
+            pos, indicators, 240.0,  # intraday_low for short
+            direction="short",
+            atr_multiplier=2.0,
+            vwap_volume_threshold=1.3,
+        )
+        assert should_exit
+        assert "vwap_crossover" in signals
+
+    def test_evaluate_overrides_allow_signals_empty_fires_nothing(self):
+        # swing short: allow_signals=frozenset() → no signal exits, even hard stop excluded
+        rm = _rm()
+        pos = _short_position()
+        indicators = {
+            "vwap_position": "above",
+            "volume_ratio": 2.0,
+            "rsi_divergence": "bullish",
+            "roc_negative_deceleration": True,
+            "roc_5": 1.0,
+            "price": 255.0,
+            "atr_14": 1.0,
+        }
+        should_exit, signals = rm.evaluate_overrides(
+            pos, indicators, 240.0,
+            allow_signals=frozenset(),
+            direction="short",
+            atr_multiplier=2.0,
+            vwap_volume_threshold=1.3,
+        )
+        assert not should_exit
+        assert signals == []
+
+    def test_evaluate_overrides_per_strategy_atr_multiplier_respected(self):
+        rm = _rm()
+        pos = _position()
+        # intraday_high=100, price=90, atr=4: drop=10
+        # With multiplier=2.0: 10 > 8 → fires. With multiplier=3.0: 10 < 12 → no fire.
+        indicators = {
+            "vwap_position": "above", "volume_ratio": 0.8,
+            "rsi_divergence": False, "roc_deceleration": False,
+            "roc_5": 0.5, "price": 90.0, "atr_14": 4.0,
+        }
+        should_exit_narrow, _ = rm.evaluate_overrides(
+            pos, indicators, 100.0, direction="long", atr_multiplier=2.0, vwap_volume_threshold=1.3
+        )
+        should_exit_wide, _ = rm.evaluate_overrides(
+            pos, indicators, 100.0, direction="long", atr_multiplier=3.0, vwap_volume_threshold=1.3
+        )
+        assert should_exit_narrow is True
+        assert should_exit_wide is False
+
+    def test_evaluate_overrides_per_strategy_vwap_threshold_respected(self):
+        rm = _rm()
+        pos = _position()
+        # volume_ratio=1.4: > 1.3 threshold fires; < 1.5 threshold does not
+        indicators = {
+            "vwap_position": "below", "volume_ratio": 1.4,
+            "rsi_divergence": False, "roc_deceleration": False,
+            "roc_5": 0.5, "price": 105.0, "atr_14": 100.0,
+        }
+        should_exit_low, _ = rm.evaluate_overrides(
+            pos, indicators, 108.0, direction="long", atr_multiplier=2.0, vwap_volume_threshold=1.3
+        )
+        should_exit_high, _ = rm.evaluate_overrides(
+            pos, indicators, 108.0, direction="long", atr_multiplier=2.0, vwap_volume_threshold=1.5
+        )
+        assert should_exit_low is True
+        assert should_exit_high is False
