@@ -59,6 +59,7 @@ class SchedulerConfig:
     bypass_market_hours: bool = False                # when True, skip all market-hours gates (loop guards, dead zone, session check); for off-hours testing only
     disable_conservative_mode: bool = False          # when True, skip conservative startup mode; use after manually closing broker positions that triggered reconciliation errors
     bars_cache_ttl_sec: int = 110                    # yfinance bars cache TTL; must be < medium_loop_sec to ensure fresh bars every cycle (medium_loop_sec=120)
+    yfinance_fetch_stagger_max_sec: float = 0.5      # max random sleep (seconds) before each cache-miss fetch; spreads burst of parallel requests to avoid rate limits
     max_entry_defer_cycles: int = 5                  # drop a deferred opportunity after this many consecutive entry_conditions misses; prevents indefinite deferral on stale Claude thesis
     max_filter_rejection_cycles: int = 3             # suppress a symbol for the rest of the session after it fails hard filters this many times; stops Claude re-proposing RVOL/volume failures every cycle
     position_profit_trigger_pct: float = 0.015       # fire a Claude position review when unrealised gain exceeds this fraction of avg_cost; re-arms each time gain grows by another interval
@@ -72,6 +73,7 @@ class SchedulerConfig:
     macro_rsi_panic_threshold: int = 25              # SPY RSI ≤ this fires market_rsi_extreme:panic trigger (market selloff)
     macro_rsi_euphoria_threshold: int = 72           # SPY RSI ≥ this fires market_rsi_extreme:euphoria trigger (overheating)
     macro_rsi_rearm_band: int = 5                    # RSI must recover by this many points before the extreme trigger can re-fire
+    watchlist_refresh_interval_min: int = 120        # proactive watchlist rebuild interval (minutes); 0 disables watchlist_stale trigger
 
 
 @dataclass
@@ -104,6 +106,7 @@ class ClaudeConfig:
     recent_executions_count: int = 5
     # Phase 15: minimum trades required before compute_session_stats returns non-empty stats
     execution_stats_min_trades: int = 3
+    min_call_interval_sec: float = 3.0   # minimum seconds between successive Claude API calls; proactively prevents RPM rate-limit hits from burst of position reviews or thesis challenges
     # Phase 17 — adaptive reasoning cache TTL (minutes) by market regime
     cache_max_age_default_min: int = 60    # normal market conditions
     cache_max_age_stressed_min: int = 20   # SPY RSI in stress zone (≤ cache_stress_rsi_low)

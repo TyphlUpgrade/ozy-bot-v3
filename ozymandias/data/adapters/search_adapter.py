@@ -63,7 +63,6 @@ class SearchAdapter:
             url,
             headers={
                 "Accept": "application/json",
-                "Accept-Encoding": "gzip",
                 "X-Subscription-Token": self._api_key,
             },
         )

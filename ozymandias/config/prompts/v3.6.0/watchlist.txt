@@ -27,15 +27,22 @@ Select high-volatility, high-liquidity equities suitable for momentum and swing 
 - Recent catalysts or strong technical setups
 - Mix of momentum candidates (days timeframe) and swing candidates (weeks timeframe)
 
+NO-ENTRY SYMBOLS (never add these — they cannot be traded):
+{no_entry_symbols}
+These are used as macro-context monitors by the system and are already tracked automatically.
+Adding them wastes watchlist slots that could hold actual trade candidates.
+
 TIER ASSIGNMENT RULES (strictly enforced):
 - priority_tier 1: Individual equity trade candidates ONLY. Max 12 symbols. These receive full
   Claude analysis every cycle. Reserve for your highest-conviction individual stock setups with
   clear catalysts, strong technicals, and specific entry theses.
-- priority_tier 2: Broad market ETFs (SPY, QQQ, IWM, DIA), sector ETFs (XLK, XLF, XLE, etc.),
-  and backup/lower-conviction individual names. Max 28 symbols. These are monitored for context
-  or as secondary candidates if tier 1 slots are exhausted.
+- priority_tier 2: Sector ETFs (XLK, XLF, XLE, XLI, XLB, XLP, etc.) and backup/lower-conviction
+  individual names. Max 28 symbols. Sector ETFs here are monitored as context; individual names
+  are secondary candidates if tier 1 slots are exhausted.
 
-Do NOT put broad market or sector ETFs in tier 1 — they belong in tier 2 as market-context monitors.
+Do NOT add any symbol from the NO-ENTRY list above — broad-market ETFs and volatility products in
+  that list are already tracked as market context and cannot be entered as trades.
+Do NOT put sector ETFs or broad-market ETFs in tier 1 — they belong in tier 2 at most.
 Do NOT add non-tradeable index tickers (VIX, VXN, SPX, NDX, RUT, DJI, COMP, or any caret-prefixed ^symbol).
   Indices cannot be ordered on Alpaca. Use tradeable proxies instead (e.g. UVXY or VIXY for volatility).
 Do NOT repeat symbols already in the current watchlist unless you are re-tiering them.

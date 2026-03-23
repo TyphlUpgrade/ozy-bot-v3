@@ -26,13 +26,17 @@ pip install -r requirements.txt
 {
   "api_key": "YOUR_ALPACA_API_KEY_ID",
   "secret_key": "YOUR_ALPACA_SECRET_KEY",
-  "anthropic_api_key": "YOUR_ANTHROPIC_API_KEY"
+  "anthropic_api_key": "YOUR_ANTHROPIC_API_KEY",
+  "gemini_api_key": "YOUR_GEMINI_API_KEY",
+  "brave_search_api_key": "YOUR_BRAVE_SEARCH_API_KEY"
 }
 ```
 
 - `api_key` — Alpaca API Key ID (found under Paper Trading → API Keys at alpaca.markets)
 - `secret_key` — Alpaca Secret Key (shown once at creation time)
 - `anthropic_api_key` — Anthropic API key (console.anthropic.com → API Keys)
+- `gemini_api_key` — Google Gemini API key (aistudio.google.com → API Keys). Optional — enables Claude fallback to Gemini if Claude becomes unavailable.
+- `brave_search_api_key` — Brave Search API key (api.search.brave.com → API Keys). Optional — omit to disable web search at watchlist build time.
 
 **Do not rename these fields.** The loader checks exact key names. The file must be valid JSON with no trailing commas.
 

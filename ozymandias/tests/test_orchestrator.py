@@ -261,6 +261,8 @@ class TestCheckTriggers:
         orch._trigger_state.last_override_exit_count = 0
         orch._override_exit_count = 0
         orch._latest_indicators = {}
+        # Suppress watchlist_stale: set last build to very recent so elapsed < interval.
+        orch._trigger_state.last_watchlist_build_utc = quiet_now - timedelta(minutes=10)
         # Sync last_session to actual current session so the transition trigger doesn't fire.
         orch._trigger_state.last_session = get_current_session().value
         triggers = await orch._check_triggers(now=quiet_now)

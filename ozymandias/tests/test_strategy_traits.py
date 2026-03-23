@@ -94,11 +94,13 @@ class TestMomentumEntryGate:
         assert passed is False
         assert "below VWAP" in reason
 
-    def test_rejects_short_with_price_above_vwap(self):
+    def test_short_above_vwap_passes_gate(self):
+        """Shorts are not VWAP-gated at the strategy level — mean-reversion fades above
+        VWAP are valid; Claude controls the VWAP relationship via entry_conditions."""
         strat = _momentum()
         passed, reason = strat.apply_entry_gate("sell_short", _signals(vwap_position="above", volume_ratio=1.5))
-        assert passed is False
-        assert "above VWAP" in reason
+        assert passed is True
+        assert reason == ""
 
     def test_passes_long_with_price_above_vwap(self):
         strat = _momentum()
@@ -166,22 +168,16 @@ class TestMomentumEntryGate:
         assert passed is False
         assert "below VWAP" in reason
 
-    def test_reclaim_short_passes_with_bearish_macd_and_high_rvol(self):
-        """Symmetric: above-VWAP short passes when MACD bearish-equivalent + high RVOL."""
-        # For shorts: wrong side = "above", reclaim exception needs bearish MACD.
-        # Current implementation checks is_bullish_macd for both directions — shorts
-        # above VWAP with bullish MACD would NOT get the reclaim exception (correct:
-        # that's a breakout long setup, not a short reclaim).
-        # Shorts above VWAP with bearish MACD should still be rejected by the gate
-        # since _MOMENTUM_WRONG_VWAP maps sell_short → "above".
+    def test_short_above_vwap_passes_regardless_of_macd(self):
+        """Shorts are not VWAP-gated, so above-VWAP shorts pass the strategy gate
+        regardless of MACD direction. The reclaim exception is long-only."""
         strat = _momentum()
-        passed, reason = strat.apply_entry_gate(
-            "sell_short",
-            _signals(vwap_position="above", volume_ratio=2.5, macd_signal="bearish"),
-        )
-        # bearish MACD is NOT in ("bullish", "bullish_cross") → no reclaim exception fires
-        assert passed is False
-        assert "above VWAP" in reason
+        for macd in ("bearish", "bullish", "bullish_cross", "neutral"):
+            passed, reason = strat.apply_entry_gate(
+                "sell_short",
+                _signals(vwap_position="above", volume_ratio=2.5, macd_signal=macd),
+            )
+            assert passed is True, f"expected pass with macd={macd!r}, got reason={reason!r}"
 
     def test_reclaim_threshold_configurable(self):
         """vwap_reclaim_min_rvol is tunable — higher threshold requires more volume."""

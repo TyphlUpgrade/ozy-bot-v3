@@ -625,12 +625,12 @@ class TestShortDirectionFilters:
 
     # --- Momentum VWAP gate ---
 
-    def test_momentum_short_price_above_vwap_rejected(self):
-        """Short entry with price above VWAP is the wrong side — reject."""
+    def test_momentum_short_price_above_vwap_passes_gate(self):
+        """Short above VWAP is no longer hard-rejected — mean-reversion fades are valid.
+        Claude controls VWAP relationship via entry_conditions."""
         opp = _short_opportunity(strategy="momentum")
-        passes, reason = self._filter(opp, _signals_with("TSLA", vwap_position="above"))
-        assert passes is False
-        assert "above VWAP" in reason
+        passes, _ = self._filter(opp, _signals_with("TSLA", vwap_position="above"))
+        assert passes is True
 
     def test_momentum_short_price_below_vwap_passes(self):
         """Short entry with price below VWAP is the correct side — pass."""

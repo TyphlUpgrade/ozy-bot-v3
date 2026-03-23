@@ -152,26 +152,31 @@ class UniverseFetcher:
 
     @staticmethod
     def _fetch_index_constituents() -> list[str]:
-        """Synchronous Wikipedia table fetch — called via asyncio.to_thread."""
+        """Synchronous Wikipedia table fetch — called via asyncio.to_thread.
+
+        Fetches HTML manually with a browser User-Agent (Wikipedia 403s Python's
+        default urllib agent) then passes the content to pd.read_html as a StringIO
+        so no URL request is made internally by pandas.
+        """
+        import io
         import pandas as pd
+        _HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ozymandias-bot/3.0)"}
         seen: set[str] = set()
         result: list[str] = []
-        try:
-            sp500_tables = pd.read_html(_SP500_URL, attrs={"id": "constituents"})
-            for sym in sp500_tables[0]["Symbol"].tolist():
-                s = str(sym).strip().upper()
-                if s and s not in seen:
-                    seen.add(s)
-                    result.append(s)
-        except Exception as exc:
-            log.warning("Source B: S&P 500 fetch failed — %s", exc)
-        try:
-            ndx_tables = pd.read_html(_NDX100_URL, attrs={"id": "constituents"})
-            for sym in ndx_tables[0]["Ticker"].tolist():
-                s = str(sym).strip().upper()
-                if s and s not in seen:
-                    seen.add(s)
-                    result.append(s)
-        except Exception as exc:
-            log.warning("Source B: Nasdaq-100 fetch failed — %s", exc)
+        for url, ticker_col, label in [
+            (_SP500_URL,  "Symbol", "S&P 500"),
+            (_NDX100_URL, "Ticker", "Nasdaq-100"),
+        ]:
+            try:
+                req = urllib.request.Request(url, headers=_HEADERS)
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    html = resp.read().decode("utf-8", errors="replace")
+                tables = pd.read_html(io.StringIO(html), attrs={"id": "constituents"})
+                for sym in tables[0][ticker_col].tolist():
+                    s = str(sym).strip().upper()
+                    if s and s not in seen:
+                        seen.add(s)
+                        result.append(s)
+            except Exception as exc:
+                log.warning("Source B: %s fetch failed — %s", label, exc)
         return result

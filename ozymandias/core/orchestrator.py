@@ -189,6 +189,10 @@ class SlowLoopTriggerState:
     # Once fired, the trigger cannot re-fire until RSI recovers by macro_rsi_rearm_band points.
     rsi_extreme_fired_low: bool = False    # True after panic trigger fires; cleared when RSI recovers above threshold + band
     rsi_extreme_fired_high: bool = False   # True after euphoria trigger fires; cleared when RSI falls below threshold - band
+    # watchlist_stale trigger: UTC timestamp of the last completed watchlist build.
+    # None at startup → elapsed = ∞ → watchlist_stale fires on the first slow loop tick.
+    # Reset after every successful build (both watchlist_small and watchlist_stale paths).
+    last_watchlist_build_utc: Optional[datetime] = None
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +339,14 @@ class Orchestrator:
         # In-memory only — no state file persistence; cleared on restart (acceptable).
         self._recommendation_outcomes: dict[str, dict] = {}
 
+        # Consecutive Claude soft-rejection tracker.
+        # symbol → number of consecutive cycles Claude placed it in rejected_opportunities.
+        # Reset to 0 when Claude enters the symbol or it is absent from the reasoning window.
+        # Never cleared on restart (session-scoped, so restarts are acceptable).
+        # To add a new tracking dimension: add a parallel dict here and update
+        # _run_claude_cycle after run_reasoning_cycle returns.
+        self._claude_soft_rejections: dict[str, int] = {}
+
         # Symbols suppressed for this session after repeatedly failing hard filters.
         # Maps symbol → rejection reason. Populated by the medium loop when a symbol
         # reaches max_filter_rejection_cycles consecutive ranker rejections. Cleared
@@ -478,7 +490,8 @@ class Orchestrator:
 
         # -- Market data adapter ----------------------------------------------
         self._data_adapter = YFinanceAdapter(
-            bars_ttl=self._config.scheduler.bars_cache_ttl_sec
+            bars_ttl=self._config.scheduler.bars_cache_ttl_sec,
+            fetch_stagger_max_sec=self._config.scheduler.yfinance_fetch_stagger_max_sec,
         )
 
         # -- Claude reasoning engine ------------------------------------------
@@ -1850,7 +1863,13 @@ class Orchestrator:
 
         async def _fetch_one(sym: str):
             async with semaphore:
-                df = await self._data_adapter.fetch_bars(sym, interval="5m", period="5d")
+                try:
+                    df = await self._data_adapter.fetch_bars(sym, interval="5m", period="5d")
+                except Exception:
+                    # fetch_bars already logged the failure with the symbol name;
+                    # swallow here so asyncio.gather never returns an Exception item
+                    # and the orchestrator doesn't double-log without context.
+                    return sym, None, None
                 if df is None or df.empty:
                     log.warning("Medium loop: no bars returned for %s", sym)
                     return sym, None, None
@@ -1863,7 +1882,9 @@ class Orchestrator:
         )
         for item in fetch_results:
             if isinstance(item, Exception):
-                log.warning("Medium loop: TA failed: %s", item)
+                # Should not happen — _fetch_one catches internally — but kept as
+                # a safety net in case a future refactor re-introduces propagation.
+                log.warning("Medium loop: unexpected TA error: %s", item)
                 continue
             sym, df, summary = item
             if summary is None:
@@ -2844,6 +2865,27 @@ class Orchestrator:
             triggers.append("watchlist_small")
             log.debug("Trigger: watchlist_small FIRED  size=%d", len(watchlist.entries))
 
+        # 6b. Watchlist stale — periodic proactive refresh.
+        # Fires when enough time has elapsed since the last watchlist build (both
+        # watchlist_small and watchlist_stale paths update last_watchlist_build_utc).
+        # interval_min = 0 disables this trigger entirely (no overhead).
+        # To add a new time-based watchlist trigger: add an entry here and route it
+        # through is_watchlist_build in _run_claude_cycle.
+        interval_min = self._config.scheduler.watchlist_refresh_interval_min
+        if interval_min > 0:
+            last_build = ts.last_watchlist_build_utc
+            elapsed_min = (
+                (now - last_build).total_seconds() / 60
+                if last_build is not None
+                else float("inf")  # never built → fire immediately on first tick
+            )
+            if elapsed_min >= interval_min:
+                triggers.append("watchlist_stale")
+                log.debug(
+                    "Trigger: watchlist_stale FIRED  elapsed_min=%.1f  interval=%d",
+                    elapsed_min, interval_min,
+                )
+
         # 7. Indicators seeded for the first time — fire once after the first medium
         #    loop cycle so Claude always has real TA data on its first call.
         if not ts.indicators_seeded and self._all_indicators:
@@ -3133,8 +3175,10 @@ class Orchestrator:
         # fired, the build runs first and then reasoning continues with the
         # freshly-updated watchlist.
         triggers_list = [t for t in trigger_name.split("|") if t]
-        is_watchlist_build = "watchlist_small" in triggers_list
-        other_triggers = [t for t in triggers_list if t != "watchlist_small"]
+        # Both watchlist_small and watchlist_stale route through the same build path.
+        # To add another watchlist-build trigger: add it to this condition and to _check_triggers.
+        is_watchlist_build = "watchlist_small" in triggers_list or "watchlist_stale" in triggers_list
+        other_triggers = [t for t in triggers_list if t not in ("watchlist_small", "watchlist_stale")]
 
         if is_watchlist_build:
             # Universe scan (with session cache)
@@ -3160,9 +3204,12 @@ class Orchestrator:
                 else:
                     log.debug("Universe scan: cache still fresh (%.1f min old)", cache_age_min)
 
+            # Derive trigger name for logging (may be watchlist_small, watchlist_stale, or both)
+            wl_build_triggers = [t for t in triggers_list if t in ("watchlist_small", "watchlist_stale")]
             log.info(
-                "Slow loop: running watchlist build [trigger=watchlist_small]  "
+                "Slow loop: running watchlist build [trigger=%s]  "
                 "candidates=%d  search=%s",
+                "|".join(wl_build_triggers),
                 len(self._last_universe_scan),
                 "enabled" if (self._search_adapter and self._search_adapter.enabled) else "disabled",
             )
@@ -3172,6 +3219,7 @@ class Orchestrator:
                     current_watchlist=watchlist,
                     candidates=self._last_universe_scan or None,
                     search_adapter=self._search_adapter,
+                    no_entry_symbols=self._config.ranker.no_entry_symbols,
                 )
                 if wl_result is not None:
                     open_symbols = {p.symbol for p in portfolio.positions}
@@ -3184,6 +3232,10 @@ class Orchestrator:
                     )
                     # Reload so subsequent reasoning call sees the updated watchlist
                     watchlist = await self._state_manager.load_watchlist()
+                # Stamp the build timestamp regardless of result — even a failed/empty build
+                # should reset the cooldown so watchlist_stale doesn't re-fire every tick.
+                self._trigger_state.last_watchlist_build_utc = datetime.now(timezone.utc)
+                log.debug("Watchlist build complete — last_watchlist_build_utc updated")
             except Exception as exc:
                 log.error("Watchlist build failed: %s", exc, exc_info=True)
 
@@ -3227,6 +3279,7 @@ class Orchestrator:
                 recent_executions=recent_executions,
                 execution_stats=execution_stats,
                 session_suppressed=self._filter_suppressed,
+                claude_soft_rejections=self._claude_soft_rejections,
             )
         except Exception as exc:
             self._handle_claude_failure(exc)
@@ -3241,6 +3294,17 @@ class Orchestrator:
         self._degradation.claude_backoff_until_utc = None
         self._trigger_state.last_claude_call_utc = datetime.now(timezone.utc)
         self._trigger_state.last_override_exit_count = self._override_exit_count
+
+        # Update consecutive soft-rejection counts.
+        # A symbol is penalised each cycle it appears in rejected_opportunities.
+        # Reset when Claude enters it or it was absent from the reasoning window.
+        rejected_syms = {r["symbol"] for r in (result.rejected_opportunities or []) if r.get("symbol")}
+        for entry in watchlist.entries:
+            sym = entry.symbol
+            if sym in rejected_syms:
+                self._claude_soft_rejections[sym] = self._claude_soft_rejections.get(sym, 0) + 1
+            else:
+                self._claude_soft_rejections.pop(sym, None)
         # Phase 17 (Fix 2): snapshot prices anchored to this call for macro/sector move triggers.
         for sym, ind in self._all_indicators.items():
             price = ind.get("price") or ind.get("signals", {}).get("price")

@@ -33,6 +33,7 @@
     "market_order_conviction_threshold": 0.80,
     "min_hold_before_override_min": 5,
     "bars_cache_ttl_sec": 110,
+    "yfinance_fetch_stagger_max_sec": 0.5,
     "max_entry_defer_cycles": 5,
     "position_profit_trigger_pct": 0.015,
     "medium_loop_scan_concurrency": 10,
@@ -42,9 +43,11 @@
     "sector_exposure_threshold_factor": 0.7,
     "macro_rsi_panic_threshold": 25,
     "macro_rsi_euphoria_threshold": 72,
-    "macro_rsi_rearm_band": 5
+    "macro_rsi_rearm_band": 5,
+    "watchlist_refresh_interval_min": 120
   },
   "claude": {
+    "min_call_interval_sec": 3.0,
     "model": "claude-sonnet-4-20250514",
     "max_tokens_per_cycle": 4096,
     "prompt_version": "v3.6.0",

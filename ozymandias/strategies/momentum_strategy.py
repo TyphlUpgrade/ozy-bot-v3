@@ -4,8 +4,13 @@ strategies/momentum_strategy.py
 Short-term momentum strategy.  Targets stocks with strong directional moves
 confirmed by technical indicators.  Holds for hours to a few days.
 
-Entry philosophy: price breaking out above VWAP with rising volume, RSI with
-room to run, and MACD confirming bullish direction.
+Entry philosophy (longs): price breaking out above VWAP with rising volume,
+RSI with room to run, and MACD confirming bullish direction.
+Entry philosophy (shorts): two valid setups — (1) breakdown: price below VWAP
+with bearish momentum confirming trend continuation; (2) mean-reversion fade:
+price extended above VWAP with deteriorating internals, fading back to the
+mean.  Claude selects the VWAP relationship via entry_conditions; the strategy
+gate does not enforce a VWAP direction for shorts.
 Exit philosophy: exit on momentum exhaustion — never let a winner become a
 loser.  Hard stop on VWAP breakdown; forced exit before end-of-day if no
 swing hold thesis.
@@ -38,11 +43,13 @@ _FALLBACK_STOP_PCT = 0.05   # 5% below entry
 _FALLBACK_TARGET_PCT = 0.10  # 10% above entry
 
 # Entry gate: maps action → the VWAP position value that disqualifies the entry.
-# Longs need price above VWAP; shorts need price below VWAP.
+# Longs only: price must be above VWAP.
+# Shorts are NOT gated here — two valid short setups exist (breakdown: below VWAP;
+# mean-reversion fade: above VWAP), and Claude selects the intended relationship
+# via entry_conditions (require_below_vwap / require_above_vwap).
 # To support a new action type, add one entry here; gate logic is unchanged.
 _MOMENTUM_WRONG_VWAP: dict[str, str] = {
-    "buy":        "below",   # longs need price above VWAP
-    "sell_short": "above",   # shorts need price below VWAP
+    "buy": "below",  # longs need price above VWAP
 }
 
 
@@ -129,9 +136,12 @@ class MomentumStrategy(Strategy):
         Three gates evaluated in order:
 
         1. RVOL floor — no volume participation means no momentum.
-        2. VWAP position — longs need price above VWAP; shorts below.
-           VWAP reclaim exception: bullish MACD + high RVOL bypasses the gate
-           for accumulation-before-reclaim long setups.
+        2. VWAP position — longs only: price must be above VWAP.
+           VWAP reclaim exception (longs only): bullish MACD + high RVOL
+           bypasses the gate for accumulation-before-reclaim setups.
+           Shorts are not VWAP-gated here; Claude controls the intended VWAP
+           relationship via entry_conditions (require_below_vwap for breakdown
+           shorts; require_above_vwap for mean-reversion fades above VWAP).
         3. RSI slope-aware gate (direction-aware three-zone logic):
            Longs:  normal [rsi_entry_min, rsi_entry_max] passes; extended
                    (rsi_entry_max, rsi_max_absolute] requires slope ≥
@@ -153,14 +163,17 @@ class MomentumStrategy(Strategy):
         if self._p("require_vwap_gate"):
             wrong_vwap = _MOMENTUM_WRONG_VWAP.get(action)
             if wrong_vwap and signals.get("vwap_position", "") == wrong_vwap:
-                # VWAP reclaim exception: bullish MACD divergence + elevated RVOL
-                # signals accumulation; price is expected to reclaim VWAP imminently.
-                reclaim_rvol = self._p("vwap_reclaim_min_rvol")
-                macd = signals.get("macd_signal", "")
-                is_bullish_macd = macd in ("bullish", "bullish_cross")
-                rvol_qualifies = rvol is not None and reclaim_rvol > 0 and rvol >= reclaim_rvol
-                if is_bullish_macd and rvol_qualifies:
-                    return True, ""
+                # VWAP reclaim exception (longs only): bullish MACD divergence +
+                # elevated RVOL signals accumulation before price reclaims VWAP.
+                # Shorts are not in _MOMENTUM_WRONG_VWAP, so this block only fires
+                # for buys — the action == "buy" guard makes that dependency explicit.
+                if action == "buy":
+                    reclaim_rvol = self._p("vwap_reclaim_min_rvol")
+                    macd = signals.get("macd_signal", "")
+                    is_bullish_macd = macd in ("bullish", "bullish_cross")
+                    rvol_qualifies = rvol is not None and reclaim_rvol > 0 and rvol >= reclaim_rvol
+                    if is_bullish_macd and rvol_qualifies:
+                        return True, ""
                 return False, f"momentum {action} rejected — price {wrong_vwap} VWAP"
 
         # RSI slope-aware gate — direction-aware.

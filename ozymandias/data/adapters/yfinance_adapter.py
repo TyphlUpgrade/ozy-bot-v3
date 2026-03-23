@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -57,11 +58,13 @@ class YFinanceAdapter(DataAdapter):
         bars_ttl: int = 300,
         fundamentals_ttl: int = 3600,
         news_ttl: int = 900,
+        fetch_stagger_max_sec: float = 0.5,  # max random sleep before each cache-miss fetch; spreads burst of parallel requests
     ) -> None:
         self._quote_ttl = quote_ttl
         self._bars_ttl = bars_ttl
         self._fundamentals_ttl = fundamentals_ttl
         self._news_ttl = news_ttl  # 15 min default — news freshness degrades slowly
+        self._fetch_stagger_max_sec = fetch_stagger_max_sec
         self._cache: dict[str, _CacheEntry] = {}
 
     # ------------------------------------------------------------------
@@ -75,6 +78,12 @@ class YFinanceAdapter(DataAdapter):
         if cached is not None:
             log.debug("Cache hit: bars %s %s %s", symbol, interval, period)
             return cached
+
+        # Stagger concurrent cache-miss requests so parallel coroutines don't all
+        # hit yfinance at the exact same instant.  Each caller sleeps a random
+        # fraction of fetch_stagger_max_sec before issuing its request.
+        if self._fetch_stagger_max_sec > 0:
+            await asyncio.sleep(random.uniform(0, self._fetch_stagger_max_sec))
 
         log.debug("Fetching bars: %s interval=%s period=%s", symbol, interval, period)
         try:
@@ -314,7 +323,10 @@ class YFinanceAdapter(DataAdapter):
         return entry.data
 
     def _set_cache(self, key: str, data: Any, ttl: int) -> None:
+        # Add up to 15% random jitter so symbols cached in the same burst expire
+        # at different times, preventing synchronized stampede on the next cycle.
+        jitter = random.uniform(0.0, ttl * 0.15)
         self._cache[key] = _CacheEntry(
             data=data,
-            expires_at=time.monotonic() + ttl,
+            expires_at=time.monotonic() + ttl + jitter,
         )

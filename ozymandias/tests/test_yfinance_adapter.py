@@ -266,8 +266,8 @@ class TestCaching:
         await adapter.fetch_quote('AAPL')
         assert mock_ticker_cls.call_count == 1
 
-        # Advance time past TTL
-        mock_mono.return_value = 31.0
+        # Advance time past TTL + max jitter (ttl * 1.15 + margin)
+        mock_mono.return_value = 36.0
 
         # Second call after TTL should hit the source again
         await adapter.fetch_quote('AAPL')

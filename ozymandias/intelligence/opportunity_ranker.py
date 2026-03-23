@@ -613,9 +613,13 @@ class OpportunityRanker:
             )
 
         scored.sort(key=lambda s: s.composite_score, reverse=True)
+        # Count only symbols that entered the filter pipeline (suppressed/vetoed symbols
+        # are skipped via `continue` before scored/rejections are touched, so they must
+        # not inflate this count — "1 candidates, 0 passed, 0 rejected" was misleading).
+        evaluated = len(scored) + len(rejections)
         logger.info(
             "rank_opportunities: %d candidates, %d passed filters, %d rejected",
-            len(reasoning_result.new_opportunities),
+            evaluated,
             len(scored),
             len(rejections),
         )
