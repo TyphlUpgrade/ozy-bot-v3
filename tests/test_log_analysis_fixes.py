@@ -243,6 +243,8 @@ class TestOverrideExitTrigger:
         orch._degradation.claude_available = True
         orch._degradation.claude_backoff_until_utc = None
         orch._latest_indicators = {}
+        orch._all_indicators = {}
+        orch._market_context_indicators = {}
         orch._state_manager = MagicMock()
         orch._state_manager.load_watchlist = AsyncMock(return_value=WatchlistState(entries=[]))
         orch._state_manager.load_portfolio = AsyncMock(return_value=PortfolioState())

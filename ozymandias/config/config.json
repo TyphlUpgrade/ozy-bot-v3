@@ -47,7 +47,7 @@
   "claude": {
     "model": "claude-sonnet-4-20250514",
     "max_tokens_per_cycle": 4096,
-    "prompt_version": "v3.5.0",
+    "prompt_version": "v3.6.0",
     "tier1_max_symbols": 12,
     "tier2_max_symbols": 28,
     "news_max_age_hours": 168,
@@ -120,6 +120,18 @@
         "override_vwap_volume_threshold": 1.5
       }
     }
+  },
+  "universe_scanner": {
+    "enabled": true,
+    "scan_concurrency": 20,
+    "max_candidates": 50,
+    "min_rvol_for_candidate": 0.8,
+    "cache_ttl_min": 60
+  },
+  "search": {
+    "enabled": true,
+    "max_searches_per_build": 3,
+    "result_count_per_query": 5
   },
   "timezone": "America/New_York"
 }

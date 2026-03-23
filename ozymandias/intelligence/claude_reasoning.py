@@ -803,29 +803,263 @@ class ClaudeReasoningEngine:
         )
         return result
 
+    # ------------------------------------------------------------------
+    # Tool-use call (used by watchlist build with web search)
+    # ------------------------------------------------------------------
+
+    # Web search tool definition — offered to Claude during watchlist builds
+    # when Brave Search is configured.  Claude uses 2–3 queries to surface
+    # near-term catalysts not visible in the screener candidates.
+    # Extension point: to add a second tool, append another dict here and
+    # handle it in the tool_executor passed to call_claude_with_tools.
+    _WEB_SEARCH_TOOL: dict = {
+        "name": "web_search",
+        "description": (
+            "Search the web for current financial news, earnings calendars, analyst "
+            "actions, and market catalysts. Use 2–3 targeted queries per watchlist "
+            "build. Focus on near-term catalysts: earnings this week, analyst upgrades, "
+            "sector rotation, breakout setups with news backing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The search query string."}
+            },
+            "required": ["query"],
+        },
+    }
+
+    async def call_claude_with_tools(
+        self,
+        prompt_template: str,
+        context: dict,
+        tools: list[dict],
+        tool_executor,   # Callable[[str, dict], Awaitable[str]]
+        max_tokens_override: int | None = None,
+        max_tool_rounds: int = 3,
+    ) -> str:
+        """
+        Multi-turn Claude call with tool use support.
+
+        Fills the prompt template, then runs a conversation loop:
+          1. Call Claude with tools offered.
+          2. If stop_reason == "tool_use": execute each tool_use block and
+             append results, then continue the loop.
+          3. If stop_reason != "tool_use" (i.e. "end_turn" or "max_tokens"):
+             extract and return the text from the final content block.
+          4. If max_tool_rounds exhausted: force a final call without tools
+             to get a text response.
+
+        All retry/circuit-breaker logic from call_claude applies (529, 5xx,
+        RateLimitError). Gemini fallback is used on the forced final call if
+        the circuit is open.
+
+        The caller does not need to know tool use happened — the method always
+        returns a plain text string.
+        """
+        from typing import Callable, Awaitable
+
+        missing: list[str] = []
+
+        def _sub(m: re.Match) -> str:
+            key = m.group(1)
+            if key in context:
+                return str(context[key])
+            missing.append(key)
+            return m.group(0)
+
+        prompt = re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", _sub, prompt_template)
+        if missing:
+            raise ValueError(f"Prompt template missing placeholder key(s): {missing}")
+
+        max_tokens = max_tokens_override or self._claude_cfg.max_tokens_per_cycle
+        messages = [{"role": "user", "content": prompt}]
+
+        for round_num in range(max_tool_rounds):
+            response = await self._call_claude_raw(messages, max_tokens, tools=tools)
+            # Extract text blocks and tool_use blocks from response
+            if response.stop_reason != "tool_use":
+                # Done — extract text from last content block
+                for block in reversed(response.content):
+                    if hasattr(block, "text"):
+                        return block.text
+                return ""  # no text block (shouldn't happen)
+
+            # Process tool calls and append results
+            assistant_content = response.content
+            tool_results = []
+            for block in assistant_content:
+                if block.type != "tool_use":
+                    continue
+                try:
+                    tool_output = await tool_executor(block.name, block.input)
+                except Exception as exc:
+                    log.warning("Tool executor error for %r — %s", block.name, exc)
+                    tool_output = f"Tool error: {exc}"
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": tool_output,
+                })
+
+            messages.append({"role": "assistant", "content": assistant_content})
+            messages.append({"role": "user", "content": tool_results})
+
+        # Rounds exhausted — force a final response without tools
+        log.warning(
+            "call_claude_with_tools: tool use rounds exhausted (%d) — "
+            "forcing final response without tools",
+            max_tool_rounds,
+        )
+        response = await self._call_claude_raw(
+            messages, max_tokens, tools=[], tool_choice={"type": "none"}
+        )
+        for block in reversed(response.content):
+            if hasattr(block, "text"):
+                return block.text
+        return ""
+
+    async def _call_claude_raw(self, messages: list, max_tokens: int, tools: list | None = None, tool_choice: dict | None = None):
+        """
+        Low-level Claude API call with full retry/fallback logic.
+        Shared by call_claude (single-turn) and call_claude_with_tools (multi-turn).
+        Returns the raw Anthropic response object.
+        """
+        fb = self._cfg.ai_fallback
+
+        circuit_broken = (
+            fb.enabled
+            and self._overload_fallback_count >= fb.circuit_breaker_threshold
+        )
+        if circuit_broken:
+            probe_interval = fb.circuit_breaker_probe_min * 60
+            since = time.monotonic() - (self._circuit_broken_since or 0)
+            if since >= probe_interval:
+                circuit_broken = False
+            else:
+                raise RuntimeError(
+                    f"Claude circuit breaker active — {self._overload_fallback_count} consecutive "
+                    f"overload fallbacks. Tool-use calls cannot fall back to Gemini."
+                )
+
+        overload_attempt = 0
+        server_attempt = 0
+        kwargs: dict = {"model": self._claude_cfg.model, "max_tokens": max_tokens, "messages": messages}
+        if tools is not None:
+            kwargs["tools"] = tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+
+        while True:
+            try:
+                t0 = time.monotonic()
+                response = await asyncio.wait_for(
+                    self._client.messages.create(**kwargs),
+                    timeout=120.0,
+                )
+                elapsed = time.monotonic() - t0
+                if elapsed > 60:
+                    log.warning("Claude API call (tools) took %.1fs", elapsed)
+                self._last_input_tokens = response.usage.input_tokens
+                self._last_output_tokens = response.usage.output_tokens
+                if self._overload_fallback_count > 0:
+                    self._overload_fallback_count = 0
+                    self._circuit_broken_since = None
+                return response
+
+            except asyncio.TimeoutError:
+                log.error("Claude API call (tools) timed out after 120s")
+                raise
+
+            except anthropic.RateLimitError as exc:
+                delay = min(fb.server_error_base_sec * (2 ** server_attempt), fb.server_error_max_sec)
+                log.warning("Claude rate limit (tools, attempt %d), retrying in %.0fs: %s", server_attempt + 1, delay, exc)
+                await asyncio.sleep(delay)
+                server_attempt += 1
+
+            except anthropic.APIStatusError as exc:
+                if exc.status_code < 500:
+                    log.error("Claude API client error %d (tools): %s", exc.status_code, exc)
+                    raise
+                if exc.status_code == 529:
+                    if overload_attempt < fb.overload_retries:
+                        delay = min(fb.overload_base_sec * (2 ** overload_attempt), fb.overload_max_sec)
+                        log.warning("Claude overloaded (tools, 529) attempt %d/%d, retrying %.0fs", overload_attempt + 1, fb.overload_retries, delay)
+                        await asyncio.sleep(delay)
+                        overload_attempt += 1
+                    else:
+                        self._overload_fallback_count += 1
+                        if self._circuit_broken_since is None:
+                            self._circuit_broken_since = time.monotonic()
+                        log.error("Claude overloaded (tools) after %d retries — raising (no Gemini fallback for tool calls)", fb.overload_retries)
+                        raise
+                else:
+                    delay = min(fb.server_error_base_sec * (2 ** server_attempt), fb.server_error_max_sec)
+                    log.warning("Claude server error %d (tools, attempt %d), retrying %.0fs", exc.status_code, server_attempt + 1, delay)
+                    await asyncio.sleep(delay)
+                    server_attempt += 1
+
     async def run_watchlist_build(
         self,
         market_context: dict,
         current_watchlist: WatchlistState,
         target_count: int = 20,
+        candidates: list[dict] | None = None,
+        search_adapter=None,   # SearchAdapter | None
     ) -> Optional[WatchlistResult]:
         """
         Dedicated watchlist population cycle. Called on startup or when the
         watchlist has fewer than 10 tickers.
+
+        Args:
+            candidates:     RVOL-ranked candidate list from UniverseScanner.
+                            Serialized as JSON in the {candidates} template slot.
+                            Pass None (or empty list) to fall back to the original
+                            prompt behaviour (no screener data).
+            search_adapter: SearchAdapter instance. When enabled, Claude is offered
+                            the web_search tool so it can research catalysts live.
+                            When None or disabled, behaves identically to pre-Phase-18.
 
         Returns None if parsing fails.
         """
         current_symbols = [e.symbol for e in current_watchlist.entries]
         watchlist_str = ", ".join(current_symbols) if current_symbols else "none"
         market_ctx_str = json.dumps(market_context, default=str, indent=2)
+        candidates_str = json.dumps(candidates, indent=2) if candidates else "none"
 
-        template = self._load_prompt("watchlist.txt")
-        raw_text = await self.call_claude(template, {
+        ctx = {
             "current_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
             "market_context": market_ctx_str,
             "current_watchlist": watchlist_str,
             "target_count": target_count,
-        })
+            "candidates": candidates_str,
+        }
+
+        template = self._load_prompt("watchlist.txt")
+
+        # Use tool-use path when Brave Search is configured; otherwise plain call.
+        if search_adapter is not None and getattr(search_adapter, "enabled", False):
+            async def _execute_search_tool(name: str, inputs: dict) -> str:
+                if name != "web_search":
+                    return "Unknown tool."
+                results = await search_adapter.search(
+                    inputs.get("query", ""),
+                    n_results=self._cfg.search.result_count_per_query,
+                )
+                if not results:
+                    return "No results returned."
+                return "\n\n".join(
+                    f"{r['title']}\n{r.get('description', '')}" for r in results
+                )
+
+            raw_text = await self.call_claude_with_tools(
+                template, ctx,
+                tools=[self._WEB_SEARCH_TOOL],
+                tool_executor=_execute_search_tool,
+                max_tool_rounds=self._cfg.search.max_searches_per_build,
+            )
+        else:
+            raw_text = await self.call_claude(template, ctx)
 
         parsed = parse_claude_response(raw_text)
         if parsed is None:

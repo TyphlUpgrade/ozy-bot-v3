@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -40,12 +41,14 @@ from ozymandias.execution.broker_interface import BrokerInterface, Order
 from ozymandias.execution.fill_protection import FillProtectionManager
 from ozymandias.execution.pdt_guard import PDTGuard
 from ozymandias.execution.risk_manager import RiskManager
+from ozymandias.data.adapters.search_adapter import SearchAdapter
 from ozymandias.intelligence.claude_reasoning import (
     ClaudeReasoningEngine,
     ReasoningResult,
     _result_from_raw_reasoning,
 )
 from ozymandias.intelligence.opportunity_ranker import OpportunityRanker, RankResult, evaluate_entry_conditions
+from ozymandias.intelligence.universe_scanner import UniverseScanner
 from ozymandias.intelligence.technical_analysis import compute_composite_score, generate_signal_summary
 from ozymandias.strategies.base_strategy import Strategy, get_strategy
 
@@ -341,6 +344,14 @@ class Orchestrator:
         # _recommendation_outcomes and let the threshold check here handle suppression.
         self._filter_suppressed: dict[str, str] = {}
 
+        # Phase 18: Universe scanner + search adapter (instantiated in _startup)
+        self._universe_scanner: Optional[UniverseScanner] = None
+        self._search_adapter: Optional[SearchAdapter] = None
+        # Session cache for universe scan results — avoids re-scanning on every
+        # watchlist_small trigger within the same session.
+        self._last_universe_scan: list[dict] = []
+        self._last_universe_scan_time: float = 0.0
+
         # Shutdown flag — set by _shutdown(), checked by loops
         self._stopping = False
 
@@ -474,6 +485,16 @@ class Orchestrator:
         self._claude = ClaudeReasoningEngine(
             config=self._config,
             cache=self._reasoning_cache,
+        )
+
+        # -- Universe scanner + search adapter (Phase 18) ---------------------
+        self._universe_scanner = UniverseScanner(
+            data_adapter=self._data_adapter,
+            config=self._config.universe_scanner,
+            no_entry_symbols=list(self._config.ranker.no_entry_symbols),
+        )
+        self._search_adapter = SearchAdapter(
+            api_key=os.environ.get("BRAVE_SEARCH_API_KEY")
         )
 
         # -- Opportunity ranker -----------------------------------------------
@@ -3104,6 +3125,79 @@ class Orchestrator:
 
         self._latest_market_context = market_data  # store for medium loop thesis challenge
 
+        # -- Phase 18: watchlist_small → dedicated build cycle ----------------
+        # When watchlist_small fires, run the universe scanner and a focused
+        # watchlist build (with live RVOL candidates + optional Brave Search).
+        # If watchlist_small is the only trigger, apply results and return early
+        # (skipping the heavier run_reasoning_cycle). If other triggers also
+        # fired, the build runs first and then reasoning continues with the
+        # freshly-updated watchlist.
+        triggers_list = [t for t in trigger_name.split("|") if t]
+        is_watchlist_build = "watchlist_small" in triggers_list
+        other_triggers = [t for t in triggers_list if t != "watchlist_small"]
+
+        if is_watchlist_build:
+            # Universe scan (with session cache)
+            if self._config.universe_scanner.enabled and self._universe_scanner is not None:
+                cache_age_min = (time.monotonic() - self._last_universe_scan_time) / 60
+                if cache_age_min > self._config.universe_scanner.cache_ttl_min or not self._last_universe_scan:
+                    existing_symbols = {e.symbol for e in watchlist.entries}
+                    blacklist_symbols = set(self._config.ranker.no_entry_symbols)
+                    try:
+                        self._last_universe_scan = await self._universe_scanner.get_top_candidates(
+                            n=self._config.universe_scanner.max_candidates,
+                            exclude=existing_symbols,
+                            blacklist=blacklist_symbols,
+                        )
+                        self._last_universe_scan_time = time.monotonic()
+                        log.info(
+                            "Universe scan: %d candidates (top RVOL: %s)",
+                            len(self._last_universe_scan),
+                            [c["symbol"] for c in self._last_universe_scan[:5]],
+                        )
+                    except Exception as exc:
+                        log.warning("Universe scan failed — proceeding without candidates: %s", exc)
+                else:
+                    log.debug("Universe scan: cache still fresh (%.1f min old)", cache_age_min)
+
+            log.info(
+                "Slow loop: running watchlist build [trigger=watchlist_small]  "
+                "candidates=%d  search=%s",
+                len(self._last_universe_scan),
+                "enabled" if (self._search_adapter and self._search_adapter.enabled) else "disabled",
+            )
+            try:
+                wl_result = await self._claude.run_watchlist_build(
+                    market_context=market_data,
+                    current_watchlist=watchlist,
+                    candidates=self._last_universe_scan or None,
+                    search_adapter=self._search_adapter,
+                )
+                if wl_result is not None:
+                    open_symbols = {p.symbol for p in portfolio.positions}
+                    await self._apply_watchlist_changes(
+                        watchlist, wl_result.watchlist, [], open_symbols
+                    )
+                    log.info(
+                        "Slow loop: watchlist build complete — %d suggestions applied",
+                        len(wl_result.watchlist),
+                    )
+                    # Reload so subsequent reasoning call sees the updated watchlist
+                    watchlist = await self._state_manager.load_watchlist()
+            except Exception as exc:
+                log.error("Watchlist build failed: %s", exc, exc_info=True)
+
+            if not other_triggers:
+                # Watchlist build was the only trigger — update prices and return.
+                # Do NOT set last_claude_call_utc (watchlist build is not a reasoning call;
+                # the time-ceiling trigger should still fire normally).
+                await self._update_trigger_prices()
+                return
+
+            # Other triggers also fired — continue with run_reasoning_cycle below,
+            # using the refreshed watchlist.
+            trigger_name = "|".join(other_triggers)
+
         log.info(
             "Slow loop: calling Claude reasoning [trigger=%s]  "
             "positions=%d  watchlist=%d  session=%s",
@@ -3641,6 +3735,14 @@ class Orchestrator:
             log.debug("GEMINI_API_KEY set from credentials file")
         elif os.environ.get("GEMINI_API_KEY"):
             log.debug("GEMINI_API_KEY already set in environment — credentials file value ignored")
+
+        # Inject Brave Search key into env if present and not already set externally
+        brave_key = creds.get("brave_search_api_key")
+        if brave_key and not os.environ.get("BRAVE_SEARCH_API_KEY"):
+            os.environ["BRAVE_SEARCH_API_KEY"] = brave_key
+            log.debug("BRAVE_SEARCH_API_KEY set from credentials file")
+        elif os.environ.get("BRAVE_SEARCH_API_KEY"):
+            log.debug("BRAVE_SEARCH_API_KEY already set in environment — credentials file value ignored")
 
         api_key = creds.get("api_key") or creds.get("APCA_API_KEY_ID")
         secret_key = creds.get("secret_key") or creds.get("APCA_API_SECRET_KEY")

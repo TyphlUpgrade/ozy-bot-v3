@@ -143,6 +143,24 @@ class RankerConfig:
 
 
 @dataclass
+class UniverseScannerConfig:
+    enabled: bool = True
+    scan_concurrency: int = 20          # parallel yfinance fetches for universe scan;
+                                        # intentionally higher than medium_loop_scan_concurrency (10)
+                                        # — universe scan covers 75+ symbols and is less latency-sensitive
+    max_candidates: int = 50            # top N by RVOL sent to Claude
+    min_rvol_for_candidate: float = 0.8 # drop stale/inactive symbols below this RVOL
+    cache_ttl_min: int = 60             # reuse scan result within same session without re-scanning
+
+
+@dataclass
+class SearchConfig:
+    enabled: bool = True
+    max_searches_per_build: int = 3     # cap on tool_use rounds per watchlist build call
+    result_count_per_query: int = 5     # results returned per Brave Search query
+
+
+@dataclass
 class StrategyConfig:
     active_strategies: list[str] = field(default_factory=lambda: ["momentum", "swing"])  # must match keys in get_strategy() registry
     strategy_params: dict[str, dict] = field(default_factory=dict)
@@ -160,6 +178,8 @@ class Config:
     ai_fallback: AIFallbackConfig = field(default_factory=AIFallbackConfig)
     ranker: RankerConfig = field(default_factory=RankerConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    universe_scanner: UniverseScannerConfig = field(default_factory=UniverseScannerConfig)
+    search: SearchConfig = field(default_factory=SearchConfig)
     timezone: str = "America/New_York"  # used by market hours logic; all internal timestamps remain UTC
 
     # Path to the config directory (set by loader)

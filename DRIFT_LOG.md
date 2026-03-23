@@ -867,3 +867,42 @@ Read the relevant phase section before modifying or debugging any module built i
 
 **Dead `== "sell_short"` fallback removed** · *(cleanup)* · `core/orchestrator.py` + `execution/risk_manager.py`
 - **Impl:** Two residual legacy checks (`_is_short_dir = _pos_is_short or direction == "sell_short"` style) removed. Direction normalization on load makes these dead.
+
+---
+
+## Phase 18 — Watchlist Intelligence (2026-03-23)
+
+**Dynamic universe pipeline** · *(new feature)* · `intelligence/universe_fetcher.py` (new) + `intelligence/universe_scanner.py` (new)
+- **Spec:** `phases/18_watchlist_intelligence.md`
+- **Impl:** `UniverseFetcher` merges Source A (Yahoo Finance screener: `most_actives` 50 + `day_gainers` 25) and Source B (S&P 500 + Nasdaq 100 from Wikipedia, 24h cache). `UniverseScanner` fetches bars + runs TA in parallel (semaphore-bounded), filters by `bars_available < 5` and `min_rvol_for_candidate`, sorts by RVOL descending, enriches top symbols with news + earnings calendar, returns top `n` candidates.
+- **Candidate dict schema:** `{symbol, rvol, technical_summary, composite_score, price, recent_news, earnings_within_days}`
+- **Config:** `universe_scanner` section — `enabled`, `scan_concurrency=20`, `max_candidates=50`, `min_rvol_for_candidate=0.8`, `cache_ttl_min=60`
+
+**`SearchAdapter`** · *(new feature)* · `data/adapters/search_adapter.py` (new)
+- **Spec:** `phases/18_watchlist_intelligence.md`
+- **Impl:** Wraps Brave Search API. `enabled` = `bool(api_key)`. All failures return `[]`. `_fetch` uses `urllib.request`. Credentials injected via `BRAVE_SEARCH_API_KEY` from credentials file in `_load_credentials`.
+- **Config:** `search` section — `max_searches_per_build=3`, `result_count_per_query=5`
+
+**`call_claude_with_tools` + `_call_claude_raw`** · *(new feature)* · `intelligence/claude_reasoning.py`
+- **Spec:** `phases/18_watchlist_intelligence.md`
+- **Impl:** `call_claude_with_tools(prompt_template, context, tools, tool_executor, max_tool_rounds=3)` — multi-turn loop. On `tool_use` stop: calls `tool_executor(tool_name, tool_input)`, appends result, loops. Exhausted rounds → forced final call with `tool_choice={"type": "none"}`. `_call_claude_raw` is an internal helper with full 529/5xx/RateLimitError retry logic returning raw response (no Gemini fallback for tool calls).
+- **`_WEB_SEARCH_TOOL`:** Class variable with Brave Search tool definition.
+
+**`run_watchlist_build` updated** · *(interface change)* · `intelligence/claude_reasoning.py`
+- **Spec:** *(extended beyond spec)*
+- **Impl:** Added `candidates: list[dict] | None` and `search_adapter` parameters. Routes to `call_claude_with_tools` when `search_adapter.enabled`, else `call_claude`. `{candidates}` added to context dict.
+
+**Orchestrator Phase 18 wiring** · *(new feature)* · `core/orchestrator.py`
+- **Impl:** `UniverseScanner` + `SearchAdapter` instantiated in `_startup`. Added `_last_universe_scan: list[dict]` + `_last_universe_scan_time: float` for session-level cache. In `_run_claude_cycle`: when `watchlist_small` is in triggers, runs universe scan (respects `cache_ttl_min`), calls `run_watchlist_build` with candidates + search adapter, applies results. If `watchlist_small` is the sole trigger, returns early without calling `run_reasoning_cycle` or updating `last_claude_call_utc`.
+
+**Prompt version bump** · *(new version)* · `config/prompts/v3.6.0/watchlist.txt` (new)
+- **Impl:** Copied from `v3.5.0`, added `{candidates}` slot and instructions for using screener data and `web_search` tool at watchlist build time.
+
+**`scripts/reset_watchlist.py`** · *(new feature)* · `scripts/reset_watchlist.py` (new)
+- **Spec:** `phases/18_watchlist_intelligence.md`
+- **Impl:** CLI tool. Positional SYMBOL args or `--empty` flag; `--tier`, `--strategy`, `--dry-run` options. Uses `StateManager` for atomic writes and schema validation. Prints current and new watchlist; warns about `watchlist_small` trigger when emptying.
+
+**`pytest.ini` testpaths updated** · *(build fix)*
+- **Fix:** Added `tests` to `testpaths` (was `ozymandias/tests` only). Phase 18 tests live in root `tests/`.
+
+**Test count:** 1077 (up from 978 — 99 new tests across 4 new test files)
