@@ -176,9 +176,15 @@ class RiskManager:
         if not hours_ok:
             return False, hours_msg
 
-        # 6. PDT day-trade check — only when closing a position opened today AND
-        # equity is below the PDT threshold. Above $25,500 the broker permits
-        # unlimited day trades regardless of PDT designation.
+        # 6. PDT day-trade check — guards against opening a second position on a
+        # symbol that already has a position open today (which, when closed same-day,
+        # would count as two round-trips on the same symbol in one session).
+        # NOTE: closing orders do NOT go through validate_entry; the pdt_buffer
+        # reserves one slot for exits so they are never blocked. This check only
+        # fires for the edge case of re-entering a symbol same-day — which the
+        # recently_closed guard normally prevents.
+        # NOTE: side == "sell" covers long closes only; short closes (side="buy")
+        # are not reachable here anyway since exits bypass validate_entry.
         if account.equity < self._cfg.min_equity_for_trading:
             today_et = now.astimezone(ET).date()
             opened_today = any(

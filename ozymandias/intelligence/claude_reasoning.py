@@ -274,6 +274,7 @@ class ClaudeReasoningEngine:
         recommendation_outcomes: dict | None = None,
         recent_executions: list | None = None,
         execution_stats: dict | None = None,
+        session_suppressed: dict[str, str] | None = None,
     ) -> dict:
         """
         Build the structured input context sent to Claude each cycle.
@@ -468,6 +469,7 @@ class ClaudeReasoningEngine:
             }
             recent_executions_context.append(exec_entry)
 
+        _suppressed = session_suppressed or {}
         context: dict[str, Any] = {
             "portfolio": {
                 "cash": portfolio.cash,
@@ -479,6 +481,9 @@ class ClaudeReasoningEngine:
             "recommendation_outcomes": outcomes_list,
             "recent_executions": recent_executions_context,
             "execution_stats": execution_stats or {},
+            "session_suppressed": [
+                {"symbol": s, "reason": r} for s, r in _suppressed.items()
+            ],
         }
 
         # --- Token guard: trim watchlist until context fits within budget ---
@@ -736,6 +741,7 @@ class ClaudeReasoningEngine:
         recommendation_outcomes: dict | None = None,
         recent_executions: list | None = None,
         execution_stats: dict | None = None,
+        session_suppressed: dict[str, str] | None = None,
     ) -> Optional[ReasoningResult]:
         """
         Full reasoning cycle: check cache → assemble context → call Claude
@@ -761,6 +767,7 @@ class ClaudeReasoningEngine:
             recommendation_outcomes=recommendation_outcomes,
             recent_executions=recent_executions,
             execution_stats=execution_stats,
+            session_suppressed=session_suppressed,
         )
         context_json = json.dumps(context, default=str, indent=2)
         template = self._load_prompt("reasoning.txt")

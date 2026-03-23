@@ -60,6 +60,7 @@ class SchedulerConfig:
     disable_conservative_mode: bool = False          # when True, skip conservative startup mode; use after manually closing broker positions that triggered reconciliation errors
     bars_cache_ttl_sec: int = 110                    # yfinance bars cache TTL; must be < medium_loop_sec to ensure fresh bars every cycle (medium_loop_sec=120)
     max_entry_defer_cycles: int = 5                  # drop a deferred opportunity after this many consecutive entry_conditions misses; prevents indefinite deferral on stale Claude thesis
+    max_filter_rejection_cycles: int = 3             # suppress a symbol for the rest of the session after it fails hard filters this many times; stops Claude re-proposing RVOL/volume failures every cycle
     position_profit_trigger_pct: float = 0.015       # fire a Claude position review when unrealised gain exceeds this fraction of avg_cost; re-arms each time gain grows by another interval
     # Phase 17 — parallel medium loop fetch
     medium_loop_scan_concurrency: int = 10           # max concurrent yfinance + TA worker tasks in the medium loop; balances throughput vs rate-limit pressure

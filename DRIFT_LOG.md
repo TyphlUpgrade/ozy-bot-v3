@@ -842,3 +842,28 @@ Read the relevant phase section before modifying or debugging any module built i
 - **Spec:** *(not defined)*
 - **Impl:** Hard stop exits now tag `"hard_stop"` instead of `"short_protection"`. Signal-triggered short exits tag `"quant_override"` (same as longs). Old hint `"short_protection"` no longer emitted.
 - **Why:** More specific hint; separates hard stop (priority 1, no gates) from signal exits (evaluated through allow_signals path).
+
+---
+
+## Post-Phase-17 Bug Fixes & Hardening (2026-03-23)
+
+**`_apply_position_reviews` stale-portfolio race condition** · *(bug fix)* · `core/orchestrator.py`
+- **Bug:** `_apply_position_reviews` received `portfolio` loaded at slow-loop cycle start (before the ~39s Claude API call). Concurrent medium-loop cash-sync saves overwrote disk state, so review adjustments (stop/target updates, notes) were silently lost.
+- **Fix:** Removed `portfolio` parameter from `_apply_position_reviews`. Method now loads a fresh portfolio snapshot internally before applying changes. Call site updated.
+- **Tests:** Updated all test call sites to drop the `portfolio` argument; 3 tests that used in-memory `PortfolioState` without persisting to disk were fixed to use `_set_portfolio`.
+
+**Direction normalization for legacy `"sell_short"` states** · *(bug fix)* · `core/state_manager.py`
+- **Bug:** `_from_dict_position` deserialized `intention.direction` verbatim. State files written before Phase 12 stored `"sell_short"`. `is_short()` only matches `"short"`, so un-normalized values broke hard stop, ATR direction tracking, and P&L.
+- **Fix:** Added normalization: `"sell_short"` → `"short"` on load. All other values pass through unchanged.
+- **Tests:** Added `test_load_portfolio_normalises_sell_short_direction` regression test.
+
+**Session-level filter suppression** · *(new feature)* · `core/orchestrator.py` + `intelligence/opportunity_ranker.py` + `intelligence/claude_reasoning.py` + `core/config.py`
+- **Spec:** *(not defined)*
+- **Impl:** `_filter_suppressed: dict[str, str]` on orchestrator. After a symbol fails hard filters `max_filter_rejection_cycles` consecutive times (default 3), it is added to `_filter_suppressed` with the rejection reason. Suppressed symbols are:
+  1. Skipped before the ranker runs (pre-filter in `rank_opportunities`)
+  2. Passed as `session_suppressed` context to Claude each cycle so Claude stops nominating them
+- **Config:** `scheduler.max_filter_rejection_cycles: int = 3` (already present from Phase 17 — now consumed by this path too)
+- **Why:** Phase 15's `rejection_count` context relied on Claude self-correcting; mechanical gate needed to stop re-nomination of RVOL/volume failures every cycle (e.g., AAPL, JPM).
+
+**Dead `== "sell_short"` fallback removed** · *(cleanup)* · `core/orchestrator.py` + `execution/risk_manager.py`
+- **Impl:** Two residual legacy checks (`_is_short_dir = _pos_is_short or direction == "sell_short"` style) removed. Direction normalization on load makes these dead.

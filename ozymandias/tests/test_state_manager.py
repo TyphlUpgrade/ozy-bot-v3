@@ -323,3 +323,53 @@ async def test_save_stamps_last_updated(sm: StateManager):
     await sm.save_portfolio(state)
     saved = await sm.load_portfolio()
     assert saved.last_updated != ""
+
+
+# ---------------------------------------------------------------------------
+# Legacy "sell_short" direction normalisation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_load_portfolio_normalises_sell_short_direction(sm: StateManager, tmp_path: Path):
+    """Pre-Phase-12 state files stored 'sell_short' in intention.direction.
+    _from_dict_position must normalise this to the canonical 'short' so that
+    is_short() and all direction-aware signals work correctly after a restart."""
+    await sm.initialize()
+    now_iso = "2026-01-01T00:00:00+00:00"
+    raw = {
+        "cash": 10000.0,
+        "buying_power": 10000.0,
+        "last_updated": now_iso,
+        "recently_closed": {},
+        "positions": [
+            {
+                "symbol": "NVDA",
+                "shares": 5.0,
+                "avg_cost": 800.0,
+                "entry_date": now_iso,
+                "intention": {
+                    "direction": "sell_short",   # legacy pre-Phase-12 value
+                    "strategy": "momentum",
+                    "reasoning": "",
+                    "catalyst": "",
+                    "expected_move": "",
+                    "exit_targets": {"profit_target": 750.0, "stop_loss": 820.0},
+                    "max_expected_loss": 0.0,
+                    "entry_date": "",
+                    "review_notes": [],
+                    "entry_signals": {},
+                    "entry_conviction": 0.0,
+                    "entry_score": 0.0,
+                },
+                "order_history": [],
+                "position_id": "",
+                "reconciled": False,
+            }
+        ],
+    }
+    import json as _json
+    sm.portfolio_path.write_text(_json.dumps(raw))
+    portfolio = await sm.load_portfolio()
+    assert portfolio.positions[0].intention.direction == "short", (
+        "Legacy 'sell_short' must be normalised to canonical 'short' at load time"
+    )

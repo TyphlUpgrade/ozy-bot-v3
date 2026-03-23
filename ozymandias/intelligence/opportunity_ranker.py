@@ -498,7 +498,9 @@ class OpportunityRanker:
 
         # 6. (PDT check removed — a new entry is never a day trade by itself.
         #     The day trade occurs only when the position is closed same-day.
-        #     PDT gating happens in validate_entry at close time.)
+        #     NOTE: exit paths bypass validate_entry, so PDT enforcement for closes
+        #     is not currently implemented; the emergency buffer reserves 1 slot
+        #     for exits as the safety net. See risk_manager.validate_entry step 6.)
 
         # 7. Average daily dollar volume (shares × price).
         # Expressed in dollars so the floor is meaningful across all price ranges —
@@ -534,19 +536,21 @@ class OpportunityRanker:
         market_hours_fn=None,
         orders: list | None = None,
         strategy_lookup: dict | None = None,
+        suppressed_symbols: dict[str, str] | None = None,
     ) -> RankResult:
         """
         Full ranking pipeline:
         1. Extract candidates from Claude's reasoning output.
-        2. Drop any whose strategy is in session_veto.
-        3. Apply hard filters.
-        4. Score remaining candidates.
-        5. Sort by composite score descending.
+        2. Drop session-suppressed symbols (repeated hard-filter failures).
+        3. Drop any whose strategy is in session_veto.
+        4. Apply hard filters.
+        5. Score remaining candidates.
+        6. Sort by composite score descending.
 
         Returns RankResult with .candidates (scored/sorted) and .rejections
         (list of (symbol, reason) tuples for all hard-filter rejections).
-        Session-veto skips are NOT included in rejections — only hard-filter
-        failures that reach apply_hard_filters are recorded.
+        Session-veto and suppressed-symbol skips are NOT included in rejections —
+        only hard-filter failures that reach apply_hard_filters are recorded.
 
         Parameters
         ----------
@@ -555,7 +559,12 @@ class OpportunityRanker:
             :func:`~ozymandias.core.market_hours.is_market_open`.
         orders:
             Order list forwarded to the PDT guard.
+        suppressed_symbols:
+            symbol → rejection_reason dict of symbols suppressed for this session
+            after exceeding max_filter_rejection_cycles. Checked before hard filters.
+            To add a new suppression source: populate this dict in the orchestrator.
         """
+        _suppressed = suppressed_symbols or {}
         # session_veto contains direction strings: "long", "short", or both.
         # Filtering by direction (not strategy) lets Claude block longs without
         # killing short entries that would profit from the same bearish conditions.
@@ -565,6 +574,14 @@ class OpportunityRanker:
         rejections: list[tuple[str, str]] = []
         for opp in reasoning_result.new_opportunities:
             symbol = opp.get("symbol", "?")
+            # Session suppression: symbol has failed hard filters too many times
+            # this session — skip silently so it no longer pollutes logs or context.
+            if symbol in _suppressed:
+                logger.debug(
+                    "rank_opportunities: %s skipped — session-suppressed (%s)",
+                    symbol, _suppressed[symbol],
+                )
+                continue
             # Session veto: drop opportunities whose direction Claude has assessed
             # as structurally invalid for today's regime before scoring.
             opp_direction = direction_from_action(opp.get("action", "buy"))

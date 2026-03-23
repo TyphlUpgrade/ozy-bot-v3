@@ -332,6 +332,15 @@ class Orchestrator:
         # In-memory only — no state file persistence; cleared on restart (acceptable).
         self._recommendation_outcomes: dict[str, dict] = {}
 
+        # Symbols suppressed for this session after repeatedly failing hard filters.
+        # Maps symbol → rejection reason. Populated by the medium loop when a symbol
+        # reaches max_filter_rejection_cycles consecutive ranker rejections. Cleared
+        # on restart (session-scoped). Passed to Claude context so it stops nominating
+        # them, and checked in the medium loop to skip them before ranking.
+        # To add a new suppression reason: increment rejection_count in
+        # _recommendation_outcomes and let the threshold check here handle suppression.
+        self._filter_suppressed: dict[str, str] = {}
+
         # Shutdown flag — set by _shutdown(), checked by loops
         self._stopping = False
 
@@ -1239,9 +1248,9 @@ class Orchestrator:
     async def _journal_closed_trade(self, change, exit_reason_hint: str | None = None) -> None:
         """Write a trade journal entry and remove the position from the portfolio.
 
-        Called whenever a sell order fill is detected in the reconcile loop.
+        Called for any closing fill: sell fill (long close) or buy fill (short close).
         Captures: entry data from portfolio, exit price from broker fill, signal
-        context from _entry_contexts (populated when the buy filled).
+        context from _entry_contexts (populated when the opening fill arrived).
 
         exit_reason_hint, if provided, overrides price-inferred exit reason logic.
         Set by override/short-exit/EOD paths via _pending_exit_hints.
@@ -1963,6 +1972,7 @@ class Orchestrator:
             self._is_market_open,
             orders=orders_state.orders,
             strategy_lookup=self._strategy_lookup,
+            suppressed_symbols=self._filter_suppressed,
         )
         ranked = rank_result.candidates
 
@@ -1974,14 +1984,25 @@ class Orchestrator:
             if "already open in portfolio" in reason:
                 continue
             existing = self._recommendation_outcomes.get(symbol, {})
+            new_count = existing.get("rejection_count", 0) + 1
             self._recommendation_outcomes[symbol] = {
                 "claude_entry_target": existing.get("claude_entry_target", 0.0),
                 "attempt_time_utc": existing.get("attempt_time_utc") or datetime.now(timezone.utc).isoformat(),
                 "stage": "ranker_rejected",
                 "stage_detail": reason,
-                "rejection_count": existing.get("rejection_count", 0) + 1,
+                "rejection_count": new_count,
                 "order_id": None,
             }
+            # After max_filter_rejection_cycles consecutive hard-filter failures,
+            # suppress the symbol for the rest of the session so Claude stops
+            # re-proposing it and the ranker stops evaluating it every cycle.
+            threshold = self._config.scheduler.max_filter_rejection_cycles
+            if new_count >= threshold and symbol not in self._filter_suppressed:
+                self._filter_suppressed[symbol] = reason
+                log.warning(
+                    "Symbol %s suppressed for session — failed hard filter %d time(s): %s",
+                    symbol, new_count, reason,
+                )
 
         log.info(
             "Medium loop: ranker returned %d opportunity/ies (from %d Claude candidates)",
@@ -3111,6 +3132,7 @@ class Orchestrator:
                 recommendation_outcomes=self._recommendation_outcomes,
                 recent_executions=recent_executions,
                 execution_stats=execution_stats,
+                session_suppressed=self._filter_suppressed,
             )
         except Exception as exc:
             self._handle_claude_failure(exc)
@@ -3161,7 +3183,7 @@ class Orchestrator:
 
         # -- Apply position review notes -------------------------------------
         if result.position_reviews:
-            await self._apply_position_reviews(portfolio, result.position_reviews)
+            await self._apply_position_reviews(result.position_reviews)
 
         opp_symbols = [o.get("symbol") or o.get("ticker", "?") for o in result.new_opportunities]
         log.info(
@@ -3335,10 +3357,15 @@ class Orchestrator:
 
     async def _apply_position_reviews(
         self,
-        portfolio: "PortfolioState",
         reviews: list[dict],
     ) -> None:
-        """Append Claude's review notes and act on exit recommendations."""
+        """Append Claude's review notes and act on exit recommendations.
+
+        Always loads a fresh portfolio snapshot so stop/target adjustments are
+        not silently lost when a concurrent fast-loop or medium-loop save writes
+        the disk between the slow loop's initial load and this function's save.
+        """
+        portfolio = await self._state_manager.load_portfolio()
         now_iso = datetime.now(timezone.utc).isoformat()
         changed = False
         for review in reviews:
@@ -3406,9 +3433,9 @@ class Orchestrator:
                     # This happened with XOM when Claude raised the stop to $162 while
                     # price was $161.25, forcing an instant exit at +1.7%.
                     _cur = _review_price  # already fetched above; None if unavailable
-                    # is_short() matches "short" only; direction field may also be
-                    # "sell_short" depending on path, so check both representations.
-                    _is_short_dir = _pos_is_short or pos.intention.direction == "sell_short"
+                    # _from_dict_position normalises "sell_short" → "short" at load
+                    # time, so _pos_is_short (from is_short()) is reliable here.
+                    _is_short_dir = _pos_is_short
                     _would_trigger = (
                         _cur is not None and (
                             (not _is_short_dir and new_stop >= _cur)

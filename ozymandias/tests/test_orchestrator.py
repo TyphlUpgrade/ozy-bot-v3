@@ -845,10 +845,9 @@ class TestSlowLoopStateApplication:
             intention=TradeIntention(review_notes=[]),
         )
         await _set_portfolio(orch, [pos])
-        portfolio = await orch._state_manager.load_portfolio()
 
         reviews = [{"symbol": "AAPL", "updated_reasoning": "Thesis intact, hold."}]
-        await orch._apply_position_reviews(portfolio, reviews)
+        await orch._apply_position_reviews(reviews)
 
         saved = await orch._state_manager.load_portfolio()
         assert saved.positions[0].intention.review_notes, "No review note appended"
@@ -868,7 +867,7 @@ class TestSlowLoopStateApplication:
 
         reviews = [{"symbol": "AAPL", "updated_reasoning": "",
                     "adjusted_targets": {"profit_target": 230.0, "stop_loss": 195.0}}]
-        await orch._apply_position_reviews(portfolio, reviews)
+        await orch._apply_position_reviews(reviews)
 
         saved = await orch._state_manager.load_portfolio()
         assert saved.positions[0].intention.exit_targets.profit_target == 230.0
@@ -896,7 +895,7 @@ class TestSlowLoopStateApplication:
         orch._latest_indicators = {"AAPL": {"price": 195.0}}
         reviews = [{"symbol": "AAPL", "updated_reasoning": "",
                     "adjusted_targets": {"stop_loss": 198.0}}]
-        await orch._apply_position_reviews(portfolio, reviews)
+        await orch._apply_position_reviews(reviews)
 
         saved = await orch._state_manager.load_portfolio()
         assert saved.positions[0].intention.exit_targets.stop_loss == 185.0, (
@@ -921,7 +920,7 @@ class TestSlowLoopStateApplication:
         orch._latest_indicators = {"AAPL": {"price": 200.0}}
         reviews = [{"symbol": "AAPL", "updated_reasoning": "",
                     "adjusted_targets": {"stop_loss": 193.0}}]
-        await orch._apply_position_reviews(portfolio, reviews)
+        await orch._apply_position_reviews(reviews)
 
         saved = await orch._state_manager.load_portfolio()
         assert saved.positions[0].intention.exit_targets.stop_loss == 193.0, (
@@ -935,7 +934,7 @@ class TestSlowLoopStateApplication:
         pos = Position(
             symbol="TSLA", shares=10, avg_cost=250.0, entry_date=now_iso,
             intention=TradeIntention(
-                direction="sell_short",
+                direction="short",
                 exit_targets=ExitTargets(profit_target=220.0, stop_loss=260.0),
             ),
         )
@@ -946,7 +945,7 @@ class TestSlowLoopStateApplication:
         orch._latest_indicators = {"TSLA": {"price": 245.0}}
         reviews = [{"symbol": "TSLA", "updated_reasoning": "",
                     "adjusted_targets": {"stop_loss": 242.0}}]
-        await orch._apply_position_reviews(portfolio, reviews)
+        await orch._apply_position_reviews(reviews)
 
         saved = await orch._state_manager.load_portfolio()
         assert saved.positions[0].intention.exit_targets.stop_loss == 260.0, (
@@ -1674,7 +1673,7 @@ class TestApplyPositionReviewsExit:
 
         reviews = [{"symbol": "AAPL", "action": "exit",
                     "updated_reasoning": "Thesis invalidated — exit immediately."}]
-        await orch._apply_position_reviews(portfolio, reviews)
+        await orch._apply_position_reviews(reviews)
 
         orch._broker.place_order.assert_called_once()
         order = orch._broker.place_order.call_args[0][0]
@@ -1703,7 +1702,7 @@ class TestApplyPositionReviewsExit:
 
         reviews = [{"symbol": "AMD", "action": "exit",
                     "updated_reasoning": "Short thesis completely invalidated."}]
-        await orch._apply_position_reviews(portfolio, reviews)
+        await orch._apply_position_reviews(reviews)
 
         orch._broker.place_order.assert_called_once()
         order = orch._broker.place_order.call_args[0][0]
@@ -1740,7 +1739,7 @@ class TestApplyPositionReviewsExit:
 
         reviews = [{"symbol": "AMD", "action": "exit",
                     "updated_reasoning": "Exit now."}]
-        await orch._apply_position_reviews(portfolio, reviews)
+        await orch._apply_position_reviews(reviews)
 
         orch._broker.place_order.assert_not_called()
 
@@ -1767,7 +1766,7 @@ class TestApplyPositionReviewsExit:
 
         reviews = [{"symbol": "XOM", "action": "exit",
                     "updated_reasoning": "MACD bearish cross — exit now."}]
-        await orch._apply_position_reviews(portfolio, reviews)
+        await orch._apply_position_reviews(reviews)
 
         orch._broker.place_order.assert_not_called()
 
@@ -1799,7 +1798,7 @@ class TestApplyPositionReviewsExit:
 
         reviews = [{"symbol": "XOM", "action": "exit",
                     "updated_reasoning": "Target reached — exit."}]
-        await orch._apply_position_reviews(portfolio, reviews)
+        await orch._apply_position_reviews(reviews)
 
         orch._broker.place_order.assert_called_once()
 
@@ -1819,7 +1818,7 @@ class TestApplyPositionReviewsExit:
         orch._broker.place_order = AsyncMock()
 
         reviews = [{"symbol": "XLE", "action": "exit", "updated_reasoning": "Exit."}]
-        await orch._apply_position_reviews(portfolio, reviews)
+        await orch._apply_position_reviews(reviews)
 
         orch._broker.place_order.assert_not_called()
 
@@ -1850,7 +1849,7 @@ class TestApplyPositionReviewsExit:
         orch._fill_protection.record_order = AsyncMock()
 
         reviews = [{"symbol": "NVDA", "action": "exit", "updated_reasoning": "Override exit."}]
-        await orch._apply_position_reviews(portfolio, reviews)
+        await orch._apply_position_reviews(reviews)
 
         orch._broker.place_order.assert_called_once()
 
@@ -2854,7 +2853,7 @@ class TestTradeJournalLifecycle:
                 exit_targets=ExitTargets(stop_loss=172.0, profit_target=196.0),
             ),
         )
-        portfolio = PortfolioState(positions=[pos])
+        await _set_portfolio(orch, [pos])
         orch._entry_contexts["AMZN"] = {"trade_id": "test-trade-id-amzn"}
         orch._latest_indicators = {"AMZN": {"price": 187.0}}
 
@@ -2864,7 +2863,7 @@ class TestTradeJournalLifecycle:
             "updated_reasoning": "thesis intact, hold",
             "adjusted_targets": {"stop_loss": 175.0},
         }]
-        await orch._apply_position_reviews(portfolio, reviews)
+        await orch._apply_position_reviews(reviews)
 
         entries = _read_journal(tmp_path)
         review_entries = [e for e in entries if e.get("record_type") == "review"]
@@ -2895,14 +2894,14 @@ class TestTradeJournalLifecycle:
             )
             for sym in ("AAPL", "MSFT")
         ]
-        portfolio = PortfolioState(positions=positions)
+        await _set_portfolio(orch, positions)
         orch._latest_indicators = {"AAPL": {"price": 102.0}, "MSFT": {"price": 98.0}}
 
         reviews = [
             {"symbol": "AAPL", "action": "hold", "updated_reasoning": "ok"},
             {"symbol": "MSFT", "action": "hold", "updated_reasoning": "ok"},
         ]
-        await orch._apply_position_reviews(portfolio, reviews)
+        await orch._apply_position_reviews(reviews)
 
         entries = _read_journal(tmp_path)
         review_symbols = {e["symbol"] for e in entries if e.get("record_type") == "review"}
@@ -2911,9 +2910,8 @@ class TestTradeJournalLifecycle:
     @pytest.mark.asyncio
     async def test_review_entry_not_written_for_unmatched_symbol(self, orch, tmp_path):
         """No review entry is written when the review symbol has no open position."""
-        portfolio = PortfolioState(positions=[])
         reviews = [{"symbol": "FAKE", "action": "hold", "updated_reasoning": "ghost"}]
-        await orch._apply_position_reviews(portfolio, reviews)
+        await orch._apply_position_reviews(reviews)
 
         entries = _read_journal(tmp_path)
         assert not any(e.get("record_type") == "review" for e in entries)

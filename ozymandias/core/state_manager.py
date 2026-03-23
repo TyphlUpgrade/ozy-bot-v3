@@ -146,9 +146,15 @@ def _to_dict(obj: Any) -> Any:
 def _from_dict_position(d: dict) -> Position:
     intention_raw = d.get("intention", {})
     exit_targets_raw = intention_raw.get("exit_targets", {})
+    # Normalize legacy "sell_short" action string to canonical Direction.
+    # Pre-Phase-12 state files stored the raw Claude action ("sell_short") in
+    # this field instead of the canonical direction ("short"). is_short() only
+    # matches "short", so un-normalised values would break exit logic silently.
+    _raw_direction = intention_raw.get("direction", "long")
+    _direction: Direction = "short" if _raw_direction == "sell_short" else _raw_direction  # type: ignore[assignment]
     intention = TradeIntention(
         catalyst=intention_raw.get("catalyst", ""),
-        direction=intention_raw.get("direction", "long"),
+        direction=_direction,
         strategy=intention_raw.get("strategy", "momentum"),
         expected_move=intention_raw.get("expected_move", ""),
         reasoning=intention_raw.get("reasoning", ""),
