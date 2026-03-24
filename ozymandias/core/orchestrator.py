@@ -181,6 +181,11 @@ class SlowLoopTriggerState:
     # Trigger fires when gain_pct >= last value + position_profit_trigger_pct.
     # Updated after each successful Claude call; cleared when a position closes.
     last_profit_trigger_gain: dict[str, float] = field(default_factory=dict)
+    # monotonic timestamp of the last near_target Claude call per symbol.
+    # Suppresses repeated firing while price stays within the target zone — only
+    # re-fires after near_target_cooldown_sec elapses since last handled review.
+    # Cleared when a position closes.
+    last_near_target_time: dict[str, float] = field(default_factory=dict)
     # Phase 17: price baseline anchored to the last successful Claude call (not reset each cycle).
     # Used by macro_move and sector_move triggers so that sustained index/sector moves always fire
     # even when last_prices is updated each tick. Separate from last_prices which resets per eval.
@@ -520,6 +525,10 @@ class Orchestrator:
             "thesis_challenge_size_threshold": self._config.ranker.thesis_challenge_size_threshold,
             "min_technical_score":         self._config.ranker.min_technical_score,
             "ta_size_factor_min":          self._config.ranker.ta_size_factor_min,
+            # Position count cap sourced from risk config (single source of truth).
+            "max_positions":               self._config.risk.max_concurrent_positions,
+            # Deployment cap: blocks new entries when too much equity is already deployed.
+            "max_portfolio_deployment_pct": self._config.ranker.max_portfolio_deployment_pct,
             # Strategy-specific gate thresholds are now owned by each Strategy class
             # via _DEFAULT_PARAMS and apply_entry_gate().  No ranker config needed.
         }
@@ -1390,6 +1399,7 @@ class Orchestrator:
             self._cycle_consumed_symbols.add(symbol)
             self._position_entry_times.pop(symbol, None)
             self._trigger_state.last_profit_trigger_gain.pop(symbol, None)
+            self._trigger_state.last_near_target_time.pop(symbol, None)
             log.info(
                 "Trade closed and journaled: %s  pnl=%.2f%%  exit_reason=%s",
                 symbol, pnl_pct, exit_reason,
@@ -2760,7 +2770,11 @@ class Orchestrator:
                 )
 
         # 3. Position approaching target (within 1% of profit target or stop loss)
+        # near_target has a cooldown: once Claude reviews and holds, the trigger is
+        # suppressed for near_target_cooldown_sec to prevent repeated firing while
+        # price oscillates near the target level.
         position_indicators = self._latest_indicators
+        near_target_cooldown = self._config.scheduler.near_target_cooldown_sec
         for pos in portfolio.positions:
             targets = pos.intention.exit_targets
             current = position_indicators.get(pos.symbol, {}).get("price")
@@ -2769,11 +2783,20 @@ class Orchestrator:
             if targets.profit_target > 0:
                 pct_to_target = abs(current - targets.profit_target) / targets.profit_target
                 if pct_to_target <= 0.01:
-                    triggers.append(f"near_target:{pos.symbol}")
-                    log.debug(
-                        "Trigger: near_target:%s FIRED  price=%.4f target=%.4f pct_away=%.2f%%",
-                        pos.symbol, current, targets.profit_target, pct_to_target * 100,
-                    )
+                    last_fired = ts.last_near_target_time.get(pos.symbol, 0.0)
+                    if time.monotonic() - last_fired >= near_target_cooldown:
+                        triggers.append(f"near_target:{pos.symbol}")
+                        ts.last_near_target_time[pos.symbol] = time.monotonic()
+                        log.debug(
+                            "Trigger: near_target:%s FIRED  price=%.4f target=%.4f pct_away=%.2f%%",
+                            pos.symbol, current, targets.profit_target, pct_to_target * 100,
+                        )
+                    else:
+                        log.debug(
+                            "Trigger: near_target:%s suppressed (cooldown %.0fs remaining)",
+                            pos.symbol,
+                            near_target_cooldown - (time.monotonic() - last_fired),
+                        )
             if targets.stop_loss > 0:
                 pct_to_stop = abs(current - targets.stop_loss) / targets.stop_loss
                 if pct_to_stop <= 0.01:
@@ -3440,7 +3463,14 @@ class Orchestrator:
                 strategy = item.get("strategy", "both")
                 # Phase 15: extract expected_direction from Claude's add-item dict.
                 # Default "either" when absent for backward compatibility.
-                expected_direction = item.get("expected_direction", "either")
+                _raw_ed = item.get("expected_direction", "either")
+                if _raw_ed not in {"long", "short", "either"}:
+                    log.warning(
+                        "Watchlist add %s: Claude returned invalid expected_direction %r — using 'either'",
+                        symbol, _raw_ed,
+                    )
+                    _raw_ed = "either"
+                expected_direction = _raw_ed
             if not symbol or symbol in existing_symbols:
                 continue
             if symbol in _INDEX_BLACKLIST or symbol.startswith("^"):

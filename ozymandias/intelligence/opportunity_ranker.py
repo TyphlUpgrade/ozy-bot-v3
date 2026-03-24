@@ -156,10 +156,15 @@ def evaluate_entry_conditions(conditions: dict | None, signals: dict) -> tuple[b
         val = signals.get("rsi_slope_5")
         if val is None:
             return False, "signal 'rsi_slope_5' unavailable"
-        if float(val) < float(conditions["rsi_slope_min"]):
-            return False, (
-                f"rsi_slope_min not met: rsi_slope_5 {float(val):.2f} < {float(conditions['rsi_slope_min']):.2f}"
+        threshold = float(conditions["rsi_slope_min"])
+        if threshold < 0:
+            logger.warning(
+                "entry_conditions rsi_slope_min=%s is negative (must be positive for longs) — blocking entry",
+                threshold,
             )
+            return False, f"entry_condition rsi_slope_min={threshold} is invalid (must be >= 0)"
+        if float(val) < threshold:
+            return False, f"rsi_slope_min not met: rsi_slope_5 {float(val):.2f} < {threshold:.2f}"
 
     # rsi_slope_max — shorts: RSI must be falling at least this fast ---------
     # Use rsi_slope_max with a negative value (e.g. -0.5) to confirm downward RSI momentum.
@@ -167,12 +172,21 @@ def evaluate_entry_conditions(conditions: dict | None, signals: dict) -> tuple[b
         val = signals.get("rsi_slope_5")
         if val is None:
             return False, "signal 'rsi_slope_5' unavailable"
-        if float(val) > float(conditions["rsi_slope_max"]):
-            return False, (
-                f"rsi_slope_max exceeded: rsi_slope_5 {float(val):.2f} > {float(conditions['rsi_slope_max']):.2f}"
+        threshold = float(conditions["rsi_slope_max"])
+        if threshold > 0:
+            logger.warning(
+                "entry_conditions rsi_slope_max=%s is positive (must be negative for shorts) — blocking entry",
+                threshold,
             )
+            return False, f"entry_condition rsi_slope_max={threshold} is invalid (must be <= 0)"
+        if float(val) > threshold:
+            return False, f"rsi_slope_max exceeded: rsi_slope_5 {float(val):.2f} > {threshold:.2f}"
 
-    # require_volume_ratio_min ---------------------------------------------
+    # require_volume_ratio_min — per-trade volume floor set by Claude -----------
+    # Precedence: min_rvol_for_entry (strategy-level hard gate in apply_entry_gate)
+    # runs BEFORE this check and cannot be deferred or expired. This condition is
+    # the per-trade threshold Claude sets ABOVE that strategy floor (e.g. ≥2.0×
+    # RVOL for a high-conviction catalyst play while the strategy floor is 1.0×).
     if "require_volume_ratio_min" in conditions:
         val = signals.get("volume_ratio")
         if val is None:
@@ -251,6 +265,11 @@ class OpportunityRanker:
         self._max_positions = int(cfg.get("max_positions", _MAX_POSITIONS))
         self._min_dollar_volume = float(cfg.get("min_avg_daily_dollar_volume", _MIN_AVG_DAILY_DOLLAR_VOLUME))
         self._min_conviction = float(cfg.get("min_conviction_threshold", 0.10))  # sanity floor
+        # Max fraction of equity that may be deployed before new entries are blocked.
+        # 0.0 = disabled. Complements max_positions: allows more concurrent small-sized
+        # positions without exceeding equity limits when Claude sizes conservatively.
+        # To add: adjust max_portfolio_deployment_pct in config.json ranker section.
+        self._max_deployment_pct = float(cfg.get("max_portfolio_deployment_pct", 0.0))
         self._min_technical_score = float(cfg.get("min_technical_score", 0.30))  # TA quality floor
         # Symbols that may appear on the watchlist for market context but must never be entered.
         no_entry_raw = cfg.get("no_entry_symbols", [
@@ -491,6 +510,20 @@ class OpportunityRanker:
                 False,
                 f"{symbol}: max concurrent positions ({self._max_positions}) reached",
             )
+
+        # 5b. Portfolio deployment cap — block new entries when too much equity is deployed.
+        # Uses buying_power / equity as a proxy for available capital. When buying_power
+        # approaches zero relative to equity, the portfolio is fully deployed regardless
+        # of position count. Set max_portfolio_deployment_pct=0 to disable.
+        # To add: set max_portfolio_deployment_pct in config.json ranker section.
+        if self._max_deployment_pct > 0 and account_info.equity > 0:
+            deployed_pct = 1.0 - (account_info.buying_power / account_info.equity)
+            if deployed_pct >= self._max_deployment_pct:
+                return (
+                    False,
+                    f"{symbol}: portfolio {deployed_pct:.0%} deployed ≥ cap {self._max_deployment_pct:.0%} "
+                    f"(buying_power={account_info.buying_power:.0f}, equity={account_info.equity:.0f})",
+                )
 
         # 5a. Per-symbol duplicate guard — never enter a symbol already in portfolio
         if any(p.symbol == symbol for p in portfolio.positions):

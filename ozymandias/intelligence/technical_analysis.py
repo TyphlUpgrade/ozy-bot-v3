@@ -547,9 +547,20 @@ def generate_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
     # --- RSI slope over 5 bars (velocity / trajectory) ---
     # Distinguishes RSI 73 climbing from RSI 73 falling.
     # Positive = rising, negative = falling. 0.0 when fewer than 6 values.
+    # Overnight-gap guard (intraday only): if the 5-bar window spans a date
+    # boundary, slope is contaminated by the gap — zero it out. For daily bars
+    # every bar is a different date, so the guard is disabled when the 5-bar
+    # span exceeds 24h (detected via average bar spacing, not calendar dates).
     rsi_clean = rsi.dropna()
     if len(rsi_clean) >= 6:
-        rsi_slope_5 = float(rsi_clean.iloc[-1]) - float(rsi_clean.iloc[-6])
+        _is_intraday = (
+            isinstance(rsi_clean.index, pd.DatetimeIndex)
+            and (rsi_clean.index[-1] - rsi_clean.index[-6]).total_seconds() < 24 * 3600
+        )
+        if _is_intraday and rsi_clean.index[-1].date() != rsi_clean.index[-6].date():
+            rsi_slope_5 = 0.0
+        else:
+            rsi_slope_5 = float(rsi_clean.iloc[-1]) - float(rsi_clean.iloc[-6])
     else:
         rsi_slope_5 = 0.0
 

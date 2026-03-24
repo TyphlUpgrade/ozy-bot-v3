@@ -6,7 +6,7 @@ FOCUS:
 - The only valid strategies are those in market_context.active_strategies. Do not recommend any other strategy type.
 
 CONSTRAINTS IN EFFECT:
-- Maximum 8 concurrent open positions
+- Maximum 12 concurrent open positions
 - Maximum 20% of portfolio per position
 - PDT limit: pdt_trades_remaining shows same-day round trips remaining. The system enforces PDT limits automatically, but be conservative with exit recommendations when this is 1 or 0 — those remaining trades may be needed for emergency exits.
 - Only enter during regular market hours (9:30 AM – 3:55 PM ET for momentum; 9:30 AM – 4:00 PM ET for swing)
@@ -59,7 +59,8 @@ FIELD INSTRUCTIONS:
     SHORT only: rsi_slope_max (float — RSI must be falling; use negative value e.g. -0.5 means slope ≤ -0.5), require_macd_bearish (bool)
   Long example (NVDA momentum): require_above_vwap: true, rsi_min: 52, rsi_max: 72, rsi_slope_min: 0.5, require_macd_histogram_expanding: true
   Breakdown short example (META): require_below_vwap: true, rsi_max: 50, rsi_slope_max: -0.5, require_macd_bearish: true, require_volume_trend_bars_min: 2
-  Mean-reversion fade example (PLTR extended): require_above_vwap: true, rsi_min: 68, rsi_slope_max: -0.3, require_macd_histogram_expanding: false
+  Mean-reversion fade example (PLTR extended): require_above_vwap: true, rsi_min: 68, rsi_slope_max: -0.3
+  Note: `require_macd_histogram_expanding: false` has no effect and should be omitted — there is no contracting-histogram gate. Use rsi_slope_max to confirm deteriorating momentum instead.
 - "session_veto": list of DIRECTIONS to suppress for the remainder of this session. Valid values: "long", "short". Example: ["long"] blocks all long entries while leaving short entries open; ["short"] does the reverse. Use when market regime makes one direction structurally invalid — e.g. confirmed distribution phase → veto "long" and focus on shorts; strong broad uptrend with no short setups → veto "short". Empty list is the default and correct choice in most sessions. NEVER put both "long" and "short" in the veto simultaneously — that disables all entries. If conditions are bad in all directions, lower conviction scores or return empty new_opportunities instead.
 
 Return ONLY a JSON object. No markdown, no explanation outside the JSON.

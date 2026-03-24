@@ -389,13 +389,24 @@ class ClaudeReasoningEngine:
             sig_summary = indicators.get(sym, {})
             raw_signals = sig_summary.get("signals", {})
             ed = getattr(entry, "expected_direction", "either")
-            # Direction-adjusted composite score: map "either" → "long" for scoring.
-            score_direction = ed if ed != "either" else "long"
-            direction_score = (
-                compute_composite_score(raw_signals, direction=score_direction)
-                if raw_signals
-                else float(sig_summary.get("composite_technical_score") or 0.0)
-            )
+            # Direction-adjusted composite score: mirror the tier-1 sort-key logic so
+            # Claude sees the same score used for ranking. "either" takes the better of
+            # long/short rather than defaulting to long (which understates bearish setups).
+            if ed == "either":
+                direction_score = (
+                    max(
+                        compute_composite_score(raw_signals, direction="long"),
+                        compute_composite_score(raw_signals, direction="short"),
+                    )
+                    if raw_signals
+                    else float(sig_summary.get("composite_technical_score") or 0.0)
+                )
+            else:
+                direction_score = (
+                    compute_composite_score(raw_signals, direction=ed)
+                    if raw_signals
+                    else float(sig_summary.get("composite_technical_score") or 0.0)
+                )
             # ta_readiness: pass through all live signals + direction-adjusted composite_score
             ta_readiness: dict = dict(raw_signals) if raw_signals else {}
             ta_readiness["composite_score"] = round(direction_score, 4)
@@ -498,9 +509,16 @@ class ClaudeReasoningEngine:
         # Both sides are in chars/4 (estimated) tokens — same unit, no conversion needed.
         context_token_budget = _TOTAL_TOKEN_BUDGET - self._prompt_template_tokens
         context_json = json.dumps(context, default=str)
+        _tier1_before_trim = len(context["watchlist_tier1"])
         while _estimate_tokens(context_json) > context_token_budget and context["watchlist_tier1"]:
             context["watchlist_tier1"].pop()
             context_json = json.dumps(context, default=str)
+        if not context["watchlist_tier1"] and _tier1_before_trim > 0:
+            log.warning(
+                "Token budget overflow: all watchlist_tier1 entries trimmed — "
+                "Claude will reason with zero watchlist symbols this cycle. "
+                "Consider reducing context size or raising _TOTAL_TOKEN_BUDGET."
+            )
 
         # Tell Claude exactly how many tier-1 symbols exist and how many it's seeing.
         # Without this, Claude can't tell it's working from a sample and will keep
@@ -612,6 +630,11 @@ class ClaudeReasoningEngine:
         fb = self._cfg.ai_fallback
         max_tokens = max_tokens_override or self._claude_cfg.max_tokens_per_cycle
 
+        # BUG-002: Gemini fallback must NOT be called while holding _call_lock —
+        # it can block for up to 120s and starves all concurrent callers.
+        # Sentinel pattern: set _fallback_args inside the lock, call after releasing.
+        _fallback_args: tuple | None = None
+
         async with self._call_lock:
             # Enforce minimum spacing between successive API calls.
             # Prevents RPM rate-limit hits when multiple calls queue up in the same
@@ -645,105 +668,110 @@ class ClaudeReasoningEngine:
                             self._overload_fallback_count,
                             (probe_interval - since) / 60,
                         )
-                        return await self._call_gemini_fallback(prompt, max_tokens)
+                        _fallback_args = (prompt, max_tokens)  # released after finally
 
-                # ── Primary: Claude with fast overload retries then Gemini fallback ─
-                overload_attempt = 0
-                server_attempt = 0
+                if _fallback_args is None:
+                    # ── Primary: Claude with fast overload retries then Gemini fallback ─
+                    overload_attempt = 0
+                    server_attempt = 0
 
-                while True:
-                    try:
-                        t0 = time.monotonic()
-                        response = await asyncio.wait_for(
-                            self._client.messages.create(
-                                model=self._claude_cfg.model,
-                                max_tokens=max_tokens,
-                                messages=[{"role": "user", "content": prompt}],
-                            ),
-                            timeout=120.0,
-                        )
-                        elapsed = time.monotonic() - t0
-                        if elapsed > 60:
-                            log.warning("Claude API call took %.1fs (>60s threshold)", elapsed)
-                        else:
-                            log.debug("Claude API call completed in %.1fs", elapsed)
-
-                        if response.stop_reason == "max_tokens":
-                            log.warning(
-                                "Claude response truncated (stop_reason=max_tokens). "
-                                "Parsed JSON may be incomplete — defensive parser will handle."
+                    while True:
+                        try:
+                            t0 = time.monotonic()
+                            response = await asyncio.wait_for(
+                                self._client.messages.create(
+                                    model=self._claude_cfg.model,
+                                    max_tokens=max_tokens,
+                                    messages=[{"role": "user", "content": prompt}],
+                                ),
+                                timeout=120.0,
                             )
+                            elapsed = time.monotonic() - t0
+                            if elapsed > 60:
+                                log.warning("Claude API call took %.1fs (>60s threshold)", elapsed)
+                            else:
+                                log.debug("Claude API call completed in %.1fs", elapsed)
 
-                        self._last_input_tokens = response.usage.input_tokens
-                        self._last_output_tokens = response.usage.output_tokens
-                        log.debug(
-                            "Token usage: %d input, %d output",
-                            self._last_input_tokens, self._last_output_tokens,
-                        )
-                        # Successful — reset circuit breaker
-                        if self._overload_fallback_count > 0:
-                            log.info(
-                                "Claude API recovered — resetting circuit breaker "
-                                "(was at %d consecutive fallbacks)",
-                                self._overload_fallback_count,
+                            if response.stop_reason == "max_tokens":
+                                log.warning(
+                                    "Claude response truncated (stop_reason=max_tokens). "
+                                    "Parsed JSON may be incomplete — defensive parser will handle."
+                                )
+
+                            self._last_input_tokens = response.usage.input_tokens
+                            self._last_output_tokens = response.usage.output_tokens
+                            log.debug(
+                                "Token usage: %d input, %d output",
+                                self._last_input_tokens, self._last_output_tokens,
                             )
-                            self._overload_fallback_count = 0
-                            self._circuit_broken_since = None
-                        return response.content[0].text
+                            # Successful — reset circuit breaker
+                            if self._overload_fallback_count > 0:
+                                log.info(
+                                    "Claude API recovered — resetting circuit breaker "
+                                    "(was at %d consecutive fallbacks)",
+                                    self._overload_fallback_count,
+                                )
+                                self._overload_fallback_count = 0
+                                self._circuit_broken_since = None
+                            return response.content[0].text
 
-                    except asyncio.TimeoutError:
-                        log.error("Claude API call timed out after 120s (attempt %d)", overload_attempt + server_attempt + 1)
-                        raise
-
-                    except anthropic.RateLimitError as exc:
-                        # 429 rate limit — use slow server-error curve (hard quota reset)
-                        delay = min(fb.server_error_base_sec * (2 ** server_attempt), fb.server_error_max_sec)
-                        log.warning(
-                            "Claude rate limit (attempt %d), retrying in %.0fs: %s",
-                            server_attempt + 1, delay, exc,
-                        )
-                        await asyncio.sleep(delay)
-                        server_attempt += 1
-
-                    except anthropic.APIStatusError as exc:
-                        if exc.status_code < 500:
-                            log.error("Claude API client error %d: %s", exc.status_code, exc)
+                        except asyncio.TimeoutError:
+                            log.error("Claude API call timed out after 120s (attempt %d)", overload_attempt + server_attempt + 1)
                             raise
 
-                        if exc.status_code == 529:
-                            if overload_attempt < fb.overload_retries:
-                                delay = min(fb.overload_base_sec * (2 ** overload_attempt), fb.overload_max_sec)
-                                log.warning(
-                                    "Claude overloaded (529) — attempt %d/%d, retrying in %.0fs "
-                                    "(bot is alive, transient queue spike)",
-                                    overload_attempt + 1, fb.overload_retries, delay,
-                                )
-                                await asyncio.sleep(delay)
-                                overload_attempt += 1
-                            else:
-                                # Exhausted fast retries — switch to Gemini fallback
-                                self._overload_fallback_count += 1
-                                if self._circuit_broken_since is None:
-                                    self._circuit_broken_since = time.monotonic()
-                                log.error(
-                                    "Claude overloaded after %d retries — switching to Gemini fallback "
-                                    "(session overload fallback count: %d)",
-                                    fb.overload_retries, self._overload_fallback_count,
-                                )
-                                if not fb.enabled:
-                                    raise
-                                return await self._call_gemini_fallback(prompt, max_tokens)
-                        else:
-                            # Other 5xx — slow retries, no fallback limit
+                        except anthropic.RateLimitError as exc:
+                            # 429 rate limit — use slow server-error curve (hard quota reset)
                             delay = min(fb.server_error_base_sec * (2 ** server_attempt), fb.server_error_max_sec)
                             log.warning(
-                                "Claude server error %d (attempt %d), retrying in %.0fs: %s",
-                                exc.status_code, server_attempt + 1, delay, exc,
+                                "Claude rate limit (attempt %d), retrying in %.0fs: %s",
+                                server_attempt + 1, delay, exc,
                             )
                             await asyncio.sleep(delay)
                             server_attempt += 1
+
+                        except anthropic.APIStatusError as exc:
+                            if exc.status_code < 500:
+                                log.error("Claude API client error %d: %s", exc.status_code, exc)
+                                raise
+
+                            if exc.status_code == 529:
+                                if overload_attempt < fb.overload_retries:
+                                    delay = min(fb.overload_base_sec * (2 ** overload_attempt), fb.overload_max_sec)
+                                    log.warning(
+                                        "Claude overloaded (529) — attempt %d/%d, retrying in %.0fs "
+                                        "(bot is alive, transient queue spike)",
+                                        overload_attempt + 1, fb.overload_retries, delay,
+                                    )
+                                    await asyncio.sleep(delay)
+                                    overload_attempt += 1
+                                else:
+                                    # Exhausted fast retries — schedule Gemini fallback after lock release
+                                    self._overload_fallback_count += 1
+                                    if self._circuit_broken_since is None:
+                                        self._circuit_broken_since = time.monotonic()
+                                    log.error(
+                                        "Claude overloaded after %d retries — switching to Gemini fallback "
+                                        "(session overload fallback count: %d)",
+                                        fb.overload_retries, self._overload_fallback_count,
+                                    )
+                                    if not fb.enabled:
+                                        raise
+                                    _fallback_args = (prompt, max_tokens)
+                                    break
+                            else:
+                                # Other 5xx — slow retries, no fallback limit
+                                delay = min(fb.server_error_base_sec * (2 ** server_attempt), fb.server_error_max_sec)
+                                log.warning(
+                                    "Claude server error %d (attempt %d), retrying in %.0fs: %s",
+                                    exc.status_code, server_attempt + 1, delay, exc,
+                                )
+                                await asyncio.sleep(delay)
+                                server_attempt += 1
             finally:
                 self._last_call_end_time = time.monotonic()
+
+        if _fallback_args is not None:
+            return await self._call_gemini_fallback(*_fallback_args)
 
     # ------------------------------------------------------------------
     # High-level reasoning methods

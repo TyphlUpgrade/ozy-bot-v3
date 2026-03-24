@@ -60,7 +60,7 @@ class MomentumStrategy(Strategy):
     Entry requires ≥ ``min_signals_for_entry`` of 6 technical conditions:
 
     1. Price above VWAP
-    2. RSI 45–65 (mid-range with room to run; not weak trend or late chase)
+    2. RSI 60–65 (live rsi_entry_min=60 per backtest: RSI 45–55 → 17% WR vs RSI ≥65 → 37%)
     3. MACD bullish or bullish crossover
     4. Volume ratio ≥ ``min_volume_ratio``
     5. Trend structure bullishly aligned (9 + 20 EMAs at minimum)
@@ -69,7 +69,7 @@ class MomentumStrategy(Strategy):
 
     _DEFAULT_PARAMS = {
         "min_volume_ratio": 1.2,
-        "rsi_entry_min": 45,   # tightened from 40: RSI 40–45 = weakening trend, not momentum
+        "rsi_entry_min": 45,   # DEFAULT; live config.json overrides to 60 (backtest: RSI 45–55 → 17% WR)
         "rsi_entry_max": 65,   # tightened from 70: RSI >65 approaches overbought late-chase territory
         "rsi_overbought": 80,
         "min_signals_for_entry": 4,

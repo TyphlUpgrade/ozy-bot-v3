@@ -9,7 +9,7 @@
   },
   "risk": {
     "max_position_pct": 0.20,
-    "max_concurrent_positions": 8,
+    "max_concurrent_positions": 12,
     "max_daily_loss_pct": 0.02,
     "per_trade_max_loss_pct": 0.03,
     "pdt_buffer": 1,
@@ -36,6 +36,7 @@
     "yfinance_fetch_stagger_max_sec": 0.5,
     "max_entry_defer_cycles": 5,
     "position_profit_trigger_pct": 0.015,
+    "near_target_cooldown_sec": 1800,
     "medium_loop_scan_concurrency": 10,
     "macro_move_trigger_pct": 1.0,
     "macro_move_symbols": ["SPY", "QQQ", "IWM"],
@@ -89,6 +90,7 @@
     "max_entry_drift_pct": 0.015,
     "max_adverse_drift_pct": 0.020,
     "min_technical_score": 0.30,
+    "max_portfolio_deployment_pct": 0.85,
     "min_avg_daily_dollar_volume": 10000000,
     "ta_size_factor_min": 0.60,
     "no_entry_symbols": [

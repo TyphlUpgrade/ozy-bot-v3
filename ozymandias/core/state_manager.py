@@ -181,7 +181,20 @@ def _from_dict_position(d: dict) -> Position:
     )
 
 
+_VALID_DIRECTIONS = {"long", "short", "either"}
+
+_log_state = __import__("logging").getLogger(__name__)
+
+
 def _from_dict_watchlist_entry(d: dict) -> WatchlistEntry:
+    raw_ed = d.get("expected_direction", "either")
+    if raw_ed not in _VALID_DIRECTIONS:
+        _log_state.warning(
+            "WatchlistEntry %s: invalid expected_direction %r — resetting to 'either'",
+            d.get("symbol", "?"),
+            raw_ed,
+        )
+        raw_ed = "either"
     return WatchlistEntry(
         symbol=d["symbol"],
         date_added=d["date_added"],
@@ -189,7 +202,7 @@ def _from_dict_watchlist_entry(d: dict) -> WatchlistEntry:
         priority_tier=d.get("priority_tier", 2),
         strategy=d.get("strategy", "both"),
         removal_candidate=d.get("removal_candidate", False),
-        expected_direction=d.get("expected_direction", "either"),
+        expected_direction=raw_ed,
     )
 
 

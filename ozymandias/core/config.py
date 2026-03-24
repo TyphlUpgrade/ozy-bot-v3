@@ -63,6 +63,7 @@ class SchedulerConfig:
     max_entry_defer_cycles: int = 5                  # drop a deferred opportunity after this many consecutive entry_conditions misses; prevents indefinite deferral on stale Claude thesis
     max_filter_rejection_cycles: int = 3             # suppress a symbol for the rest of the session after it fails hard filters this many times; stops Claude re-proposing RVOL/volume failures every cycle
     position_profit_trigger_pct: float = 0.015       # fire a Claude position review when unrealised gain exceeds this fraction of avg_cost; re-arms each time gain grows by another interval
+    near_target_cooldown_sec: int = 1800             # suppress near_target re-firing for this many seconds after Claude reviews and holds; prevents repeated calls while price oscillates near the target level
     # Phase 17 — parallel medium loop fetch
     medium_loop_scan_concurrency: int = 10           # max concurrent yfinance + TA worker tasks in the medium loop; balances throughput vs rate-limit pressure
     # Phase 17 — macro/sector move triggers
@@ -136,6 +137,7 @@ class RankerConfig:
     momentum_min_rvol: float = 1.0           # momentum hard gate: reject if current volume_ratio < this (ensures participation)
     momentum_require_vwap_above: bool = True  # momentum hard gate: reject if price is below VWAP at entry
     swing_block_bearish_trend: bool = True    # swing hard gate: reject if trend_structure is bearish_aligned
+    max_portfolio_deployment_pct: float = 0.85  # block new entries when buying_power/equity implies this fraction of capital is deployed; 0 = disabled. Allows more concurrent small positions without exceeding equity limits.
     no_entry_symbols: list = field(default_factory=lambda: [
         # Broad-market and volatility ETFs used as market-context monitors only.
         # These may appear on the watchlist (tier 2) but must never be entered as trades.

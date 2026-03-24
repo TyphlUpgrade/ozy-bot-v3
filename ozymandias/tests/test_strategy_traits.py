@@ -244,6 +244,26 @@ class TestSwingEntryGate:
         passed, _ = strat.apply_entry_gate("buy", _signals(trend_structure="bearish_aligned"))
         assert passed is True
 
+    # BUG-008: RVOL gate
+    def test_rejects_low_rvol(self):
+        strat = _swing()
+        passed, reason = strat.apply_entry_gate("buy", _signals(volume_ratio=0.5, trend_structure="bullish_aligned"))
+        assert passed is False
+        assert "RVOL" in reason
+
+    def test_passes_sufficient_rvol(self):
+        strat = _swing()
+        passed, _ = strat.apply_entry_gate("buy", _signals(volume_ratio=0.9, trend_structure="mixed"))
+        assert passed is True
+
+    def test_missing_rvol_passes(self):
+        """volume_ratio=None must not block — consistent with MomentumStrategy."""
+        strat = _swing()
+        signals = _signals(trend_structure="mixed")
+        signals.pop("volume_ratio", None)
+        passed, _ = strat.apply_entry_gate("buy", signals)
+        assert passed is True
+
 
 # ---------------------------------------------------------------------------
 # 4. Registry-based construction (_build_strategies equivalent)

@@ -783,8 +783,8 @@ class TestTaReadiness:
         # Short-direction should score higher on bearish signals
         assert score_short != score_long
 
-    def test_ta_readiness_either_uses_long_default(self, tmp_path):
-        """expected_direction='either' maps to 'long' for composite scoring."""
+    def test_ta_readiness_either_uses_best_direction_score(self, tmp_path):
+        """expected_direction='either' uses max(long_score, short_score) — not long-biased default."""
         from ozymandias.intelligence.technical_analysis import compute_composite_score
         engine = self._engine(tmp_path)
         signals = {"rsi": 62.0, "macd_signal": "bullish", "volume_ratio": 2.0}
@@ -795,8 +795,11 @@ class TestTaReadiness:
             PortfolioState(), watchlist, {}, indicators,
         )
         score_either = ctx["watchlist_tier1"][0]["ta_readiness"]["composite_score"]
-        # Should equal the long-direction score
-        expected = compute_composite_score(signals, direction="long")
+        # Should equal the best of long and short direction scores
+        expected = max(
+            compute_composite_score(signals, direction="long"),
+            compute_composite_score(signals, direction="short"),
+        )
         assert score_either == pytest.approx(expected, abs=0.001)
 
     def test_ta_readiness_empty_when_symbol_absent_from_indicators(self, tmp_path):
@@ -957,3 +960,85 @@ class TestBackwardCompat:
         assert entry["symbol"] == "AMD"
         assert entry["duration_min"] == 1117  # int, not float
         assert "hold_duration_min" not in entry
+
+
+# ---------------------------------------------------------------------------
+# BUG-003: token budget overflow warning
+# ---------------------------------------------------------------------------
+
+class TestTokenBudgetOverflowWarning:
+
+    def _engine(self, tmp_path):
+        return _make_engine(tmp_path)
+
+    def _watchlist_entry(self, symbol):
+        return WatchlistEntry(
+            symbol=symbol, date_added="2026-03-24", reason="test",
+            priority_tier=1, strategy="momentum",
+        )
+
+    def test_warning_fires_when_all_tier1_trimmed(self, tmp_path, caplog):
+        """When every watchlist_tier1 entry is trimmed, a WARNING is logged."""
+        import logging
+        engine = self._engine(tmp_path)
+        # Force an extremely tight budget so everything is trimmed
+        engine._prompt_template_tokens = 999_999
+        # Build a watchlist with entries that have signal data (so they get included)
+        entries = [self._watchlist_entry(s) for s in ["AAPL", "MSFT", "NVDA"]]
+        watchlist = WatchlistState(entries=entries)
+        signals = {"rsi": 55.0, "volume_ratio": 1.5}
+        indicators = {s: {"composite_technical_score": 0.5, "signals": signals} for s in ["AAPL", "MSFT", "NVDA"]}
+        with caplog.at_level(logging.WARNING, logger="ozymandias.intelligence.claude_reasoning"):
+            engine.assemble_reasoning_context(PortfolioState(), watchlist, {}, indicators)
+        assert any("Token budget overflow" in r.message for r in caplog.records)
+
+    def test_no_warning_when_watchlist_starts_empty(self, tmp_path, caplog):
+        """No warning when watchlist was already empty before trimming."""
+        import logging
+        engine = self._engine(tmp_path)
+        engine._prompt_template_tokens = 999_999
+        with caplog.at_level(logging.WARNING, logger="ozymandias.intelligence.claude_reasoning"):
+            engine.assemble_reasoning_context(PortfolioState(), WatchlistState(), {}, {})
+        assert not any("Token budget overflow" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# BUG-010: expected_direction validation on load and Claude output
+# ---------------------------------------------------------------------------
+
+class TestExpectedDirectionValidation:
+
+    @pytest.mark.asyncio
+    async def test_invalid_direction_on_load_resets_to_either(self, tmp_path, caplog):
+        """Invalid expected_direction in JSON file is reset to 'either' with a WARNING."""
+        from ozymandias.core.state_manager import StateManager
+        import json, logging
+        sm = StateManager()
+        sm._dir = tmp_path
+        await sm.initialize()
+        data = {
+            "entries": [{
+                "symbol": "AAPL",
+                "date_added": "2026-03-24",
+                "reason": "test",
+                "priority_tier": 1,
+                "strategy": "momentum",
+                "removal_candidate": False,
+                "expected_direction": "sideways",  # invalid
+            }],
+            "last_updated": "2026-03-24T00:00:00+00:00",
+        }
+        (tmp_path / "watchlist.json").write_text(json.dumps(data))
+        with caplog.at_level(logging.WARNING, logger="ozymandias.core.state_manager"):
+            loaded = await sm.load_watchlist()
+        assert loaded.entries[0].expected_direction == "either"
+        assert any("invalid expected_direction" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_invalid_direction_claude_output_resets_to_either(self, orch):
+        """Claude returning invalid expected_direction in watchlist add is reset to 'either'."""
+        from ozymandias.core.state_manager import WatchlistState
+        watchlist = WatchlistState(entries=[])
+        add_list = [{"symbol": "TSLA", "reason": "test", "expected_direction": "sideways"}]
+        await orch._apply_watchlist_changes(watchlist, add_list, [])
+        assert watchlist.entries[0].expected_direction == "either"

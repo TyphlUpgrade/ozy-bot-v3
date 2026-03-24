@@ -834,3 +834,50 @@ class TestCatalystTypeConvictionCap:
         opp = _opportunity(strategy="swing", conviction=0.75)
         passes, _ = self._filter(opp)
         assert passes is True
+
+
+# ---------------------------------------------------------------------------
+# BUG-004: rsi_slope sign validation
+# ---------------------------------------------------------------------------
+
+class TestEntryConditionSlopeSignValidation:
+    """evaluate_entry_conditions rejects invalid slope signs rather than passing."""
+
+    def test_rsi_slope_min_negative_blocks_entry(self):
+        """rsi_slope_min must be >= 0 for longs; a negative value is invalid — block."""
+        from ozymandias.intelligence.opportunity_ranker import evaluate_entry_conditions
+        import logging
+        conditions = {"rsi_slope_min": -0.5}
+        signals = {"rsi_slope_5": 1.0}  # would pass the comparison if sign not checked
+        with patch("ozymandias.intelligence.opportunity_ranker.logger") as mock_log:
+            passed, reason = evaluate_entry_conditions(conditions, signals)
+        assert passed is False
+        assert "invalid" in reason
+        assert "rsi_slope_min" in reason
+
+    def test_rsi_slope_max_positive_blocks_entry(self):
+        """rsi_slope_max must be <= 0 for shorts; a positive value is invalid — block."""
+        from ozymandias.intelligence.opportunity_ranker import evaluate_entry_conditions
+        conditions = {"rsi_slope_max": 0.3}
+        signals = {"rsi_slope_5": -0.1}  # would pass the comparison if sign not checked
+        with patch("ozymandias.intelligence.opportunity_ranker.logger") as mock_log:
+            passed, reason = evaluate_entry_conditions(conditions, signals)
+        assert passed is False
+        assert "invalid" in reason
+        assert "rsi_slope_max" in reason
+
+    def test_rsi_slope_min_zero_passes(self):
+        """rsi_slope_min=0 is valid (exact boundary)."""
+        from ozymandias.intelligence.opportunity_ranker import evaluate_entry_conditions
+        conditions = {"rsi_slope_min": 0.0}
+        signals = {"rsi_slope_5": 0.1}
+        passed, _ = evaluate_entry_conditions(conditions, signals)
+        assert passed is True
+
+    def test_rsi_slope_max_zero_passes(self):
+        """rsi_slope_max=0 is valid (exact boundary)."""
+        from ozymandias.intelligence.opportunity_ranker import evaluate_entry_conditions
+        conditions = {"rsi_slope_max": 0.0}
+        signals = {"rsi_slope_5": -0.1}
+        passed, _ = evaluate_entry_conditions(conditions, signals)
+        assert passed is True

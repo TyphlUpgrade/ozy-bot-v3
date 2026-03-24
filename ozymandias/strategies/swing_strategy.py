@@ -113,7 +113,14 @@ class SwingStrategy(Strategy):
         return False
 
     def apply_entry_gate(self, action: str, signals: dict) -> tuple[bool, str]:
-        """Reject swing entries when the long-term trend is fully adverse."""
+        """Reject swing entries when the long-term trend is fully adverse or RVOL is absent."""
+        rvol = signals.get("volume_ratio")
+        if rvol is not None and rvol < self._p("min_rvol_for_entry"):
+            return (
+                False,
+                f"swing {action} rejected — RVOL {rvol:.2f} below floor "
+                f"{self._p('min_rvol_for_entry'):.2f} (no volume participation)",
+            )
         if self._p("block_bearish_trend"):
             wrong_trend = _SWING_WRONG_TREND.get(action)
             if wrong_trend and signals.get("trend_structure", "") == wrong_trend:
