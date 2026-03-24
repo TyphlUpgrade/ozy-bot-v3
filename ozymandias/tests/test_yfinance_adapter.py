@@ -59,6 +59,19 @@ def _make_ticker_info() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Suppress the per-fetch stagger sleep so tests don't accumulate 0–0.5s delays
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def no_fetch_stagger(monkeypatch):
+    """Zero out the random stagger sleep in the adapter so tests run fast."""
+    monkeypatch.setattr(
+        "ozymandias.data.adapters.yfinance_adapter.random.uniform",
+        lambda a, b: 0,
+    )
+
+
+# ---------------------------------------------------------------------------
 # fetch_bars
 # ---------------------------------------------------------------------------
 

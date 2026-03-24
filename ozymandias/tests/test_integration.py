@@ -181,6 +181,11 @@ async def orch(tmp_path):
         o._reasoning_cache._dir.mkdir()
         await o._startup()
 
+    # Disable the universe scanner so integration tests don't make real yfinance
+    # calls for 543+ symbols. The scanner holds its own adapter reference set
+    # during _startup(), so replacing orch._data_adapter per-test is insufficient.
+    o._universe_scanner = None
+
     broker = MagicMock()
     broker.get_account     = AsyncMock(return_value=_stub_account())
     broker.get_open_orders = AsyncMock(return_value=[])
@@ -193,6 +198,10 @@ async def orch(tmp_path):
     o._claude._load_prompt = MagicMock(return_value="Context: {context_json} Respond in JSON.")
     o._claude._client = MagicMock()
     o._claude._client.messages.create = AsyncMock(return_value=_mock_claude_response())
+    # Mock watchlist build to prevent the 3-second min_call_interval_sec sleep:
+    # watchlist_small/watchlist_stale triggers cause run_watchlist_build to run first
+    # (setting _last_call_end_time), then run_reasoning_cycle hits the rate-limit gap.
+    o._claude.run_watchlist_build = AsyncMock(return_value=[])
 
     return o
 

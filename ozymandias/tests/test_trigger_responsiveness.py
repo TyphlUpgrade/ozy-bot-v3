@@ -88,6 +88,19 @@ async def orch(tmp_path):
         o._reasoning_cache._dir.mkdir()
         await o._startup()
 
+    # Disable the universe scanner so tests don't make real yfinance calls for
+    # 543+ symbols. The scanner holds its own adapter reference set during
+    # _startup(), so replacing orch._data_adapter per-test is insufficient.
+    o._universe_scanner = None
+
+    # Mock Claude API calls so tests don't hit the 3-second min_call_interval_sec
+    # sleep. Root cause: when watchlist_small/watchlist_stale triggers fire,
+    # _run_claude_cycle calls run_watchlist_build first (which sets _last_call_end_time),
+    # then run_reasoning_cycle hits the 3-second rate-limit gap sleep.
+    # Tests that need specific Claude behaviour override these in their body.
+    o._claude.run_reasoning_cycle = AsyncMock(return_value=None)
+    o._claude.run_watchlist_build = AsyncMock(return_value=[])
+
     broker = MagicMock()
     broker.get_account = AsyncMock(return_value=_stub_account())
     broker.get_open_orders = AsyncMock(return_value=[])
