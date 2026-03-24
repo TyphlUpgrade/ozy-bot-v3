@@ -64,6 +64,8 @@ class SchedulerConfig:
     max_filter_rejection_cycles: int = 3             # suppress a symbol for the rest of the session after it fails hard filters this many times; stops Claude re-proposing RVOL/volume failures every cycle
     position_profit_trigger_pct: float = 0.015       # fire a Claude position review when unrealised gain exceeds this fraction of avg_cost; re-arms each time gain grows by another interval
     near_target_cooldown_sec: int = 1800             # suppress near_target re-firing for this many seconds after Claude reviews and holds; prevents repeated calls while price oscillates near the target level
+    override_exit_cooldown_min: int = 20             # extended re-entry cooldown (minutes) after a quant-override exit; longer than re_entry_cooldown_min because the momentum signal structurally failed and needs time to reset
+    fetch_failure_removal_threshold: int = 3         # auto-remove a watchlist symbol after this many consecutive medium-loop fetch failures; catches delisted or dead tickers without requiring Claude to see them
     # Phase 17 — parallel medium loop fetch
     medium_loop_scan_concurrency: int = 10           # max concurrent yfinance + TA worker tasks in the medium loop; balances throughput vs rate-limit pressure
     # Phase 17 — macro/sector move triggers

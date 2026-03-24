@@ -21,7 +21,7 @@
     "max_risk_per_trade_pct": 0.02
   },
   "scheduler": {
-    "bypass_market_hours": true,
+    "bypass_market_hours": false,
     "fast_loop_sec": 10,
     "medium_loop_sec": 120,
     "slow_loop_check_sec": 60,
@@ -37,6 +37,8 @@
     "max_entry_defer_cycles": 5,
     "position_profit_trigger_pct": 0.015,
     "near_target_cooldown_sec": 1800,
+    "override_exit_cooldown_min": 20,
+    "fetch_failure_removal_threshold": 3,
     "medium_loop_scan_concurrency": 10,
     "macro_move_trigger_pct": 1.0,
     "macro_move_symbols": ["SPY", "QQQ", "IWM"],
@@ -52,8 +54,8 @@
     "model": "claude-sonnet-4-20250514",
     "max_tokens_per_cycle": 4096,
     "prompt_version": "v3.6.0",
-    "tier1_max_symbols": 12,
-    "tier2_max_symbols": 28,
+    "tier1_max_symbols": 8,
+    "tier2_max_symbols": 15,
     "news_max_age_hours": 168,
     "news_max_items_per_symbol": 3,
     "recommendation_outcome_max_age_min": 60,

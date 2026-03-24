@@ -404,6 +404,19 @@ class Orchestrator:
         # A position closed 58 seconds before restart should expire in ~2 seconds, not 60.
         self._recently_closed: dict[str, float] = {}
 
+        # Tracks consecutive medium-loop fetch failures per watchlist symbol.
+        # When a symbol reaches fetch_failure_removal_threshold failures without
+        # a successful fetch in between, it is automatically removed from the watchlist.
+        # Prevents delisted or stale symbols from generating persistent yfinance errors.
+        self._fetch_failure_counts: dict[str, int] = {}
+
+        # Tracks when each symbol was last exited via quant override (hard stop or signal).
+        # Enforces a longer re-entry cooldown than the normal recently_closed guard,
+        # because a quant override indicates the momentum signal broke down — the setup
+        # needs more time to reset before re-entry is appropriate.
+        # Values are time.monotonic() timestamps of the override exit.
+        self._override_closed: dict[str, float] = {}
+
         log.debug("Orchestrator created (config loaded, modules not yet connected)")
 
     # -----------------------------------------------------------------------
@@ -773,6 +786,29 @@ class Orchestrator:
                 log.debug("Startup: could not parse recently_closed entry %s: %s", sym, exc)
         if reloaded:
             log.info("Startup: reloaded recently_closed guard for %d symbol(s)", reloaded)
+
+        # Reload recommendation_outcomes from the previous session within the same day.
+        # Rejection counts must survive restarts so _filter_suppressed can accumulate
+        # correctly across bot restarts (e.g. 2 rejections in session 1, 1 more in
+        # session 2 → suppressed, rather than resetting to 0 on each restart).
+        today_utc_date = datetime.now(timezone.utc).date()
+        reloaded_outcomes = 0
+        for sym, rec in portfolio.recommendation_outcomes.items():
+            ts = rec.get("attempt_time_utc")
+            if not ts:
+                continue
+            try:
+                entry_date = datetime.fromisoformat(ts).date()
+            except Exception:
+                continue
+            if entry_date == today_utc_date:
+                self._recommendation_outcomes[sym] = rec
+                reloaded_outcomes += 1
+        if reloaded_outcomes:
+            log.info(
+                "Startup: reloaded %d recommendation outcome(s) from previous session",
+                reloaded_outcomes,
+            )
 
         log.info("=== Startup reconciliation complete ===")
 
@@ -1400,6 +1436,7 @@ class Orchestrator:
             self._position_entry_times.pop(symbol, None)
             self._trigger_state.last_profit_trigger_gain.pop(symbol, None)
             self._trigger_state.last_near_target_time.pop(symbol, None)
+            self._override_closed.pop(symbol, None)
             log.info(
                 "Trade closed and journaled: %s  pnl=%.2f%%  exit_reason=%s",
                 symbol, pnl_pct, exit_reason,
@@ -1454,6 +1491,10 @@ class Orchestrator:
             self._pending_exit_hints[symbol] = exit_hint
             # Increment override exit counter (feeds slow loop trigger)
             self._override_exit_count += 1
+            # Record override-close timestamp for the extended re-entry cooldown.
+            # override_exit_cooldown_min >> re_entry_cooldown_min because the quant
+            # signal broke down — re-entry should not be allowed until momentum resets.
+            self._override_closed[symbol] = time.monotonic()
         except Exception as exc:
             log.error("Failed to place override exit for %s (hint=%s): %s", symbol, exit_hint, exc)
 
@@ -1898,9 +1939,47 @@ class Orchestrator:
                 continue
             sym, df, summary = item
             if summary is None:
+                # Track consecutive fetch failures for watchlist symbols so persistently
+                # broken symbols (e.g. delisted tickers) can be auto-removed.
+                # Context symbols (SPY, QQQ, sector ETFs) are excluded — they are not
+                # on the watchlist and their fetch failures are normal and expected.
+                if sym in scan_symbols:
+                    self._fetch_failure_counts[sym] = self._fetch_failure_counts.get(sym, 0) + 1
                 continue
+            # Successful fetch — reset any failure streak for this symbol.
+            self._fetch_failure_counts.pop(sym, None)
             indicators[sym] = summary
             bars[sym] = df
+
+        # Auto-remove watchlist symbols that have persistently failed to fetch data.
+        # This cleans up delisted tickers without requiring Claude to see them first.
+        _removal_threshold = self._config.scheduler.fetch_failure_removal_threshold
+        _symbols_to_purge = [
+            s for s, c in self._fetch_failure_counts.items() if c >= _removal_threshold
+        ]
+        if _symbols_to_purge:
+            _watchlist = await self._state_manager.load_watchlist()
+            _open_syms = set()
+            try:
+                _pf = await self._state_manager.load_portfolio()
+                _open_syms = {p.symbol for p in _pf.positions}
+            except Exception:
+                pass
+            _actually_removed = []
+            for _sym in _symbols_to_purge:
+                if _sym in _open_syms:
+                    # Never auto-remove a symbol with an open position.
+                    continue
+                _watchlist.entries = [e for e in _watchlist.entries if e.symbol != _sym]
+                self._fetch_failure_counts.pop(_sym, None)
+                _actually_removed.append(_sym)
+            if _actually_removed:
+                await self._state_manager.save_watchlist(_watchlist)
+                log.warning(
+                    "Auto-removed %d symbol(s) from watchlist after %d consecutive "
+                    "fetch failures (likely delisted): %s",
+                    len(_actually_removed), _removal_threshold, _actually_removed,
+                )
 
         if not indicators:
             log.warning("Medium loop: TA produced no results — all fetches failed")
@@ -2149,6 +2228,23 @@ class Orchestrator:
                     "Medium loop: re-entry cooldown for %s (%s) — closed %.0fmin ago "
                     "(cooldown=%dmin)",
                     symbol, top.strategy, elapsed / 60, cooldown_min,
+                )
+                return False
+
+        # Extended re-entry cooldown for quant-override exits.
+        # A quant override means the momentum signal structurally failed — the setup
+        # needs more time to reset than the normal re_entry_cooldown_min allows.
+        # This guard runs AFTER the normal cooldown check: if recently_closed hasn't
+        # expired yet, this is moot; if it has, this provides additional protection.
+        override_closed_at = self._override_closed.get(symbol, 0.0)
+        if override_closed_at > 0:
+            override_cooldown_min = self._config.scheduler.override_exit_cooldown_min
+            override_elapsed = time.monotonic() - override_closed_at
+            if override_elapsed < override_cooldown_min * 60:
+                log.info(
+                    "Medium loop: override-exit cooldown for %s — override closed %.0fmin ago "
+                    "(cooldown=%dmin)",
+                    symbol, override_elapsed / 60, override_cooldown_min,
                 )
                 return False
 
@@ -3366,6 +3462,16 @@ class Orchestrator:
         if result.position_reviews:
             await self._apply_position_reviews(result.position_reviews)
 
+        # Persist recommendation_outcomes so rejection counts survive restarts within
+        # the same trading day. Load a fresh portfolio to avoid clobbering any
+        # concurrent fast-loop or medium-loop writes.
+        try:
+            _pf_for_outcomes = await self._state_manager.load_portfolio()
+            _pf_for_outcomes.recommendation_outcomes = dict(self._recommendation_outcomes)
+            await self._state_manager.save_portfolio(_pf_for_outcomes)
+        except Exception as _exc:
+            log.warning("Slow loop: failed to persist recommendation_outcomes: %s", _exc)
+
         opp_symbols = [o.get("symbol") or o.get("ticker", "?") for o in result.new_opportunities]
         log.info(
             "Slow loop: Claude cycle complete — %d new opportunities %s  "
@@ -3594,6 +3700,7 @@ class Orchestrator:
                     "unrealized_pnl_pct": _unrealized_pnl_pct,
                     "current_stop": pos.intention.exit_targets.stop_loss,
                     "current_target": pos.intention.exit_targets.profit_target,
+                    "thesis_intact": review.get("thesis_intact"),
                     "adjusted_targets": review.get("adjusted_targets"),
                     "source": "live",
                     "prompt_version": self._config.claude.prompt_version,

@@ -80,6 +80,10 @@ class PortfolioState:
     # Reloaded on startup to restore the in-memory _recently_closed cooldown for
     # entries younger than 60 seconds. Older entries are discarded on load.
     recently_closed: dict[str, str] = field(default_factory=dict)
+    # Persisted ranker rejection outcomes: symbol → {rejection_count, stage, ...}.
+    # Saved at the end of each slow-loop reasoning cycle so rejection counts survive
+    # restarts within the same trading day. Entries from prior dates are discarded on load.
+    recommendation_outcomes: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -387,6 +391,7 @@ class StateManager:
                 positions=[_from_dict_position(p) for p in data["positions"]],
                 last_updated=data["last_updated"],
                 recently_closed=data.get("recently_closed", {}),
+                recommendation_outcomes=data.get("recommendation_outcomes", {}),
             )
 
     async def save_portfolio(self, state: PortfolioState) -> None:
