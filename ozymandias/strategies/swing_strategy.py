@@ -69,9 +69,12 @@ class SwingStrategy(Strategy):
         # Volatility regime gate: swing trades tolerate quieter regimes than momentum
         # but still need some directional energy to avoid pure chop stop-outs.
         "min_vol_regime_ratio": 0.70,
-        # Hard RVOL gate: current bar volume / 20-bar SMA must meet this floor.
-        # Softer than momentum (0.8 vs 1.0) — swing entries tolerate quieter tape.
-        "min_rvol_for_entry": 0.8,
+        # RVOL gate disabled for swing (0.0 = no gate).
+        # Swing holds for hours-to-days; intraday 5m RVOL is not a meaningful entry
+        # filter for a multi-day thesis. Volume participation is already captured via
+        # the volume_trend_bars signal in generate_signals(). Claude's per-trade
+        # require_volume_ratio_min can add a volume gate on high-conviction setups.
+        "min_rvol_for_entry": 0.0,
         # Entry gate: when True, reject entries where trend_structure is fully adverse.
         # Longs reject bearish_aligned; shorts reject bullish_aligned.
         "block_bearish_trend": True,

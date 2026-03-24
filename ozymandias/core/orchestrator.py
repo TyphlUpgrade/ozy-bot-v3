@@ -3367,6 +3367,11 @@ class Orchestrator:
 
             # Other triggers also fired — continue with run_reasoning_cycle below,
             # using the refreshed watchlist.
+            # Reset the inter-call gap so the reasoning call doesn't wait 3 seconds for
+            # the watchlist build to expire. Both calls are sequential steps in the same
+            # cycle — the min_call_interval_sec guard is intended to prevent rapid bursts
+            # across independent cycles, not within a single _run_claude_cycle invocation.
+            self._claude._last_call_end_time = 0.0
             trigger_name = "|".join(other_triggers)
 
         log.info(

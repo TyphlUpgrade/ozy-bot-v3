@@ -244,12 +244,12 @@ class TestSwingEntryGate:
         passed, _ = strat.apply_entry_gate("buy", _signals(trend_structure="bearish_aligned"))
         assert passed is True
 
-    # BUG-008: RVOL gate
-    def test_rejects_low_rvol(self):
+    # RVOL gate disabled for swing (min_rvol_for_entry=0.0): intraday 5m RVOL
+    # is not a meaningful filter for multi-day swing positions.
+    def test_low_rvol_passes_swing(self):
         strat = _swing()
-        passed, reason = strat.apply_entry_gate("buy", _signals(volume_ratio=0.5, trend_structure="bullish_aligned"))
-        assert passed is False
-        assert "RVOL" in reason
+        passed, _ = strat.apply_entry_gate("buy", _signals(volume_ratio=0.5, trend_structure="bullish_aligned"))
+        assert passed is True  # RVOL gate disabled
 
     def test_passes_sufficient_rvol(self):
         strat = _swing()

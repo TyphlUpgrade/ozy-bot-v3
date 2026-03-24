@@ -635,16 +635,16 @@ class TestMomentumRvolGate:
 class TestSwingRvolGate:
 
     @pytest.mark.asyncio
-    async def test_rvol_below_threshold_blocks_entry(self):
-        """volume_ratio=0.7 < min_rvol_for_entry=0.8 → no signal."""
+    async def test_rvol_below_old_threshold_still_passes(self):
+        """RVOL gate disabled for swing (min_rvol_for_entry=0.0): low volume does not block."""
         s = SwingStrategy()
         inds = _swing_indicators(volume_ratio=0.7)
         signals = await s.generate_signals("TSLA", _df(), inds)
-        assert len(signals) == 0
+        assert len(signals) == 1  # RVOL no longer gates swing entries
 
     @pytest.mark.asyncio
-    async def test_rvol_exactly_at_threshold_allows_entry(self):
-        """volume_ratio exactly == 0.8 → allowed."""
+    async def test_rvol_above_zero_allows_entry(self):
+        """volume_ratio=0.8 with no RVOL floor → allowed."""
         s = SwingStrategy()
         inds = _swing_indicators(volume_ratio=0.8)
         signals = await s.generate_signals("TSLA", _df(), inds)

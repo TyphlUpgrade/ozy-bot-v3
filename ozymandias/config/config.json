@@ -52,6 +52,7 @@
   "claude": {
     "min_call_interval_sec": 3.0,
     "model": "claude-sonnet-4-20250514",
+    "watchlist_max_entries": 30,
     "max_tokens_per_cycle": 4096,
     "prompt_version": "v3.6.0",
     "tier1_max_symbols": 8,
@@ -120,7 +121,7 @@
       "swing": {
         "target_atr_multiplier": 5.0,
         "min_signals_for_entry": 5,
-        "min_rvol_for_entry": 0.8,
+        "min_rvol_for_entry": 0.0,
         "block_bearish_trend": true,
         "rsi_slope_min_for_entry": 0.5,
         "override_atr_multiplier": 3.0,
