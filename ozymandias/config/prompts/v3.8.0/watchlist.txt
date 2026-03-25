@@ -10,7 +10,7 @@ CURRENT WATCHLIST (may be empty or small):
 {current_watchlist}
 
 LIVE SCREENER CANDIDATES — SYMBOLS ACTIVE TODAY:
-The following symbols were pre-screened from a live universe (S&P 500, Nasdaq 100, today's most-active list) for elevated relative volume right now. Each entry shows: symbol, RVOL, current technical summary, composite score (long-biased — evaluate direction independently), recent news, and days until earnings (if within 10 days).
+The following symbols were pre-screened from a live universe (S&P 500, Nasdaq 100, today's most-active list) for elevated relative volume or significant price displacement right now. Each entry shows: symbol, RVOL, current technical summary, composite_score_long (how well the setup scores as a long entry), composite_score_short (how well it scores as a short/fade entry), recent news, and days until earnings (if within 10 days). Use the composite score that matches your intended direction thesis.
 
 {candidates}
 
@@ -56,8 +56,11 @@ RESPONSE FORMAT:
       "symbol": "<SYMBOL>",
       "reason": "<why this ticker, what is the catalyst or setup>",
       "priority_tier": 1,
-      "strategy": "momentum|swing|both"
+      "strategy": "momentum|swing|both",
+      "expected_direction": "long|short|either"
     }
   ],
   "market_notes": "<brief assessment of current market conditions and sector opportunities>"
 }
+
+expected_direction: set to "long" if the thesis is clearly bullish (breakout, earnings beat, oversold reversal, sector tailwind), "short" if clearly bearish (breakdown, downgrade, extended fade candidate, sector headwind), or "either" only if genuinely ambiguous. This field affects how the system evaluates TA signals for the symbol — getting it right matters.

@@ -150,7 +150,8 @@ class UniverseScanner:
             signals = summary.get("signals", {})
             rvol = signals.get("volume_ratio", 0.0) or 0.0
             price = signals.get("price") or 0.0
-            composite = compute_composite_score(signals, direction="long")
+            composite_long = compute_composite_score(signals, direction="long")
+            composite_short = compute_composite_score(signals, direction="short")
             tech_summary = _make_technical_summary(signals)
 
             # fetch_news is on YFinanceAdapter (not the base ABC); degrade if absent
@@ -190,7 +191,8 @@ class UniverseScanner:
                 "symbol": sym,
                 "rvol": round(rvol, 2),
                 "technical_summary": tech_summary,
-                "composite_score": round(composite, 3),
+                "composite_score_long": round(composite_long, 3),
+                "composite_score_short": round(composite_short, 3),
                 "price": round(price, 2),
                 "recent_news": recent_news,
                 "earnings_within_days": earnings,
