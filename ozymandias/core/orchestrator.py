@@ -3467,10 +3467,15 @@ class Orchestrator:
                 "enabled" if (self._search_adapter and self._search_adapter.enabled) else "disabled",
             )
             try:
+                # Slice to max_candidates_to_claude before passing to Claude.
+                # The scanner ranks by RVOL descending; the slice keeps the highest-
+                # activity names and reduces prompt size / token pressure.
+                _n = self._config.universe_scanner.max_candidates_to_claude
+                _candidates_for_claude = (self._last_universe_scan or [])[:_n] or None
                 wl_result = await self._claude.run_watchlist_build(
                     market_context=market_data,
                     current_watchlist=watchlist,
-                    candidates=self._last_universe_scan or None,
+                    candidates=_candidates_for_claude,
                     search_adapter=self._search_adapter,
                     no_entry_symbols=self._config.ranker.no_entry_symbols,
                 )

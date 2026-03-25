@@ -135,13 +135,14 @@
     "enabled": true,
     "scan_concurrency": 20,
     "max_candidates": 50,
+    "max_candidates_to_claude": 20,
     "min_rvol_for_candidate": 0.8,
     "min_price_move_pct_for_candidate": 1.5,
     "cache_ttl_min": 60
   },
   "search": {
     "enabled": true,
-    "max_searches_per_build": 3,
+    "max_searches_per_build": 5,
     "result_count_per_query": 5,
     "search_429_retry_count": 2,
     "search_429_retry_sec": 5.0

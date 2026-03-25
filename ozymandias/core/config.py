@@ -54,6 +54,7 @@ class SchedulerConfig:
     dead_zone_end_et: str = "14:30"
     entry_attempts_per_cycle: int = 3                # max ranked candidates to attempt per medium cycle before giving up
     limit_order_timeout_sec: int = 300               # cancel unfilled limit orders after this many seconds (default 5 min)
+    swing_limit_order_timeout_sec: int = 1200        # longer timeout for swing strategy limit entries (default 20 min); swing theses are multi-day and need more time to fill at a tight spread
     market_order_conviction_threshold: float = 0.80  # use market order (immediate fill) for momentum entries at or above this conviction
     min_hold_before_override_min: int = 5            # quant overrides cannot fire within this many minutes of position entry
     bypass_market_hours: bool = False                # when True, skip all market-hours gates (loop guards, dead zone, session check); for off-hours testing only
@@ -77,6 +78,7 @@ class SchedulerConfig:
     macro_rsi_euphoria_threshold: int = 72           # SPY RSI ≥ this fires market_rsi_extreme:euphoria trigger (overheating)
     macro_rsi_rearm_band: int = 5                    # RSI must recover by this many points before the extreme trigger can re-fire
     watchlist_refresh_interval_min: int = 120        # proactive watchlist rebuild interval (minutes); 0 disables watchlist_stale trigger
+    no_opportunity_streak_warn_threshold: int = 8    # log a gate-breakdown WARN when this many consecutive medium loops produce zero ranked candidates; helps diagnose whether the watchlist or a specific gate is the bottleneck
 
 
 @dataclass
@@ -155,16 +157,24 @@ class UniverseScannerConfig:
     scan_concurrency: int = 20          # parallel yfinance fetches for universe scan;
                                         # intentionally higher than medium_loop_scan_concurrency (10)
                                         # — universe scan covers 75+ symbols and is less latency-sensitive
-    max_candidates: int = 50            # top N by RVOL sent to Claude
-    min_rvol_for_candidate: float = 0.8 # drop stale/inactive symbols below this RVOL
+    max_candidates: int = 50            # top N ranked by the scanner (full ranked pool)
+    max_candidates_to_claude: int = 20  # how many of the top-ranked candidates to include in
+                                        # the watchlist build prompt; smaller = less token pressure
+                                        # + forces Claude to focus on highest-RVOL names
+    min_rvol_for_candidate: float = 0.8 # pass if RVOL ≥ this (volume-activity path)
+    min_price_move_pct_for_candidate: float = 1.5  # pass if abs(roc_5) ≥ this (price-move path);
+                                        # direction-agnostic: captures breakdowns and fades that
+                                        # have low RVOL but meaningful price displacement
     cache_ttl_min: int = 60             # reuse scan result within same session without re-scanning
 
 
 @dataclass
 class SearchConfig:
     enabled: bool = True
-    max_searches_per_build: int = 3     # cap on tool_use rounds per watchlist build call
+    max_searches_per_build: int = 5     # cap on tool_use rounds per watchlist build call
     result_count_per_query: int = 5     # results returned per Brave Search query
+    search_429_retry_count: int = 2     # retry Brave Search calls that hit a 429 rate limit this many times
+    search_429_retry_sec: float = 5.0   # seconds to wait between Brave Search 429 retries
 
 
 @dataclass
