@@ -881,3 +881,86 @@ class TestEntryConditionSlopeSignValidation:
         signals = {"rsi_slope_5": -0.1}
         passed, _ = evaluate_entry_conditions(conditions, signals)
         assert passed is True
+
+
+class TestRsiAccelEntryConditions:
+    """evaluate_entry_conditions: rsi_accel_min and rsi_accel_max keys."""
+
+    def _eval(self, conditions, signals):
+        from ozymandias.intelligence.opportunity_ranker import evaluate_entry_conditions
+        return evaluate_entry_conditions(conditions, signals)
+
+    # --- rsi_accel_min ---
+
+    def test_accel_min_passes_when_above_threshold(self):
+        """rsi_accel_3 above rsi_accel_min → condition met."""
+        passed, _ = self._eval({"rsi_accel_min": 0.5}, {"rsi_accel_3": 1.2})
+        assert passed is True
+
+    def test_accel_min_passes_at_exact_threshold(self):
+        """rsi_accel_3 equal to rsi_accel_min → condition met (>= is inclusive)."""
+        passed, _ = self._eval({"rsi_accel_min": 0.5}, {"rsi_accel_3": 0.5})
+        assert passed is True
+
+    def test_accel_min_blocks_when_below_threshold(self):
+        """rsi_accel_3 below rsi_accel_min → condition not met."""
+        passed, reason = self._eval({"rsi_accel_min": 0.5}, {"rsi_accel_3": 0.2})
+        assert passed is False
+        assert "rsi_accel_min" in reason
+
+    def test_accel_min_zero_blocks_negative_accel(self):
+        """rsi_accel_min=0.0 blocks entry when RSI slope is decelerating."""
+        passed, reason = self._eval({"rsi_accel_min": 0.0}, {"rsi_accel_3": -0.3})
+        assert passed is False
+        assert "rsi_accel_min" in reason
+
+    def test_accel_min_zero_passes_zero_accel(self):
+        """rsi_accel_min=0.0 passes when acceleration is exactly zero."""
+        passed, _ = self._eval({"rsi_accel_min": 0.0}, {"rsi_accel_3": 0.0})
+        assert passed is True
+
+    def test_accel_min_missing_signal_blocks(self):
+        """rsi_accel_3 absent from signals → condition treated as unmet."""
+        passed, reason = self._eval({"rsi_accel_min": 0.5}, {})
+        assert passed is False
+        assert "rsi_accel_3" in reason
+
+    # --- rsi_accel_max ---
+
+    def test_accel_max_passes_when_below_threshold(self):
+        """rsi_accel_3 below rsi_accel_max → condition met."""
+        passed, _ = self._eval({"rsi_accel_max": -0.5}, {"rsi_accel_3": -1.2})
+        assert passed is True
+
+    def test_accel_max_passes_at_exact_threshold(self):
+        """rsi_accel_3 equal to rsi_accel_max → condition met (<= is inclusive)."""
+        passed, _ = self._eval({"rsi_accel_max": -0.5}, {"rsi_accel_3": -0.5})
+        assert passed is True
+
+    def test_accel_max_blocks_when_above_threshold(self):
+        """rsi_accel_3 above rsi_accel_max → condition not met."""
+        passed, reason = self._eval({"rsi_accel_max": -0.5}, {"rsi_accel_3": 0.2})
+        assert passed is False
+        assert "rsi_accel_max" in reason
+
+    def test_accel_max_missing_signal_blocks(self):
+        """rsi_accel_3 absent from signals → condition treated as unmet."""
+        passed, reason = self._eval({"rsi_accel_max": -0.5}, {})
+        assert passed is False
+        assert "rsi_accel_3" in reason
+
+    def test_accel_min_and_max_both_pass(self):
+        """Both rsi_accel_min and rsi_accel_max conditions satisfied simultaneously."""
+        passed, _ = self._eval(
+            {"rsi_accel_min": -1.0, "rsi_accel_max": 1.0},
+            {"rsi_accel_3": 0.3},
+        )
+        assert passed is True
+
+    def test_accel_independent_of_other_conditions(self):
+        """rsi_accel conditions evaluated alongside other condition keys."""
+        passed, _ = self._eval(
+            {"rsi_min": 50.0, "rsi_accel_min": 0.0},
+            {"rsi": 60.0, "rsi_accel_3": 0.5},
+        )
+        assert passed is True

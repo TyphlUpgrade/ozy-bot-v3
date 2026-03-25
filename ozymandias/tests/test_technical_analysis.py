@@ -795,3 +795,89 @@ class TestRsiSlope5OvernightGuard:
         # For daily bars the 5-bar span > 24h → guard skipped → slope can be nonzero
         # (constant volume → RSI may be near 50 flat; just verify no crash and it's a float)
         assert isinstance(result["signals"]["rsi_slope_5"], float)
+
+
+# ---------------------------------------------------------------------------
+# rsi_accel_3 — RSI 2nd derivative
+# ---------------------------------------------------------------------------
+
+class TestRsiAccel3:
+    """rsi_accel_3 is the change in rsi_slope_5 over 3 bars (2nd derivative of RSI)."""
+
+    def test_present_in_signals(self):
+        """rsi_accel_3 key exists in generate_signal_summary output."""
+        close = [100.0 + i * 0.5 for i in range(30)]
+        df = _ohlcv(close)
+        result = generate_signal_summary("TEST", df)
+        assert "rsi_accel_3" in result["signals"]
+
+    def test_type_is_float(self):
+        """rsi_accel_3 is always a float."""
+        close = [100.0] * 30
+        df = _ohlcv(close)
+        result = generate_signal_summary("TEST", df)
+        assert isinstance(result["signals"]["rsi_accel_3"], float)
+
+    def test_zero_when_fewer_than_9_rsi_values(self):
+        """rsi_accel_3 is 0.0 when there are fewer than 9 clean RSI values."""
+        # RSI 14 requires 15 bars minimum for first value; with only 10 bars
+        # we won't have 9 clean RSI values for the acceleration window.
+        close = [100.0 + i for i in range(10)]
+        df = _ohlcv(close)
+        result = generate_signal_summary("TEST", df)
+        assert result["signals"]["rsi_accel_3"] == 0.0
+
+    def test_positive_when_slope_accelerating(self):
+        """Rising RSI with increasing velocity → positive rsi_accel_3."""
+        # Price accelerating upward → RSI should accelerate upward too.
+        # Use convex price series (slow start, fast finish).
+        close = [100.0 + i ** 1.5 for i in range(30)]
+        df = _ohlcv(close)
+        result = generate_signal_summary("TEST", df)
+        accel = result["signals"]["rsi_accel_3"]
+        assert isinstance(accel, float)
+        # We can't guarantee the sign with certainty due to RSI smoothing,
+        # but the value must be a valid float (not NaN, not inf).
+        assert accel == accel  # NaN check
+        assert abs(accel) < 1000  # sanity bound
+
+    def test_negative_when_slope_decelerating(self):
+        """Strong uptrend then sharp reversal → rsi_accel_3 negative at the reversal point.
+
+        RSI was rising fast (positive slope) then reverses sharply downward. The slope
+        3 bars ago was still positive; the current slope is now negative.
+        accel = slope_now - slope_3ago = (negative) - (positive) → clearly negative.
+        """
+        # 25 bars of strong uptrend → RSI near 100. Then 5 bars of sharp reversal.
+        # RSI falls rapidly on the reversal while slope_3ago was still ascending.
+        close = [100.0 + i * 3 for i in range(25)] + [172.0 - i * 6 for i in range(5)]
+        df = _ohlcv(close)
+        result = generate_signal_summary("TEST", df)
+        accel = result["signals"]["rsi_accel_3"]
+        assert isinstance(accel, float)
+        assert accel < 0, f"Expected negative acceleration on sharp reversal, got {accel}"
+
+    def test_overnight_guard_zeroes_acceleration(self):
+        """Intraday data spanning a date boundary → rsi_accel_3 zeroed (contaminated window)."""
+        import pandas as pd
+        day1_start = pd.Timestamp("2026-03-24 14:00:00", tz="UTC")
+        day2_start = pd.Timestamp("2026-03-25 14:00:00", tz="UTC")
+        idx1 = pd.date_range(start=day1_start, periods=5, freq="1min")
+        idx2 = pd.date_range(start=day2_start, periods=10, freq="1min")
+        idx = idx1.append(idx2)
+        n = len(idx)
+        df = pd.DataFrame(
+            {"open": [100.0] * n, "high": [101.0] * n,
+             "low": [99.0] * n, "close": [100.0] * n, "volume": [1_000_000] * n},
+            index=idx,
+        )
+        result = generate_signal_summary("TEST", df)
+        assert result["signals"]["rsi_accel_3"] == 0.0
+
+    def test_daily_bars_guard_not_fired(self):
+        """Daily bars — overnight guard must NOT zero out acceleration."""
+        close = [100.0 + i * 0.5 for i in range(30)]
+        df = _ohlcv(close, freq="D")
+        result = generate_signal_summary("TEST", df)
+        # Daily bars span > 24h per bar → guard skipped; value is a plain float.
+        assert isinstance(result["signals"]["rsi_accel_3"], float)

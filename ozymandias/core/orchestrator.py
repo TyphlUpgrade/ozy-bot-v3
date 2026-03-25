@@ -56,6 +56,46 @@ log = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
 
+
+def _rejection_gate_category(reason: str) -> str:
+    """Map a ranker rejection-reason string to a short gate-category label.
+
+    Used to build the gate-breakdown summary in the no-opportunity streak WARN.
+    To add a new category: add one entry to the lookup before the fallback.
+    """
+    r = reason.lower()
+    if "no_entry_symbols" in r or "market-context" in r:
+        return "no_entry_list"
+    if "already open in portfolio" in r:
+        return "already_open"
+    if "conviction" in r:
+        return "conviction_floor"
+    if "composite_technical_score" in r or "technical score" in r:
+        return "technical_score_floor"
+    if "rvol" in r or "volume_ratio" in r:
+        return "rvol_gate"
+    if "rsi" in r:
+        return "rsi_gate"
+    if "vwap" in r:
+        return "vwap_gate"
+    if "entry_condition" in r:
+        return "entry_conditions"
+    if "pdt" in r:
+        return "pdt_guard"
+    if "market" in r and "open" in r:
+        return "market_hours"
+    if "dead zone" in r or "dead_zone" in r:
+        return "dead_zone"
+    if "max_concurrent" in r or "position cap" in r:
+        return "position_cap"
+    if "deployment" in r:
+        return "deployment_cap"
+    if "drift" in r:
+        return "price_drift"
+    if "suppressed" in r:
+        return "session_suppressed"
+    return "other"
+
 # Market context instruments fetched every medium cycle for Claude macro context.
 # Results go into _market_context_indicators only — never into _latest_indicators
 # (no entry pipeline contamination).
@@ -335,6 +375,12 @@ class Orchestrator:
         # Cleared with _cycle_consumed_symbols on each successful Claude call.
         self._entry_defer_counts: dict[str, int] = {}
 
+        # Consecutive medium-loop cycles where the ranker returned zero candidates.
+        # Used to emit a gate-breakdown WARN (Finding 4) so the operator can diagnose
+        # whether a watchlist or a specific gate is the bottleneck. Reset when ranked
+        # candidates appear or a fresh Claude reasoning cycle fires.
+        self._no_opportunity_streak: int = 0
+
         # Phase 15: unified recommendation outcome tracker.
         # symbol → {claude_entry_target, attempt_time_utc, stage, stage_detail,
         #            rejection_count, order_id}
@@ -525,7 +571,9 @@ class Orchestrator:
             no_entry_symbols=list(self._config.ranker.no_entry_symbols),
         )
         self._search_adapter = SearchAdapter(
-            api_key=os.environ.get("BRAVE_SEARCH_API_KEY")
+            api_key=os.environ.get("BRAVE_SEARCH_API_KEY"),
+            retry_count=self._config.search.search_429_retry_count,
+            retry_sec=self._config.search.search_429_retry_sec,
         )
 
         # -- Opportunity ranker -----------------------------------------------
@@ -2109,6 +2157,12 @@ class Orchestrator:
 
         # Phase 15: record hard-filter rejections in _recommendation_outcomes.
         # Session-veto symbols and already-open duplicates are not recorded (spec §1).
+        # Finding 6: build a symbol → opportunity lookup once so we can pull
+        # conviction/strategy for the first-occurrence journal record below.
+        _opp_by_symbol: dict[str, dict] = {
+            o.get("symbol", ""): o
+            for o in reasoning_result.new_opportunities
+        }
         for symbol, reason in rank_result.rejections:
             # Skip symbols that are already in the portfolio (expected every cycle
             # on stale recommendations while a position is held — not useful noise).
@@ -2124,6 +2178,21 @@ class Orchestrator:
                 "rejection_count": new_count,
                 "order_id": None,
             }
+            # Finding 6: journal the first conviction_floor rejection per symbol
+            # per session so calibration data accumulates across sessions.
+            # Write only on new_count==1 (first occurrence this session) to avoid
+            # flooding the journal on every cycle for the same stale proposal.
+            if new_count == 1 and _rejection_gate_category(reason) == "conviction_floor":
+                opp = _opp_by_symbol.get(symbol, {})
+                await self._trade_journal.append({
+                    "record_type": "rejected",
+                    "rejection_gate": "conviction_floor",
+                    "symbol": symbol,
+                    "strategy": opp.get("strategy", ""),
+                    "conviction": opp.get("conviction", 0.0),
+                    "conviction_threshold": self._config.ranker.min_conviction_threshold,
+                    "reason": reason,
+                })
             # After max_filter_rejection_cycles consecutive hard-filter failures,
             # suppress the symbol for the rest of the session so Claude stops
             # re-proposing it and the ranker stops evaluating it every cycle.
@@ -2139,6 +2208,43 @@ class Orchestrator:
             "Medium loop: ranker returned %d opportunity/ies (from %d Claude candidates)",
             len(ranked), len(reasoning_result.new_opportunities),
         )
+
+        # -- No-opportunity streak tracking (Finding 4 / Proposal B) ----------------
+        # When ranked is empty, increment the streak counter. After
+        # no_opportunity_streak_warn_threshold consecutive empty loops, emit a
+        # gate-breakdown WARN so the operator can see which filter is the bottleneck.
+        # "already_open" rejections are excluded from the breakdown (expected noise
+        # while holding positions). Reset when candidates are available or fresh
+        # reasoning fires (see _run_claude_cycle).
+        if not ranked:
+            self._no_opportunity_streak += 1
+            warn_threshold = self._config.scheduler.no_opportunity_streak_warn_threshold
+            if self._no_opportunity_streak >= warn_threshold:
+                # Build gate → count breakdown, excluding already_open noise.
+                gate_counts: dict[str, int] = {}
+                for _sym, _reason in rank_result.rejections:
+                    cat = _rejection_gate_category(_reason)
+                    if cat == "already_open":
+                        continue
+                    gate_counts[cat] = gate_counts.get(cat, 0) + 1
+                breakdown = ", ".join(
+                    f"{g}={c}" for g, c in sorted(gate_counts.items(), key=lambda x: -x[1])
+                ) or "no hard-filter rejections (zero Claude candidates?)"
+                log.warning(
+                    "No-opportunity streak: %d consecutive empty medium loops. "
+                    "Gate breakdown: [%s]. "
+                    "Consider reviewing the watchlist or relaxing entry gates if "
+                    "market conditions remain favorable.",
+                    self._no_opportunity_streak,
+                    breakdown,
+                )
+        else:
+            if self._no_opportunity_streak > 0:
+                log.info(
+                    "No-opportunity streak cleared after %d loop(s)",
+                    self._no_opportunity_streak,
+                )
+            self._no_opportunity_streak = 0
 
         # -- Step 5: try ranked opportunities in order (one entry per cycle) --------
         if not self._degradation.safe_mode and ranked:
@@ -2179,6 +2285,19 @@ class Orchestrator:
                 "Medium loop: skipping %s — composite score %.3f < floor %.2f",
                 symbol, top.composite_score, min_score,
             )
+            # Finding 6: journal every composite_score_floor rejection for calibration.
+            # These pass the ranker's hard filters but fail the second-stage composite
+            # floor, so they don't appear in rank_result.rejections. Journalling here
+            # captures how close each near-miss was to the 0.45 threshold.
+            await self._trade_journal.append({
+                "record_type": "rejected",
+                "rejection_gate": "composite_score_floor",
+                "symbol": symbol,
+                "strategy": top.strategy,
+                "conviction": top.ai_conviction,
+                "composite_score": round(top.composite_score, 4),
+                "composite_score_floor": min_score,
+            })
             return False
 
         log.info(
@@ -2278,21 +2397,26 @@ class Orchestrator:
                 self._entry_defer_counts[symbol] = self._entry_defer_counts.get(symbol, 0) + 1
                 count = self._entry_defer_counts[symbol]
                 if count >= max_defers:
+                    # Suppress for the session — same mechanism as hard-filter rejection.
+                    # Clearing entry_conditions on the live object is insufficient because
+                    # the object is rebuilt from the reasoning cache each medium loop, so
+                    # the cleared gate is restored on the next cycle. Session suppression
+                    # is the correct termination — Claude will reconsider on the next build.
+                    suppression_reason = (
+                        f"stale thesis gate: entry conditions expired after {count} consecutive defers"
+                    )
+                    self._filter_suppressed[symbol] = suppression_reason
                     log.warning(
                         "Entry conditions not met for %s: %s — "
-                        "expired after %d consecutive defers (stale thesis gate; awaiting fresh Claude call)",
+                        "suppressed for session after %d consecutive defers (stale thesis gate)",
                         symbol, conds_reason, count,
                     )
-                    # Clear the gate on the live object so the medium loop skips this check
-                    # for the remainder of the current reasoning cycle. The ranker rebuilds
-                    # from fresh reasoning on the next Claude cycle, resetting defer_count.
-                    top.entry_conditions = {}
                     # Phase 15: record gate expiry
                     self._recommendation_outcomes[symbol] = {
                         **self._recommendation_outcomes.get(symbol, {}),
                         "stage": "gate_expired",
                         "stage_detail": (
-                            f"gate cleared after {self._config.scheduler.max_entry_defer_cycles} misses"
+                            f"session-suppressed after {count} defers: {suppression_reason}"
                         ),
                     }
                 else:
@@ -2407,6 +2531,7 @@ class Orchestrator:
             quantity=quantity,
             price=entry_price,
             blocks_eod_entries=strategy_obj.blocks_eod_entries if strategy_obj is not None else False,
+            dead_zone_exempt=strategy_obj.dead_zone_exempt if strategy_obj is not None else False,
             account=acct,
             portfolio=portfolio,
             orders=orders,
@@ -2538,6 +2663,14 @@ class Orchestrator:
 
         now_iso = datetime.now(timezone.utc).isoformat()
         actual_order_type = "market" if use_market else "limit"
+        # Strategy-specific limit order timeout: swing entries need more time to fill
+        # at a tight spread than momentum scalps. Set per-order timeout_seconds so
+        # get_stale_orders() can use it directly without a global switch.
+        # To add a new strategy-specific timeout, add one entry to this dict.
+        _strategy_timeouts = {
+            "swing": self._config.scheduler.swing_limit_order_timeout_sec,
+        }
+        entry_timeout = _strategy_timeouts.get(strategy_name, self._config.scheduler.limit_order_timeout_sec)
         record = OrderRecord(
             order_id=result.order_id,
             symbol=symbol,
@@ -2548,6 +2681,7 @@ class Orchestrator:
             status="PENDING",
             created_at=now_iso,
             last_checked_at=now_iso,
+            timeout_seconds=entry_timeout,
         )
         await self._fill_protection.record_order(record)
         # Phase 15: record order_pending outcome.
@@ -3357,6 +3491,19 @@ class Orchestrator:
                 log.debug("Watchlist build complete — last_watchlist_build_utc updated")
             except Exception as exc:
                 log.error("Watchlist build failed: %s", exc, exc_info=True)
+                # Back-date last_watchlist_build_utc so watchlist_stale re-fires after the
+                # circuit-breaker probe interval (circuit_breaker_probe_min) rather than on
+                # every slow-loop tick. Without this, a sustained 529 outage generates one
+                # failed build attempt per minute until the probe clears.
+                probe_sec = self._config.ai_fallback.circuit_breaker_probe_min * 60
+                interval_sec = self._config.scheduler.watchlist_refresh_interval_min * 60
+                self._trigger_state.last_watchlist_build_utc = (
+                    datetime.now(timezone.utc) - timedelta(seconds=interval_sec - probe_sec)
+                )
+                log.debug(
+                    "Watchlist build failed — next retry in ~%d min",
+                    self._config.ai_fallback.circuit_breaker_probe_min,
+                )
 
             if not other_triggers:
                 # Watchlist build was the only trigger — update prices and return.
@@ -3438,6 +3585,7 @@ class Orchestrator:
         # so new opportunities from this cycle can be entered on a clean slate.
         self._cycle_consumed_symbols.clear()
         self._entry_defer_counts.clear()
+        self._no_opportunity_streak = 0
 
         # Snapshot current unrealised gain for each open position so the
         # position_in_profit trigger re-arms from the reviewed level, not from

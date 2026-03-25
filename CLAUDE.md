@@ -103,10 +103,10 @@ Features not described in the spec may be requested. When implementing them, fol
 
 ## Post-MVP Status
 
-All 10 spec phases complete per `ozymandias_v3_spec_revised.md`. Post-MVP phases (11–18) are addressing architectural gaps discovered during paper trading.
+All 10 spec phases complete per `ozymandias_v3_spec_revised.md`. Post-MVP phases (11–18) complete.
 
 Last spec phase completed: Phase 10 (March 15)
-Last post-MVP phase completed: Phase 15 — Context Enrichment (March 20)
+Last post-MVP phase completed: Phase 18 — Watchlist Intelligence (March 23)
 
 ### Completed post-MVP work
 - **Anti-bias hardening** (March 15): conviction sanity floor, `rejected_opportunities` logging,
@@ -179,20 +179,56 @@ Last post-MVP phase completed: Phase 15 — Context Enrichment (March 20)
   composite score); `TradeJournal.load_recent` + `compute_session_stats`; `recent_executions` and
   `execution_stats` passed to Claude each cycle; prompt v3.5.0; 50 new tests.
 
-### Post-MVP Roadmap: Phases 17–19
+- **Phase 17 — Trigger Responsiveness & Data Freshness** (March 23): parallel medium loop fetch
+  with `asyncio.Semaphore(medium_loop_scan_concurrency=10)`; `_all_indicators` merged dict;
+  `_last_medium_loop_completed_utc` gate so slow loop only calls Claude after fresh data;
+  bidirectional macro/sector triggers (`market_move:SPY/QQQ/IWM`, `sector_move:<etf>`,
+  `market_rsi_extreme` for panic + euphoria); `_SECTOR_MAP` + `_CONTEXT_SECTOR_ETFS` extension
+  points; `last_claude_call_prices` baseline in `SlowLoopTriggerState`; adaptive reasoning cache
+  TTL (`cache_max_age_panic_min=10` when SPY RSI < 25, `cache_max_age_stressed_min=20` < 30).
 
-- **Phase 17 — Trigger Responsiveness & Data Freshness**: see `phases/17_trigger_responsiveness.md`
-  - Parallel medium loop fetch, medium-loop-gated slow loop, bidirectional macro/sector triggers,
-    adaptive reasoning cache TTL
-- **Phase 18 — Watchlist Intelligence**: see `phases/18_watchlist_intelligence.md`
-  - Dynamic universe (Yahoo Finance screener + Wikipedia indices), RVOL-ranked candidates,
-    Brave Search tool use for Claude to research catalysts at watchlist build time
-  - `scripts/reset_watchlist.py`: CLI tool to replace or clear `watchlist.json` without running
-    the bot. Interface: positional symbol args + `--empty` flag + `--dry-run` preview.
-    Must use StateManager for atomic writes and schema validation.
+- **Post-Phase-17 hardening** (March 23): `_apply_position_reviews` stale-portfolio race fix
+  (loads fresh snapshot internally); `"sell_short"` → `"short"` direction normalization on state
+  load; session-level filter suppression (`_filter_suppressed: dict[str, str]` — symbols that fail
+  hard filters `max_filter_rejection_cycles` times are blocked + shown to Claude as suppressed).
+
+- **Phase 18 — Watchlist Intelligence** (March 23): `UniverseFetcher` — Yahoo Finance screener
+  (`most_actives` + `day_gainers`) + Wikipedia S&P 500/Nasdaq 100 (24h cache); `UniverseScanner`
+  — RVOL filter with OR-gate price-move path (`min_price_move_pct_for_candidate=1.5%`), earnings
+  calendar, news enrichment, sort by RVOL descending; `SearchAdapter` — Brave Search API with 429
+  retry, graceful degradation when no key; `call_claude_with_tools` — multi-turn tool-use loop in
+  `claude_reasoning.py` with forced final call on round exhaustion; `run_watchlist_build` updated
+  with `candidates` + `search_adapter` params; `scripts/reset_watchlist.py` CLI tool; prompt v3.6.0.
+
+- **2026-03-24 paper session fixes**: strategy-specific limit order timeout
+  (`swing_limit_order_timeout_sec=1200`, momentum keeps 300s); Brave Search 429 retry
+  (`search_429_retry_count=2`, `search_429_retry_sec=5.0`).
+
+- **2026-03-24 observability**: no-opportunity streak WARN at configurable threshold (default 8)
+  with gate-breakdown summary; `record_type="rejected"` journal entries for conviction-floor and
+  composite-score-floor rejections for cross-session calibration.
+
+- **2026-03-25 paper session fixes**:
+  - *Defer expiry suppression*: on hitting `max_entry_defer_cycles`, symbol now added to
+    `_filter_suppressed` (session suppression) instead of clearing `top.entry_conditions` — the
+    prior approach was a no-op because `top` is rebuilt from the reasoning cache each medium loop.
+  - *Dead zone exempt for swing*: `dead_zone_exempt` property on `Strategy` ABC (default `False`);
+    `SwingStrategy.dead_zone_exempt = True`; `validate_entry` + `_check_market_hours` in
+    `risk_manager.py` accept and enforce the flag. Swing theses are multi-day and unaffected by
+    the noon lull the dead zone was designed for.
+  - *Universe scanner OR-gate*: RVOL path OR price-move path (abs(roc_5) ≥
+    `min_price_move_pct_for_candidate`). Direction-agnostic — captures shorts and low-float movers
+    that have elevated moves without proportionally elevated RVOL.
+  - *Watchlist build re-fire suppression*: on build failure, `last_watchlist_build_utc` back-dated
+    so `watchlist_stale` re-fires after `circuit_breaker_probe_min` minutes, not every 60s.
+  - *Prompt v3.8.0*: clean version boundary (content unchanged from v3.7.0 — reserved for rsi_max
+    swing instruction pending further discussion).
+
+### Post-MVP Roadmap: Phase 19
+
 - **Phase 19 — Context Compression**: see `phases/19_context_compression.md`
   - Haiku pre-screener ranks all watchlist candidates before strategic reasoning context assembly;
-    most valuable after Phase 18 populates a large, diverse tier1/tier2 candidate pool
+    most valuable now that Phase 18 populates a large, diverse tier1/tier2 candidate pool
 
 ## Spec Drift Log
 See `DRIFT_LOG.md`. Read the relevant phase section of DRIFT_LOG.md before modifying or debugging any module built in a previous phase.

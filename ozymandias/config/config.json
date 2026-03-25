@@ -30,6 +30,7 @@
     "dead_zone_start_et": "11:30",
     "dead_zone_end_et": "14:30",
     "limit_order_timeout_sec": 300,
+    "swing_limit_order_timeout_sec": 1200,
     "market_order_conviction_threshold": 0.80,
     "min_hold_before_override_min": 5,
     "bars_cache_ttl_sec": 110,
@@ -47,14 +48,15 @@
     "macro_rsi_panic_threshold": 25,
     "macro_rsi_euphoria_threshold": 72,
     "macro_rsi_rearm_band": 5,
-    "watchlist_refresh_interval_min": 120
+    "watchlist_refresh_interval_min": 120,
+    "no_opportunity_streak_warn_threshold": 8
   },
   "claude": {
     "min_call_interval_sec": 3.0,
     "model": "claude-sonnet-4-20250514",
-    "watchlist_max_entries": 30,
+    "watchlist_max_entries": 40,
     "max_tokens_per_cycle": 4096,
-    "prompt_version": "v3.6.0",
+    "prompt_version": "v3.8.0",
     "tier1_max_symbols": 8,
     "tier2_max_symbols": 15,
     "news_max_age_hours": 168,
@@ -134,12 +136,15 @@
     "scan_concurrency": 20,
     "max_candidates": 50,
     "min_rvol_for_candidate": 0.8,
+    "min_price_move_pct_for_candidate": 1.5,
     "cache_ttl_min": 60
   },
   "search": {
     "enabled": true,
     "max_searches_per_build": 3,
-    "result_count_per_query": 5
+    "result_count_per_query": 5,
+    "search_429_retry_count": 2,
+    "search_429_retry_sec": 5.0
   },
   "timezone": "America/New_York"
 }

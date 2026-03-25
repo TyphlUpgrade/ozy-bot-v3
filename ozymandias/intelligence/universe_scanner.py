@@ -1,11 +1,15 @@
 """
-Universe Scanner — takes the live symbol universe and produces an RVOL-ranked
+Universe Scanner — takes the live symbol universe and produces an activity-ranked
 candidate list for Claude's watchlist build.
 
 Pipeline:
   1. Fetch bars for all universe symbols (parallel, semaphore-bounded)
   2. Run TA (generate_signal_summary) in asyncio.to_thread (CPU-bound)
-  3. Filter: bars_available < 5 or volume_ratio < min_rvol_for_candidate
+  3. Filter (OR gate — either path qualifies):
+       - Volume path:     volume_ratio >= min_rvol_for_candidate (elevated activity)
+       - Price-move path: abs(roc_5)   >= min_price_move_pct_for_candidate (significant
+                          price displacement regardless of volume — captures breakdowns,
+                          quiet distributions, and extended names for fades)
   4. Sort by volume_ratio descending (direction-neutral activity signal)
   5. For top min(n*2, 60) symbols: fetch news + earnings calendar concurrently
   6. Return top n as candidate dicts
@@ -39,6 +43,7 @@ class UniverseScannerConfig:
     scan_concurrency: int = 20
     max_candidates: int = 50
     min_rvol_for_candidate: float = 0.8
+    min_price_move_pct_for_candidate: float = 1.5
     cache_ttl_min: int = 60
 
 
@@ -103,21 +108,38 @@ class UniverseScanner:
 
         scan_results = await asyncio.gather(*[_scan_one(s) for s in universe])
 
-        # -- Step 3: filter by bars_available and RVOL -------------------------
+        # -- Step 3: filter — OR gate (volume path OR price-move path) ---------
+        # Volume path:     RVOL >= min_rvol_for_candidate
+        # Price-move path: abs(roc_5) >= min_price_move_pct_for_candidate
+        # Direction-agnostic: both long breakouts and short candidates (quiet
+        # distributions, extended fades) can qualify via the price-move path
+        # even when current-period volume is normal.
+        # To add a new qualification path: add one condition to the OR below.
         scored: list[tuple[str, dict]] = []
+        volume_path_count = 0
+        price_move_path_count = 0
         for sym, summary in scan_results:
             if summary is None:
                 continue
             signals = summary.get("signals", {})
             bars = summary.get("bars_available", 0)
             rvol = signals.get("volume_ratio", 0.0) or 0.0
+            roc5 = signals.get("roc_5", 0.0) or 0.0
             if bars < 5:
                 continue
-            if rvol < self._cfg.min_rvol_for_candidate:
+            via_rvol = rvol >= self._cfg.min_rvol_for_candidate
+            via_move = abs(roc5) >= self._cfg.min_price_move_pct_for_candidate
+            if not (via_rvol or via_move):
                 continue
             scored.append((sym, summary))
+            if via_rvol:
+                volume_path_count += 1
+            if via_move and not via_rvol:
+                price_move_path_count += 1
 
         # -- Step 4: sort by RVOL descending -----------------------------------
+        # High-RVOL candidates rank first; price-move-only candidates appear at
+        # the bottom but are still passed to Claude for evaluation.
         scored.sort(key=lambda x: x[1].get("signals", {}).get("volume_ratio", 0.0) or 0.0, reverse=True)
 
         # -- Step 5: enrich top symbols with news + earnings -------------------
@@ -179,8 +201,10 @@ class UniverseScanner:
         # Return top n
         candidates = list(enriched)[:n]
         log.info(
-            "Universe scanner: %d candidates (top RVOL: %s)",
+            "Universe scanner: %d candidates (rvol_path=%d  move_path=%d)  top RVOL: %s",
             len(candidates),
+            volume_path_count,
+            price_move_path_count,
             [c["symbol"] for c in candidates[:5]],
         )
         return candidates

@@ -198,6 +198,17 @@ class Strategy(ABC):
         """
         return False  # safe default; momentum overrides to True
 
+    @property
+    def dead_zone_exempt(self) -> bool:
+        """True if this strategy is exempt from the midday dead zone (11:30–14:30 ET).
+
+        The dead zone was designed to suppress intraday momentum entries during the
+        low-volume noon lull, where whipsaw risk is highest. Multi-day swing theses
+        are not affected by hour-of-day volatility patterns and should be exempt.
+        To add a new strategy: return True here to bypass the dead zone gate.
+        """
+        return False  # safe default; swing overrides to True
+
     @abstractmethod
     def apply_entry_gate(
         self,

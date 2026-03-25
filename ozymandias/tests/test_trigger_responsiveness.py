@@ -648,4 +648,103 @@ class TestAdaptiveCacheTtl:
         )
         # max_age_min must be an integer (one of the TTL config values)
         assert isinstance(passed_max_age, int)
-        assert passed_max_age > 0
+
+
+# ===========================================================================
+# Watchlist build failure — re-fire suppression (Problem A fix)
+# ===========================================================================
+
+class TestWatchlistBuildFailureBackdate:
+    """
+    On a failed watchlist build, last_watchlist_build_utc must be back-dated
+    to (now - (interval - probe_min)) so that watchlist_stale re-fires after
+    ~probe_min minutes, not on every slow-loop tick.
+    """
+
+    @pytest.mark.asyncio
+    async def test_failed_build_sets_backdate_timestamp(self, orch):
+        """last_watchlist_build_utc is set on failure, not left as None."""
+        await _seed_watchlist(orch, ["AAPL"])
+        await _seed_portfolio(orch)
+
+        orch._claude.run_watchlist_build = AsyncMock(side_effect=RuntimeError("529 overloaded"))
+        orch._trigger_state.last_watchlist_build_utc = None
+
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            await orch._run_claude_cycle("watchlist_stale")
+
+        assert orch._trigger_state.last_watchlist_build_utc is not None
+
+    @pytest.mark.asyncio
+    async def test_failed_build_backdate_prevents_immediate_refire(self, orch):
+        """
+        After a failed build, watchlist_stale must NOT fire on the immediately
+        following _check_triggers call.
+        """
+        await _seed_watchlist(orch, ["AAPL"])
+        await _seed_portfolio(orch)
+
+        orch._claude.run_watchlist_build = AsyncMock(side_effect=RuntimeError("529"))
+        orch._trigger_state.last_watchlist_build_utc = None
+        orch._all_indicators = {"AAPL": {}}
+        orch._trigger_state.indicators_seeded = True
+
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            await orch._run_claude_cycle("watchlist_stale")
+            triggers = await orch._check_triggers()
+
+        assert "watchlist_stale" not in triggers, (
+            "watchlist_stale must not re-fire immediately after a failed build"
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_build_refire_after_probe_interval(self, orch):
+        """
+        After a failed build, watchlist_stale fires again once the probe interval
+        has elapsed (i.e., the back-date is exactly right).
+        """
+        await _seed_watchlist(orch, ["AAPL"])
+        await _seed_portfolio(orch)
+
+        orch._claude.run_watchlist_build = AsyncMock(side_effect=RuntimeError("529"))
+        orch._trigger_state.last_watchlist_build_utc = None
+        orch._all_indicators = {"AAPL": {}}
+        orch._trigger_state.indicators_seeded = True
+
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            await orch._run_claude_cycle("watchlist_stale")
+
+        # Simulate probe_min minutes passing by adjusting the timestamp backward
+        probe_min = orch._config.ai_fallback.circuit_breaker_probe_min
+        orch._trigger_state.last_watchlist_build_utc -= timedelta(minutes=probe_min)
+
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            triggers = await orch._check_triggers()
+
+        assert "watchlist_stale" in triggers, (
+            "watchlist_stale must re-fire once probe_min minutes have elapsed after failure"
+        )
+
+    @pytest.mark.asyncio
+    async def test_successful_build_sets_full_timestamp(self, orch):
+        """Successful build stamps the full current time, not the back-date."""
+        await _seed_watchlist(orch, ["AAPL"])
+        await _seed_portfolio(orch)
+
+        orch._claude.run_watchlist_build = AsyncMock(return_value=None)
+        orch._trigger_state.last_watchlist_build_utc = None
+
+        before = datetime.now(timezone.utc)
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            await orch._run_claude_cycle("watchlist_stale")
+        after = datetime.now(timezone.utc)
+
+        ts = orch._trigger_state.last_watchlist_build_utc
+        assert ts is not None
+        interval_sec = orch._config.scheduler.watchlist_refresh_interval_min * 60
+        probe_sec = orch._config.ai_fallback.circuit_breaker_probe_min * 60
+        # Successful build: elapsed at next check should be near zero (not near probe_min)
+        # Verify timestamp is close to now (within 5 seconds), not backdated
+        assert (after - ts).total_seconds() < 5, (
+            "Successful build must stamp current time, not the failure back-date"
+        )

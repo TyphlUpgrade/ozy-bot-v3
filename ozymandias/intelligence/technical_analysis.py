@@ -564,6 +564,31 @@ def generate_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
     else:
         rsi_slope_5 = 0.0
 
+    # --- RSI acceleration over 3 bars (2nd derivative of RSI) ---
+    # Rate of change of rsi_slope_5: how fast the slope itself is changing.
+    # Positive = RSI momentum is accelerating (slope steepening).
+    # Negative = RSI momentum is decelerating (slope flattening or reversing).
+    # Key use cases:
+    #   - Extended long (RSI > 70): rsi_accel_3 going negative signals the move
+    #     is losing steam even before RSI turns down — early warning.
+    #   - Mean-reversion fade setup: require rsi_accel_3 < threshold to confirm
+    #     deceleration before shorting an overextended move.
+    # Computed as: slope_now - slope_3_bars_ago (both using the same 5-bar window).
+    # Requires 9 clean RSI values. Zeroed on overnight boundary (intraday guard
+    # identical to rsi_slope_5). 0.0 when fewer than 9 values available.
+    rsi_accel_3 = 0.0
+    if len(rsi_clean) >= 9:
+        _accel_is_intraday = (
+            isinstance(rsi_clean.index, pd.DatetimeIndex)
+            and (rsi_clean.index[-1] - rsi_clean.index[-9]).total_seconds() < 24 * 3600
+        )
+        if _accel_is_intraday and rsi_clean.index[-1].date() != rsi_clean.index[-9].date():
+            rsi_accel_3 = 0.0
+        else:
+            slope_now = float(rsi_clean.iloc[-1]) - float(rsi_clean.iloc[-6])
+            slope_3ago = float(rsi_clean.iloc[-4]) - float(rsi_clean.iloc[-9])
+            rsi_accel_3 = slope_now - slope_3ago
+
     # --- MACD histogram expanding (momentum trajectory) ---
     # True when the histogram's absolute value grew bar-over-bar AND the sign
     # is unchanged (same-direction build, not a zero-crossing).
@@ -626,6 +651,7 @@ def generate_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
         'rsi':                        round(last_rsi, 2),
         'rsi_divergence':             rsi_divergence,
         'rsi_slope_5':                round(rsi_slope_5, 4),
+        'rsi_accel_3':                round(rsi_accel_3, 4),
         'macd_signal':                macd_signal,
         'macd_histogram_expanding':   macd_histogram_expanding,
         'trend_structure':            trend_structure,

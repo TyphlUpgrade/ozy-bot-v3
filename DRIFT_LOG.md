@@ -906,3 +906,68 @@ Read the relevant phase section before modifying or debugging any module built i
 - **Fix:** Added `tests` to `testpaths` (was `ozymandias/tests` only). Phase 18 tests live in root `tests/`.
 
 **Test count:** 1077 (up from 978 — 99 new tests across 4 new test files)
+
+
+---
+
+### 2026-03-24 Paper Session Fixes (LOG-FINDING-A, LOG-FINDING-B)
+
+**Strategy-specific limit order timeout** · *(operational fix)* · `execution/fill_protection.py`, `core/orchestrator.py`, `core/config.py`, `core/state_manager.py`
+- **Problem:** STX and GRMN swing limit orders were cancelled after 300s (momentum timeout). Swing entries are wider-spread and need more fill time than momentum scalps.
+- **Impl:** `OrderRecord.timeout_seconds` (already existed, was unused) is now wired into `get_stale_orders` — effective timeout = `order.timeout_seconds` if > 0, else `timeout_sec` global fallback (sentinel pattern). In `_medium_try_entry`, entry orders set `timeout_seconds` based on strategy via a lookup dict (`_strategy_timeouts`). To add a new strategy timeout, add one entry to that dict.
+- **Config:** `scheduler.swing_limit_order_timeout_sec = 1200` (20 min). Momentum uses existing `limit_order_timeout_sec = 300`.
+- **`OrderRecord.timeout_seconds` default changed:** 60 → 0 (0 = use global). Deserialization default updated to match.
+- **`get_stale_orders` default changed:** `timeout_sec=60` → `timeout_sec=300` to match the global config default.
+
+**Brave Search 429 retry** · *(operational fix)* · `data/adapters/search_adapter.py`, `core/config.py`
+- **Problem:** Two 429s during watchlist builds exhausted tool-use rounds, cutting Claude's research short.
+- **Impl:** `SearchAdapter` now accepts `retry_count` and `retry_sec` params. `_fetch_with_retry` wraps `_fetch` with retry logic for `urllib.error.HTTPError` code 429 only. Non-429 errors re-raised immediately. All retries exhausted → `search()` still returns `[]` (graceful degradation unchanged). The 3-round `max_searches_per_build` cap is unaffected.
+- **Config:** `search.search_429_retry_count = 2`, `search.search_429_retry_sec = 5.0`. Passed to `SearchAdapter.__init__` in orchestrator `_startup`.
+
+**LOG-FINDING-C (WMT fill count mismatch)** · *(deferred)* · N/A
+- **Status:** The "local=16 vs broker=6" log message was not found in the codebase. It may have come from an external debug tool or a now-removed log statement. No code change made. Monitor in future sessions.
+
+**Test count:** 1002 (stable — 6 new tests in `test_fill_protection.py`, 6 in new `test_search_adapter.py`, replaced some previously-counted tests from root `tests/` dir)
+
+### 2026-03-24 Observability Additions (Finding 4 + Finding 6)
+
+**No-opportunity streak WARN** · *(new observability)* · `core/orchestrator.py`
+- **Problem:** 8 consecutive empty medium loops produced no diagnostic output about *why* no candidates were passing. The operator couldn't tell whether the watchlist was stale, a specific gate was too tight, or market conditions were genuinely unfavorable.
+- **Impl:** `self._no_opportunity_streak` counter increments each medium loop cycle when `len(ranked) == 0`. At `no_opportunity_streak_warn_threshold` (default 8) consecutive misses, a WARNING is logged with a gate-breakdown summary: rejection counts grouped by gate category (conviction_floor, technical_score_floor, rvol_gate, rsi_gate, vwap_gate, entry_conditions, pdt_guard, market_hours, etc.). "already_open" rejections excluded from the breakdown (expected noise while holding positions). Counter resets when ranked candidates appear OR when a fresh Claude reasoning cycle fires.
+- **`_rejection_gate_category(reason)`:** Module-level helper in `orchestrator.py` mapping rejection-reason strings to short labels. Extension point: add one entry per new gate category.
+- **Config:** `scheduler.no_opportunity_streak_warn_threshold = 8`
+
+**Ranker-rejection journal records** · *(new observability)* · `core/orchestrator.py`
+- **Problem:** Rejections by `min_conviction_threshold` and `min_composite_score` were only visible in INFO logs and `_recommendation_outcomes` (in-memory). No cross-session calibration data.
+- **Impl:** Two `record_type="rejected"` entries appended to `trade_journal.jsonl`:
+  1. **`conviction_floor`** — written in the `rank_result.rejections` loop, on `rejection_count == 1` (first occurrence this session). Includes: `symbol`, `strategy`, `conviction`, `conviction_threshold`, `reason`.
+  2. **`composite_score_floor`** — written in `_medium_try_entry` every time the gate fires (these pass the ranker hard filters, so they don't appear in `rank_result.rejections`). Includes: `symbol`, `strategy`, `conviction`, `composite_score`, `composite_score_floor`.
+- Both gate values and actual values are included so calibration analysis can identify marginal near-misses without reading config.
+- `load_recent` and `compute_session_stats` already exclude `record_type != "close"` records, so these don't affect Claude's execution context.
+
+---
+
+### 2026-03-25 Paper Session Fixes
+
+**Defer expiry now uses session suppression** · *(bug fix)* · `core/orchestrator.py`
+- **Bug:** When a symbol's `_entry_defer_counts` reached `max_entry_defer_cycles`, the code set `top.entry_conditions = {}` on the live `ScoredOpportunity` object. This was a no-op: `top` is rebuilt from the reasoning cache on every medium loop, restoring the original `entry_conditions`. The opportunity continued being ranked and attempted indefinitely (PFE accumulated 18 consecutive defers today before being cleared by a watchlist rotation).
+- **Fix:** On expiry, symbol is now added to `_filter_suppressed` with reason `"stale thesis gate: entry conditions expired after N consecutive defers"`. This immediately prevents the ranker from evaluating it and stops Claude from re-nominating it via the session suppression context. Claude reconsiders at the next watchlist build.
+- **Log message updated:** Was "awaiting fresh Claude call" (misleading — no such trigger existed). Now "suppressed for session after N consecutive defers (stale thesis gate)".
+
+**`dead_zone_exempt` trait on Strategy ABC** · *(new feature)* · `strategies/base_strategy.py`, `strategies/swing_strategy.py`, `execution/risk_manager.py`, `core/orchestrator.py`
+- **Problem:** The dead zone (11:30–14:30 ET) blocked all new entries regardless of strategy. Swing entries have multi-day theses and are unaffected by the noon lull the dead zone was designed for. Today MRK (conviction 0.75) was blocked for 2+ hours by dead zone then pruned from the watchlist before it could enter.
+- **Impl:** `dead_zone_exempt: bool` property on `Strategy` ABC (default `False` — safe). `SwingStrategy.dead_zone_exempt = True`. `validate_entry` in `risk_manager.py` accepts `dead_zone_exempt: bool = False` and passes it to `_check_market_hours`, which skips the dead zone gate when set. Orchestrator passes `strategy_obj.dead_zone_exempt` at the `validate_entry` call site. Same extension pattern as `blocks_eod_entries`.
+- **To add a new strategy:** set `dead_zone_exempt` in the concrete class — no other file changes needed.
+
+**Universe scanner OR-gate filter** · *(new feature)* · `intelligence/universe_scanner.py`, `core/config.py`, `config/config.json`
+- **Problem:** RVOL-only filtering excluded symbols with large price moves but low volume (shorts, low-float movers, pre-market gappers). Directionally it was also biased toward long setups since RVOL doesn't capture short-side activity well.
+- **Impl:** Filter is now `volume_path OR move_path`. `via_rvol = rvol >= min_rvol_for_candidate`. `via_move = abs(roc_5) >= min_price_move_pct_for_candidate` (default 1.5%). Both paths are direction-agnostic. Sort remains RVOL-descending; price-move-only candidates appear at the bottom of the candidate pool. Log line updated to show both path counts.
+- **Config:** `universe_scanner.min_price_move_pct_for_candidate = 1.5`
+- **9 new tests** in `tests/test_universe_scanner.py`.
+
+**Watchlist build re-fire suppression on failure** · *(bug fix)* · `core/orchestrator.py`
+- **Problem:** When a watchlist build failed (Claude 529, network error), `last_watchlist_build_utc` was not updated. On the next slow loop check (~60s), elapsed time was ∞ → `watchlist_stale` fired again → build failed again → 12 cascading failures over 25 minutes during today's 529 outage.
+- **Fix:** In the `except` block, `last_watchlist_build_utc` is back-dated to `now - (interval_sec - probe_sec)`, so elapsed time at the next check equals `probe_sec`. This aligns the re-fire cadence with the circuit breaker's probe interval (~10 min) instead of every 60s.
+
+**Prompt version v3.8.0** · *(new version)* · `config/prompts/v3.8.0/` (new), `config/config.json`
+- Copied from v3.7.0. Content unchanged — reserved as a clean version boundary for the rsi_max swing entry instruction (pending discussion).

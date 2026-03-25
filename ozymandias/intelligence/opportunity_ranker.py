@@ -182,6 +182,30 @@ def evaluate_entry_conditions(conditions: dict | None, signals: dict) -> tuple[b
         if float(val) > threshold:
             return False, f"rsi_slope_max exceeded: rsi_slope_5 {float(val):.2f} > {threshold:.2f}"
 
+    # rsi_accel_min — RSI acceleration must be at least this value ---------------
+    # Use a positive value (e.g. 0.5) to confirm RSI momentum is still building.
+    # Use 0.0 to simply require non-negative acceleration (slope not yet flattening).
+    # Primary use: swing longs at elevated RSI — ensures the move hasn't peaked.
+    if "rsi_accel_min" in conditions:
+        val = signals.get("rsi_accel_3")
+        if val is None:
+            return False, "signal 'rsi_accel_3' unavailable"
+        threshold = float(conditions["rsi_accel_min"])
+        if float(val) < threshold:
+            return False, f"rsi_accel_min not met: rsi_accel_3 {float(val):.2f} < {threshold:.2f}"
+
+    # rsi_accel_max — RSI acceleration must not exceed this value ---------------
+    # Use a negative value (e.g. -0.5) to confirm RSI deceleration.
+    # Primary uses: (1) mean-reversion fade: require deceleration before shorting
+    # an extended move; (2) block long entry into a decelerating overextended RSI.
+    if "rsi_accel_max" in conditions:
+        val = signals.get("rsi_accel_3")
+        if val is None:
+            return False, "signal 'rsi_accel_3' unavailable"
+        threshold = float(conditions["rsi_accel_max"])
+        if float(val) > threshold:
+            return False, f"rsi_accel_max exceeded: rsi_accel_3 {float(val):.2f} > {threshold:.2f}"
+
     # require_volume_ratio_min — per-trade volume floor set by Claude -----------
     # Precedence: min_rvol_for_entry (strategy-level hard gate in apply_entry_gate)
     # runs BEFORE this check and cannot be deferred or expired. This condition is

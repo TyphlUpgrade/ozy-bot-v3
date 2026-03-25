@@ -120,6 +120,7 @@ class RiskManager:
         orders: list[OrderRecord],
         avg_daily_volume: float | None = None,
         now: datetime | None = None,
+        dead_zone_exempt: bool = False,
     ) -> tuple[bool, str]:
         """
         Run all pre-trade checks. Return (allowed, reason).
@@ -140,6 +141,8 @@ class RiskManager:
             avg_daily_volume:   Stock's average daily volume from fundamentals.
                                 Skip the min-volume check if None.
             now:                Override current time (for testing).
+            dead_zone_exempt:   True if this strategy bypasses the midday dead zone.
+                                Pass ``strategy_obj.dead_zone_exempt``.
         """
         now = now or datetime.now(ET)
 
@@ -172,7 +175,7 @@ class RiskManager:
             )
 
         # 5. Market hours
-        hours_ok, hours_msg = self._check_market_hours(blocks_eod_entries, now)
+        hours_ok, hours_msg = self._check_market_hours(blocks_eod_entries, now, dead_zone_exempt)
         if not hours_ok:
             return False, hours_msg
 
@@ -219,9 +222,18 @@ class RiskManager:
 
         return True, "All risk checks passed"
 
-    def _check_market_hours(self, blocks_eod_entries: bool, now: datetime) -> tuple[bool, str]:
+    def _check_market_hours(
+        self,
+        blocks_eod_entries: bool,
+        now: datetime,
+        dead_zone_exempt: bool = False,
+    ) -> tuple[bool, str]:
         """Block entries in non-regular sessions; block all entries in dead zone;
-        block intraday strategies (blocks_eod_entries=True) in last 5 minutes."""
+        block intraday strategies (blocks_eod_entries=True) in last 5 minutes.
+
+        dead_zone_exempt: strategies with multi-day theses (swing) bypass the dead
+        zone — the noon lull is irrelevant to a position held for days.
+        """
         if self._bypass_market_hours:
             return True, "Market hours bypass active"
         session = get_current_session(now)
@@ -230,10 +242,11 @@ class RiskManager:
                 f"Market not in regular hours (session={session.value}) — "
                 f"new entries blocked"
             )
-        # Dead zone: no new entries during midday low-volume window
+        # Dead zone: no new entries during midday low-volume window.
+        # Exempt strategies (swing) are not subject to this gate.
         et = now.astimezone(ET)
         t = et.time()
-        if self._dead_zone_start <= t < self._dead_zone_end:
+        if not dead_zone_exempt and self._dead_zone_start <= t < self._dead_zone_end:
             return False, (
                 f"Dead zone active ({self._dead_zone_start.strftime('%H:%M')}–"
                 f"{self._dead_zone_end.strftime('%H:%M')} ET) "

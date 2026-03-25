@@ -115,6 +115,10 @@ class SwingStrategy(Strategy):
     def blocks_eod_entries(self) -> bool:
         return False
 
+    @property
+    def dead_zone_exempt(self) -> bool:
+        return True
+
     def apply_entry_gate(self, action: str, signals: dict) -> tuple[bool, str]:
         """Reject swing entries when the long-term trend is fully adverse or RVOL is absent."""
         rvol = signals.get("volume_ratio")
