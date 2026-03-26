@@ -78,6 +78,7 @@ class SchedulerConfig:
     macro_rsi_euphoria_threshold: int = 72           # SPY RSI ≥ this fires market_rsi_extreme:euphoria trigger (overheating)
     macro_rsi_rearm_band: int = 5                    # RSI must recover by this many points before the extreme trigger can re-fire
     watchlist_refresh_interval_min: int = 120        # proactive watchlist rebuild interval (minutes); 0 disables watchlist_stale trigger
+    watchlist_rebuild_on_restart: bool = False       # if True, always rebuild watchlist on startup regardless of when the last build ran; overrides the persisted build timestamp
     no_opportunity_streak_warn_threshold: int = 8    # log a gate-breakdown WARN when this many consecutive medium loops produce zero ranked candidates; helps diagnose whether the watchlist or a specific gate is the bottleneck
 
 

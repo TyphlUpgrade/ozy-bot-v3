@@ -787,6 +787,28 @@ class Orchestrator:
         else:
             log.info("Step 4 — no fresh cache — Claude will be called on first trigger")
 
+        # Restore last_watchlist_build_utc from the watchlist file's last_updated timestamp
+        # so that watchlist_stale respects the real build time across restarts.
+        # Without this, every restart fires watchlist_stale immediately regardless of how
+        # recently the build ran — causing the full rebuild+prune cycle on every startup.
+        # Skipped when watchlist_rebuild_on_restart=True — in that case we leave
+        # last_watchlist_build_utc as None so watchlist_stale fires immediately as before.
+        if self._config.scheduler.watchlist_rebuild_on_restart:
+            log.info("Step 4b — watchlist_rebuild_on_restart=True, skipping timestamp restore")
+        else:
+            try:
+                _wl = await self._state_manager.load_watchlist()
+                if _wl.last_updated:
+                    _wl_ts = datetime.fromisoformat(_wl.last_updated)
+                    self._trigger_state.last_watchlist_build_utc = _wl_ts
+                    log.info(
+                        "Step 4b — watchlist build timestamp restored: %s (%.0f min ago)",
+                        _wl_ts.isoformat(),
+                        (datetime.now(timezone.utc) - _wl_ts).total_seconds() / 60,
+                    )
+            except Exception as _exc:
+                log.debug("Step 4b — could not restore watchlist build timestamp: %s", _exc)
+
         # -- Step 5: Validation gate -----------------------------------------
         if reconciliation_errors:
             mins = self._config.scheduler.conservative_startup_mode_min

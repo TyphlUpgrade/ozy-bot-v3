@@ -49,6 +49,7 @@
     "macro_rsi_euphoria_threshold": 72,
     "macro_rsi_rearm_band": 5,
     "watchlist_refresh_interval_min": 240,
+    "watchlist_rebuild_on_restart": false,
     "no_opportunity_streak_warn_threshold": 8
   },
   "claude": {
