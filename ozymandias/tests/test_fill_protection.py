@@ -282,6 +282,44 @@ class TestGetStaleOrders:
         stale = fpm.get_stale_orders(timeout_sec=60)
         assert len(stale) == 1
 
+    def test_per_order_timeout_overrides_global(self):
+        # Order with timeout_seconds=1200 (swing) should NOT be stale after 400s
+        # even though global timeout_sec=300 would have expired it.
+        order = _order("o1", "CMI", status="PENDING", order_type="limit", created_offset_sec=400.0)
+        order.timeout_seconds = 1200
+        fpm = _make_fpm(order)
+        stale = fpm.get_stale_orders(timeout_sec=300)
+        assert len(stale) == 0
+
+    def test_per_order_timeout_expires_correctly(self):
+        # Same swing order at 1300s — now stale.
+        order = _order("o1", "CMI", status="PENDING", order_type="limit", created_offset_sec=1300.0)
+        order.timeout_seconds = 1200
+        fpm = _make_fpm(order)
+        stale = fpm.get_stale_orders(timeout_sec=300)
+        assert len(stale) == 1
+        assert stale[0].order_id == "o1"
+
+    def test_zero_timeout_seconds_falls_back_to_global(self):
+        # timeout_seconds=0 (default sentinel) should use the global timeout_sec.
+        order = _order("o1", "AAPL", status="PENDING", order_type="limit", created_offset_sec=90.0)
+        assert order.timeout_seconds == 0
+        fpm = _make_fpm(order)
+        stale = fpm.get_stale_orders(timeout_sec=60)
+        assert len(stale) == 1  # 90s > 60s global timeout
+
+    def test_mixed_strategies_independent_timeouts(self):
+        # Momentum order (timeout_seconds=300) is stale at 400s;
+        # swing order (timeout_seconds=1200) is NOT stale at 400s.
+        momentum = _order("mo1", "NVDA", status="PENDING", order_type="limit", created_offset_sec=400.0)
+        momentum.timeout_seconds = 300
+        swing = _order("sw1", "CMI", status="PENDING", order_type="limit", created_offset_sec=400.0)
+        swing.timeout_seconds = 1200
+        fpm = _make_fpm(momentum, swing)
+        stale = fpm.get_stale_orders(timeout_sec=300)
+        assert len(stale) == 1
+        assert stale[0].order_id == "mo1"
+
 
 # ---------------------------------------------------------------------------
 # handle_cancel_result — race condition handling

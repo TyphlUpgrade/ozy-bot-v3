@@ -254,11 +254,18 @@ class FillProtectionManager:
     # Stale order detection
     # ------------------------------------------------------------------
 
-    def get_stale_orders(self, timeout_sec: int = 60) -> list[OrderRecord]:
+    def get_stale_orders(self, timeout_sec: int = 300) -> list[OrderRecord]:
         """
         Return limit orders in PENDING or PARTIALLY_FILLED state that have been
-        open longer than ``timeout_sec``. Market orders are not considered stale
-        (they should fill immediately or be rejected).
+        open longer than their effective timeout. Market orders are not considered
+        stale (they should fill immediately or be rejected).
+
+        Effective timeout per order:
+          - ``order.timeout_seconds`` when > 0 (strategy-specific, set at order creation)
+          - ``timeout_sec`` parameter otherwise (global fallback from scheduler config)
+
+        To add a new strategy-specific timeout, set ``timeout_seconds`` on the
+        ``OrderRecord`` at creation time — no changes needed here.
         """
         now = datetime.now(timezone.utc)
         stale = []
@@ -269,12 +276,13 @@ class FillProtectionManager:
                 continue
             if not order.created_at:
                 continue
+            effective_timeout = order.timeout_seconds if order.timeout_seconds > 0 else timeout_sec
             created = datetime.fromisoformat(order.created_at)
-            if (now - created).total_seconds() > timeout_sec:
+            age_sec = (now - created).total_seconds()
+            if age_sec > effective_timeout:
                 stale.append(order)
-                log.debug("Stale order detected: %s %s age=%.0fs",
-                          order.symbol, order.order_id,
-                          (now - created).total_seconds())
+                log.debug("Stale order detected: %s %s age=%.0fs timeout=%ds",
+                          order.symbol, order.order_id, age_sec, effective_timeout)
         return stale
 
     # ------------------------------------------------------------------

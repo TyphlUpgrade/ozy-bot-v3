@@ -118,8 +118,10 @@ class TradeJournal:
             "avg_pnl_pct": avg_pnl_pct,
         }
 
-        # short_win_rate_pct — only include when short trades are present
+        # shorts_entered — always present so Claude sees when it has never entered a short.
+        # short_win_rate_pct — only included when short trades exist (no denominator when 0).
         shorts = [r for r in recent if r.get("direction") == "short"]
+        stats["shorts_entered"] = len(shorts)
         if shorts:
             short_wins = sum(1 for r in shorts if float(r.get("pnl_pct", 0) or 0) > 0)
             stats["short_win_rate_pct"] = int(round(short_wins / len(shorts) * 100))

@@ -3571,6 +3571,36 @@ class Orchestrator:
         self._trigger_state.last_claude_call_utc = datetime.now(timezone.utc)
         self._trigger_state.last_override_exit_count = self._override_exit_count
 
+        # --- Implicit rejection detection -----------------------------------
+        # Directional (non-"either") tier-1 symbols that were sent to Claude but
+        # appear in neither new_opportunities nor rejected_opportunities were silently
+        # omitted. Log and journal them so we can measure the pattern over time.
+        # This is observability only — no corrective action is taken here.
+        _mentioned_syms = (
+            {o.get("symbol") for o in (result.new_opportunities or []) if o.get("symbol")}
+            | {r.get("symbol") for r in (result.rejected_opportunities or []) if r.get("symbol")}
+        )
+        _sent_tier1 = set(self._claude.last_sent_tier1_symbols)
+        _watchlist_dir = {
+            e.symbol: e.expected_direction
+            for e in watchlist.entries
+            if e.priority_tier == 1 and getattr(e, "expected_direction", "either") != "either"
+        }
+        for _sym, _dir in _watchlist_dir.items():
+            if _sym in _sent_tier1 and _sym not in _mentioned_syms:
+                log.info(
+                    "Implicit rejection: %s (expected_direction=%s) sent to Claude but absent "
+                    "from both new_opportunities and rejected_opportunities",
+                    _sym, _dir,
+                )
+                await self._trade_journal.append({
+                    "record_type": "implicit_rejection",
+                    "symbol": _sym,
+                    "expected_direction": _dir,
+                    "prompt_version": self._config.claude.prompt_version,
+                    "bot_version": self._config.claude.model,
+                })
+
         # Update consecutive soft-rejection counts.
         # A symbol is penalised each cycle it appears in rejected_opportunities.
         # Reset when Claude enters it or it was absent from the reasoning window.
@@ -3588,6 +3618,41 @@ class Orchestrator:
                 self._trigger_state.last_claude_call_prices[sym] = price
         # Fresh reasoning arrived — unlock all consumed symbols and reset defer counts
         # so new opportunities from this cycle can be entered on a clean slate.
+        # Before clearing: journal any deferred entries Claude just abandoned so we
+        # can measure how often this happens and whether price moved after abandonment.
+        if self._entry_defer_counts:
+            new_opp_syms = {o.get("symbol") for o in (result.new_opportunities or []) if o.get("symbol")}
+            for sym, defer_count in self._entry_defer_counts.items():
+                if sym in new_opp_syms:
+                    continue  # re-recommended — not abandoned
+                outcome = self._recommendation_outcomes.get(sym, {})
+                if outcome.get("stage") not in ("conditions_waiting",):
+                    continue  # wasn't in deferred state
+                rejection = next(
+                    (r for r in (result.rejected_opportunities or []) if r.get("symbol") == sym),
+                    None,
+                )
+                price_now = (
+                    self._all_indicators.get(sym, {}).get("price")
+                    or self._latest_indicators.get(sym, {}).get("price")
+                )
+                await self._trade_journal.append({
+                    "record_type": "deferred_abandoned",
+                    "symbol": sym,
+                    "defer_count": defer_count,
+                    "price_at_abandonment": price_now,
+                    "abandonment_type": "explicit_rejection" if rejection else "not_re_recommended",
+                    "rejection_reason": rejection.get("rejection_reason") if rejection else None,
+                    "conditions": outcome.get("stage_detail"),
+                    "prompt_version": self._config.claude.prompt_version,
+                    "bot_version": self._config.claude.model,
+                })
+                log.info(
+                    "Deferred entry abandoned: %s  defer_count=%d  type=%s  price=%.4f",
+                    sym, defer_count,
+                    "explicit_rejection" if rejection else "not_re_recommended",
+                    price_now or 0.0,
+                )
         self._cycle_consumed_symbols.clear()
         self._entry_defer_counts.clear()
         self._no_opportunity_streak = 0
@@ -3872,12 +3937,16 @@ class Orchestrator:
                 adj = review.get("adjusted_targets") or {}
                 if adj.get("profit_target"):
                     old_target = pos.intention.exit_targets.profit_target
-                    pos.intention.exit_targets.profit_target = float(adj["profit_target"])
-                    changed = True
-                    log.info(
-                        "Position review: %s target adjusted  %.4f → %.4f",
-                        symbol, old_target, pos.intention.exit_targets.profit_target,
-                    )
+                    new_target = float(adj["profit_target"])
+                    if new_target == old_target:
+                        log.debug("Position review: %s target no-op (%.4f unchanged)", symbol, old_target)
+                    else:
+                        pos.intention.exit_targets.profit_target = new_target
+                        changed = True
+                        log.info(
+                            "Position review: %s target adjusted  %.4f → %.4f",
+                            symbol, old_target, new_target,
+                        )
                 if adj.get("stop_loss"):
                     new_stop = float(adj["stop_loss"])
                     # Guard: reject a stop adjustment that would put the stop on the
@@ -3895,16 +3964,18 @@ class Orchestrator:
                             or (_is_short_dir and new_stop <= _cur)
                         )
                     )
-                    if _would_trigger:
+                    old_stop = pos.intention.exit_targets.stop_loss
+                    if new_stop == old_stop:
+                        log.debug("Position review: %s stop no-op (%.4f unchanged)", symbol, old_stop)
+                    elif _would_trigger:
                         log.warning(
                             "Stop adjustment rejected for %s: new_stop=%.4f would "
                             "immediately trigger at current_price=%.4f — keeping "
                             "existing stop=%.4f",
                             symbol, new_stop, _cur,
-                            pos.intention.exit_targets.stop_loss,
+                            old_stop,
                         )
                     else:
-                        old_stop = pos.intention.exit_targets.stop_loss
                         pos.intention.exit_targets.stop_loss = new_stop
                         changed = True
                         log.info(

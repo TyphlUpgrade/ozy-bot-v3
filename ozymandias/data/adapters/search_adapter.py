@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -28,10 +30,21 @@ class SearchAdapter:
 
     Returns [] on any failure so Claude reasoning degrades gracefully when
     search is unavailable (no API key, network error, rate limit, etc.).
+
+    429 rate-limit responses are retried with a short sleep (configurable via
+    ``retry_count`` and ``retry_sec``). The 3-round cap in call_claude_with_tools
+    remains the hard ceiling on total tool-use rounds regardless of retries here.
     """
 
-    def __init__(self, api_key: str | None) -> None:
+    def __init__(
+        self,
+        api_key: str | None,
+        retry_count: int = 2,
+        retry_sec: float = 5.0,
+    ) -> None:
         self._api_key = api_key or None
+        self._retry_count = retry_count
+        self._retry_sec = retry_sec
         if not self._api_key:
             log.info("Brave Search not configured — watchlist build will use screener data only.")
 
@@ -44,19 +57,38 @@ class SearchAdapter:
         """
         Search the web and return a list of {title, url, description} dicts.
         Returns [] if disabled (no API key) or on any exception.
+
+        Retries up to ``retry_count`` times on 429 rate-limit responses,
+        sleeping ``retry_sec`` between attempts.
         """
         if not self._api_key:
             return []
         try:
             import asyncio
-            results = await asyncio.to_thread(self._fetch, query, n_results)
+            results = await asyncio.to_thread(self._fetch_with_retry, query, n_results)
             return results
         except Exception as exc:
             log.warning("Brave Search failed for query %r — %s", query, exc)
             return []
 
+    def _fetch_with_retry(self, query: str, n_results: int) -> list[dict]:
+        """Synchronous HTTP fetch with 429 retry — called via asyncio.to_thread."""
+        for attempt in range(self._retry_count + 1):
+            try:
+                return self._fetch(query, n_results)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429 and attempt < self._retry_count:
+                    log.warning(
+                        "Brave Search 429 for query %r (attempt %d/%d) — retrying in %.0fs",
+                        query, attempt + 1, self._retry_count + 1, self._retry_sec,
+                    )
+                    time.sleep(self._retry_sec)
+                else:
+                    raise
+        return []  # unreachable, satisfies type checker
+
     def _fetch(self, query: str, n_results: int) -> list[dict]:
-        """Synchronous HTTP fetch — called via asyncio.to_thread."""
+        """Single synchronous HTTP fetch — raises on any HTTP error."""
         params = urllib.parse.urlencode({"q": query, "count": min(n_results, 20)})
         url = f"{_BRAVE_SEARCH_URL}?{params}"
         req = urllib.request.Request(

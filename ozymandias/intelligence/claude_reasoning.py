@@ -243,6 +243,10 @@ class ClaudeReasoningEngine:
         # reasoning cycles queue up in the same slow-loop tick.
         self._call_lock = asyncio.Lock()
         self._last_call_end_time: float = 0.0   # monotonic time the most recent call finished
+        # Tracks which tier-1 symbols were actually sent in the last reasoning context
+        # (after token-budget trimming). Used by the orchestrator to detect implicit rejections —
+        # directional candidates that Claude silently omitted from both lists.
+        self.last_sent_tier1_symbols: list[str] = []
         # Fallback provider state
         self._fallback_client = None          # lazy-initialized Gemini client
         self._overload_fallback_count: int = 0  # session circuit breaker counter
@@ -519,6 +523,10 @@ class ClaudeReasoningEngine:
                 "Claude will reason with zero watchlist symbols this cycle. "
                 "Consider reducing context size or raising _TOTAL_TOKEN_BUDGET."
             )
+
+        # Record exactly which tier-1 symbols made it into context after trimming.
+        # The orchestrator reads this after each reasoning cycle to detect implicit rejections.
+        self.last_sent_tier1_symbols = [e["symbol"] for e in context["watchlist_tier1"]]
 
         # Tell Claude exactly how many tier-1 symbols exist and how many it's seeing.
         # Without this, Claude can't tell it's working from a sample and will keep

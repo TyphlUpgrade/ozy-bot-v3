@@ -11,10 +11,10 @@ CONSTRAINTS IN EFFECT:
 - PDT limit: pdt_trades_remaining shows same-day round trips remaining. The system enforces PDT limits automatically, but be conservative with exit recommendations when this is 1 or 0 — those remaining trades may be needed for emergency exits.
 - Only enter during regular market hours (9:30 AM – 3:55 PM ET for momentum; 9:30 AM – 4:00 PM ET for swing)
 - Only recommend strategies listed in market_context.active_strategies — do not suggest a strategy that is not in that list
-- Swing position minimum hold: do NOT recommend exit for a swing position with hold_hours < 4 unless the stop-loss has been breached. Intraday signal deterioration (MACD cross, RSI dip, short-term price decline) is expected noise for a multi-day thesis and is not a valid exit reason.
+- Swing position minimum hold: do NOT recommend exit for a swing position with hold_hours < 4 unless the stop-loss has been breached. Intraday signal deterioration (MACD cross, RSI dip, short-term price decline, SPY/QQQ RSI moves, sector composite score changes, broad market trend deterioration) is expected noise for a multi-day thesis and is not a valid exit reason. A swing position entered with a known macro backdrop is not invalidated by that backdrop worsening within the first few hours — the stop exists precisely to define the thesis risk in adverse conditions.
   - Stop-loss breach for LONG positions: current_price has fallen below exit_targets.stop_loss → exit.
   - Stop-loss breach for SHORT positions: current_price has risen above exit_targets.stop_loss → exit.
-  - If the stop has not been breached, hold regardless of intraday noise.
+  - If the stop has not been breached, hold regardless of intraday noise. Do not recommend exit for multiple positions simultaneously citing the same macro condition — that is a signal you are reacting to noise, not thesis failure.
 
 CONTEXT:
 {context_json}
@@ -54,6 +54,7 @@ FIELD INSTRUCTIONS:
 - "entry_conditions": per-trade TA gate confirmed at execution time. The medium loop checks these against live indicators before entering; if any condition is unmet, the entry is deferred to the next cycle.
   For MOMENTUM entries, always include at minimum: rsi_slope_min (long) or rsi_slope_max (short), and require_macd_histogram_expanding. Momentum theses are time-sensitive — if the slope or histogram condition you cited as your rationale is no longer true when the medium loop checks, the entry should not fire. Omitting these allows entry on a decaying setup.
   For SWING entries, entry_conditions are optional in a confirmed uptrend — but strongly recommended when momentum signals are mixed or turning against the trade direction at reasoning time. Specifically: if `rsi_slope_5` is negative for a long, or positive for a short, or if `macd_signal` is already against the trade direction, specify at minimum `rsi_slope_min` (long) or `rsi_slope_max` (short) so the entry waits for momentum to confirm rather than entering into a decaying setup. Omitting conditions when signals are already against you means the medium loop will enter immediately regardless of whether momentum has reversed.
+  For catalyst-driven SWING entries specifically: prefer `rsi_accel_min: 0.0` over `rsi_slope_min` when you want momentum confirmation. `rsi_slope_min` gates on RSI velocity — appropriate for momentum entries where the trend must already be in motion. `rsi_accel_min: 0.0` gates on deceleration — appropriate for catalyst swings where you want to block entries into a fading setup without requiring the RSI to be actively climbing. See the swing example above.
   Available keys:
     BOTH directions: rsi_min (float), rsi_max (float), rsi_accel_min (float — RSI acceleration ≥ value; positive confirms momentum still building; 0.0 requires non-negative acceleration), rsi_accel_max (float — RSI acceleration ≤ value; use negative e.g. -0.5 to confirm deceleration for fades or to block entries into peaking moves), require_volume_ratio_min (float), require_volume_trend_bars_min (int — consecutive bars of increasing volume), require_macd_histogram_expanding (bool — MACD histogram growing in current direction), require_above_vwap (bool — price must be above VWAP; use for longs OR mean-reversion shorts fading an extended move), require_below_vwap (bool — price must be below VWAP; use for breakdown shorts OR as a long stop gate)
     LONG only: rsi_slope_min (float — RSI rising at least this fast, e.g. 0.5), require_macd_bullish (bool)
@@ -68,6 +69,8 @@ FIELD INSTRUCTIONS:
 
 Return ONLY a JSON object. No markdown, no explanation outside the JSON.
 
+adjusted_targets field: only include fields you are actually changing. Omit any field whose value would equal the current exit_targets value — echoing back an unchanged value wastes a cycle and produces a confusing log. Use action="adjust" only when at least one field differs from current exit_targets. If no change is needed, use action="hold".
+
 RESPONSE FORMAT:
 {
   "timestamp": "<ISO 8601 UTC>",
@@ -77,7 +80,7 @@ RESPONSE FORMAT:
       "action": "hold|exit|adjust",
       "thesis_intact": true|false,
       "updated_reasoning": "<action rationale AND the strongest current argument against holding — even for hold decisions. Reference specific price levels, patterns, or catalysts, not generic risk statements.>",
-      "adjusted_targets": null | {"profit_target": 0.0, "stop_loss": 0.0}
+      "adjusted_targets": null | {"profit_target": <new_price>, "stop_loss": <new_price>}
     }
   ],
   "new_opportunities": [

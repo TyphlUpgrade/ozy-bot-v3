@@ -558,7 +558,16 @@ def generate_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
             and (rsi_clean.index[-1] - rsi_clean.index[-6]).total_seconds() < 24 * 3600
         )
         if _is_intraday and rsi_clean.index[-1].date() != rsi_clean.index[-6].date():
-            rsi_slope_5 = 0.0
+            # Window spans overnight: avoid gap inflation, but don't zero out
+            # intraday momentum. Fall back to same-day bars only (≥2 required).
+            # Example: stock open 3 bars, rising 1 RSI pt/bar → slope = 3.0.
+            # Gap-up that stalls → slope ≈ 0 or negative — still filtered.
+            _today = rsi_clean.index[-1].date()
+            _same_day = rsi_clean[rsi_clean.index.map(lambda x: x.date()) == _today]
+            if len(_same_day) >= 2:
+                rsi_slope_5 = float(_same_day.iloc[-1]) - float(_same_day.iloc[0])
+            else:
+                rsi_slope_5 = 0.0
         else:
             rsi_slope_5 = float(rsi_clean.iloc[-1]) - float(rsi_clean.iloc[-6])
     else:

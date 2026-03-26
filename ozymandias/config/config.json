@@ -35,8 +35,8 @@
     "min_hold_before_override_min": 5,
     "bars_cache_ttl_sec": 110,
     "yfinance_fetch_stagger_max_sec": 0.5,
-    "max_entry_defer_cycles": 5,
-    "position_profit_trigger_pct": 0.015,
+    "max_entry_defer_cycles": 15,
+    "position_profit_trigger_pct": 0.030,
     "near_target_cooldown_sec": 1800,
     "override_exit_cooldown_min": 20,
     "fetch_failure_removal_threshold": 3,
@@ -48,7 +48,7 @@
     "macro_rsi_panic_threshold": 25,
     "macro_rsi_euphoria_threshold": 72,
     "macro_rsi_rearm_band": 5,
-    "watchlist_refresh_interval_min": 120,
+    "watchlist_refresh_interval_min": 240,
     "no_opportunity_streak_warn_threshold": 8
   },
   "claude": {

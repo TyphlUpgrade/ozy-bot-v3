@@ -285,7 +285,7 @@ class TestCheckTriggers:
 
     @pytest.mark.asyncio
     async def test_profit_trigger_fires_when_gain_exceeds_threshold(self, orch):
-        """Long position up >1.5% → position_in_profit trigger fires."""
+        """Long position up >3.0% → position_in_profit trigger fires."""
         now = datetime.now(timezone.utc).isoformat()
         pos = Position(
             symbol="HAL", shares=100, avg_cost=33.00, entry_date=now,
@@ -298,13 +298,13 @@ class TestCheckTriggers:
         orch._trigger_state.last_claude_call_utc = (
             datetime.now(timezone.utc) - timedelta(minutes=5)
         )
-        orch._latest_indicators = {"HAL": {"price": 33.51}}  # +1.55%
+        orch._latest_indicators = {"HAL": {"price": 34.00}}  # +3.03%
         triggers = await orch._check_triggers()
         assert "position_in_profit:HAL" in triggers
 
     @pytest.mark.asyncio
     async def test_profit_trigger_does_not_fire_below_threshold(self, orch):
-        """Long position up 0.9% (below 1.5% default) → no profit trigger."""
+        """Long position up 0.9% (below 3.0% default) → no profit trigger."""
         now = datetime.now(timezone.utc).isoformat()
         pos = Position(
             symbol="HAL", shares=100, avg_cost=33.00, entry_date=now,
@@ -323,7 +323,7 @@ class TestCheckTriggers:
 
     @pytest.mark.asyncio
     async def test_profit_trigger_does_not_refire_until_next_interval(self, orch):
-        """After last_profit_trigger_gain is set at 1.6%, trigger doesn't refire until 3.1%."""
+        """After last_profit_trigger_gain is set at 1.6%, trigger doesn't refire until 4.6%."""
         now = datetime.now(timezone.utc).isoformat()
         pos = Position(
             symbol="HAL", shares=100, avg_cost=33.00, entry_date=now,
@@ -338,14 +338,14 @@ class TestCheckTriggers:
         )
         # Simulate Claude already reviewed at +1.6% gain
         orch._trigger_state.last_profit_trigger_gain["HAL"] = 0.016
-        # Position is up 2.0% — not yet 1.6% + 1.5% = 3.1%
+        # Position is up 2.0% — not yet 1.6% + 3.0% = 4.6%
         orch._latest_indicators = {"HAL": {"price": 33.66}}  # +2.0%
         triggers = await orch._check_triggers()
         assert "position_in_profit:HAL" not in triggers
 
     @pytest.mark.asyncio
     async def test_profit_trigger_rearms_at_next_interval(self, orch):
-        """After last review at +1.6%, trigger fires again when gain reaches 3.1%."""
+        """After last review at +1.6%, trigger fires again when gain reaches 4.6%."""
         now = datetime.now(timezone.utc).isoformat()
         pos = Position(
             symbol="HAL", shares=100, avg_cost=33.00, entry_date=now,
@@ -359,8 +359,8 @@ class TestCheckTriggers:
             datetime.now(timezone.utc) - timedelta(minutes=5)
         )
         orch._trigger_state.last_profit_trigger_gain["HAL"] = 0.016
-        # +3.15% = 0.016 + 0.015 threshold cleared
-        orch._latest_indicators = {"HAL": {"price": 34.04}}  # +3.15%
+        # +4.67% = 0.016 + 0.030 threshold cleared
+        orch._latest_indicators = {"HAL": {"price": 34.54}}  # +4.67%
         triggers = await orch._check_triggers()
         assert "position_in_profit:HAL" in triggers
 
@@ -379,7 +379,7 @@ class TestCheckTriggers:
         orch._trigger_state.last_claude_call_utc = (
             datetime.now(timezone.utc) - timedelta(minutes=5)
         )
-        orch._latest_indicators = {"INTC": {"price": 45.28}}  # -1.57% from short entry
+        orch._latest_indicators = {"INTC": {"price": 44.57}}  # -3.11% from short entry
         triggers = await orch._check_triggers()
         assert "position_in_profit:INTC" in triggers
 
@@ -2811,7 +2811,7 @@ class TestTradeJournalLifecycle:
         )
         # Seed a trade_id so the snapshot can carry it
         orch._entry_contexts["HAL"] = {"trade_id": "test-trade-id-hal"}
-        orch._latest_indicators = {"HAL": {"price": 33.51}}  # +1.55% > 1.5% threshold
+        orch._latest_indicators = {"HAL": {"price": 34.00}}  # +3.03% > 3.0% threshold
 
         triggers = await orch._check_triggers()
         assert "position_in_profit:HAL" in triggers
@@ -2823,7 +2823,7 @@ class TestTradeJournalLifecycle:
         assert snap["trigger"] == "position_in_profit"
         assert snap["trade_id"] == "test-trade-id-hal"
         assert snap["unrealized_pnl_pct"] > 0
-        assert abs(snap["current_price"] - 33.51) < 0.01
+        assert abs(snap["current_price"] - 34.00) < 0.01
         assert abs(snap["stop_price"] - 31.50) < 0.01
         assert abs(snap["target_price"] - 35.00) < 0.01
 

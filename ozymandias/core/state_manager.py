@@ -123,7 +123,7 @@ class OrderRecord:
     filled_at: str = ""
     cancelled_at: str = ""
     position_id: str = ""
-    timeout_seconds: int = 60
+    timeout_seconds: int = 0   # 0 = use the global limit_order_timeout_sec; set per-order for strategy-specific timeouts
 
 
 @dataclass
@@ -226,7 +226,7 @@ def _from_dict_order(d: dict) -> OrderRecord:
         filled_at=d.get("filled_at", ""),
         cancelled_at=d.get("cancelled_at", ""),
         position_id=d.get("position_id", ""),
-        timeout_seconds=d.get("timeout_seconds", 60),
+        timeout_seconds=d.get("timeout_seconds", 0),
     )
 
 
