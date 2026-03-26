@@ -226,6 +226,12 @@ class SlowLoopTriggerState:
     # re-fires after near_target_cooldown_sec elapses since last handled review.
     # Cleared when a position closes.
     last_near_target_time: dict[str, float] = field(default_factory=dict)
+    # monotonic timestamp of the last near_stop Claude call per symbol.
+    # Mirrors near_target_time — same cooldown (near_target_cooldown_sec) prevents
+    # repeated firing while price oscillates within 1% of the stop level.
+    # Without this, near_stop fires every slow-loop tick (~60s) indefinitely.
+    # Cleared when a position closes.
+    last_near_stop_time: dict[str, float] = field(default_factory=dict)
     # Phase 17: price baseline anchored to the last successful Claude call (not reset each cycle).
     # Used by macro_move and sector_move triggers so that sustained index/sector moves always fire
     # even when last_prices is updated each tick. Separate from last_prices which resets per eval.
@@ -1484,6 +1490,7 @@ class Orchestrator:
             self._position_entry_times.pop(symbol, None)
             self._trigger_state.last_profit_trigger_gain.pop(symbol, None)
             self._trigger_state.last_near_target_time.pop(symbol, None)
+            self._trigger_state.last_near_stop_time.pop(symbol, None)
             self._override_closed.pop(symbol, None)
             log.info(
                 "Trade closed and journaled: %s  pnl=%.2f%%  exit_reason=%s",
@@ -3030,11 +3037,20 @@ class Orchestrator:
             if targets.stop_loss > 0:
                 pct_to_stop = abs(current - targets.stop_loss) / targets.stop_loss
                 if pct_to_stop <= 0.01:
-                    triggers.append(f"near_stop:{pos.symbol}")
-                    log.debug(
-                        "Trigger: near_stop:%s FIRED  price=%.4f stop=%.4f pct_away=%.2f%%",
-                        pos.symbol, current, targets.stop_loss, pct_to_stop * 100,
-                    )
+                    last_fired = ts.last_near_stop_time.get(pos.symbol, 0.0)
+                    if time.monotonic() - last_fired >= near_target_cooldown:
+                        triggers.append(f"near_stop:{pos.symbol}")
+                        ts.last_near_stop_time[pos.symbol] = time.monotonic()
+                        log.debug(
+                            "Trigger: near_stop:%s FIRED  price=%.4f stop=%.4f pct_away=%.2f%%",
+                            pos.symbol, current, targets.stop_loss, pct_to_stop * 100,
+                        )
+                    else:
+                        log.debug(
+                            "Trigger: near_stop:%s suppressed (cooldown %.0fs remaining)",
+                            pos.symbol,
+                            near_target_cooldown - (time.monotonic() - last_fired),
+                        )
 
         # 4. Override exit occurred since last Claude call
         if self._override_exit_count > ts.last_override_exit_count:
