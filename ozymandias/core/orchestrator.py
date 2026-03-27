@@ -49,7 +49,7 @@ from ozymandias.intelligence.claude_reasoning import (
 )
 from ozymandias.intelligence.opportunity_ranker import OpportunityRanker, RankResult, evaluate_entry_conditions
 from ozymandias.intelligence.universe_scanner import UniverseScanner
-from ozymandias.intelligence.technical_analysis import compute_composite_score, generate_signal_summary
+from ozymandias.intelligence.technical_analysis import compute_composite_score, generate_daily_signal_summary, generate_signal_summary
 from ozymandias.strategies.base_strategy import Strategy, get_strategy
 
 log = logging.getLogger(__name__)
@@ -244,6 +244,12 @@ class SlowLoopTriggerState:
     # None at startup → elapsed = ∞ → watchlist_stale fires on the first slow loop tick.
     # Reset after every successful build (both watchlist_small and watchlist_stale paths).
     last_watchlist_build_utc: Optional[datetime] = None
+    # Set by the medium loop when every symbol from the current reasoning cache has been
+    # suppressed by the hard-filter. Cleared by _check_triggers after firing once per
+    # cache generation (guarded by last_exhaustion_trigger_utc < last_claude_call_utc).
+    # To add another exhaustion-style trigger: follow this same flag+timestamp pattern.
+    candidates_exhausted: bool = False
+    last_exhaustion_trigger_utc: Optional[datetime] = None
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +344,12 @@ class Orchestrator:
         #   - Phase 19 ContextCompressor (_build_all_candidates)
         # Initialized empty; populated after first medium loop cycle completes.
         self._all_indicators: dict = {}
+
+        # Daily-bar TA signals for swing position reviews and macro regime context.
+        # Fetched each slow loop before run_reasoning_cycle; keyed by symbol.
+        # Subset: open swing positions + SPY + QQQ. Updated in-place on each slow
+        # loop pass; stale entries for closed positions are harmless (small dict).
+        self._daily_indicators: dict[str, dict] = {}
 
         # Phase 17: UTC timestamp of the last completed medium loop cycle.
         # Used by the medium-loop gate in _slow_loop_cycle to prevent Claude from
@@ -2238,6 +2250,29 @@ class Orchestrator:
             len(ranked), len(reasoning_result.new_opportunities),
         )
 
+        # -- Candidates exhaustion detection ----------------------------------
+        # When every symbol Claude recommended this cache generation has been
+        # suppressed, no recovery is possible without a fresh reasoning call.
+        # Set a flag so _check_triggers fires "candidates_exhausted" immediately.
+        # Guard: only set once per cache generation (cleared after trigger fires).
+        cache_opps = {
+            o.get("symbol")
+            for o in reasoning_result.new_opportunities
+            if o.get("symbol")
+        }
+        if (
+            cache_opps
+            and cache_opps.issubset(self._filter_suppressed)
+            and not self._trigger_state.candidates_exhausted
+        ):
+            self._trigger_state.candidates_exhausted = True
+            log.info(
+                "Candidates exhausted — all %d Claude candidate(s) suppressed %s; "
+                "flagging for immediate re-reasoning",
+                len(cache_opps),
+                sorted(cache_opps),
+            )
+
         # -- No-opportunity streak tracking (Finding 4 / Proposal B) ----------------
         # When ranked is empty, increment the streak counter. After
         # no_opportunity_streak_warn_threshold consecutive empty loops, emit a
@@ -3304,6 +3339,25 @@ class Orchestrator:
         else:
             log.debug("Trigger: market_rsi_extreme skip — SPY RSI unavailable")
 
+        # 9. Candidates exhausted — all current Claude recommendations suppressed.
+        # Fires at most once per reasoning cache generation: guarded by
+        # last_exhaustion_trigger_utc so a new reasoning cycle must complete before
+        # this can fire again (prevents rapid-fire if the new cycle also produces
+        # immediately-suppressable candidates).
+        if ts.candidates_exhausted:
+            last_exhausted = ts.last_exhaustion_trigger_utc
+            last_call = ts.last_claude_call_utc
+            already_fired_this_generation = (
+                last_exhausted is not None
+                and last_call is not None
+                and last_exhausted >= last_call
+            )
+            if not already_fired_this_generation:
+                triggers.append("candidates_exhausted")
+                ts.candidates_exhausted = False
+                ts.last_exhaustion_trigger_utc = now
+                log.debug("Trigger: candidates_exhausted FIRED")
+
         return triggers
 
     async def _update_trigger_prices(self) -> None:
@@ -3389,7 +3443,7 @@ class Orchestrator:
             if result:
                 watchlist_news[sym] = result
 
-        return {
+        market_ctx: dict = {
             "spy_trend":         _classify_trend("SPY"),
             "spy_rsi":           spy_rsi,
             "qqq_trend":         _classify_trend("QQQ"),
@@ -3403,6 +3457,26 @@ class Orchestrator:
             # Active strategies from config — Claude must only recommend strategies in this list.
             "active_strategies": self._config.strategy.active_strategies,
         }
+
+        # Daily-bar macro regime context — added when _daily_indicators is populated.
+        # These are daily signals for SPY/QQQ; useful for multi-day swing thesis evaluation.
+        # spy_rsi above remains the intraday 5-min signal; spy_daily.rsi_14d is the daily view.
+        _spy_daily = self._daily_indicators.get("SPY")
+        if _spy_daily:
+            market_ctx["spy_daily"] = {
+                "rsi_14d":       _spy_daily.get("rsi_14d"),
+                "daily_trend":   _spy_daily.get("daily_trend"),
+                "roc_5d":        _spy_daily.get("roc_5d"),
+                "ema20_vs_ema50": _spy_daily.get("ema20_vs_ema50"),
+            }
+        _qqq_daily = self._daily_indicators.get("QQQ")
+        if _qqq_daily:
+            market_ctx["qqq_daily"] = {
+                "rsi_14d":     _qqq_daily.get("rsi_14d"),
+                "daily_trend": _qqq_daily.get("daily_trend"),
+            }
+
+        return market_ctx
 
     async def _run_claude_cycle(self, trigger_name: str) -> None:
         """
@@ -3457,6 +3531,35 @@ class Orchestrator:
         market_data = await self._build_market_context(acct, pdt_remaining)
 
         self._latest_market_context = market_data  # store for medium loop thesis challenge
+
+        # -- Daily-bar fetch for swing position reviews and macro context -----
+        # Fetch daily bars for all open swing positions + SPY + QQQ.
+        # Failures are logged and silently skipped — stale/missing daily indicators
+        # degrade gracefully; they never block the reasoning call.
+        _daily_symbols: list[str] = ["SPY", "QQQ"]
+        for _pos in portfolio.positions:
+            if getattr(_pos.intention, "strategy", None) == "swing":
+                if _pos.symbol not in _daily_symbols:
+                    _daily_symbols.append(_pos.symbol)
+
+        async def _fetch_daily(sym: str) -> tuple[str, dict]:
+            try:
+                df = await self._data_adapter.fetch_bars(sym, interval="1d", period="3mo")
+                return sym, generate_daily_signal_summary(sym, df)
+            except Exception as exc:
+                log.warning("Daily bar fetch failed for %s: %s", sym, exc)
+                return sym, {}
+
+        _daily_results = await asyncio.gather(
+            *[_fetch_daily(s) for s in _daily_symbols],
+            return_exceptions=True,
+        )
+        for _item in _daily_results:
+            if isinstance(_item, Exception):
+                continue
+            _sym, _dsig = _item
+            if _dsig:
+                self._daily_indicators[_sym] = _dsig
 
         # -- Phase 18: watchlist_small → dedicated build cycle ----------------
         # When watchlist_small fires, run the universe scanner and a focused
@@ -3513,6 +3616,7 @@ class Orchestrator:
                 wl_result = await self._claude.run_watchlist_build(
                     market_context=market_data,
                     current_watchlist=watchlist,
+                    target_count=self._config.claude.watchlist_build_target,
                     candidates=_candidates_for_claude,
                     search_adapter=self._search_adapter,
                     no_entry_symbols=self._config.ranker.no_entry_symbols,
@@ -3594,6 +3698,7 @@ class Orchestrator:
                 execution_stats=execution_stats,
                 session_suppressed=self._filter_suppressed,
                 claude_soft_rejections=self._claude_soft_rejections,
+                daily_indicators=self._daily_indicators,
             )
         except Exception as exc:
             self._handle_claude_failure(exc)

@@ -281,6 +281,7 @@ class ClaudeReasoningEngine:
         execution_stats: dict | None = None,
         session_suppressed: dict[str, str] | None = None,
         claude_soft_rejections: dict[str, int] | None = None,
+        daily_indicators: dict[str, dict] | None = None,
     ) -> dict:
         """
         Build the structured input context sent to Claude each cycle.
@@ -332,7 +333,7 @@ class ClaudeReasoningEngine:
                 )
             except Exception:
                 hold_hours = None
-            position_entries.append({
+            pos_entry: dict = {
                 "symbol": pos.symbol,
                 "shares": pos.shares,
                 "avg_cost": pos.avg_cost,
@@ -353,7 +354,16 @@ class ClaudeReasoningEngine:
                     "entry_date": entry_date_str,
                     "review_notes": pos.intention.review_notes[-3:],
                 },
-            })
+            }
+            # Swing positions get daily-bar signals so Claude evaluates thesis health
+            # on the appropriate timeframe. Momentum positions use intraday signals only.
+            if (
+                pos.intention.strategy == "swing"
+                and daily_indicators
+                and daily_indicators.get(pos.symbol)
+            ):
+                pos_entry["daily_signals"] = daily_indicators[pos.symbol]
+            position_entries.append(pos_entry)
 
         # --- Tier 1 watchlist candidates (fill remaining budget) ---
         # Sort by current composite technical score descending so Claude always
@@ -798,6 +808,7 @@ class ClaudeReasoningEngine:
         execution_stats: dict | None = None,
         session_suppressed: dict[str, str] | None = None,
         claude_soft_rejections: dict[str, int] | None = None,
+        daily_indicators: dict[str, dict] | None = None,
     ) -> Optional[ReasoningResult]:
         """
         Full reasoning cycle: check cache → assemble context → call Claude
@@ -825,6 +836,7 @@ class ClaudeReasoningEngine:
             execution_stats=execution_stats,
             session_suppressed=session_suppressed,
             claude_soft_rejections=claude_soft_rejections,
+            daily_indicators=daily_indicators,
         )
         context_json = json.dumps(context, default=str, indent=2)
         template = self._load_prompt("reasoning.txt")
@@ -1069,7 +1081,7 @@ class ClaudeReasoningEngine:
         self,
         market_context: dict,
         current_watchlist: WatchlistState,
-        target_count: int = 20,
+        target_count: int = 8,
         candidates: list[dict] | None = None,
         search_adapter=None,   # SearchAdapter | None
         no_entry_symbols: list[str] | None = None,

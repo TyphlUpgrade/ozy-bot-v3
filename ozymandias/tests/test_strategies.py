@@ -489,13 +489,13 @@ class TestSwingEval:
         assert result.confidence == pytest.approx(1.0)
 
     @pytest.mark.asyncio
-    async def test_exit_on_trend_structure_breakdown(self):
+    async def test_bearish_aligned_no_longer_triggers_exit(self):
+        """Intraday bearish_aligned is disabled as an exit trigger — swing holds on stop/target only."""
         s = SwingStrategy()
         pos = _position(strategy="swing")
         inds = _swing_indicators(price=98.0, trend_structure="bearish_aligned")
         result = await s.evaluate_position(pos, _df(), inds)
-        assert result.action == "exit"
-        assert "bearish_aligned" in result.reasoning
+        assert result.action == "hold"
 
     @pytest.mark.asyncio
     async def test_scale_out_near_profit_target(self):
@@ -524,14 +524,14 @@ class TestSwingEval:
         assert result.action == "hold"
 
     @pytest.mark.asyncio
-    async def test_no_scale_in_when_trend_bearish(self):
-        """Do not average down into a broken trend."""
+    async def test_scale_in_when_trend_bearish_and_stop_intact(self):
+        """Intraday bearish_aligned no longer blocks scale_in — stop intact, dip qualifies."""
         s = SwingStrategy()
         pos = _position(avg_cost=100.0, profit_target=120.0, stop_loss=88.0, strategy="swing")
         inds = _swing_indicators(price=94.0, trend_structure="bearish_aligned")
         result = await s.evaluate_position(pos, _df(), inds)
-        # trend breakdown takes priority → exit, not scale_in
-        assert result.action == "exit"
+        # 6% dip, stop not breached → scale_in (intraday trend gate disabled)
+        assert result.action == "scale_in"
 
     @pytest.mark.asyncio
     async def test_swing_no_end_of_day_forced_exit(self):
@@ -561,13 +561,15 @@ class TestSwingExit:
         assert suggestion.urgency == pytest.approx(1.0)
 
     @pytest.mark.asyncio
-    async def test_trend_breakdown_is_market_urgency_0_9(self):
+    async def test_bearish_aligned_no_longer_urgent_market_exit(self):
+        """Intraday bearish_aligned disabled — suggest_exit falls through to default limit."""
         s = SwingStrategy()
         pos = _position(stop_loss=80.0, strategy="swing")
         inds = _swing_indicators(price=95.0, trend_structure="bearish_aligned")
         suggestion = await s.suggest_exit(pos, _df(), inds)
-        assert suggestion.order_type == "market"
-        assert suggestion.urgency == pytest.approx(0.9)
+        # Stop not breached, no profit target proximity — default limit exit
+        assert suggestion.order_type == "limit"
+        assert suggestion.urgency < 0.9
 
     @pytest.mark.asyncio
     async def test_profit_target_is_limit_low_urgency(self):

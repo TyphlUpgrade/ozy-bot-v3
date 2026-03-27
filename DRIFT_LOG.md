@@ -971,3 +971,60 @@ Read the relevant phase section before modifying or debugging any module built i
 
 **Prompt version v3.8.0** · *(new version)* · `config/prompts/v3.8.0/` (new), `config/config.json`
 - Copied from v3.7.0. Content unchanged — reserved as a clean version boundary for the rsi_max swing entry instruction (pending discussion).
+
+
+---
+
+### 2026-03-27 — Two-Profile Indicator Layer + Watchlist Pipeline Fixes
+
+**Root cause: macro panic exits on swing positions** · *(bug fix)* · `intelligence/technical_analysis.py`, `core/orchestrator.py`, `intelligence/claude_reasoning.py`
+- **Problem:** `_build_market_context` read `_market_context_indicators` (5-min bars) to produce `spy_rsi`. When SPY RSI dropped to 35 intraday, Claude exited multi-day swing positions citing bearish market structure — reasoning categorically inappropriate for a 5+ ATR multi-day thesis. DPZ exited this way after < 4 hours despite the 4h hold guard (guard only prevents `_apply_position_reviews` from acting on review output; `evaluate_position` in the medium loop was a separate path that bypassed it).
+- **Fix:** Two-profile indicator layer: intraday signals unchanged for momentum; daily-bar signals added separately for swing reviews and macro regime context.
+
+**`generate_daily_signal_summary(symbol, df)`** · *(new function)* · `intelligence/technical_analysis.py`
+- Returns `{}` for < 20 bars or NaN RSI. Signals: `rsi_14d`, `price_vs_ema20`, `price_vs_ema50` (50+ bars only), `ema20_vs_ema50` (50+ bars only), `daily_trend` (uptrend/downtrend/mixed based on EMA20/EMA50 alignment), `roc_5d`, `volume_trend_daily` (expanding/contracting/neutral: 5d avg vs 20d avg ±10%), `macd_signal_daily`.
+- Uses existing `compute_rsi`, `compute_ema`, `compute_macd` — no new dependencies.
+
+**`_daily_indicators`** · *(new orchestrator state)* · `core/orchestrator.py`
+- `dict[str, dict]` populated each slow loop in `_run_claude_cycle` after `_build_market_context`.
+- Fetches daily bars for: SPY, QQQ, all open swing position symbols.
+- Uses `asyncio.gather(return_exceptions=True)` — failures logged at WARNING, silently skipped.
+- Cache key `bars:SYMBOL:1d:3mo` is distinct from intraday keys — no cache collision.
+
+**`spy_daily` / `qqq_daily` in market context** · *(interface change)* · `core/orchestrator.py`
+- `_build_market_context` now appends `spy_daily` and `qqq_daily` keys from `_daily_indicators` when available. Absent during first slow loop (before daily fetch runs) — keys simply omitted.
+- Co-exists with existing `spy_rsi` (intraday) — both present simultaneously; different timeframes.
+
+**`daily_signals` in swing position context** · *(interface change)* · `intelligence/claude_reasoning.py`
+- `assemble_reasoning_context` accepts `daily_indicators: dict[str, dict] | None = None`.
+- Swing positions with non-empty `daily_indicators[symbol]` get `pos_entry["daily_signals"] = ...`.
+- Momentum positions receive no `daily_signals` — intraday is correct timeframe for them.
+- `run_reasoning_cycle` signature extended with `daily_indicators` param; passed through from orchestrator.
+
+**Swing intraday gates disabled** · *(behaviour change)* · `strategies/swing_strategy.py`
+- `apply_entry_gate`: `trend_structure` block commented out (wrong timeframe for swing entries). Was blocking POOL and other valid oversold setups when 5-min trend was bearish.
+- `evaluate_position`: `bearish_aligned` exit commented out. Was bypassing the 4h hold guard via `_medium_evaluate_positions` (which calls `evaluate_position` directly, outside `applicable_override_signals()` frozenset).
+- `suggest_exit`: `bearish_aligned` market exit commented out.
+- Code preserved (not deleted) for future re-entry/repositioning logic.
+- **Tests updated:** `test_strategies.py` (3 renames), `test_strategy_traits.py` (2 renames + 1 removal), `test_opportunity_ranker.py` (2 renames). All 1046 tests passing.
+
+**Prompt v3.9.0** · *(new version)* · `config/prompts/v3.9.0/` (new), `config/config.json`
+- `reasoning.txt`: `TWO-PROFILE MARKET CONTEXT` section explaining intraday vs. daily signal usage; `OPEN POSITIONS — DAILY SIGNALS` section weighting `daily_signals` over intraday for swing reviews; swing entry restrictions: `daily_trend == "downtrend"` → near-prohibited swing longs (require catalyst_driven + conviction ≥ 0.70 + named near-term event); `daily_trend == "mixed"` → conviction cap 0.65 + 10% equity size cap.
+- `review.txt`: `TIMEFRAME GUIDANCE FOR SWING POSITIONS` block instructing Claude to weight `daily_signals` over intraday `market_context` for swing reviews. Intraday weakness alone is not a valid exit reason for swing positions.
+- `watchlist.txt`: `spy_daily.daily_trend` calibration instructions — favor short candidates in downtrend regime; raise bar for swing long additions in mixed regime.
+- `review.txt`, `watchlist.txt`, `thesis_challenge.txt` copied from v3.8.0 (were missing — caused "no such file" error on startup).
+
+---
+
+### 2026-03-27 — Watchlist Pipeline Fixes
+
+**`tier1_max_symbols` raised 8 → 18** · *(config change)* · `config/config.json`
+- **Problem:** With 3 open positions, Claude was seeing only 5 watchlist candidates per reasoning cycle out of 33 tier-1 symbols (15%). New short candidates from daily watchlist builds were invisible to Claude's reasoning — the 50-candidate screener runs at 9:30 ET, Claude reasons at 9:34 ET, newly-added symbols may not have indicators yet and score 0, ranking out of the visible 5. Token trim guard in `assemble_reasoning_context` is the real safety net; 8 was an overly conservative cap set before Phase 18 grew the watchlist.
+- **Fix:** Raised to 18. With 3 positions, Claude now sees ~15 candidates (~45% of watchlist) per cycle.
+
+**`watchlist_max_entries` raised 40 → 60 + `watchlist_build_target` 20 → 8** · *(config + code change)* · `config/config.json`, `core/config.py`, `intelligence/claude_reasoning.py`, `core/orchestrator.py`
+- **Problem:** The size-cap pruner in `_apply_watchlist_changes` was evicting ~20 symbols every watchlist build. Mechanism: `target_count=20` → Claude adds 20 new symbols → 40+20=60 entries → pruner fires to restore cap of 40, evicting 20 lowest intraday composite scores. Pruning by intraday composite score is a category error for swing setups (e.g., POOL added for RSI 29 oversold thesis scores low intraday — gets immediately evicted). Net result: watchlist churned ~50% of its contents daily with no thesis continuity.
+- **Fix 1:** `watchlist_max_entries` raised 40 → 60. Builds of ≤ 8 new symbols no longer trigger pruning.
+- **Fix 2:** `watchlist_build_target` config key added to `ClaudeConfig` (default 8). Replaces hardcoded `target_count=20` in `run_watchlist_build`. Forces Claude to add its 8 highest-conviction picks per build rather than a wholesale refresh. Wired through orchestrator call site.
+- **Fix 3:** Watchlist prompt framing: "TARGET WATCHLIST SIZE: N tickers" → "ADD UP TO N NEW TICKERS THIS BUILD". Disambiguates additive vs. rebuild semantics — the old framing caused Claude to treat the watchlist build as a full replacement rather than incremental addition.
+- **`ClaudeConfig.watchlist_max_entries` default** updated 30 → 60 in `core/config.py`.

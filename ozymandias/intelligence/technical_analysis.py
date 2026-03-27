@@ -684,3 +684,88 @@ def generate_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
         'composite_technical_score': round(compute_composite_score(signals), 4),
         'bars_available':           len(df),  # raw bar count; used by orchestrator warm-up guard
     }
+
+
+def generate_daily_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
+    """
+    Daily-bar signals for swing position reviews and daily macro regime context.
+
+    Extension point: to add a new daily signal, add one key to the returned dict here.
+    All signals are derived from daily OHLCV bars (interval="1d", period="3mo").
+
+    Returns {} when fewer than 20 daily bars are available.
+    Requires df with lowercase columns: open, high, low, close, volume.
+    """
+    if df is None or len(df) < 20:
+        return {}
+
+    rsi_series = compute_rsi(df, length=14)
+    last_rsi = float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else float('nan')
+    if pd.isna(last_rsi):
+        return {}
+
+    ema20 = compute_ema(df['close'], 20)
+    last_close = float(df['close'].iloc[-1])
+    last_ema20 = float(ema20.iloc[-1])
+
+    price_vs_ema20 = 'above' if last_close >= last_ema20 else 'below'
+
+    # EMA50 only if we have at least 50 bars
+    price_vs_ema50: str | None = None
+    ema20_vs_ema50: str | None = None
+    if len(df) >= 50:
+        ema50 = compute_ema(df['close'], 50)
+        last_ema50 = float(ema50.iloc[-1])
+        price_vs_ema50 = 'above' if last_close >= last_ema50 else 'below'
+        ema20_vs_ema50 = 'above' if last_ema20 >= last_ema50 else 'below'
+
+    # Daily trend classification
+    if price_vs_ema50 is not None and ema20_vs_ema50 is not None:
+        if price_vs_ema20 == 'above' and ema20_vs_ema50 == 'above':
+            daily_trend = 'uptrend'
+        elif price_vs_ema20 == 'below' and ema20_vs_ema50 == 'below':
+            daily_trend = 'downtrend'
+        else:
+            daily_trend = 'mixed'
+    else:
+        # Fewer than 50 bars — use only price vs EMA20
+        daily_trend = 'uptrend' if price_vs_ema20 == 'above' else 'downtrend'
+
+    # 5-day rate of change
+    roc_series = compute_roc(df, length=5)
+    last_roc_5d = float(roc_series.iloc[-1]) if not pd.isna(roc_series.iloc[-1]) else 0.0
+
+    # Volume trend: 5-day avg vs 20-day avg
+    vol = df['volume']
+    vol_5d_avg = float(vol.iloc[-5:].mean()) if len(vol) >= 5 else float(vol.mean())
+    vol_20d_avg = float(vol.iloc[-20:].mean()) if len(vol) >= 20 else float(vol.mean())
+    if vol_20d_avg > 0:
+        vol_ratio = vol_5d_avg / vol_20d_avg
+        if vol_ratio > 1.1:
+            volume_trend_daily = 'expanding'
+        elif vol_ratio < 0.9:
+            volume_trend_daily = 'contracting'
+        else:
+            volume_trend_daily = 'neutral'
+    else:
+        volume_trend_daily = 'neutral'
+
+    # MACD signal on daily bars
+    macd_df = compute_macd(df)
+    last_macd = float(macd_df['macd'].iloc[-1])
+    last_signal = float(macd_df['signal'].iloc[-1])
+    macd_signal_daily = 'bullish' if last_macd >= last_signal else 'bearish'
+
+    result: dict = {
+        'rsi_14d':            round(last_rsi, 1),
+        'price_vs_ema20':     price_vs_ema20,
+        'daily_trend':        daily_trend,
+        'roc_5d':             round(last_roc_5d, 2),
+        'volume_trend_daily': volume_trend_daily,
+        'macd_signal_daily':  macd_signal_daily,
+    }
+    if price_vs_ema50 is not None:
+        result['price_vs_ema50'] = price_vs_ema50
+    if ema20_vs_ema50 is not None:
+        result['ema20_vs_ema50'] = ema20_vs_ema50
+    return result

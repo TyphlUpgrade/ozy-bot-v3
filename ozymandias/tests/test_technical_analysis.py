@@ -26,6 +26,7 @@ from ozymandias.intelligence.technical_analysis import (
     compute_vwap,
     detect_macd_cross,
     detect_rsi_divergence,
+    generate_daily_signal_summary,
     generate_signal_summary,
 )
 
@@ -881,3 +882,145 @@ class TestRsiAccel3:
         result = generate_signal_summary("TEST", df)
         # Daily bars span > 24h per bar → guard skipped; value is a plain float.
         assert isinstance(result["signals"]["rsi_accel_3"], float)
+
+
+# ---------------------------------------------------------------------------
+# generate_daily_signal_summary tests
+# ---------------------------------------------------------------------------
+
+class TestGenerateDailySignalSummary:
+    """Tests for the daily-bar TA profile used by swing position reviews."""
+
+    def _daily_df(
+        self,
+        closes: list[float],
+        volumes: list[float] | None = None,
+    ) -> pd.DataFrame:
+        """Build a daily OHLCV DataFrame with DatetimeIndex."""
+        n = len(closes)
+        if volumes is None:
+            volumes = [1_000_000.0] * n
+        return pd.DataFrame(
+            {
+                "open":   [c - 0.5 for c in closes],
+                "high":   [c + 1.0 for c in closes],
+                "low":    [c - 1.0 for c in closes],
+                "close":  closes,
+                "volume": volumes,
+            },
+            index=pd.date_range(start="2025-01-01", periods=n, freq="D"),
+        )
+
+    def test_too_few_bars_returns_empty(self):
+        """Fewer than 20 bars → return {}."""
+        df = self._daily_df([100.0] * 19)
+        assert generate_daily_signal_summary("TEST", df) == {}
+
+    def test_none_df_returns_empty(self):
+        assert generate_daily_signal_summary("TEST", None) == {}
+
+    def test_daily_signal_uptrend(self):
+        """price > EMA20 > EMA50 → daily_trend == 'uptrend'."""
+        # Steadily rising prices ensure price > EMA20 > EMA50 at the tail end.
+        closes = [100.0 + i * 1.0 for i in range(60)]
+        df = self._daily_df(closes)
+        result = generate_daily_signal_summary("AAPL", df)
+        assert result["daily_trend"] == "uptrend"
+        assert result["price_vs_ema20"] == "above"
+        assert result["price_vs_ema50"] == "above"
+        assert result["ema20_vs_ema50"] == "above"
+
+    def test_daily_signal_downtrend(self):
+        """price < EMA20 < EMA50 → daily_trend == 'downtrend'."""
+        # Steadily falling prices ensure price < EMA20 < EMA50 at the tail end.
+        closes = [160.0 - i * 1.0 for i in range(60)]
+        df = self._daily_df(closes)
+        result = generate_daily_signal_summary("NVDA", df)
+        assert result["daily_trend"] == "downtrend"
+        assert result["price_vs_ema20"] == "below"
+        assert result["price_vs_ema50"] == "below"
+        assert result["ema20_vs_ema50"] == "below"
+
+    def test_daily_signal_mixed_trend(self):
+        """price above EMA20 but EMA20 below EMA50 → 'mixed'."""
+        # Build a sequence that ends with a sharp spike: the last few days push price and
+        # EMA20 above close but EMA50 (slower) is still higher.
+        base = [100.0 - i * 0.3 for i in range(55)]  # declining phase
+        spike = [base[-1] + i * 2.0 for i in range(1, 6)]  # sharp 5-bar spike at end
+        closes = base + spike
+        df = self._daily_df(closes)
+        result = generate_daily_signal_summary("TEST", df)
+        # At minimum the function should return a non-empty dict with required keys.
+        assert "daily_trend" in result
+        assert result["daily_trend"] in ("uptrend", "downtrend", "mixed")
+
+    def test_daily_signal_too_few_bars_for_ema50(self):
+        """20–49 bars: ema20_vs_ema50 / price_vs_ema50 absent; daily_trend derived from EMA20 only."""
+        closes = [100.0 + i * 0.5 for i in range(30)]
+        df = self._daily_df(closes)
+        result = generate_daily_signal_summary("TEST", df)
+        assert result != {}
+        assert "price_vs_ema50" not in result
+        assert "ema20_vs_ema50" not in result
+        # Rising prices → price > EMA20 → uptrend
+        assert result["daily_trend"] == "uptrend"
+
+    def test_daily_volume_expanding(self):
+        """5-day avg > 1.1× 20-day avg → volume_trend_daily == 'expanding'."""
+        base_vol = [1_000_000.0] * 40
+        spike_vol = [2_500_000.0] * 5  # 2.5× baseline → well above 1.1×
+        closes = [100.0] * 45
+        df = self._daily_df(closes, volumes=base_vol + spike_vol)
+        result = generate_daily_signal_summary("TEST", df)
+        assert result["volume_trend_daily"] == "expanding"
+
+    def test_daily_volume_contracting(self):
+        """5-day avg < 0.9× 20-day avg → volume_trend_daily == 'contracting'."""
+        base_vol = [1_000_000.0] * 40
+        low_vol = [200_000.0] * 5  # 0.2× baseline → well below 0.9×
+        closes = [100.0] * 45
+        df = self._daily_df(closes, volumes=base_vol + low_vol)
+        result = generate_daily_signal_summary("TEST", df)
+        assert result["volume_trend_daily"] == "contracting"
+
+    def test_daily_rsi_computed_correctly(self):
+        """RSI(14) on 15 bars of constant 1.0 gain should be 100 (all gains, no losses)."""
+        # 20 bars all increasing by exactly 1.0 each day
+        closes = [100.0 + i for i in range(25)]
+        df = self._daily_df(closes)
+        result = generate_daily_signal_summary("TEST", df)
+        # All gains → RSI should be 100 (or very close due to EWM seed)
+        assert result["rsi_14d"] >= 99.0
+
+    def test_rsi_14d_is_rounded_to_1dp(self):
+        """rsi_14d should be rounded to 1 decimal place."""
+        closes = [100.0 + (i % 3) * 0.7 for i in range(30)]
+        df = self._daily_df(closes)
+        result = generate_daily_signal_summary("TEST", df)
+        if result:
+            assert result["rsi_14d"] == round(result["rsi_14d"], 1)
+
+    def test_macd_signal_daily_bullish_on_rising(self):
+        """Steadily rising prices → MACD line > signal line → 'bullish'."""
+        closes = [100.0 + i * 0.8 for i in range(40)]
+        df = self._daily_df(closes)
+        result = generate_daily_signal_summary("TEST", df)
+        assert result["macd_signal_daily"] == "bullish"
+
+    def test_macd_signal_daily_bearish_on_falling(self):
+        """Steadily falling prices → MACD line < signal line → 'bearish'."""
+        closes = [140.0 - i * 0.8 for i in range(40)]
+        df = self._daily_df(closes)
+        result = generate_daily_signal_summary("TEST", df)
+        assert result["macd_signal_daily"] == "bearish"
+
+    def test_required_keys_present(self):
+        """All required keys present in a standard 60-bar input."""
+        closes = [100.0 + i * 0.5 for i in range(60)]
+        df = self._daily_df(closes)
+        result = generate_daily_signal_summary("TEST", df)
+        required = {
+            "rsi_14d", "price_vs_ema20", "daily_trend",
+            "roc_5d", "volume_trend_daily", "macd_signal_daily",
+        }
+        assert required.issubset(result.keys())

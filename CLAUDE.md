@@ -224,6 +224,42 @@ Last post-MVP phase completed: Phase 18 — Watchlist Intelligence (March 23)
   - *Prompt v3.8.0*: clean version boundary (content unchanged from v3.7.0 — reserved for rsi_max
     swing instruction pending further discussion).
 
+- **2026-03-27 — Two-Profile Indicator Layer (daily TA for swing reviews)**:
+  - *Root cause fixed*: intraday SPY RSI (5-min bars) was driving swing position exits ("macro panic
+    exits"). SPY RSI 35 intraday was triggering Claude to exit multi-day swing positions.
+  - *`generate_daily_signal_summary(symbol, df)`* added to `technical_analysis.py`: computes
+    `rsi_14d`, `price_vs_ema20`, `price_vs_ema50`, `ema20_vs_ema50`, `daily_trend`
+    (uptrend/downtrend/mixed), `roc_5d`, `volume_trend_daily`, `macd_signal_daily` from daily bars.
+    Returns `{}` for < 20 bars.
+  - *`_daily_indicators: dict[str, dict]`* on orchestrator: populated each slow loop for SPY, QQQ,
+    and all open swing position symbols. Fetch failures logged at WARNING (not silently dropped).
+  - *`spy_daily` / `qqq_daily`* added to `_build_market_context` output for macro regime context.
+  - *`daily_signals` block* injected into swing position context in `assemble_reasoning_context`.
+    Momentum positions receive no `daily_signals` block — intraday is correct for them.
+  - *Prompt v3.9.0*: `TWO-PROFILE MARKET CONTEXT` section; `OPEN POSITIONS — DAILY SIGNALS`
+    section; swing entry restrictions in daily downtrend (`daily_trend == "downtrend"` → near-
+    prohibited swing longs, require catalyst_driven + conviction ≥ 0.70); `review.txt` updated to
+    instruct Claude to weight `daily_signals` over intraday context for swing reviews; `watchlist.txt`
+    updated with `spy_daily.daily_trend` calibration instructions.
+  - *Swing intraday gate removal*: `apply_entry_gate` trend_structure block commented out (wrong
+    timeframe). `evaluate_position` and `suggest_exit` bearish_aligned exits commented out (bypassed
+    4h hold guard via medium loop). Code preserved, not deleted, for future re-entry/repositioning
+    logic. 13 new tests in `test_technical_analysis.py`. 3 test renames in `test_strategies.py`,
+    `test_strategy_traits.py`, `test_opportunity_ranker.py`.
+
+- **2026-03-27 — Watchlist pipeline fixes**:
+  - *`tier1_max_symbols` raised 8 → 18*: with 3 open positions, Claude was seeing only 5 candidates
+    per cycle out of 33 tier-1 symbols (15%). Now sees ~15 candidates (45%).
+  - *`watchlist_max_entries` raised 40 → 60*: the size-cap pruner was evicting ~20 symbols every
+    watchlist build because `target_count=20` additions + 40 cap = 20 forced evictions. Pruner used
+    intraday composite score as eviction criterion — a category error for swing setups with low
+    intraday scores by design (e.g., POOL RSI 29 oversold thesis).
+  - *`watchlist_build_target` config key added (default 8)*: replaces hardcoded `target_count=20`
+    in `run_watchlist_build`. Forces Claude to add ≤ 8 selective picks per build rather than a
+    wholesale refresh. Wired through `ClaudeConfig` and orchestrator.
+  - *Watchlist prompt framing fixed*: "TARGET WATCHLIST SIZE: N" → "ADD UP TO N NEW TICKERS THIS
+    BUILD" — disambiguates additive vs. rebuild semantics.
+
 ### Post-MVP Roadmap: Phase 19
 
 - **Phase 19 — Context Compression**: see `phases/19_context_compression.md`

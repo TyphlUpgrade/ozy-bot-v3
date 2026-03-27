@@ -374,14 +374,19 @@ class MomentumStrategy(Strategy):
 
         stop = position.intention.exit_targets.stop_loss
         target = position.intention.exit_targets.profit_target
+        is_short = getattr(position.intention, "direction", "long") == "short"
 
-        # 1. Stop-loss breach
-        if stop > 0 and price <= stop:
+        # 1. Stop-loss breach — direction-aware:
+        #    Long:  stop is below entry → exit when price falls to/below stop
+        #    Short: stop is above entry → exit when price rises to/above stop
+        stop_breached = (price >= stop) if is_short else (price <= stop)
+        if stop > 0 and stop_breached:
+            direction_word = "at/above" if is_short else "at/below"
             return PositionEval(
                 symbol=position.symbol,
                 action="exit",
                 confidence=1.0,
-                reasoning=f"Price {price:.2f} at/below stop {stop:.2f}",
+                reasoning=f"Price {price:.2f} {direction_word} stop {stop:.2f}",
             )
 
         # 2. Extremely overbought + momentum fading
@@ -462,11 +467,13 @@ class MomentumStrategy(Strategy):
         price = float(indicators.get("price") or market_data["close"].iloc[-1])
         stop = position.intention.exit_targets.stop_loss
         target = position.intention.exit_targets.profit_target
+        is_short = getattr(position.intention, "direction", "long") == "short"
 
         action = eval_result.action
 
-        # Stop-loss breach
-        if stop > 0 and price <= stop:
+        # Stop-loss breach — direction-aware (mirrors evaluate_position logic)
+        stop_breached = (price >= stop) if is_short else (price <= stop)
+        if stop > 0 and stop_breached:
             return ExitSuggestion(
                 symbol=position.symbol,
                 exit_price=0.0,

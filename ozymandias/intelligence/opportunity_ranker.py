@@ -474,6 +474,11 @@ class OpportunityRanker:
         # 2. Minimum composite technical score floor — computed with direction so
         #    short opportunities are evaluated against bearish signal strength,
         #    not penalised for the absence of bullish signals.
+        #    Applied to both intraday and swing strategies: even swing entries
+        #    benefit from some intraday confirmation to avoid starting underwater.
+        #    The composite is direction-adjusted, so a swing short scoring below
+        #    the floor means bearish intraday signals aren't confirming the thesis —
+        #    a valid reason to defer until setup improves.
         if technical_signals is not None:
             sig_summary = technical_signals.get(symbol, {})
             raw_signals = sig_summary.get("signals", {})

@@ -102,7 +102,8 @@ class ClaudeConfig:
     prompt_version: str = "v3.5.0"            # versioned subdirectory under config/prompts/ loaded for all templates
     tier1_max_symbols: int = 12               # max tier-1 watchlist symbols passed to Claude with full indicator detail
     tier2_max_symbols: int = 28               # max tier-2 symbols passed as watchlist replenishment candidates
-    watchlist_max_entries: int = 30           # hard cap on total watchlist entries; lowest-scoring entries pruned first; open positions always protected
+    watchlist_max_entries: int = 60           # hard cap on total watchlist entries; lowest-scoring entries pruned first; open positions always protected
+    watchlist_build_target: int = 8           # max new symbols Claude may add per watchlist build; lower = more selective, less daily churn
     max_reasoning_interval_min: int = 60      # time-ceiling trigger: Claude runs at least this often during market hours
     news_max_age_hours: int = 168             # age gate for watchlist_news passed to Claude; adapter filters to this window (default 7 days)
     news_max_items_per_symbol: int = 3        # headline cap per symbol sent to Claude; controls token budget

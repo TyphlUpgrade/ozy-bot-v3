@@ -221,27 +221,21 @@ class TestSwingEntryGate:
         passed, _ = strat.apply_entry_gate("sell_short", _signals(trend_structure="bearish_aligned"))
         assert passed is True
 
-    def test_rejects_long_with_bearish_trend(self):
+    def test_long_with_bearish_trend_now_passes(self):
+        """Intraday trend gate disabled — swing long passes regardless of trend_structure."""
         strat = _swing()
-        passed, reason = strat.apply_entry_gate("buy", _signals(trend_structure="bearish_aligned"))
-        assert passed is False
-        assert "bearish_aligned" in reason
+        passed, _ = strat.apply_entry_gate("buy", _signals(trend_structure="bearish_aligned"))
+        assert passed is True
 
-    def test_rejects_short_with_bullish_trend(self):
+    def test_short_with_bullish_trend_now_passes(self):
+        """Intraday trend gate disabled — swing short passes regardless of trend_structure."""
         strat = _swing()
-        passed, reason = strat.apply_entry_gate("sell_short", _signals(trend_structure="bullish_aligned"))
-        assert passed is False
-        assert "bullish_aligned" in reason
+        passed, _ = strat.apply_entry_gate("sell_short", _signals(trend_structure="bullish_aligned"))
+        assert passed is True
 
     def test_passes_long_with_mixed_trend(self):
         strat = _swing()
         passed, _ = strat.apply_entry_gate("buy", _signals(trend_structure="mixed"))
-        assert passed is True
-
-    def test_trend_gate_disabled_via_param(self):
-        strat = _swing(block_bearish_trend=False)
-        # Even with bearish_aligned for a long, gate is off → passes
-        passed, _ = strat.apply_entry_gate("buy", _signals(trend_structure="bearish_aligned"))
         assert passed is True
 
     # RVOL gate disabled for swing (min_rvol_for_entry=0.0): intraday 5m RVOL

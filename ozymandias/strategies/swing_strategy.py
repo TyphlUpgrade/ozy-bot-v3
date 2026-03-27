@@ -120,7 +120,21 @@ class SwingStrategy(Strategy):
         return True
 
     def apply_entry_gate(self, action: str, signals: dict) -> tuple[bool, str]:
-        """Reject swing entries when the long-term trend is fully adverse or RVOL is absent."""
+        """Reject swing entries when RVOL is absent.
+
+        Intraday trend_structure is intentionally NOT checked here — swing theses
+        are multi-day and the 5-min bar EMA alignment is noise on that timeframe.
+        Daily trend context is passed to Claude via daily_signals; Claude's per-trade
+        entry_conditions are the appropriate mechanism for trend-based swing gates.
+
+        # DISABLED: intraday trend gate — wrong timeframe for swing entries.
+        # Preserved for re-entry/repositioning logic: when that is implemented,
+        # this block can be re-enabled and extended with daily_trend awareness.
+        # if self._p("block_bearish_trend"):
+        #     wrong_trend = _SWING_WRONG_TREND.get(action)
+        #     if wrong_trend and signals.get("trend_structure", "") == wrong_trend:
+        #         return False, f"swing {action} rejected — {wrong_trend} trend"
+        """
         rvol = signals.get("volume_ratio")
         if rvol is not None and rvol < self._p("min_rvol_for_entry"):
             return (
@@ -128,10 +142,6 @@ class SwingStrategy(Strategy):
                 f"swing {action} rejected — RVOL {rvol:.2f} below floor "
                 f"{self._p('min_rvol_for_entry'):.2f} (no volume participation)",
             )
-        if self._p("block_bearish_trend"):
-            wrong_trend = _SWING_WRONG_TREND.get(action)
-            if wrong_trend and signals.get("trend_structure", "") == wrong_trend:
-                return False, f"swing {action} rejected — {wrong_trend} trend"
         return True, ""
 
     # ------------------------------------------------------------------
@@ -260,10 +270,14 @@ class SwingStrategy(Strategy):
 
         Priority order:
           1. Stop-loss breach → EXIT
-          2. Long-term trend structure broken → EXIT (bearish_aligned)
-          3. Near profit target → SCALE_OUT
-          4. Price dipped further but trend intact → SCALE_IN (if under limit)
-          5. Default → HOLD
+          2. Near profit target → SCALE_OUT
+          3. Price dipped further but trend not broken → SCALE_IN (if under limit)
+          4. Default → HOLD
+
+        Intraday trend_structure is intentionally NOT used as an exit trigger.
+        Swing positions are multi-day; 5-min bar EMA alignment is noise on that
+        timeframe. Stop-loss and Claude's slow-loop position review are the
+        authoritative exit mechanisms for swing.
         """
         rsi = float(indicators.get("rsi") or 50.0)
         trend = indicators.get("trend_structure", "mixed")
@@ -273,26 +287,35 @@ class SwingStrategy(Strategy):
         stop = position.intention.exit_targets.stop_loss
         target = position.intention.exit_targets.profit_target
         entry = position.avg_cost
+        is_short = getattr(position.intention, "direction", "long") == "short"
 
-        # 1. Stop-loss breach
-        if stop > 0 and price <= stop:
+        # 1. Stop-loss breach — direction-aware:
+        #    Long:  stop is below entry → exit when price falls to/below stop
+        #    Short: stop is above entry → exit when price rises to/above stop
+        stop_breached = (price >= stop) if is_short else (price <= stop)
+        if stop > 0 and stop_breached:
+            direction_word = "at/above" if is_short else "at/below"
             return PositionEval(
                 symbol=position.symbol,
                 action="exit",
                 confidence=1.0,
-                reasoning=f"Price {price:.2f} at/below stop {stop:.2f}",
+                reasoning=f"Price {price:.2f} {direction_word} stop {stop:.2f}",
             )
 
-        # 2. Long-term trend breakdown (50 EMA crossed below 200 EMA)
-        if trend == "bearish_aligned":
-            return PositionEval(
-                symbol=position.symbol,
-                action="exit",
-                confidence=0.90,
-                reasoning="Long-term trend structure broken (bearish_aligned) — thesis invalidated",
-            )
+        # DISABLED: intraday trend breakdown exit — wrong timeframe for swing.
+        # 5-min bar bearish_aligned is noise on a multi-day thesis; stop-loss and
+        # Claude's slow-loop review are the authoritative exit mechanisms.
+        # Preserved for re-entry/repositioning logic — when implemented, this can
+        # gate exits that precede a structured re-entry at a better level.
+        # if trend == "bearish_aligned":
+        #     return PositionEval(
+        #         symbol=position.symbol,
+        #         action="exit",
+        #         confidence=0.90,
+        #         reasoning="Long-term trend structure broken (bearish_aligned) — thesis invalidated",
+        #     )
 
-        # 3. Approaching profit target
+        # 2. Approaching profit target
         if target > 0:
             proximity_pct = abs(price - target) / target * 100
             if proximity_pct <= self._p("profit_target_proximity_pct"):
@@ -305,22 +328,25 @@ class SwingStrategy(Strategy):
                     ),
                 )
 
-        # 4. Price dipped further from entry — potential scale-in
+        # 3. Price moved adversely from entry — potential scale-in
+        #    Long:  adverse = price < entry (dipped below entry cost)
+        #    Short: adverse = price > entry (rose above entry cost)
         scale_in_count = getattr(position.intention, "scale_in_count", 0)
+        adverse_move = (price > entry) if is_short else (price < entry)
         if (
             entry > 0
-            and price < entry
+            and adverse_move
             and scale_in_count < self._p("max_scale_in_count")
         ):
-            dip_pct = (entry - price) / entry * 100
-            if dip_pct >= self._p("scale_in_dip_pct") and trend != "bearish_aligned":
+            dip_pct = abs(price - entry) / entry * 100
+            if dip_pct >= self._p("scale_in_dip_pct"):
                 return PositionEval(
                     symbol=position.symbol,
                     action="scale_in",
                     confidence=0.60,
                     reasoning=(
                         f"Price dipped {dip_pct:.1f}% below entry — "
-                        f"averaging down while trend intact ({trend})"
+                        f"averaging down ({trend})"
                     ),
                 )
 
@@ -358,9 +384,11 @@ class SwingStrategy(Strategy):
         stop = position.intention.exit_targets.stop_loss
         target = position.intention.exit_targets.profit_target
         trend = indicators.get("trend_structure", "mixed")
+        is_short = getattr(position.intention, "direction", "long") == "short"
 
-        # Stop-loss breach
-        if stop > 0 and price <= stop:
+        # Stop-loss breach — direction-aware (mirrors evaluate_position logic)
+        stop_breached = (price >= stop) if is_short else (price <= stop)
+        if stop > 0 and stop_breached:
             return ExitSuggestion(
                 symbol=position.symbol,
                 exit_price=0.0,
@@ -369,15 +397,16 @@ class SwingStrategy(Strategy):
                 reasoning="Stop-loss triggered — market exit",
             )
 
-        # Trend structure breakdown
-        if trend == "bearish_aligned":
-            return ExitSuggestion(
-                symbol=position.symbol,
-                exit_price=0.0,
-                order_type="market",
-                urgency=0.9,
-                reasoning="Trend structure breakdown — urgent market exit",
-            )
+        # DISABLED: intraday trend breakdown exit — wrong timeframe for swing.
+        # Preserved for re-entry/repositioning logic (see evaluate_position note).
+        # if trend == "bearish_aligned":
+        #     return ExitSuggestion(
+        #         symbol=position.symbol,
+        #         exit_price=0.0,
+        #         order_type="market",
+        #         urgency=0.9,
+        #         reasoning="Trend structure breakdown — urgent market exit",
+        #     )
 
         # Profit target
         if target > 0 and eval_result.action == "scale_out":

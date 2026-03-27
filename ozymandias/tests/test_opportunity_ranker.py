@@ -659,25 +659,23 @@ class TestShortDirectionFilters:
         passes, _ = self._filter(opp, _signals_with("TSLA", trend="bearish_aligned"))
         assert passes is True
 
-    def test_swing_short_bullish_trend_rejected(self):
-        """Bullish-aligned trend is adverse for a swing short — reject."""
+    def test_swing_short_bullish_trend_no_longer_rejected(self):
+        """Intraday trend gate disabled — swing short passes even with bullish_aligned."""
         opp = _short_opportunity(strategy="swing")
-        passes, reason = self._filter(opp, _signals_with("TSLA", trend="bullish_aligned"))
-        assert passes is False
-        assert "bullish_aligned" in reason
+        passes, _ = self._filter(opp, _signals_with("TSLA", trend="bullish_aligned"))
+        assert passes is True
 
-    def test_swing_long_bearish_trend_rejected(self):
-        """Bearish-aligned trend still rejects a swing long (regression guard)."""
+    def test_swing_long_bearish_trend_no_longer_rejected(self):
+        """Intraday trend gate disabled — swing long passes even with bearish_aligned."""
         opp = _opportunity(strategy="swing", action="buy",
                            suggested_entry=150.0, suggested_exit=165.0, suggested_stop=145.0)
         signals = _signals_with("AAPL", trend="bearish_aligned")
         r = _ranker()
-        passes, reason = r.apply_hard_filters(
+        passes, _ = r.apply_hard_filters(
             opp, _account(), _portfolio(), _pdt_guard(True), _market_open(True),
             orders=[], technical_signals=signals,
         )
-        assert passes is False
-        assert "bearish_aligned" in reason
+        assert passes is True
 
 
 # ---------------------------------------------------------------------------
