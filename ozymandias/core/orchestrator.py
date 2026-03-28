@@ -1269,10 +1269,15 @@ class Orchestrator:
                 age_sec = int((datetime.now(timezone.utc) - datetime.fromisoformat(stale_order.created_at)).total_seconds())
             except Exception:
                 age_sec = -1
+            effective_timeout = (
+                stale_order.timeout_seconds
+                if stale_order.timeout_seconds > 0
+                else stale_timeout
+            )
             log.warning(
                 "Cancelling stale order %s for %s (type=%s age=%ds timeout=%ds)",
                 stale_order.order_id, stale_order.symbol,
-                stale_order.order_type, age_sec, stale_timeout,
+                stale_order.order_type, age_sec, effective_timeout,
             )
             try:
                 cancel_result = await self._broker.cancel_order(stale_order.order_id)

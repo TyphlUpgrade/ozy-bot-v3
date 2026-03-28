@@ -1,4 +1,10 @@
-# Phase 19: Context Compression Layer — Haiku Pre-Screener for Watchlist Quality Sorting
+> **DEPRECATED — HISTORICAL RECORD ONLY**
+> This was the original Phase 19 specification. It has been superseded by the two-tier
+> architecture described in `phases/19_sonnet_strategic_output.md`,
+> `phases/20_haiku_operational_layer.md`, and `phases/21_durability_and_regime_response.md`.
+> Do not implement from this document.
+
+# Context Compression Layer — Haiku Pre-Screener for Watchlist Quality Sorting *(superseded)*
 
 Read the Phase 16 section of DRIFT_LOG.md and the `Post-MVP Roadmap` section of CLAUDE.md before starting. This phase assumes Phases 11, 14, 15, 16, 17, and 18 are complete.
 

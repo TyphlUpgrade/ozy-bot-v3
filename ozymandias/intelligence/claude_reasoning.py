@@ -372,7 +372,18 @@ class ClaudeReasoningEngine:
         # what the rest of the watchlist is doing.
         slots = max(0, max_tier1 - len(position_entries))
 
-        all_tier1 = [e for e in watchlist.entries if e.priority_tier == 1]
+        # Exclude symbols already held as open positions: they appear in the positions
+        # block above and Claude reviews them there. Including them here causes Claude
+        # to re-propose them as new entry candidates and triggers false "implicit
+        # rejection" warnings in the orchestrator.
+        # NOTE: if position scaling (adding to existing positions) is ever implemented,
+        # this filter should be removed or conditioned on whether the strategy supports
+        # pyramiding — held symbols would legitimately need to appear as candidates again.
+        open_position_symbols = {pos.symbol for pos in portfolio.positions}
+        all_tier1 = [
+            e for e in watchlist.entries
+            if e.priority_tier == 1 and e.symbol not in open_position_symbols
+        ]
         total_tier1 = len(all_tier1)
 
         def _tier1_score(entry) -> float:
