@@ -49,7 +49,7 @@ from ozymandias.intelligence.claude_reasoning import (
 )
 from ozymandias.intelligence.opportunity_ranker import OpportunityRanker, RankResult, evaluate_entry_conditions
 from ozymandias.intelligence.universe_scanner import UniverseScanner
-from ozymandias.intelligence.technical_analysis import compute_composite_score, generate_daily_signal_summary, generate_signal_summary
+from ozymandias.intelligence.technical_analysis import compute_composite_score, compute_sector_dispersion, generate_daily_signal_summary, generate_signal_summary
 from ozymandias.strategies.base_strategy import Strategy, get_strategy
 
 log = logging.getLogger(__name__)
@@ -347,9 +347,28 @@ class Orchestrator:
 
         # Daily-bar TA signals for swing position reviews and macro regime context.
         # Fetched each slow loop before run_reasoning_cycle; keyed by symbol.
-        # Subset: open swing positions + SPY + QQQ. Updated in-place on each slow
-        # loop pass; stale entries for closed positions are harmless (small dict).
+        # Phase 19: extended to all open watchlist symbols (for sector_dispersion).
+        # Stale entries for closed/removed symbols are harmless (small dict).
         self._daily_indicators: dict[str, dict] = {}
+
+        # Phase 19: Claude-proposed threshold relaxation from last reasoning cycle.
+        # Reset to None at the start of each new reasoning cycle; repopulated from
+        # result.filter_adjustments. If the Claude call errors, reset fires but
+        # repopulation doesn't — thresholds fall back to config defaults until next
+        # successful cycle. This is the correct safe behavior.
+        self._filter_adjustments: dict | None = None
+
+        # Phase 19: last regime assessment from Sonnet, for regime_condition trigger.
+        # Updated after each successful reasoning cycle. Also consumed by Phase 21
+        # regime-change detection and watchlist rebuild logic.
+        self._last_regime_assessment: dict | None = None
+        # Phase 20: last sector_regimes from Sonnet, passed to Haiku compressor
+        # for regime-aware candidate ranking. Updated alongside _last_regime_assessment.
+        self._last_sector_regimes: dict | None = None
+        # Phase 21: prior regime name for regime-change detection.
+        # Compared against new regime_assessment.regime after each Sonnet cycle.
+        # When they differ, a regime-reset watchlist build fires immediately.
+        self._prior_regime_name: str | None = None
 
         # Phase 17: UTC timestamp of the last completed medium loop cycle.
         # Used by the medium-loop gate in _slow_loop_cycle to prevent Claude from
@@ -496,6 +515,14 @@ class Orchestrator:
         """
         log.info("=== Ozymandias v3 startup ===")
         log.info("Model: %s  env: %s", self._config.claude.model, self._config.broker.environment)
+        log.info(
+            "Config: watchlist_max_entries=%d  watchlist_build_target=%d  "
+            "max_position_pct=%.0f%%  max_concurrent_positions=%d",
+            self._config.claude.watchlist_max_entries,
+            self._config.claude.watchlist_build_target,
+            self._config.risk.max_position_pct * 100,
+            self._config.risk.max_concurrent_positions,
+        )
 
         # -- State files ------------------------------------------------------
         await self._state_manager.initialize()
@@ -796,6 +823,27 @@ class Orchestrator:
                 self._trigger_state.last_claude_call_utc = ts
             except Exception:
                 pass  # malformed timestamp — let trigger fire naturally
+            # Phase 21: restore regime_assessment and sector_regimes from prior session
+            # so regime_condition trigger and Haiku compressor have context on restart.
+            try:
+                _parsed = fresh.get("parsed_response") or {}
+                if isinstance(_parsed, dict):
+                    _cached_result = _result_from_raw_reasoning(_parsed)
+                    if _cached_result.regime_assessment:
+                        self._last_regime_assessment = _cached_result.regime_assessment
+                        self._prior_regime_name = _cached_result.regime_assessment.get("regime")
+                        log.info(
+                            "Step 4c — regime_assessment restored from cache: regime=%s",
+                            self._prior_regime_name,
+                        )
+                    if _cached_result.sector_regimes:
+                        self._last_sector_regimes = _cached_result.sector_regimes
+                        log.debug(
+                            "Step 4c — sector_regimes restored from cache (%d sectors)",
+                            len(self._last_sector_regimes),
+                        )
+            except Exception as _exc:
+                log.debug("Step 4c — could not restore regime from cache: %s", _exc)
         else:
             log.info("Step 4 — no fresh cache — Claude will be called on first trigger")
 
@@ -2198,6 +2246,7 @@ class Orchestrator:
             orders=orders_state.orders,
             strategy_lookup=self._strategy_lookup,
             suppressed_symbols=self._filter_suppressed,
+            filter_adjustments=self._filter_adjustments,
         )
         ranked = rank_result.candidates
 
@@ -2325,6 +2374,43 @@ class Orchestrator:
         # -- Step 6: re-evaluate open positions ------------------------------
         await self._medium_evaluate_positions(portfolio, bars, indicators, acct, orders_state.orders)
 
+        # -- Phase 21: position thesis breach monitoring ---------------------
+        # Haiku checks active_theses[symbol].thesis_breaking_conditions against live
+        # indicators. On breach, flags needs_sonnet="position_thesis_breach" so the
+        # slow loop fires a targeted Sonnet review.
+        if (
+            self._claude._compressor is not None
+            and portfolio.positions
+            and self._reasoning_cache is not None
+        ):
+            try:
+                # Get active_theses from the most recent reasoning cache
+                _cached = self._reasoning_cache.load_latest_if_fresh()
+                _active_theses = None
+                if _cached and _cached.get("parsed_response"):
+                    _cached_result = _result_from_raw_reasoning(_cached["parsed_response"])
+                    _active_theses = _cached_result.active_theses
+
+                if _active_theses:
+                    _breach = self._claude._compressor.check_position_theses(
+                        positions=portfolio.positions,
+                        active_theses=_active_theses,
+                        indicators=self._all_indicators,
+                        cycle_id=f"medium_{self._trigger_state.last_claude_call_utc}",
+                    )
+                    if _breach and _breach.needs_sonnet:
+                        log.warning(
+                            "Phase 21: position thesis breach detected — "
+                            "scheduling Sonnet review [%s]",
+                            _breach.notes,
+                        )
+                        # Add to slow-loop triggers for next check cycle
+                        asyncio.ensure_future(
+                            self._run_claude_cycle(trigger_name="thesis_breach")
+                        )
+            except Exception as _exc:
+                log.debug("Phase 21: thesis breach check error — %s", _exc)
+
     async def _medium_try_entry(self, top, acct, portfolio, orders) -> bool:
         """Validate and execute a single entry order for the top-ranked opportunity.
 
@@ -2348,7 +2434,16 @@ class Orchestrator:
 
         # Composite score floor — prevents marginal entries where each individual component
         # clears its gate but the combined score is too weak to justify capital deployment.
+        # Phase 19: Claude may relax this floor via filter_adjustments.min_composite_score,
+        # but never below the absolute config floor (filter_adj_min_composite).
         min_score = self._config.ranker.min_composite_score
+        if self._filter_adjustments and "min_composite_score" in self._filter_adjustments:
+            try:
+                proposed = float(self._filter_adjustments["min_composite_score"])
+                abs_floor = self._config.ranker.filter_adj_min_composite
+                min_score = max(abs_floor, proposed)
+            except (TypeError, ValueError):
+                pass
         if top.composite_score < min_score:
             log.info(
                 "Medium loop: skipping %s — composite score %.3f < floor %.2f",
@@ -3363,7 +3458,64 @@ class Orchestrator:
                 ts.last_exhaustion_trigger_utc = now
                 log.debug("Trigger: candidates_exhausted FIRED")
 
+        # Phase 19: regime condition trigger — check valid_until_conditions from last
+        # Sonnet regime_assessment. When a condition is met, fire a fresh reasoning cycle.
+        # _run_claude_cycle uses skip_cache=True so no explicit cache expiry needed.
+        if self._check_regime_conditions():
+            triggers.append("regime_condition")
+            log.debug("Trigger: regime_condition FIRED")
+
         return triggers
+
+    def _check_regime_conditions(self) -> bool:
+        """Phase 19: check regime_assessment.valid_until_conditions against live indicators.
+
+        Returns True if any condition is now met — caller should append
+        "regime_condition" to the trigger list, which causes a fresh reasoning call
+        (_run_claude_cycle already uses skip_cache=True, so no explicit expiry needed).
+
+        Conditions are parsed via simple regex — not LLM evaluation.
+        Unknown condition formats are logged at DEBUG and ignored.
+
+        Supported formats:
+          "SPY daily RSI > N"  / "SPY daily RSI < N"
+          "daily_trend == uptrend"  / "daily_trend == downtrend"
+
+        To add a new condition key: add a branch below and update Phase 19 prompt docs.
+        """
+        if not self._last_regime_assessment:
+            return False
+        conditions = self._last_regime_assessment.get("valid_until_conditions")
+        if not conditions or not isinstance(conditions, list):
+            return False
+
+        spy_daily = self._daily_indicators.get("SPY", {})
+        spy_rsi_daily = spy_daily.get("rsi_14d")
+        spy_trend_daily = spy_daily.get("daily_trend")
+
+        for cond in conditions:
+            if not isinstance(cond, str):
+                continue
+            triggered = False
+            # "SPY daily RSI > N"
+            m = re.match(r"SPY daily RSI\s*>\s*(\d+(?:\.\d+)?)", cond, re.IGNORECASE)
+            if m and spy_rsi_daily is not None:
+                triggered = float(spy_rsi_daily) > float(m.group(1))
+            # "SPY daily RSI < N"
+            m = re.match(r"SPY daily RSI\s*<\s*(\d+(?:\.\d+)?)", cond, re.IGNORECASE)
+            if m and spy_rsi_daily is not None:
+                triggered = float(spy_rsi_daily) < float(m.group(1))
+            # "daily_trend == uptrend" / "daily_trend == downtrend"
+            m = re.match(r"daily_trend\s*==\s*(\w+)", cond, re.IGNORECASE)
+            if m and spy_trend_daily is not None:
+                triggered = spy_trend_daily.lower() == m.group(1).lower()
+
+            if triggered:
+                log.info("Regime condition met — triggering fresh reasoning: %s", cond)
+                return True
+            else:
+                log.debug("Regime condition not yet met: %s", cond)
+        return False
 
     async def _update_trigger_prices(self) -> None:
         """Snapshot current prices into last_prices for next trigger comparison."""
@@ -3481,6 +3633,47 @@ class Orchestrator:
                 "daily_trend": _qqq_daily.get("daily_trend"),
             }
 
+        # Phase 19: sector_dispersion — relative performance of watchlist symbols vs sector ETF
+        _sector_dispersion = compute_sector_dispersion(
+            watchlist.entries,
+            _SECTOR_MAP,
+            self._daily_indicators,
+        )
+        if _sector_dispersion:
+            market_ctx["sector_dispersion"] = _sector_dispersion
+
+        # Phase 19: recent_rejections — per-symbol hard-filter failure counts from this session
+        # Shows Claude which candidates the quant system keeps blocking and why.
+        _rejections = [
+            {
+                "symbol": sym,
+                "reason": data["stage_detail"],
+                "cycles_rejected": data["rejection_count"],
+            }
+            for sym, data in self._recommendation_outcomes.items()
+            if data.get("rejection_count", 0) >= 1 and data.get("stage_detail")
+        ]
+        if _rejections:
+            market_ctx["recent_rejections"] = sorted(
+                _rejections, key=lambda x: x["cycles_rejected"], reverse=True
+            )[:10]
+
+        # Phase 19: news_theme_synthesis — aggregate watchlist entry reasons by sector
+        # Pure string aggregation from WatchlistEntry.reason; no new Claude calls.
+        _news_themes: dict[str, str] = {}
+        for _wl_entry in watchlist.entries:
+            _etf = _SECTOR_MAP.get(_wl_entry.symbol)
+            if not _etf or not _wl_entry.reason:
+                continue
+            _snippet = _wl_entry.reason[:80].replace("\n", " ")
+            existing = _news_themes.get(_etf, "")
+            if not existing:
+                _news_themes[_etf] = _snippet
+            elif len(existing) < 160:
+                _news_themes[_etf] = existing + " | " + _snippet
+        if _news_themes:
+            market_ctx["news_themes"] = _news_themes
+
         return market_ctx
 
     async def _run_claude_cycle(self, trigger_name: str) -> None:
@@ -3537,15 +3730,21 @@ class Orchestrator:
 
         self._latest_market_context = market_data  # store for medium loop thesis challenge
 
-        # -- Daily-bar fetch for swing position reviews and macro context -----
-        # Fetch daily bars for all open swing positions + SPY + QQQ.
-        # Failures are logged and silently skipped — stale/missing daily indicators
-        # degrade gracefully; they never block the reasoning call.
+        # -- Daily-bar fetch for swing position reviews, macro context, and sector_dispersion -----
+        # Phase 19: extended from (SPY + QQQ + open swing positions) to all watchlist symbols.
+        # sector_dispersion requires per-symbol roc_5d vs ETF roc_5d for all watchlist entries.
+        # Fetch failures logged at WARNING; never block the reasoning call.
         _daily_symbols: list[str] = ["SPY", "QQQ"]
         for _pos in portfolio.positions:
-            if getattr(_pos.intention, "strategy", None) == "swing":
-                if _pos.symbol not in _daily_symbols:
-                    _daily_symbols.append(_pos.symbol)
+            if _pos.symbol not in _daily_symbols:
+                _daily_symbols.append(_pos.symbol)
+        for _entry in watchlist.entries:
+            if _entry.symbol not in _daily_symbols:
+                _daily_symbols.append(_entry.symbol)
+        # Also include sector ETFs needed for dispersion computation
+        for _etf in _CONTEXT_SECTOR_ETFS:
+            if _etf not in _daily_symbols:
+                _daily_symbols.append(_etf)
 
         async def _fetch_daily(sym: str) -> tuple[str, dict]:
             try:
@@ -3591,6 +3790,10 @@ class Orchestrator:
                             n=self._config.universe_scanner.max_candidates,
                             exclude=existing_symbols,
                             blacklist=blacklist_symbols,
+                            # Phase 21: pass regime context for regime-aware screener selection
+                            sector_regimes=self._last_sector_regimes,
+                            regime_assessment=self._last_regime_assessment,
+                            sector_map=_SECTOR_MAP,
                         )
                         self._last_universe_scan_time = time.monotonic()
                         log.info(
@@ -3690,6 +3893,10 @@ class Orchestrator:
             min_trades=self._config.claude.execution_stats_min_trades
         )
 
+        # Phase 19: reset filter_adjustments before the call so stale adjustments
+        # never persist if this call fails. Repopulated from result after success.
+        self._filter_adjustments = None
+
         try:
             result = await self._claude.run_reasoning_cycle(
                 portfolio=portfolio,
@@ -3704,6 +3911,11 @@ class Orchestrator:
                 session_suppressed=self._filter_suppressed,
                 claude_soft_rejections=self._claude_soft_rejections,
                 daily_indicators=self._daily_indicators,
+                # Phase 20: pass all_indicators (merged dict) so compressor sees every symbol;
+                # pass prior Sonnet strategic output so Haiku can do regime-aware ranking.
+                all_indicators=self._all_indicators,
+                regime_assessment=self._last_regime_assessment,
+                sector_regimes=self._last_sector_regimes,
             )
         except Exception as exc:
             self._handle_claude_failure(exc)
@@ -3719,6 +3931,71 @@ class Orchestrator:
         self._trigger_state.last_claude_call_utc = datetime.now(timezone.utc)
         self._trigger_state.last_override_exit_count = self._override_exit_count
 
+        # Phase 19: store strategic output fields from this cycle
+        if result.filter_adjustments:
+            self._filter_adjustments = result.filter_adjustments
+            log.info(
+                "Phase 19: filter_adjustments applied — min_rvol=%s min_composite=%s reason=%s",
+                result.filter_adjustments.get("min_rvol"),
+                result.filter_adjustments.get("min_composite_score"),
+                result.filter_adjustments.get("reason", ""),
+            )
+        if result.regime_assessment:
+            self._last_regime_assessment = result.regime_assessment
+            log.info(
+                "Phase 19: regime_assessment — regime=%s confidence=%s",
+                result.regime_assessment.get("regime"),
+                result.regime_assessment.get("confidence"),
+            )
+        # Phase 21: regime change detection → regime-reset watchlist build
+        # Store previous values before updating so we can detect changes.
+        _prev_sector_regimes = self._last_sector_regimes
+
+        if result.sector_regimes:
+            self._last_sector_regimes = result.sector_regimes
+            log.debug("Phase 20: sector_regimes updated (%d sectors)", len(result.sector_regimes))
+
+        # Detect regime changes and fire regime-reset watchlist build when needed.
+        # Regime change = broad regime name change OR any sector's regime string changes.
+        # Reset build: evicts direction-conflicting watchlist entries, rebuilds with fresh
+        # aligned candidates, and clears direction-dependent session suppressions.
+        new_regime_name = result.regime_assessment.get("regime") if result.regime_assessment else None
+        regime_name_changed = (
+            new_regime_name is not None
+            and new_regime_name != self._prior_regime_name
+            and self._prior_regime_name is not None  # don't fire on first-ever call
+        )
+        sector_regime_changed = False
+        changed_sectors: set[str] = set()
+        if result.sector_regimes and _prev_sector_regimes:
+            for etf, info in result.sector_regimes.items():
+                prev = _prev_sector_regimes.get(etf, {}).get("regime", "neutral")
+                if info.get("regime") != prev:
+                    sector_regime_changed = True
+                    changed_sectors.add(etf)
+
+        if regime_name_changed or sector_regime_changed:
+            log.info(
+                "Phase 21: regime change detected — broad=%s sectors=%s",
+                f"{self._prior_regime_name} → {new_regime_name}" if regime_name_changed else "unchanged",
+                list(changed_sectors) if sector_regime_changed else "none",
+            )
+            # Evict conflicting entries and rebuild with fresh names.
+            # Fire async and do not await (rebuild runs in background after this cycle).
+            asyncio.ensure_future(
+                self._regime_reset_build(
+                    prev_sector_regimes=_prev_sector_regimes,
+                    new_sector_regimes=result.sector_regimes,
+                    new_regime=new_regime_name or "",
+                    changed_sectors=changed_sectors,
+                    broad_regime_changed=regime_name_changed,
+                )
+            )
+
+        # Update prior regime name after detection (before next cycle comparison)
+        if new_regime_name:
+            self._prior_regime_name = new_regime_name
+
         # --- Implicit rejection detection -----------------------------------
         # Directional (non-"either") tier-1 symbols that were sent to Claude but
         # appear in neither new_opportunities nor rejected_opportunities were silently
@@ -3729,12 +4006,15 @@ class Orchestrator:
             | {r.get("symbol") for r in (result.rejected_opportunities or []) if r.get("symbol")}
         )
         _sent_tier1 = set(self._claude.last_sent_tier1_symbols)
+        _open_position_syms = {p.symbol for p in portfolio.positions}
         _watchlist_dir = {
             e.symbol: e.expected_direction
             for e in watchlist.entries
             if e.priority_tier == 1 and getattr(e, "expected_direction", "either") != "either"
         }
         for _sym, _dir in _watchlist_dir.items():
+            if _sym in _open_position_syms:
+                continue  # BUG-3: open positions are reviewed, not re-entered; not implicit rejections
             if _sym in _sent_tier1 and _sym not in _mentioned_syms:
                 log.info(
                     "Implicit rejection: %s (expected_direction=%s) sent to Claude but absent "
@@ -3881,6 +4161,150 @@ class Orchestrator:
             return cfg.cache_max_age_euphoria_min
         return cfg.cache_max_age_default_min
 
+    def _clear_directional_suppression(self, affected_sectors: set[str] | None) -> None:
+        """Clear direction-dependent session suppressions on regime reset.
+
+        Called when a regime change causes a watchlist rebuild so that symbols
+        suppressed under the old regime's direction can be reconsidered under
+        the new regime's direction.
+
+        Args:
+            affected_sectors: ETF keys whose regime changed. Pass None to clear
+                              all sectors (broad panic flip).
+
+        Direction-dependent reasons (cleared): rvol, composite_score, conviction_floor,
+                                                defer_expired
+        Direction-neutral reasons (preserved): fetch_failure, blacklist, no_entry
+        """
+        # Patterns indicating direction-dependent suppression — these are stale
+        # when the regime or sector bias flips; the symbol may now be valid in the
+        # opposite direction or under relaxed conditions.
+        # Extension point: add new reason patterns here if new suppression reasons
+        # are added that are direction-dependent.
+        _DIRECTION_DEPENDENT_PATTERNS = (
+            "rvol", "composite_score", "conviction_floor", "defer_expired",
+        )
+
+        to_clear: list[str] = []
+        for sym, reason in list(self._filter_suppressed.items()):
+            if not any(pat in reason.lower() for pat in _DIRECTION_DEPENDENT_PATTERNS):
+                continue
+            if affected_sectors is not None:
+                etf = _SECTOR_MAP.get(sym)
+                if etf not in affected_sectors:
+                    continue
+            to_clear.append(sym)
+
+        for sym in to_clear:
+            del self._filter_suppressed[sym]
+
+        if to_clear:
+            log.info(
+                "Regime reset: cleared %d directional suppression(s): %s",
+                len(to_clear), to_clear,
+            )
+
+    async def _regime_reset_build(
+        self,
+        prev_sector_regimes: dict | None,
+        new_sector_regimes: dict | None,
+        new_regime: str,
+        changed_sectors: set[str],
+        broad_regime_changed: bool,
+    ) -> None:
+        """Evict direction-conflicting watchlist entries and rebuild for the new regime.
+
+        Called (fire-and-forget) after a regime or sector-regime change is detected.
+        Does not block the reasoning cycle that triggered it — runs as a background task.
+
+        Eviction rules:
+        - Broad "risk-off panic": evict all swing/both longs (no `catalyst_driven` flag
+          concept implemented yet — future: add to WatchlistEntry).
+        - Sector-granular: evict entries in changed sectors whose direction conflicts
+          with the new sector bias:
+            long entry + "correcting" / "downtrend" sector → evict
+            short entry + "breaking_out" / "uptrend" sector → evict
+        After eviction: run a targeted watchlist build with target_count=20 (full rebuild
+        semantics) to fill with aligned candidates.
+        """
+        try:
+            watchlist = await self._state_manager.load_watchlist()
+            portfolio = await self._state_manager.load_portfolio()
+            open_syms = {p.symbol for p in portfolio.positions}
+
+            broad_panic = new_regime == "risk-off panic"
+
+            # Determine which entries to evict
+            to_evict: list[str] = []
+            for e in watchlist.entries:
+                if e.symbol in open_syms:
+                    continue
+                if broad_panic:
+                    # Evict all long candidates (swing and both strategies)
+                    if e.expected_direction == "long":
+                        to_evict.append(e.symbol)
+                elif new_sector_regimes:
+                    etf = _SECTOR_MAP.get(e.symbol)
+                    if etf not in changed_sectors:
+                        continue
+                    sector_info = new_sector_regimes.get(etf, {})
+                    sector_regime = sector_info.get("regime", "neutral")
+                    if e.expected_direction == "long" and sector_regime in ("correcting", "downtrend"):
+                        to_evict.append(e.symbol)
+                    elif e.expected_direction == "short" and sector_regime in ("breaking_out", "uptrend"):
+                        to_evict.append(e.symbol)
+
+            if to_evict:
+                evict_set = set(to_evict)
+                watchlist.entries = [e for e in watchlist.entries if e.symbol not in evict_set]
+                log.info(
+                    "Regime reset: evicted %d conflicting watchlist entries: %s",
+                    len(to_evict), to_evict,
+                )
+                # Persist eviction immediately so entries are not restored on the
+                # next state load (regardless of whether the rebuild below succeeds).
+                await self._state_manager.save_watchlist(watchlist)
+
+            # Clear direction-dependent session suppressions for affected sectors
+            if broad_panic:
+                self._clear_directional_suppression(None)
+            elif changed_sectors:
+                self._clear_directional_suppression(changed_sectors)
+
+            # Rebuild with fresh names aligned to the new regime
+            market_data = self._latest_market_context or {}
+            if self._last_universe_scan:
+                _n = self._config.universe_scanner.max_candidates_to_claude
+                _candidates = self._last_universe_scan[:_n]
+            else:
+                _candidates = None
+
+            try:
+                wl_result = await self._claude.run_watchlist_build(
+                    market_context=market_data,
+                    current_watchlist=watchlist,
+                    target_count=20,  # regime reset: full rebuild semantics (bypasses watchlist_build_target)
+                    candidates=_candidates,
+                    search_adapter=self._search_adapter,
+                    no_entry_symbols=self._config.ranker.no_entry_symbols,
+                )
+                if wl_result is not None:
+                    await self._apply_watchlist_changes(
+                        watchlist, wl_result.watchlist, [], open_syms
+                    )
+                    log.info(
+                        "Regime reset build complete — %d suggestions applied",
+                        len(wl_result.watchlist),
+                    )
+                    # Only stamp timestamp when a build actually completed (not on None
+                    # return or exception — those don't count as successful builds).
+                    self._trigger_state.last_watchlist_build_utc = datetime.now(timezone.utc)
+            except Exception as exc:
+                log.error("Regime reset watchlist build failed: %s", exc, exc_info=True)
+
+        except Exception as exc:
+            log.error("_regime_reset_build failed: %s", exc, exc_info=True)
+
     def _handle_claude_failure(self, exc: Exception) -> None:
         """Enter quantitative-only mode; schedule exponential backoff retry."""
         now = datetime.now(timezone.utc)
@@ -3974,12 +4398,14 @@ class Orchestrator:
             if removed:
                 log.info("Watchlist: removed %d symbol(s): %s", removed, remove_list)
 
-        # Hard size cap — prune lowest-scoring entries beyond the limit.
-        # Open positions are always protected; entries with no recent TA data
-        # (score=0.0) are pruned first, followed by weakest-signal entries.
-        # Phase 15: direction-aware scoring — symbols with an expected_direction use
-        # the direction-adjusted composite score so a short-thesis symbol is not
-        # evicted because its long score is weak.
+        # Hard size cap — prune lowest-value entries beyond the limit.
+        # Open positions and newly-added symbols are always protected.
+        # Phase 21: multi-tier eviction order:
+        #   1. Tier-2 entries (exploratory; lower conviction than tier-1)
+        #   2. Tier-1 entries whose expected_direction conflicts with current sector_regimes
+        #   3. Remaining tier-1 entries by lowest composite score (existing behavior)
+        # This prevents the pruner from evicting deliberate swing setups (e.g. oversold
+        # mean-reversion theses) which legitimately have low intraday composite scores.
         max_entries = self._config.claude.watchlist_max_entries
         if len(watchlist.entries) > max_entries:
             # Newly-added symbols are protected for this cycle: they haven't been
@@ -3991,13 +4417,12 @@ class Orchestrator:
             } - {""}
             protected = (open_symbols or set()) | newly_added
 
-            def _prune_score(e) -> float:
+            def _composite(e) -> float:
                 ind = self._latest_indicators.get(e.symbol, {})
                 raw = ind.get("signals") or {}
                 if raw:
                     ed = getattr(e, "expected_direction", "either")
                     if ed != "either":
-                        # Direction-adjusted: use thesis direction for scoring.
                         return compute_composite_score(raw, direction=ed)
                     return max(
                         compute_composite_score(raw, direction="long"),
@@ -4005,10 +4430,39 @@ class Orchestrator:
                     )
                 return ind.get("composite_technical_score", 0.0)
 
+            def _direction_conflicts(e) -> bool:
+                """True if this entry's direction conflicts with current sector_regimes."""
+                if not self._last_sector_regimes:
+                    return False
+                etf = _SECTOR_MAP.get(e.symbol)
+                if not etf:
+                    return False
+                sector_info = self._last_sector_regimes.get(etf, {})
+                sector_regime = sector_info.get("regime", "neutral")
+                ed = getattr(e, "expected_direction", "either")
+                # Long entry in correcting/downtrend sector conflicts
+                if ed == "long" and sector_regime in ("correcting", "downtrend"):
+                    return True
+                # Short entry in breaking_out/uptrend sector conflicts
+                if ed == "short" and sector_regime in ("breaking_out", "uptrend"):
+                    return True
+                return False
+
+            def _eviction_priority(e) -> tuple:
+                """Lowest priority = evicted first. Tuple comparison: (tier, composite)."""
+                composite = _composite(e)
+                if getattr(e, "priority_tier", 1) == 2:
+                    return (0, composite)   # tier-2: evict first
+                if _direction_conflicts(e):
+                    return (1, composite)   # tier-1 conflicting: evict before non-conflicting
+                return (2, composite)       # tier-1 non-conflicting: keep last
+
             keep_protected = [e for e in watchlist.entries if e.symbol in protected]
             prunable = [e for e in watchlist.entries if e.symbol not in protected]
             slots = max(0, max_entries - len(keep_protected))
-            prunable.sort(key=_prune_score, reverse=True)
+            # Sort descending by eviction priority: highest priority (tier=2, composite=1.0)
+            # at front → kept. Lowest priority (tier=0, composite=0.0) at back → pruned.
+            prunable.sort(key=_eviction_priority, reverse=True)
             pruned = [e.symbol for e in prunable[slots:]]
             watchlist.entries = keep_protected + prunable[:slots]
             if pruned:

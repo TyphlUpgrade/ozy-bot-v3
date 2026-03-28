@@ -54,11 +54,11 @@
   },
   "claude": {
     "min_call_interval_sec": 3.0,
-    "model": "claude-sonnet-4-20250514",
+    "model": "claude-sonnet-4-6",
     "watchlist_max_entries": 60,
     "watchlist_build_target": 8,
     "max_tokens_per_cycle": 4096,
-    "prompt_version": "v3.9.0",
+    "prompt_version": "v3.10.0",
     "tier1_max_symbols": 18,
     "tier2_max_symbols": 15,
     "news_max_age_hours": 168,
@@ -72,7 +72,11 @@
     "cache_max_age_euphoria_min": 15,
     "cache_stress_rsi_low": 30,
     "cache_panic_rsi_low": 25,
-    "cache_euphoria_rsi_high": 72
+    "cache_euphoria_rsi_high": 72,
+    "compressor_enabled": true,
+    "compressor_model": "claude-haiku-4-5-20251001",
+    "compressor_max_symbols_out": 18,
+    "compressor_max_tokens": 512
   },
   "ai_fallback": {
     "enabled": false,
@@ -92,6 +96,8 @@
     "weight_liquidity": 0.15,
     "min_conviction_threshold": 0.10,
     "min_composite_score": 0.45,
+    "filter_adj_min_rvol": 0.5,
+    "filter_adj_min_composite": 0.35,
     "thesis_challenge_size_threshold": 0.20,
     "thesis_challenge_max_penalty": 0.35,
     "max_entry_drift_pct": 0.015,

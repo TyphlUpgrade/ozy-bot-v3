@@ -962,3 +962,46 @@ class TestRsiAccelEntryConditions:
             {"rsi": 60.0, "rsi_accel_3": 0.5},
         )
         assert passed is True
+
+
+# ---------------------------------------------------------------------------
+# Phase 19 — filter_adjustments clamping and application
+# ---------------------------------------------------------------------------
+
+from ozymandias.intelligence.opportunity_ranker import _clamp_filter_adjustments
+
+
+class TestClampFilterAdjustments:
+
+    def test_none_returns_none(self):
+        assert _clamp_filter_adjustments(None) is None
+
+    def test_empty_dict_returns_none(self):
+        assert _clamp_filter_adjustments({}) is None
+
+    def test_min_rvol_above_floor_unchanged(self):
+        result = _clamp_filter_adjustments({"min_rvol": 0.8})
+        assert result["min_rvol"] == 0.8
+
+    def test_min_rvol_below_floor_clamped(self):
+        """Values below _FILTER_ADJ_MIN_RVOL (0.5) are raised to the floor."""
+        result = _clamp_filter_adjustments({"min_rvol": 0.2})
+        assert result["min_rvol"] == 0.5
+
+    def test_min_composite_below_floor_clamped(self):
+        """Values below _FILTER_ADJ_MIN_COMPOSITE (0.35) are raised."""
+        result = _clamp_filter_adjustments({"min_composite_score": 0.20})
+        assert result["min_composite_score"] == 0.35
+
+    def test_min_composite_above_floor_unchanged(self):
+        result = _clamp_filter_adjustments({"min_composite_score": 0.42})
+        assert result["min_composite_score"] == 0.42
+
+    def test_invalid_value_removed(self):
+        result = _clamp_filter_adjustments({"min_rvol": "bad", "reason": "x"})
+        assert "min_rvol" not in result
+        assert result["reason"] == "x"
+
+    def test_reason_field_preserved(self):
+        result = _clamp_filter_adjustments({"min_rvol": 0.6, "reason": "low participation"})
+        assert result["reason"] == "low participation"

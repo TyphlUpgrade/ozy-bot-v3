@@ -130,13 +130,23 @@ class MomentumStrategy(Strategy):
     def blocks_eod_entries(self) -> bool:
         return True
 
-    def apply_entry_gate(self, action: str, signals: dict) -> tuple[bool, str]:
+    def apply_entry_gate(
+        self,
+        action: str,
+        signals: dict,
+        entry_conditions: dict | None = None,
+        filter_adjustments: dict | None = None,
+    ) -> tuple[bool, str]:
         """Reject momentum entries that fail RVOL, VWAP, or RSI gates.
 
         Three gates evaluated in order:
 
         1. RVOL floor — no volume participation means no momentum.
+           Phase 19: floor may be lowered by filter_adjustments.min_rvol (clamped
+           to filter_adj_min_rvol config floor).
         2. VWAP position — longs only: price must be above VWAP.
+           Phase 19: when entry_conditions is non-empty, Claude has expressed
+           deliberate intent — VWAP gate yields (Claude's own conditions govern).
            VWAP reclaim exception (longs only): bullish MACD + high RVOL
            bypasses the gate for accumulation-before-reclaim setups.
            Shorts are not VWAP-gated here; Claude controls the intended VWAP
@@ -153,14 +163,35 @@ class MomentumStrategy(Strategy):
                    −rsi_slope_threshold; above extended zone passes
                    (no ceiling — RSI 80 falling is a valid short entry).
         """
+        # Phase 19: compute effective RVOL floor.
+        # filter_adjustments.min_rvol is already clamped to the absolute config floor
+        # by the ranker before this call. Strategy uses it directly when present.
+        strategy_rvol_floor = self._p("min_rvol_for_entry")
+        if filter_adjustments:
+            proposed = filter_adjustments.get("min_rvol")
+            if proposed is not None:
+                try:
+                    effective_rvol_floor = float(proposed)
+                except (TypeError, ValueError):
+                    effective_rvol_floor = strategy_rvol_floor
+            else:
+                effective_rvol_floor = strategy_rvol_floor
+        else:
+            effective_rvol_floor = strategy_rvol_floor
+
         rvol = signals.get("volume_ratio")
-        if rvol is not None and rvol < self._p("min_rvol_for_entry"):
+        if rvol is not None and effective_rvol_floor > 0 and rvol < effective_rvol_floor:
             return (
                 False,
-                f"momentum RVOL {rvol:.2f} below floor {self._p('min_rvol_for_entry'):.2f}"
+                f"momentum RVOL {rvol:.2f} below floor {effective_rvol_floor:.2f}"
                 " — no volume participation",
             )
-        if self._p("require_vwap_gate"):
+
+        # Phase 19: when entry_conditions is non-empty, Claude has already expressed
+        # deliberate intent for this entry. Yield the VWAP hard gate — Claude's own
+        # entry_conditions (require_above_vwap / require_below_vwap) govern instead.
+        has_entry_conditions = bool(entry_conditions)
+        if self._p("require_vwap_gate") and not has_entry_conditions:
             wrong_vwap = _MOMENTUM_WRONG_VWAP.get(action)
             if wrong_vwap and signals.get("vwap_position", "") == wrong_vwap:
                 # VWAP reclaim exception (longs only): bullish MACD divergence +

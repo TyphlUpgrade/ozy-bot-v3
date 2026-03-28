@@ -29,6 +29,7 @@ import anthropic
 from ozymandias.core.config import ClaudeConfig, Config
 from ozymandias.core.reasoning_cache import ReasoningCache
 from ozymandias.core.state_manager import PortfolioState, Position, WatchlistState
+from ozymandias.intelligence.context_compressor import ContextCompressor
 from ozymandias.intelligence.technical_analysis import compute_composite_score
 
 log = logging.getLogger(__name__)
@@ -59,6 +60,16 @@ class ReasoningResult:
     rejected_opportunities: list[dict]  # [{symbol, considered_reason, rejection_reason}]
     session_veto: list[str] = field(default_factory=list)  # direction strings to suppress ("long"/"short"); enforced in rank_opportunities
     raw: dict = field(default_factory=dict)                # full parsed Claude response
+
+    # Phase 19 strategic output fields — all optional (Claude may omit any)
+    regime_assessment: dict | None = None
+    # {regime, confidence, key_signals, valid_until_conditions, implications}
+    sector_regimes: dict | None = None
+    # {ETF: {regime, bias, strength}} — only sectors with watchlist symbols
+    filter_adjustments: dict | None = None
+    # {min_rvol, min_composite_score, reason} — Claude-proposed threshold relaxations
+    active_theses: list[dict] | None = None
+    # [{symbol, thesis, thesis_breaking_conditions}] — open position thesis durability
 
 
 @dataclass
@@ -108,10 +119,51 @@ def _estimate_tokens(text: str) -> int:
     return len(text) // _CHARS_PER_TOKEN
 
 
+def _safe_dict(value: object) -> dict | None:
+    """Return value if it is a non-empty dict, else None. Never raises."""
+    if isinstance(value, dict) and value:
+        return value
+    return None
+
+
+def _safe_list_of_dicts(value: object) -> list[dict] | None:
+    """Return value if it is a list of dicts, else None. Never raises."""
+    if isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
+        return value
+    return None
+
+
 def _result_from_raw_reasoning(raw: dict) -> ReasoningResult:
     # session_veto must be a list of strings; guard against Claude returning wrong type
     raw_veto = raw.get("session_veto", [])
     session_veto = [str(v) for v in raw_veto] if isinstance(raw_veto, list) else []
+
+    # Phase 19: parse optional strategic output fields defensively
+    # If present but malformed, set to None and log at DEBUG (never crash)
+    regime_assessment = None
+    try:
+        regime_assessment = _safe_dict(raw.get("regime_assessment"))
+    except Exception:
+        log.debug("_result_from_raw_reasoning: failed to parse regime_assessment")
+
+    sector_regimes = None
+    try:
+        sector_regimes = _safe_dict(raw.get("sector_regimes"))
+    except Exception:
+        log.debug("_result_from_raw_reasoning: failed to parse sector_regimes")
+
+    filter_adjustments = None
+    try:
+        filter_adjustments = _safe_dict(raw.get("filter_adjustments"))
+    except Exception:
+        log.debug("_result_from_raw_reasoning: failed to parse filter_adjustments")
+
+    active_theses = None
+    try:
+        active_theses = _safe_list_of_dicts(raw.get("active_theses"))
+    except Exception:
+        log.debug("_result_from_raw_reasoning: failed to parse active_theses")
+
     return ReasoningResult(
         timestamp=raw.get("timestamp", datetime.now(timezone.utc).isoformat()),
         position_reviews=raw.get("position_reviews", []),
@@ -122,6 +174,10 @@ def _result_from_raw_reasoning(raw: dict) -> ReasoningResult:
         rejected_opportunities=raw.get("rejected_opportunities", []),
         session_veto=session_veto,
         raw=raw,
+        regime_assessment=regime_assessment,
+        sector_regimes=sector_regimes,
+        filter_adjustments=filter_adjustments,
+        active_theses=active_theses,
     )
 
 
@@ -247,6 +303,13 @@ class ClaudeReasoningEngine:
         # (after token-budget trimming). Used by the orchestrator to detect implicit rejections —
         # directional candidates that Claude silently omitted from both lists.
         self.last_sent_tier1_symbols: list[str] = []
+        # Phase 20: Haiku context compressor — pre-screens candidates before Sonnet context assembly.
+        # Disabled when compressor_enabled=False (falls back to deterministic composite sort).
+        self._compressor: ContextCompressor | None = (
+            ContextCompressor(config.claude, self._prompts_dir)
+            if config.claude.compressor_enabled
+            else None
+        )
         # Fallback provider state
         self._fallback_client = None          # lazy-initialized Gemini client
         self._overload_fallback_count: int = 0  # session circuit breaker counter
@@ -282,6 +345,7 @@ class ClaudeReasoningEngine:
         session_suppressed: dict[str, str] | None = None,
         claude_soft_rejections: dict[str, int] | None = None,
         daily_indicators: dict[str, dict] | None = None,
+        selected_symbols: list[str] | None = None,
     ) -> dict:
         """
         Build the structured input context sent to Claude each cycle.
@@ -366,10 +430,6 @@ class ClaudeReasoningEngine:
             position_entries.append(pos_entry)
 
         # --- Tier 1 watchlist candidates (fill remaining budget) ---
-        # Sort by current composite technical score descending so Claude always
-        # sees the highest-signal symbols. Without this, the slice is insertion-
-        # order, meaning the same seed symbols appear every cycle regardless of
-        # what the rest of the watchlist is doing.
         slots = max(0, max_tier1 - len(position_entries))
 
         # Exclude symbols already held as open positions: they appear in the positions
@@ -386,23 +446,42 @@ class ClaudeReasoningEngine:
         ]
         total_tier1 = len(all_tier1)
 
-        def _tier1_score(entry) -> float:
-            ind = indicators.get(entry.symbol, {})
-            raw = ind.get("signals") or {}
-            if raw:
-                # Phase 15: use direction-adjusted score when expected_direction is set;
-                # fall back to max(long, short) for "either" so any directional setup
-                # ranks appropriately regardless of bias.
-                ed = getattr(entry, "expected_direction", "either")
-                if ed != "either":
-                    return compute_composite_score(raw, direction=ed)
-                return max(
-                    compute_composite_score(raw, direction="long"),
-                    compute_composite_score(raw, direction="short"),
-                )
-            return ind.get("composite_technical_score", 0.0)
+        if selected_symbols:
+            # Phase 20: Haiku pre-screener provided a ranked list — use it directly.
+            # Symbols may come from any watchlist tier (Haiku sees the full pool).
+            # Build lookup across all watchlist entries (not just tier1).
+            sym_to_entry = {
+                e.symbol: e for e in watchlist.entries
+                if e.symbol not in open_position_symbols
+            }
+            tier1_watch = []
+            for sym in selected_symbols:
+                if len(tier1_watch) >= slots:
+                    break
+                entry = sym_to_entry.get(sym)
+                if entry is not None:
+                    tier1_watch.append(entry)
+        else:
+            # Fallback: sort by direction-adjusted composite score descending.
+            # Without this, the slice is insertion-order, meaning the same seed symbols
+            # appear every cycle regardless of what the rest of the watchlist is doing.
+            def _tier1_score(entry) -> float:
+                ind = indicators.get(entry.symbol, {})
+                raw = ind.get("signals") or {}
+                if raw:
+                    # Phase 15: use direction-adjusted score when expected_direction is set;
+                    # fall back to max(long, short) for "either" so any directional setup
+                    # ranks appropriately regardless of bias.
+                    ed = getattr(entry, "expected_direction", "either")
+                    if ed != "either":
+                        return compute_composite_score(raw, direction=ed)
+                    return max(
+                        compute_composite_score(raw, direction="long"),
+                        compute_composite_score(raw, direction="short"),
+                    )
+                return ind.get("composite_technical_score", 0.0)
 
-        tier1_watch = sorted(all_tier1, key=_tier1_score, reverse=True)[:slots]
+            tier1_watch = sorted(all_tier1, key=_tier1_score, reverse=True)[:slots]
 
         # Phase 15: build ta_readiness dict replacing technical_summary string.
         # ta_readiness is a direct pass-through of indicators[symbol]["signals"]
@@ -820,16 +899,31 @@ class ClaudeReasoningEngine:
         session_suppressed: dict[str, str] | None = None,
         claude_soft_rejections: dict[str, int] | None = None,
         daily_indicators: dict[str, dict] | None = None,
+        all_indicators: dict | None = None,
+        regime_assessment: dict | None = None,
+        sector_regimes: dict | None = None,
     ) -> Optional[ReasoningResult]:
         """
-        Full reasoning cycle: check cache → assemble context → call Claude
-        → parse → cache result.
+        Full reasoning cycle: check cache → [Haiku pre-screen] → assemble context
+        → call Sonnet → parse → cache result.
+
+        Phase 20: when compressor_enabled=True and the candidate pool exceeds
+        tier1_max_symbols, Haiku pre-screens candidates and returns a ranked
+        shortlist that replaces the deterministic composite-score sort.
 
         On startup, if a fresh cached response from today exists (< 60 min old)
         and skip_cache is False, returns the cached result without an API call.
 
         Returns None if parsing fails — caller should skip this cycle and try
         again at the next trigger event.
+
+        Args:
+            all_indicators:   Merged indicator dict (_all_indicators on orchestrator).
+                              Used by the compressor so it sees all watchlist symbols.
+                              Falls back to indicators if not provided.
+            regime_assessment: Sonnet's latest regime assessment (from prior cycle).
+                              Passed to the compressor for regime-aware ranking.
+            sector_regimes:   Sonnet's latest sector regimes (from prior cycle).
         """
         if not skip_cache:
             cached = self._cache.load_latest_if_fresh()
@@ -840,6 +934,53 @@ class ClaudeReasoningEngine:
                 )
                 return _result_from_raw_reasoning(cached["parsed_response"])
 
+        # --- Phase 20: Haiku pre-screening -------------------------------------------
+        # When the candidate pool exceeds tier1_max_symbols, Haiku ranks all candidates
+        # and returns a shortlist. selected_symbols replaces composite-score sort in
+        # assemble_reasoning_context. Falls back to deterministic sort on failure.
+        selected_symbols: list[str] | None = None
+        open_syms = {p.symbol for p in portfolio.positions}
+        all_candidates = [
+            e for e in watchlist.entries if e.symbol not in open_syms
+        ]
+        max_symbols_out = self._claude_cfg.compressor_max_symbols_out
+
+        if self._compressor is not None and len(all_candidates) > max_symbols_out:
+            try:
+                comp_result = await self._compressor.compress(
+                    all_candidates=all_candidates,
+                    indicators=all_indicators or indicators,
+                    market_data=market_data,
+                    regime_assessment=regime_assessment,
+                    sector_regimes=sector_regimes,
+                    max_symbols_out=max_symbols_out,
+                    cycle_id=trigger,
+                )
+                selected_symbols = comp_result.symbols
+                if comp_result.from_fallback:
+                    log.debug(
+                        "ContextCompressor: fallback sort (%d → %d symbols)",
+                        len(all_candidates), len(selected_symbols),
+                    )
+                else:
+                    log.info(
+                        "ContextCompressor: Haiku pre-screened %d → %d symbols%s",
+                        len(all_candidates),
+                        len(selected_symbols),
+                        f" [needs_sonnet={comp_result.sonnet_reason}]"
+                        if comp_result.needs_sonnet else "",
+                    )
+                if comp_result.needs_sonnet:
+                    log.warning(
+                        "ContextCompressor: needs_sonnet=%s (Sonnet cycle already running)",
+                        comp_result.sonnet_reason,
+                    )
+            except Exception as exc:
+                log.warning(
+                    "ContextCompressor: unexpected error (%s) — proceeding without pre-screen", exc
+                )
+        # --- End Phase 20 pre-screening ---
+
         context = self.assemble_reasoning_context(
             portfolio, watchlist, market_data, indicators,
             recommendation_outcomes=recommendation_outcomes,
@@ -848,6 +989,7 @@ class ClaudeReasoningEngine:
             session_suppressed=session_suppressed,
             claude_soft_rejections=claude_soft_rejections,
             daily_indicators=daily_indicators,
+            selected_symbols=selected_symbols,
         )
         context_json = json.dumps(context, default=str, indent=2)
         template = self._load_prompt("reasoning.txt")

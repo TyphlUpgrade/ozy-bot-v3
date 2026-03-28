@@ -294,3 +294,64 @@ class TestRegistryDispatch:
     def test_strategy_params_swing_override(self):
         strat = get_strategy("swing", {"target_atr_multiplier": 7.0})
         assert strat._params["target_atr_multiplier"] == 7.0
+
+
+# ---------------------------------------------------------------------------
+# Phase 19 — apply_entry_gate with entry_conditions and filter_adjustments
+# ---------------------------------------------------------------------------
+
+class TestPhase19EntryGate:
+
+    def test_momentum_vwap_gate_yields_when_entry_conditions_present(self):
+        """When entry_conditions non-empty, VWAP gate should not block the entry."""
+        strat = MomentumStrategy({"min_rvol_for_entry": 0.5})
+        signals = _signals(vwap_position="below", volume_ratio=1.5)
+        # Without entry_conditions: VWAP gate fires for longs
+        passed_without, _ = strat.apply_entry_gate("buy", signals, entry_conditions=None)
+        assert passed_without is False
+        # With entry_conditions: VWAP gate yields
+        passed_with, reason = strat.apply_entry_gate(
+            "buy", signals, entry_conditions={"require_above_vwap": True}
+        )
+        assert passed_with is True
+
+    def test_momentum_vwap_gate_active_when_no_entry_conditions(self):
+        """With empty entry_conditions, VWAP gate is active as before."""
+        strat = MomentumStrategy({"min_rvol_for_entry": 0.5})
+        signals = _signals(vwap_position="below", volume_ratio=1.5)
+        passed, reason = strat.apply_entry_gate("buy", signals, entry_conditions={})
+        assert passed is False
+        assert "VWAP" in reason
+
+    def test_momentum_filter_adjustments_lowers_rvol_floor(self):
+        """filter_adjustments.min_rvol overrides strategy default when lower."""
+        strat = MomentumStrategy({"min_rvol_for_entry": 1.0})
+        signals = _signals(volume_ratio=0.7, vwap_position="above")
+        # Default floor 1.0 → rejected
+        passed_default, _ = strat.apply_entry_gate("buy", signals)
+        assert passed_default is False
+        # filter_adjustments lowers to 0.6 → passes
+        passed_adj, reason = strat.apply_entry_gate(
+            "buy", signals,
+            filter_adjustments={"min_rvol": 0.6},
+        )
+        assert passed_adj is True
+
+    def test_momentum_filter_adjustments_none_uses_strategy_default(self):
+        """filter_adjustments=None falls back to strategy RVOL floor."""
+        strat = MomentumStrategy({"min_rvol_for_entry": 1.0})
+        signals = _signals(volume_ratio=0.8, vwap_position="above")
+        passed, reason = strat.apply_entry_gate("buy", signals, filter_adjustments=None)
+        assert passed is False
+        assert "RVOL" in reason
+
+    def test_swing_applies_entry_conditions_and_filter_adjustments_without_error(self):
+        """SwingStrategy accepts new params without raising."""
+        strat = SwingStrategy()
+        signals = _signals(volume_ratio=2.0)
+        passed, reason = strat.apply_entry_gate(
+            "buy", signals,
+            entry_conditions={"rsi_min": 30},
+            filter_adjustments={"min_rvol": 0.0},
+        )
+        assert isinstance(passed, bool)

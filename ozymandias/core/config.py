@@ -122,6 +122,11 @@ class ClaudeConfig:
     cache_stress_rsi_low: int = 30         # SPY RSI floor for stress regime
     cache_panic_rsi_low: int = 25          # SPY RSI floor for panic regime
     cache_euphoria_rsi_high: int = 72      # SPY RSI ceiling for euphoria regime
+    # Phase 20 — Haiku context compressor
+    compressor_enabled: bool = True              # when True, Haiku pre-screens watchlist candidates before Sonnet context assembly
+    compressor_model: str = "claude-haiku-4-5-20251001"  # Haiku model ID for pre-screening
+    compressor_max_symbols_out: int = 18         # max symbols Haiku returns; should match tier1_max_symbols
+    compressor_max_tokens: int = 512             # Haiku output token budget; compressor output is a short JSON list
 
 
 @dataclass
@@ -144,6 +149,13 @@ class RankerConfig:
     momentum_require_vwap_above: bool = True  # momentum hard gate: reject if price is below VWAP at entry
     swing_block_bearish_trend: bool = True    # swing hard gate: reject if trend_structure is bearish_aligned
     max_portfolio_deployment_pct: float = 0.85  # block new entries when buying_power/equity implies this fraction of capital is deployed; 0 = disabled. Allows more concurrent small positions without exceeding equity limits.
+    # Phase 19: absolute floors on Claude's filter_adjustments relaxation.
+    # Claude cannot lower thresholds below these values regardless of filter_adjustments output.
+    # filter_adj_min_rvol: absolute minimum RVOL floor (applied in apply_entry_gate)
+    # filter_adj_min_composite: absolute minimum composite score floor (applied in _medium_try_entry)
+    filter_adj_min_rvol: float = 0.5
+    filter_adj_min_composite: float = 0.35
+
     no_entry_symbols: list = field(default_factory=lambda: [
         # Broad-market and volatility ETFs used as market-context monitors only.
         # These may appear on the watchlist (tier 2) but must never be entered as trades.

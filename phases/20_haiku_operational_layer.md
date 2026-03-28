@@ -429,6 +429,16 @@ Create `tests/test_context_compression_integration.py`:
 
 ---
 
+## Implementation Notes
+
+- **`run_reasoning_cycle` return type change affects every call site silently.** The TypeError
+  from an un-updated call site only surfaces when the slow loop actually fires at runtime, not
+  at import or startup. Grep for all `run_reasoning_cycle` calls before closing this phase.
+
+- **`_needs_sonnet_fired` must reset at cycle *start*, not cycle *end*.** If it resets on
+  completion, a 529 error leaves it `True` — Haiku can never escalate again until the next
+  clean cycle. Reset unconditionally at the top of `_run_claude_cycle`.
+
 ## Done When
 
 - `ozymandias/intelligence/context_compressor.py` exists with `ContextCompressor` and `CompressorResult`

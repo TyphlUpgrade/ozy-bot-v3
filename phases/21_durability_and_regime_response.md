@@ -350,6 +350,19 @@ Add to `tests/test_state_manager.py`:
 
 ---
 
+## Implementation Notes
+
+- **First-startup regime change is a false positive.** `_last_regime` is `None` on a fresh
+  start, so the first Sonnet cycle always looks like a regime change and fires
+  `_trigger_regime_reset_build`. Guard against this: only fire if `_last_regime` was loaded
+  from persisted state (not defaulted to `None`), or if the watchlist actually has
+  direction-conflicting entries to evict.
+
+- **`catalyst_driven` deserialization must use `.get(..., False)`.** `WatchlistEntry` is loaded
+  from existing JSON state files that don't have this key. If the deserialization path requires
+  the key rather than defaulting it, every existing watchlist entry fails to load on the first
+  restart after this phase deploys.
+
 ## Done When
 
 - Regime change detection in orchestrator fires `_trigger_regime_reset_build` when `regime` or any

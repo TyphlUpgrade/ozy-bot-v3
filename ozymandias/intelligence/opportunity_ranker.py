@@ -264,6 +264,41 @@ def evaluate_entry_conditions(conditions: dict | None, signals: dict) -> tuple[b
 
 
 # ---------------------------------------------------------------------------
+# Phase 19: filter_adjustments clamping helper
+# ---------------------------------------------------------------------------
+
+# Absolute floors on Claude-proposed threshold relaxation.
+# These match RankerConfig.filter_adj_min_* defaults; kept here to avoid
+# importing the config dataclass into the ranker module (circular-dep risk).
+_FILTER_ADJ_MIN_RVOL = 0.5
+_FILTER_ADJ_MIN_COMPOSITE = 0.35
+
+
+def _clamp_filter_adjustments(fa: dict | None) -> dict | None:
+    """Return a copy of filter_adjustments with values clamped to absolute floors.
+
+    Strategies receive the clamped version so they don't need to know config floors.
+    Returns None when input is None or empty.
+    """
+    if not fa:
+        return None
+    result = dict(fa)
+    if "min_rvol" in result:
+        try:
+            result["min_rvol"] = max(_FILTER_ADJ_MIN_RVOL, float(result["min_rvol"]))
+        except (TypeError, ValueError):
+            del result["min_rvol"]
+    if "min_composite_score" in result:
+        try:
+            result["min_composite_score"] = max(
+                _FILTER_ADJ_MIN_COMPOSITE, float(result["min_composite_score"])
+            )
+        except (TypeError, ValueError):
+            del result["min_composite_score"]
+    return result or None
+
+
+# ---------------------------------------------------------------------------
 # Ranker
 # ---------------------------------------------------------------------------
 
@@ -427,6 +462,7 @@ class OpportunityRanker:
         orders: list | None = None,
         technical_signals: dict[str, dict] | None = None,
         strategy_lookup: dict | None = None,
+        filter_adjustments: dict | None = None,
     ) -> tuple[bool, str]:
         """
         Run pre-scoring hard filters.  Any failure removes the opportunity.
@@ -502,6 +538,11 @@ class OpportunityRanker:
             strategy_name = opportunity.get("strategy", "")
             action = opportunity.get("action", "buy")
             sig = technical_signals.get(symbol, {}).get("signals", {})
+            entry_conds = opportunity.get("entry_conditions") or {}
+
+            # Phase 19: pre-clamp filter_adjustments.min_rvol to absolute config floor
+            # before passing to apply_entry_gate (strategy does not know config floors).
+            clamped_adjustments = _clamp_filter_adjustments(filter_adjustments)
 
             # Resolve strategy object: prefer pre-built lookup for efficiency,
             # fall back to on-demand construction for callers that don't pass one.
@@ -515,7 +556,11 @@ class OpportunityRanker:
                     pass
 
             if strategy_obj is not None:
-                passed, reason = strategy_obj.apply_entry_gate(action, sig)
+                passed, reason = strategy_obj.apply_entry_gate(
+                    action, sig,
+                    entry_conditions=entry_conds,
+                    filter_adjustments=clamped_adjustments,
+                )
                 if not passed:
                     return False, f"{symbol}: {reason}"
 
@@ -599,6 +644,7 @@ class OpportunityRanker:
         orders: list | None = None,
         strategy_lookup: dict | None = None,
         suppressed_symbols: dict[str, str] | None = None,
+        filter_adjustments: dict | None = None,
     ) -> RankResult:
         """
         Full ranking pipeline:
@@ -662,6 +708,7 @@ class OpportunityRanker:
                 orders,
                 technical_signals,
                 strategy_lookup,
+                filter_adjustments,
             )
             if not passes:
                 # Already-open rejections are expected every medium cycle while Claude's

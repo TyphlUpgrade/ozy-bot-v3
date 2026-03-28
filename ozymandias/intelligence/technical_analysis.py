@@ -769,3 +769,75 @@ def generate_daily_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
     if ema20_vs_ema50 is not None:
         result['ema20_vs_ema50'] = ema20_vs_ema50
     return result
+
+
+def compute_sector_dispersion(
+    watchlist_entries: list,
+    sector_map: dict[str, str],
+    daily_indicators: dict[str, dict],
+) -> dict:
+    """Compute relative performance of watchlist symbols vs their sector ETF (1-week).
+
+    Parameters
+    ----------
+    watchlist_entries:
+        List of WatchlistEntry objects (need .symbol attribute).
+    sector_map:
+        symbol → sector ETF string (e.g. "NVDA" → "XLK"). Built on orchestrator.
+    daily_indicators:
+        symbol → generate_daily_signal_summary output. Must include sector ETFs.
+
+    Returns
+    -------
+    Dict keyed by sector ETF:
+        {
+          "XLK": {
+            "sector_1w_return": -2.3,
+            "outperforming": [{"symbol": "CRWD", "vs_sector_1w": 1.4}, ...],
+            "underperforming": [{"symbol": "INTC", "vs_sector_1w": -3.1}, ...]
+          }
+        }
+    Sectors with fewer than 2 watchlist symbols are omitted (insufficient comparison).
+    Returns {} when no sectors qualify.
+
+    Extension point: to add a new sector, add its ETF to _SECTOR_MAP in orchestrator.
+    """
+    # Group watchlist symbols by sector ETF
+    sector_symbols: dict[str, list[str]] = {}
+    for entry in watchlist_entries:
+        sym = entry.symbol
+        etf = sector_map.get(sym)
+        if etf is None:
+            continue
+        etf_data = daily_indicators.get(etf, {})
+        if etf_data.get('roc_5d') is None:
+            continue
+        sym_data = daily_indicators.get(sym, {})
+        if sym_data.get('roc_5d') is None:
+            continue
+        sector_symbols.setdefault(etf, []).append(sym)
+
+    result: dict = {}
+    for etf, symbols in sector_symbols.items():
+        # Need at least 2 watchlist symbols for a meaningful comparison
+        if len(symbols) < 2:
+            continue
+        etf_roc = float(daily_indicators[etf]['roc_5d'])
+        pairs: list[tuple[str, float]] = []
+        for sym in symbols:
+            sym_roc = daily_indicators[sym].get('roc_5d')
+            if sym_roc is None:
+                continue
+            vs_sector = round(float(sym_roc) - etf_roc, 2)
+            pairs.append((sym, vs_sector))
+        if len(pairs) < 2:
+            continue
+        pairs.sort(key=lambda x: x[1])
+        underperforming = [{"symbol": s, "vs_sector_1w": v} for s, v in pairs[:3]]
+        outperforming   = [{"symbol": s, "vs_sector_1w": v} for s, v in pairs[-3:][::-1]]
+        result[etf] = {
+            "sector_1w_return": round(etf_roc, 2),
+            "outperforming":    outperforming,
+            "underperforming":  underperforming,
+        }
+    return result

@@ -214,6 +214,8 @@ class Strategy(ABC):
         self,
         action: str,
         signals: dict,
+        entry_conditions: dict | None = None,
+        filter_adjustments: dict | None = None,
     ) -> tuple[bool, str]:
         """Strategy-specific hard filter evaluated before scoring.
 
@@ -222,6 +224,16 @@ class Strategy(ABC):
 
         The ranker passes the raw signals sub-dict (same as generate_signals()
         receives). The action string is the Claude action ("buy" / "sell_short").
+
+        Parameters
+        ----------
+        entry_conditions:
+            Claude's per-trade TA gate dict from the opportunity. When non-empty,
+            implementations should yield hard trend/VWAP gates — Claude has
+            already expressed deliberate intent for this entry.
+        filter_adjustments:
+            Phase 19 Claude-proposed threshold relaxation (min_rvol, etc.).
+            Config absolute floors must still be enforced regardless of this value.
 
         To add a new strategy-specific filter, implement it here — no changes
         to opportunity_ranker.py are needed.

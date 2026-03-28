@@ -70,24 +70,84 @@ class UniverseScanner:
         n: int,
         exclude: set[str] | None = None,
         blacklist: set[str] | None = None,
+        sector_regimes: dict | None = None,
+        regime_assessment: dict | None = None,
+        sector_map: dict | None = None,
     ) -> list[dict]:
         """
         Return up to n candidates sorted by RVOL descending.
 
+        Phase 21 additions:
+        - sector_regimes: dict of ETF → {regime, bias, strength}. When any sector
+          is "correcting" or "downtrend", day_losers screener is added to the universe
+          so short-side candidates from that sector surface.
+        - regime_assessment: broad regime dict. When regime == "risk-off panic", the
+          min_price_move_pct_for_candidate floor is doubled so only significant
+          dislocations surface and noise is suppressed.
+        - sector_map: symbol → sector ETF mapping (from orchestrator._SECTOR_MAP).
+          Used to tag candidates with their sector for direction bias.
+
         Args:
-            n:         Maximum number of candidates to return.
-            exclude:   Symbols already on the watchlist — skipped entirely.
-            blacklist: No-entry symbols (ETFs, volatility products) — skipped entirely.
+            n:                Maximum number of candidates to return.
+            exclude:          Symbols already on the watchlist — skipped entirely.
+            blacklist:        No-entry symbols (ETFs, volatility products) — skipped.
+            sector_regimes:   Phase 21: Sonnet's latest sector regime assessment.
+            regime_assessment: Phase 21: Sonnet's latest broad regime assessment.
+            sector_map:       Phase 21: symbol → sector ETF lookup.
         """
         exclude = exclude or set()
         blacklist = blacklist or set()
 
+        # Phase 21: regime-aware adjustments.
+        # Broad panic → raise price_move floor to suppress noise.
+        # Correcting/downtrend sectors → add day_losers for short candidates.
+        broad_panic = (
+            isinstance(regime_assessment, dict)
+            and regime_assessment.get("regime") == "risk-off panic"
+        )
+        effective_price_move_floor = (
+            self._cfg.min_price_move_pct_for_candidate * 2.0
+            if broad_panic
+            else self._cfg.min_price_move_pct_for_candidate
+        )
+        # Sectors where short candidates are now preferred
+        correcting_etfs: set[str] = set()
+        if sector_regimes:
+            for etf, info in sector_regimes.items():
+                if isinstance(info, dict) and info.get("regime") in ("correcting", "downtrend"):
+                    correcting_etfs.add(etf)
+
         universe = await self._fetcher.get_universe()
         # Filter already-watched and no-entry symbols
         universe = [s for s in universe if s not in exclude and s not in blacklist]
+
+        # Phase 21: add day_losers for correcting/downtrend sectors so short-side
+        # candidates surface alongside the existing gainers/actives.
+        # Extension point: to add a new regime-specific screener source, add one
+        # branch here. The screener ID must be a valid Yahoo Finance predefined screener.
+        if correcting_etfs:
+            try:
+                losers = await asyncio.to_thread(
+                    self._fetcher._fetch_screener, "day_losers", 25
+                )
+                new_losers = [s for s in losers if s not in exclude and s not in blacklist and s not in set(universe)]
+                universe = universe + new_losers
+                log.info(
+                    "Universe scanner: added %d day_losers for correcting sectors %s",
+                    len(new_losers), sorted(correcting_etfs),
+                )
+            except Exception as exc:
+                log.warning("Universe scanner: day_losers fetch failed — %s", exc)
+
         if not universe:
             log.info("Universe scanner: empty universe after filtering")
             return []
+
+        if broad_panic:
+            log.info(
+                "Universe scanner: broad panic regime — price_move floor raised to %.1f%%",
+                effective_price_move_floor,
+            )
 
         log.info("Universe scanner: scanning %d symbols", len(universe))
 
@@ -128,7 +188,7 @@ class UniverseScanner:
             if bars < 5:
                 continue
             via_rvol = rvol >= self._cfg.min_rvol_for_candidate
-            via_move = abs(roc5) >= self._cfg.min_price_move_pct_for_candidate
+            via_move = abs(roc5) >= effective_price_move_floor
             if not (via_rvol or via_move):
                 continue
             scored.append((sym, summary))

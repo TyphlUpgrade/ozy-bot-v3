@@ -913,3 +913,98 @@ class TestAIFallback:
 
         mock_gemini.assert_not_called()
         assert result == '{"ok": true}'
+
+
+# ---------------------------------------------------------------------------
+# Phase 19 — ReasoningResult new field parsing
+# ---------------------------------------------------------------------------
+
+from ozymandias.intelligence.claude_reasoning import _result_from_raw_reasoning
+
+
+class TestPhase19ReasoningResultParsing:
+
+    def _base_raw(self) -> dict:
+        return {
+            "timestamp": "2026-01-01T00:00:00Z",
+            "position_reviews": [],
+            "new_opportunities": [],
+            "watchlist_changes": {"add": [], "remove": [], "rationale": ""},
+            "market_assessment": "test",
+            "risk_flags": [],
+            "rejected_opportunities": [],
+            "session_veto": [],
+        }
+
+    def test_all_four_fields_absent_remain_none(self):
+        result = _result_from_raw_reasoning(self._base_raw())
+        assert result.regime_assessment is None
+        assert result.sector_regimes is None
+        assert result.filter_adjustments is None
+        assert result.active_theses is None
+
+    def test_regime_assessment_parsed_correctly(self):
+        raw = self._base_raw()
+        raw["regime_assessment"] = {
+            "regime": "risk-off panic",
+            "confidence": 0.85,
+            "key_signals": ["SPY RSI 22"],
+            "valid_until_conditions": ["SPY daily RSI > 35"],
+            "implications": "Favor shorts and cash",
+        }
+        result = _result_from_raw_reasoning(raw)
+        assert result.regime_assessment is not None
+        assert result.regime_assessment["regime"] == "risk-off panic"
+        assert result.regime_assessment["confidence"] == 0.85
+
+    def test_sector_regimes_parsed_correctly(self):
+        raw = self._base_raw()
+        raw["sector_regimes"] = {
+            "XLK": {"regime": "correcting", "bias": "short", "strength": "strong"},
+            "XLE": {"regime": "breaking_out", "bias": "long", "strength": "moderate"},
+        }
+        result = _result_from_raw_reasoning(raw)
+        assert result.sector_regimes is not None
+        assert result.sector_regimes["XLK"]["regime"] == "correcting"
+
+    def test_filter_adjustments_parsed_correctly(self):
+        raw = self._base_raw()
+        raw["filter_adjustments"] = {
+            "min_rvol": 0.6,
+            "min_composite_score": 0.40,
+            "reason": "Low participation day",
+        }
+        result = _result_from_raw_reasoning(raw)
+        assert result.filter_adjustments is not None
+        assert result.filter_adjustments["min_rvol"] == 0.6
+
+    def test_active_theses_parsed_as_list_of_dicts(self):
+        raw = self._base_raw()
+        raw["active_theses"] = [
+            {"symbol": "BG", "thesis": "energy play", "thesis_breaking_conditions": ["daily_trend becomes downtrend"]},
+        ]
+        result = _result_from_raw_reasoning(raw)
+        assert result.active_theses is not None
+        assert len(result.active_theses) == 1
+        assert result.active_theses[0]["symbol"] == "BG"
+
+    def test_malformed_regime_assessment_returns_none(self):
+        """Non-dict regime_assessment → set to None, no crash."""
+        raw = self._base_raw()
+        raw["regime_assessment"] = "invalid string"
+        result = _result_from_raw_reasoning(raw)
+        assert result.regime_assessment is None
+
+    def test_malformed_active_theses_returns_none(self):
+        """List of non-dicts → set to None."""
+        raw = self._base_raw()
+        raw["active_theses"] = ["not", "dicts"]
+        result = _result_from_raw_reasoning(raw)
+        assert result.active_theses is None
+
+    def test_empty_dict_regime_assessment_returns_none(self):
+        """Empty dict is treated as absent (no meaningful assessment)."""
+        raw = self._base_raw()
+        raw["regime_assessment"] = {}
+        result = _result_from_raw_reasoning(raw)
+        assert result.regime_assessment is None

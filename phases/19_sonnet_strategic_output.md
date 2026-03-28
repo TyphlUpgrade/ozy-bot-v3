@@ -91,11 +91,11 @@ In `_build_market_context`, add:
 rejections = [
     {
         "symbol": sym,
-        "reason": data["last_rejection_reason"],
-        "cycles_rejected": data["consecutive_rejections"],
+        "reason": data["stage_detail"],
+        "cycles_rejected": data["rejection_count"],
     }
     for sym, data in self._recommendation_outcomes.items()
-    if data.get("consecutive_rejections", 0) >= 1
+    if data.get("rejection_count", 0) >= 1
 ]
 # Sort by cycles_rejected descending; cap at 10 entries
 market_data["recent_rejections"] = sorted(
@@ -199,22 +199,30 @@ Add corresponding keys to `config.json` under `ranker`.
 
 ### Application
 
-In `_medium_try_entry` and `evaluate_entry_conditions` in `opportunity_ranker.py`, where
-`min_rvol` and `min_composite_score` thresholds are checked:
+**`min_composite_score`**: Applied in `_medium_try_entry` (in orchestrator) where the composite
+floor is checked before sizing. `effective_min_composite` replaces the raw config value:
 
 ```python
-effective_min_rvol = max(
-    config.filter_adj_min_rvol,
-    filter_adjustments.get("min_rvol", config.min_rvol) if filter_adjustments else config.min_rvol
-)
 effective_min_composite = max(
     config.filter_adj_min_composite,
     filter_adjustments.get("min_composite_score", config.min_composite_score) if filter_adjustments else config.min_composite_score
 )
 ```
 
-Pass `filter_adjustments: dict | None` as a parameter to the relevant ranker methods. The
-orchestrator passes `self._filter_adjustments`.
+**`min_rvol`**: Applied in `apply_entry_gate` in strategy classes (the actual RVOL floor lives
+at `self._p("min_rvol_for_entry")` in `MomentumStrategy`). `apply_entry_gate` gains a
+`filter_adjustments: dict | None = None` parameter alongside `entry_conditions`. When present,
+compute:
+
+```python
+effective_min_rvol = max(
+    config.filter_adj_min_rvol,
+    filter_adjustments.get("min_rvol", self._p("min_rvol_for_entry")) if filter_adjustments else self._p("min_rvol_for_entry")
+)
+```
+
+Pass `filter_adjustments: dict | None` from orchestrator → ranker → `apply_entry_gate` call sites.
+The orchestrator passes `self._filter_adjustments`.
 
 ---
 
@@ -242,8 +250,9 @@ When `entry_conditions` is empty or absent: existing trend gate behavior unchang
 - `ozymandias/intelligence/opportunity_ranker.py` (pass `entry_conditions` through to
   `apply_entry_gate` call site)
 
-The `Strategy` ABC's `apply_entry_gate` signature gains `entry_conditions: dict` as a parameter
-(default `{}`). All strategy subclasses update their signature accordingly.
+The `Strategy` ABC's `apply_entry_gate` signature gains two new parameters:
+`entry_conditions: dict = {}` and `filter_adjustments: dict | None = None`.
+All strategy subclasses update their signature accordingly.
 
 ---
 
@@ -390,6 +399,20 @@ Add to `tests/test_strategies.py`:
 - `apply_entry_gate` with empty `entry_conditions` retains existing trend block behavior
 
 ---
+
+## Implementation Notes
+
+- **`filter_adjustments` lost on mid-cycle API error.** `_filter_adjustments` resets to `None`
+  at cycle start and repopulates from the result. If the Claude call errors out, the reset fires
+  but repopulation doesn't — thresholds silently fall back to config defaults until the next
+  successful cycle. This is the correct safe behavior but will look like a bug when you see
+  filters tighten immediately after a 529. Don't add recovery logic; just note it.
+
+- **Trend gate yields on *any* non-empty `entry_conditions`, not just trend-related ones.**
+  A Claude opportunity with only `rsi_min: 55` still bypasses `block_bearish_aligned`. This is
+  intentional — Claude specifying conditions at all means it was reasoning deliberately about
+  this entry. If strong-downtrend entries start slipping through unexpectedly, the fix is in
+  the prompt, not the gate logic.
 
 ## Done When
 

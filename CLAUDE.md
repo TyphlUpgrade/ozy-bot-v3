@@ -107,7 +107,7 @@ All 10 spec phases complete per `ozymandias_v3_spec_revised.md`. Post-MVP phases
 Full narrative history in `COMPLETED_PHASES.md`.
 
 Last spec phase completed: Phase 10 (March 15)
-Last post-MVP phase completed: Phase 18 — Watchlist Intelligence (March 23)
+Last post-MVP phase completed: Phase 21 — Durability and Regime Response (March 27)
 
 ### Decisions from completed phases that affect active development
 
@@ -147,13 +147,18 @@ Last post-MVP phase completed: Phase 18 — Watchlist Intelligence (March 23)
   - `run_reasoning_cycle` returns `(ReasoningResult, CompressorResult)`; `assemble_reasoning_context`
     accepts `selected_symbols`; `_needs_sonnet_fired` guard; candidates exhaustion trigger
 
-- **Phase 21 — Durability and Regime Response**: see `phases/21_durability_and_regime_response.md`
-  - Regime-reset watchlist build: conflict eviction on regime flip, `catalyst_driven` flag,
-    `full_rebuild` path in `run_watchlist_build`
-  - `_clear_directional_suppression`: clears direction-dependent session suppression after regime change
-  - Regime-aware universe scanner: `day_losers` screener source for correcting sectors
-  - Multi-tier pruner eviction: tier-2 first, then regime-conflicting tier-1, then composite score
-  - `regime_assessment` persisted across restarts in `bot_state.json`
+- **Phase 21 — Durability and Regime Response** *(complete, March 27)*
+  - `_regime_reset_build`: fire-and-forget background task; evicts conflicting watchlist entries on
+    regime/sector flip; clears directional suppression; rebuilds with `target_count=20`
+  - `_clear_directional_suppression(affected_sectors)`: clears rvol/composite_score/conviction_floor/
+    defer_expired suppressions for symbols in affected sectors; preserves fetch_failure/blacklist
+  - Multi-tier pruner eviction: tier-2 first, then direction-conflicting tier-1, then composite score
+  - Regime-aware universe scanner: `day_losers` screener for correcting/downtrend sectors;
+    doubled price_move floor in broad panic; new params `sector_regimes`, `regime_assessment`, `sector_map`
+  - Position thesis monitoring: `ContextCompressor.check_position_theses` + `_condition_met`;
+    medium loop fires `thesis_breach` Sonnet cycle on condition match
+  - Startup persistence: regime_assessment/sector_regimes restored from reasoning cache at startup
+    Step 4c (via `_result_from_raw_reasoning`, not `bot_state.json`)
 
 ## Spec Drift Log
 See `DRIFT_LOG.md`. Read the relevant phase section of DRIFT_LOG.md before modifying or debugging any module built in a previous phase.

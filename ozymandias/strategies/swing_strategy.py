@@ -119,7 +119,13 @@ class SwingStrategy(Strategy):
     def dead_zone_exempt(self) -> bool:
         return True
 
-    def apply_entry_gate(self, action: str, signals: dict) -> tuple[bool, str]:
+    def apply_entry_gate(
+        self,
+        action: str,
+        signals: dict,
+        entry_conditions: dict | None = None,
+        filter_adjustments: dict | None = None,
+    ) -> tuple[bool, str]:
         """Reject swing entries when RVOL is absent.
 
         Intraday trend_structure is intentionally NOT checked here — swing theses
@@ -135,12 +141,23 @@ class SwingStrategy(Strategy):
         #     if wrong_trend and signals.get("trend_structure", "") == wrong_trend:
         #         return False, f"swing {action} rejected — {wrong_trend} trend"
         """
+        # Phase 19: apply filter_adjustments.min_rvol when Claude has relaxed the floor.
+        # Clamping to the absolute config floor is done by the ranker before this call.
+        effective_rvol_floor = self._p("min_rvol_for_entry")
+        if filter_adjustments:
+            proposed = filter_adjustments.get("min_rvol")
+            if proposed is not None:
+                try:
+                    effective_rvol_floor = float(proposed)
+                except (TypeError, ValueError):
+                    pass
+
         rvol = signals.get("volume_ratio")
-        if rvol is not None and rvol < self._p("min_rvol_for_entry"):
+        if rvol is not None and effective_rvol_floor > 0 and rvol < effective_rvol_floor:
             return (
                 False,
                 f"swing {action} rejected — RVOL {rvol:.2f} below floor "
-                f"{self._p('min_rvol_for_entry'):.2f} (no volume participation)",
+                f"{effective_rvol_floor:.2f} (no volume participation)",
             )
         return True, ""
 

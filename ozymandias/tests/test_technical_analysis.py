@@ -22,6 +22,7 @@ from ozymandias.intelligence.technical_analysis import (
     compute_macd,
     compute_roc,
     compute_rsi,
+    compute_sector_dispersion,
     compute_volume_sma,
     compute_vwap,
     detect_macd_cross,
@@ -1024,3 +1025,112 @@ class TestGenerateDailySignalSummary:
             "roc_5d", "volume_trend_daily", "macd_signal_daily",
         }
         assert required.issubset(result.keys())
+
+
+# ---------------------------------------------------------------------------
+# Phase 19 — compute_sector_dispersion
+# ---------------------------------------------------------------------------
+
+class _FakeEntry:
+    """Minimal watchlist entry stub."""
+    def __init__(self, symbol: str):
+        self.symbol = symbol
+
+
+class TestComputeSectorDispersion:
+
+    def _entry(self, symbol: str) -> _FakeEntry:
+        return _FakeEntry(symbol)
+
+    def test_returns_empty_when_no_entries(self):
+        result = compute_sector_dispersion([], {}, {})
+        assert result == {}
+
+    def test_returns_empty_when_fewer_than_two_symbols_per_sector(self):
+        entries = [_FakeEntry("NVDA")]
+        sector_map = {"NVDA": "XLK"}
+        daily = {"NVDA": {"roc_5d": 2.0}, "XLK": {"roc_5d": 1.0}}
+        result = compute_sector_dispersion(entries, sector_map, daily)
+        assert result == {}
+
+    def test_computes_vs_sector_correctly(self):
+        """vs_sector_1w = symbol_roc_5d - etf_roc_5d."""
+        entries = [_FakeEntry("NVDA"), _FakeEntry("AMD")]
+        sector_map = {"NVDA": "XLK", "AMD": "XLK"}
+        daily = {
+            "NVDA": {"roc_5d": 5.0},
+            "AMD":  {"roc_5d": -1.0},
+            "XLK":  {"roc_5d": 2.0},
+        }
+        result = compute_sector_dispersion(entries, sector_map, daily)
+        assert "XLK" in result
+        xlk = result["XLK"]
+        assert xlk["sector_1w_return"] == 2.0
+        # NVDA outperforming: 5.0 - 2.0 = 3.0
+        assert xlk["outperforming"][0]["symbol"] == "NVDA"
+        assert xlk["outperforming"][0]["vs_sector_1w"] == 3.0
+        # AMD underperforming: -1.0 - 2.0 = -3.0
+        assert xlk["underperforming"][0]["symbol"] == "AMD"
+        assert xlk["underperforming"][0]["vs_sector_1w"] == -3.0
+
+    def test_outperforming_contains_top_3_by_vs_sector(self):
+        """Top 3 outperformers by vs_sector_1w (desc), bottom 3 underperformers (asc)."""
+        entries = [_FakeEntry(s) for s in ["A", "B", "C", "D", "E"]]
+        sector_map = {s: "XLK" for s in ["A", "B", "C", "D", "E"]}
+        daily = {
+            "A": {"roc_5d": 10.0}, "B": {"roc_5d": 8.0}, "C": {"roc_5d": 6.0},
+            "D": {"roc_5d": -2.0}, "E": {"roc_5d": -4.0},
+            "XLK": {"roc_5d": 0.0},
+        }
+        result = compute_sector_dispersion(entries, sector_map, daily)
+        xlk = result["XLK"]
+        outperforming_syms = [x["symbol"] for x in xlk["outperforming"]]
+        underperforming_syms = [x["symbol"] for x in xlk["underperforming"]]
+        assert "A" in outperforming_syms
+        assert "B" in outperforming_syms
+        assert "E" in underperforming_syms
+        assert "D" in underperforming_syms
+
+    def test_symbol_without_roc5d_is_skipped(self):
+        """Symbols missing roc_5d in daily_indicators are excluded."""
+        entries = [_FakeEntry("NVDA"), _FakeEntry("AMD"), _FakeEntry("INTC")]
+        sector_map = {"NVDA": "XLK", "AMD": "XLK", "INTC": "XLK"}
+        daily = {
+            "NVDA": {"roc_5d": 5.0},
+            "AMD":  {},                # no roc_5d
+            "INTC": {"roc_5d": 1.0},
+            "XLK":  {"roc_5d": 2.0},
+        }
+        result = compute_sector_dispersion(entries, sector_map, daily)
+        # Only NVDA and INTC have data — still 2 symbols, result should exist
+        assert "XLK" in result
+        syms = (
+            [x["symbol"] for x in result["XLK"]["outperforming"]]
+            + [x["symbol"] for x in result["XLK"]["underperforming"]]
+        )
+        assert "AMD" not in syms
+
+    def test_sector_etf_without_daily_data_is_omitted(self):
+        """Sectors whose ETF has no daily data (no roc_5d) are excluded."""
+        entries = [_FakeEntry("NVDA"), _FakeEntry("AMD")]
+        sector_map = {"NVDA": "XLK", "AMD": "XLK"}
+        daily = {
+            "NVDA": {"roc_5d": 5.0},
+            "AMD":  {"roc_5d": 3.0},
+            # XLK has no entry in daily_indicators
+        }
+        result = compute_sector_dispersion(entries, sector_map, daily)
+        assert result == {}
+
+    def test_multiple_sectors_independent(self):
+        """Each sector produces a separate result entry."""
+        entries = [_FakeEntry("NVDA"), _FakeEntry("AMD"), _FakeEntry("XOM"), _FakeEntry("CVX")]
+        sector_map = {"NVDA": "XLK", "AMD": "XLK", "XOM": "XLE", "CVX": "XLE"}
+        daily = {
+            "NVDA": {"roc_5d": 4.0}, "AMD": {"roc_5d": 2.0},
+            "XOM":  {"roc_5d": -1.0}, "CVX": {"roc_5d": 1.0},
+            "XLK":  {"roc_5d": 3.0}, "XLE": {"roc_5d": 0.0},
+        }
+        result = compute_sector_dispersion(entries, sector_map, daily)
+        assert "XLK" in result
+        assert "XLE" in result
