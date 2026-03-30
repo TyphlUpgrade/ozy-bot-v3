@@ -58,6 +58,12 @@ log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
 
 
+def _is_overload_error(exc: Exception) -> bool:
+    """Return True for Anthropic 529 overload errors (Sonnet-specific capacity issue)."""
+    import anthropic
+    return isinstance(exc, anthropic.APIStatusError) and exc.status_code == 529
+
+
 def _rejection_gate_category(reason: str) -> str:
     """Map a ranker rejection-reason string to a short gate-category label.
 
@@ -398,6 +404,12 @@ class Orchestrator:
 
         # Consecutive Claude failure count — used for exponential backoff
         self._claude_failure_count: int = 0
+
+        # Phase 22 — reasoning tier state for opportunity call degradation.
+        # Tier 1 = Sonnet full context; Tier 2 = Sonnet reduced; Tier 3 = Haiku emergency.
+        self._reasoning_tier: int = 1
+        self._tier_degraded_at: Optional[datetime] = None
+        self._tier_failure_count: int = 0
 
         # Pending entry intentions: symbol → {stop, target, strategy, reasoning, ...}.
         # Written by _medium_try_entry when an order is placed; consumed by
@@ -3962,6 +3974,60 @@ class Orchestrator:
         self._prev_filter_adjustments = self._filter_adjustments
         self._filter_adjustments = None
 
+        # --- Phase 22: Call A — position reviews (split mode) ---
+        # When split_reasoning_enabled, reviews run as a separate compact call.
+        # Failure is non-fatal: positions continue to be managed by quant rules.
+        position_reviews_from_call_a: list[dict] = []
+        _split = self._config.claude.split_reasoning_enabled
+        if _split and portfolio.positions:
+            self._claude._last_call_end_time = 0.0  # no inter-call gap within a single cycle
+            position_reviews_from_call_a = await self._claude.run_position_review_call(
+                portfolio=portfolio,
+                indicators=indicators,
+                market_data=market_data,
+                daily_indicators=self._daily_indicators or None,
+            )
+            self._claude._last_call_end_time = 0.0  # reset again before Call B
+
+        # --- Phase 22: resolve degradation tier for Call B (opportunity discovery) ---
+        active_tier = self._reasoning_tier
+        if self._should_attempt_tier_upgrade():
+            active_tier = self._reasoning_tier - 1
+            log.info(
+                "Tier upgrade probe: attempting Tier %d (was Tier %d, %.0fmin since degradation)",
+                active_tier, self._reasoning_tier,
+                (datetime.now(timezone.utc) - self._tier_degraded_at).total_seconds() / 60,
+            )
+
+        cfg = self._config.claude
+        if active_tier == 1:
+            _opp_max_symbols = cfg.tier1_max_symbols
+            _opp_max_tokens = cfg.max_tokens_per_cycle
+            _opp_model: str | None = None
+            _opp_skip_fields: frozenset = frozenset()
+            _opp_emergency = False
+            log.info(
+                "Slow loop: Claude call [Tier 1 — Sonnet full]  trigger=%s", trigger_name
+            )
+        elif active_tier == 2:
+            _opp_max_symbols = cfg.reasoning_tier2_max_symbols
+            _opp_max_tokens = cfg.reasoning_tier2_max_tokens
+            _opp_model = None
+            _opp_skip_fields = frozenset({"last_view", "sector_dispersion"})
+            _opp_emergency = False
+            log.info(
+                "Slow loop: Claude call [Tier 2 — Sonnet reduced]  trigger=%s", trigger_name
+            )
+        else:  # Tier 3
+            _opp_max_symbols = cfg.reasoning_tier3_max_symbols
+            _opp_max_tokens = cfg.reasoning_tier3_max_tokens
+            _opp_model = cfg.reasoning_tier3_model
+            _opp_skip_fields = frozenset({"last_view", "sector_dispersion"})
+            _opp_emergency = True
+            log.info(
+                "Slow loop: Claude call [Tier 3 — Haiku emergency]  trigger=%s", trigger_name
+            )
+
         try:
             result = await self._claude.run_reasoning_cycle(
                 portfolio=portfolio,
@@ -3981,9 +4047,21 @@ class Orchestrator:
                 all_indicators=self._all_indicators,
                 regime_assessment=self._last_regime_assessment,
                 sector_regimes=self._last_sector_regimes,
+                # Phase 22: split-call and degradation parameters
+                skip_position_reviews=_split,
+                max_symbols_override=_opp_max_symbols,
+                max_tokens_override=_opp_max_tokens,
+                model_override=_opp_model,
+                skip_context_fields=_opp_skip_fields,
+                use_emergency_prompt=_opp_emergency,
             )
         except Exception as exc:
-            self._handle_claude_failure(exc)
+            self._handle_claude_failure(exc, tier=active_tier)
+            # If this was an upgrade probe, reset the probe timer rather than
+            # leaving it at the (now-failed) lower tier — wait another window.
+            if active_tier < self._reasoning_tier:
+                log.info("Tier upgrade probe failed — staying at Tier %d", self._reasoning_tier)
+                self._tier_degraded_at = datetime.now(timezone.utc)
             return
 
         if result is None:
@@ -3995,6 +4073,21 @@ class Orchestrator:
         self._degradation.claude_backoff_until_utc = None
         self._trigger_state.last_claude_call_utc = datetime.now(timezone.utc)
         self._trigger_state.last_override_exit_count = self._override_exit_count
+
+        # Phase 22: merge position reviews from Call A into result, then handle tier upgrade.
+        import dataclasses as _dc
+        if position_reviews_from_call_a and not result.position_reviews:
+            result = _dc.replace(result, position_reviews=position_reviews_from_call_a)
+
+        # Tier upgrade confirmation (or reset failure count on stable degraded tier)
+        if active_tier < self._reasoning_tier:
+            self._reasoning_tier = active_tier
+            self._tier_failure_count = 0
+            if active_tier == 1:
+                self._tier_degraded_at = None  # fully restored
+            log.info("Tier upgrade confirmed → Tier %d", active_tier)
+        elif active_tier == self._reasoning_tier and self._reasoning_tier > 1:
+            self._tier_failure_count = 0  # stable at degraded tier; reset count
 
         # Phase 19: store strategic output fields from this cycle.
         # Decay rule: if filter_adjustments have been elevated for N consecutive
@@ -4435,8 +4528,41 @@ class Orchestrator:
         except Exception as exc:
             log.error("_regime_reset_build failed: %s", exc, exc_info=True)
 
-    def _handle_claude_failure(self, exc: Exception) -> None:
-        """Enter quantitative-only mode; schedule exponential backoff retry."""
+    # ------------------------------------------------------------------
+    # Phase 22 — reasoning tier management (opportunity call degradation)
+    # ------------------------------------------------------------------
+
+    def _should_attempt_tier_upgrade(self) -> bool:
+        """Return True when enough time has elapsed to probe upgrading one tier."""
+        if self._reasoning_tier == 1 or self._tier_degraded_at is None:
+            return False
+        elapsed_min = (
+            datetime.now(timezone.utc) - self._tier_degraded_at
+        ).total_seconds() / 60
+        return elapsed_min >= self._config.claude.tier_upgrade_probe_min
+
+    def _drop_reasoning_tier(self) -> None:
+        """Drop the active reasoning tier by one and record the degradation timestamp."""
+        _tier_labels = ["", "Sonnet full", "Sonnet reduced", "Haiku emergency"]
+        if self._reasoning_tier < 3:
+            self._reasoning_tier += 1
+            self._tier_degraded_at = datetime.now(timezone.utc)
+            self._tier_failure_count = 0
+            log.warning(
+                "Tier downgrade → %d (%s) after %d consecutive opportunity-call failures",
+                self._reasoning_tier,
+                _tier_labels[self._reasoning_tier],
+                self._config.claude.tier_downgrade_failures,
+            )
+
+    def _handle_claude_failure(self, exc: Exception, tier: int = 1) -> None:
+        """Enter quantitative-only mode; schedule exponential backoff retry.
+
+        Also applies tier-aware downgrade logic for the opportunity call (Phase 22):
+        - asyncio.TimeoutError: context too large → drop one tier after N failures
+        - 529 overload: Sonnet capacity issue → jump directly to Tier 3 (Haiku)
+        - 429 rate limit / other errors: backoff only, no tier change
+        """
         now = datetime.now(timezone.utc)
         # Exponential backoff: base 30s, doubles each failure, cap 10 min
         if self._degradation.claude_available:
@@ -4453,6 +4579,25 @@ class Orchestrator:
             "retry in %ds",
             self._claude_failure_count, exc, backoff_sec,
         )
+
+        # Phase 22: tier downgrade logic (applies to opportunity call failures only).
+        cfg = self._config.claude
+        if isinstance(exc, asyncio.TimeoutError):
+            if self._tier_failure_count + 1 >= cfg.tier_downgrade_failures:
+                self._drop_reasoning_tier()
+            else:
+                self._tier_failure_count += 1
+                log.info(
+                    "Tier failure count: %d/%d before downgrade",
+                    self._tier_failure_count, cfg.tier_downgrade_failures,
+                )
+        elif _is_overload_error(exc):
+            # 529 = Sonnet capacity issue; Haiku uses different infrastructure — jump to Tier 3
+            if self._reasoning_tier < 3:
+                self._reasoning_tier = 3
+                self._tier_degraded_at = now
+                self._tier_failure_count = 0
+                log.warning("Tier downgrade → 3 (Haiku emergency) due to 529 overload")
 
     async def _apply_watchlist_changes(
         self,

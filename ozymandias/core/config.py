@@ -131,6 +131,20 @@ class ClaudeConfig:
     last_view_max_age_days: int = 7              # max age (days) of WatchlistEntry.last_view before it is excluded from context as stale
     api_call_timeout_sec: float = 200.0          # asyncio.wait_for timeout for Claude API calls; 8192-token responses can take 150-180s
     macro_news_max_items: int = 2                # headline cap for SPY/QQQ macro_news; explains *why* broad indicators are moving (geopolitical, Fed, etc.)
+    # Phase 22 — split-call architecture
+    split_reasoning_enabled: bool = True         # when True, position reviews run as a separate compact call before opportunity discovery
+    review_call_max_tokens: int = 2048           # output ceiling for the position review call; reviews are compact so 2048 is ample
+    review_call_verbose: bool = False            # when True, position review prompt requests full prose reasoning (stop rationale, bear case, gain-protection analysis); compact two-sentence schema when False
+    # Phase 22 — graceful degradation tiers (opportunity call only)
+    # NOTE: reasoning_tier* uses the "reasoning_tier" prefix to avoid collision with
+    # tier2_max_symbols (line above), which controls watchlist tier-2 slot count.
+    reasoning_tier2_max_symbols: int = 8         # Sonnet reduced-context symbol cap
+    reasoning_tier3_max_symbols: int = 5         # Haiku emergency symbol cap
+    reasoning_tier2_max_tokens: int = 4096       # Sonnet reduced output ceiling
+    reasoning_tier3_max_tokens: int = 1024       # Haiku emergency output ceiling
+    reasoning_tier3_model: str = "claude-haiku-4-5-20251001"  # emergency model for Tier 3
+    tier_downgrade_failures: int = 2             # consecutive opportunity-call failures before dropping one tier
+    tier_upgrade_probe_min: int = 15             # minutes since last degradation before attempting tier upgrade
 
 
 @dataclass

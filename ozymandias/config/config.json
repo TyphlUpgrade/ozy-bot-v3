@@ -80,7 +80,17 @@
     "compressor_max_tokens": 512,
     "last_view_max_age_days": 7,
     "api_call_timeout_sec": 200.0,
-    "macro_news_max_items": 2
+    "macro_news_max_items": 2,
+    "split_reasoning_enabled": true,
+    "review_call_max_tokens": 2048,
+    "review_call_verbose": false,
+    "reasoning_tier2_max_symbols": 8,
+    "reasoning_tier3_max_symbols": 5,
+    "reasoning_tier2_max_tokens": 4096,
+    "reasoning_tier3_max_tokens": 1024,
+    "reasoning_tier3_model": "claude-haiku-4-5-20251001",
+    "tier_downgrade_failures": 2,
+    "tier_upgrade_probe_min": 15
   },
   "ai_fallback": {
     "enabled": false,

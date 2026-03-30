@@ -1269,3 +1269,39 @@ Read the relevant phase section before modifying or debugging any module built i
 - Root cause of 120s timeouts: Sonnet generating 6,000–7,000 output tokens can take 150–180s. Timeout fired before response completed, producing 0 candidates — identical failure mode to truncation.
 - New config key: `ClaudeConfig.api_call_timeout_sec: float = 200.0`. All three `asyncio.wait_for` calls now use this value.
 - Token usage logging promoted from DEBUG to INFO in the primary call path.
+
+---
+
+### 2026-03-30 — Phase 22: Split-Call Reasoning Architecture + Graceful Degradation
+
+**Root cause:** Monolithic `run_reasoning_cycle` combined position reviews and opportunity discovery in one Claude call. With 10–12 open positions + Phase 19-21 context fields, input tokens grew to ~28K. The 8192-token output ceiling caused `stop_reason=max_tokens` truncation and skipped cycles — failing exactly when AI guidance is most needed.
+
+**Split-call architecture** · `intelligence/claude_reasoning.py`, `core/orchestrator.py`, `config/prompts/v3.10.1/`
+- Position reviews now run as a separate compact Call A (`position_reviews.txt`, 2048 max_tokens).
+- Opportunity discovery runs as Call B (`reasoning.txt`, 8192 max_tokens, compact position summary only).
+- Call A failure is non-fatal: positions continue under quant rules; bot continues to Call B.
+- Results merged into a single `ReasoningResult` before downstream processing (no change to consumers).
+- Context JSON for Call B excludes `daily_signals` from positions (compact summary only), saving ~40% of per-position token cost.
+- New config: `split_reasoning_enabled: bool = True` (kill switch), `review_call_max_tokens: int = 2048`, `review_call_verbose: bool = False`.
+- When `review_call_verbose=True`, position review prompt requests full prose (stop-adjustment rationale, explicit bear case). Default compact = two sentences max.
+
+**New prompt files:**
+- `position_reviews.txt`: compact batch review — `action`, `thesis_intact`, `updated_reasoning`, optional `adjusted_targets`. No watchlist candidates or regime context.
+- `emergency_reasoning.txt`: Tier 3 (Haiku) prompt — `new_opportunities` + `rejected_opportunities` only, max 3 entries, conservative defaults.
+
+**Graceful degradation tiers (opportunity call only)** · `core/orchestrator.py`, `intelligence/claude_reasoning.py`, `core/config.py`
+- Tier 1 (default): Sonnet, 18 symbols, 8192 tokens, full context.
+- Tier 2: Sonnet, 8 symbols, 4096 tokens, drops `last_view` + `sector_dispersion`.
+- Tier 3: Haiku, 5 symbols, 1024 tokens, emergency prompt, bypasses ContextCompressor.
+- Downgrade triggers: timeout → drop tier after 2 consecutive failures; 529 overload → jump to Tier 3 directly; 429/other → backoff only, no tier change.
+- Upgrade: time-based probe after `tier_upgrade_probe_min` (15 min) since last degradation; success confirms tier restore, failure resets probe timer.
+- Every slow-loop Claude call logs `[Tier 1 — Sonnet full]`, `[Tier 2 — Sonnet reduced]`, or `[Tier 3 — Haiku emergency]`.
+- New config: `reasoning_tier2_max_symbols: 8`, `reasoning_tier3_max_symbols: 5`, `reasoning_tier2_max_tokens: 4096`, `reasoning_tier3_max_tokens: 1024`, `reasoning_tier3_model: "claude-haiku-4-5-20251001"`, `tier_downgrade_failures: 2`, `tier_upgrade_probe_min: 15`.
+
+**`call_claude` model override** · `intelligence/claude_reasoning.py`
+- `call_claude` accepts new `model_override: str | None = None` parameter.
+- Uses `model_override or self._claude_cfg.model` in `messages.create()`, enabling Haiku emergency calls without changing the primary model config.
+
+**`reasoning.txt` modification** · `config/prompts/v3.10.1/reasoning.txt`
+- Added `{position_review_notice}` template variable injected before INSTRUCTIONS.
+- When split mode is active, this instructs Claude not to produce `position_reviews` output and that positions are shown as a compact summary only.

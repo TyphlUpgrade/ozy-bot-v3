@@ -341,52 +341,41 @@ class ClaudeReasoningEngine:
     # Context assembly
     # ------------------------------------------------------------------
 
-    def assemble_reasoning_context(
+    # Verbose reasoning depth instructions for position_reviews.txt when
+    # review_call_verbose=True. Controls the output depth of updated_reasoning.
+    _REVIEW_VERBOSE_INSTRUCTIONS: str = (
+        "Provide FULL reasoning depth: state the action rationale AND the strongest "
+        "current argument against holding. Reference specific price levels, patterns, "
+        "or catalysts — not generic risk statements. When the position has meaningful "
+        "unrealised gains, explicitly assess whether to raise the stop_loss to protect "
+        "them based on thesis milestone progress, not price movement alone."
+    )
+    _REVIEW_COMPACT_INSTRUCTIONS: str = (
+        "Two sentences maximum: action rationale and the strongest current argument "
+        "against holding. Be specific (name a price level or pattern) — not generic."
+    )
+    _REVIEW_VERBOSE_SCHEMA: str = (
+        '"<action rationale — specific price levels, patterns, catalysts. '
+        'Then: the strongest current argument against holding this position. '
+        'If meaningful gains, assess stop-loss adjustment against thesis milestones.>"'
+    )
+    _REVIEW_COMPACT_SCHEMA: str = (
+        '"<two sentences max: action rationale and strongest bear case>"'
+    )
+
+    def assemble_position_review_context(
         self,
-        portfolio: PortfolioState,
-        watchlist: WatchlistState,
-        market_data: dict,
+        portfolio: "PortfolioState",
         indicators: dict,
-        recommendation_outcomes: dict | None = None,
-        recent_executions: list | None = None,
-        execution_stats: dict | None = None,
-        session_suppressed: dict[str, str] | None = None,
-        claude_soft_rejections: dict[str, int] | None = None,
+        market_data: dict,
         daily_indicators: dict[str, dict] | None = None,
-        selected_symbols: list[str] | None = None,
     ) -> dict:
         """
-        Build the structured input context sent to Claude each cycle.
-
-        Tier 1: current positions + top watchlist candidates (priority_tier=1),
-                up to tier1_max_symbols total. Full context for each symbol.
-        Tier 2: remaining watchlist — NOT sent to Claude, used locally for
-                technical scanning only.
-
-        If the assembled context exceeds the token target (~8,000 tokens),
-        Tier 1 watchlist entries are trimmed until it fits.
-
-        Args:
-            portfolio:   Current portfolio state.
-            watchlist:   Full watchlist; entries with priority_tier=1 are candidates.
-            market_data: Market context dict — passed through directly to Claude.
-                         Expected keys: spy_trend, vix, sector_rotation,
-                         macro_events_today, trading_session, pdt_trades_remaining.
-            indicators:  symbol → output dict from generate_signal_summary().
-                         May also include a flat signals dict directly.
-            recommendation_outcomes: Phase 15 — dict of symbol → outcome tracking
-                         info from the orchestrator's _recommendation_outcomes store.
-                         Assembled into a sorted list for Claude's context.
-            recent_executions: Phase 15 — pre-computed list of recent close records
-                         (from TradeJournal.load_recent). Passed in rather than awaited
-                         here to keep this method sync.
-            execution_stats: Phase 15 — pre-computed session stats dict
-                         (from TradeJournal.compute_session_stats). Same rationale.
+        Build compact context for the position review call (Phase 22 split mode).
+        Contains only open position data and minimal account context — no watchlist
+        candidates, no execution history, no market regime detail.
         """
-        max_tier1 = self._claude_cfg.tier1_max_symbols
         now_utc = datetime.now(timezone.utc)
-
-        # --- Current positions (always Tier 1) ---
         position_entries: list[dict] = []
         for pos in portfolio.positions:
             sig_summary = indicators.get(pos.symbol, {})
@@ -427,14 +416,199 @@ class ClaudeReasoningEngine:
                     "review_notes": pos.intention.review_notes[-3:],
                 },
             }
-            # Swing positions get daily-bar signals so Claude evaluates thesis health
-            # on the appropriate timeframe. Momentum positions use intraday signals only.
             if (
                 pos.intention.strategy == "swing"
                 and daily_indicators
                 and daily_indicators.get(pos.symbol)
             ):
                 pos_entry["daily_signals"] = daily_indicators[pos.symbol]
+            position_entries.append(pos_entry)
+
+        return {
+            "portfolio": {
+                "cash": portfolio.cash,
+                "buying_power": portfolio.buying_power,
+                "positions": position_entries,
+            },
+            "market_context": {
+                "trading_session": market_data.get("trading_session"),
+                "pdt_trades_remaining": market_data.get("pdt_trades_remaining"),
+                "equity": market_data.get("equity"),
+                "spy_rsi": market_data.get("spy_rsi"),
+                "spy_trend": market_data.get("spy_trend"),
+                "spy_daily": market_data.get("spy_daily"),
+            },
+        }
+
+    async def run_position_review_call(
+        self,
+        portfolio: "PortfolioState",
+        indicators: dict,
+        market_data: dict,
+        daily_indicators: dict[str, dict] | None = None,
+    ) -> list[dict]:
+        """
+        Phase 22 split-call: compact position review using position_reviews.txt.
+
+        Returns a list of position_review dicts on success, or [] on any failure.
+        Never raises — the orchestrator continues to the opportunity call regardless.
+        """
+        if not portfolio.positions:
+            return []
+
+        verbose = getattr(self._claude_cfg, "review_call_verbose", False)
+        depth_instructions = (
+            self._REVIEW_VERBOSE_INSTRUCTIONS if verbose else self._REVIEW_COMPACT_INSTRUCTIONS
+        )
+        reasoning_schema = (
+            self._REVIEW_VERBOSE_SCHEMA if verbose else self._REVIEW_COMPACT_SCHEMA
+        )
+
+        try:
+            context = self.assemble_position_review_context(
+                portfolio, indicators, market_data, daily_indicators
+            )
+            context_json = json.dumps(context, default=str)
+            template = self._load_prompt("position_reviews.txt")
+            max_tokens = getattr(self._claude_cfg, "review_call_max_tokens", 2048)
+
+            log.info(
+                "Slow loop: Claude call [position review]  positions=%d  verbose=%s",
+                len(portfolio.positions), verbose,
+            )
+            raw_text = await self.call_claude(
+                template,
+                {
+                    "context_json": context_json,
+                    "reasoning_depth_instructions": depth_instructions,
+                    "updated_reasoning_schema": reasoning_schema,
+                },
+                max_tokens_override=max_tokens,
+            )
+            parsed = parse_claude_response(raw_text)
+            if parsed is None:
+                log.warning("Position review call: unparseable response — skipping reviews")
+                return []
+            reviews = parsed.get("position_reviews", [])
+            log.info(
+                "Position review call complete: %d reviews",
+                len(reviews),
+            )
+            return reviews
+        except Exception as exc:
+            log.warning("Position review call failed: %s — skipping reviews this cycle", exc)
+            return []
+
+    def assemble_reasoning_context(
+        self,
+        portfolio: PortfolioState,
+        watchlist: WatchlistState,
+        market_data: dict,
+        indicators: dict,
+        recommendation_outcomes: dict | None = None,
+        recent_executions: list | None = None,
+        execution_stats: dict | None = None,
+        session_suppressed: dict[str, str] | None = None,
+        claude_soft_rejections: dict[str, int] | None = None,
+        daily_indicators: dict[str, dict] | None = None,
+        selected_symbols: list[str] | None = None,
+        skip_position_daily_signals: bool = False,
+        skip_context_fields: frozenset | None = None,
+        max_symbols_override: int | None = None,
+    ) -> dict:
+        """
+        Build the structured input context sent to Claude each cycle.
+
+        Tier 1: current positions + top watchlist candidates (priority_tier=1),
+                up to tier1_max_symbols total. Full context for each symbol.
+        Tier 2: remaining watchlist — NOT sent to Claude, used locally for
+                technical scanning only.
+
+        If the assembled context exceeds the token target (~8,000 tokens),
+        Tier 1 watchlist entries are trimmed until it fits.
+
+        Args:
+            portfolio:   Current portfolio state.
+            watchlist:   Full watchlist; entries with priority_tier=1 are candidates.
+            market_data: Market context dict — passed through directly to Claude.
+                         Expected keys: spy_trend, vix, sector_rotation,
+                         macro_events_today, trading_session, pdt_trades_remaining.
+            indicators:  symbol → output dict from generate_signal_summary().
+                         May also include a flat signals dict directly.
+            recommendation_outcomes: Phase 15 — dict of symbol → outcome tracking
+                         info from the orchestrator's _recommendation_outcomes store.
+                         Assembled into a sorted list for Claude's context.
+            recent_executions: Phase 15 — pre-computed list of recent close records
+                         (from TradeJournal.load_recent). Passed in rather than awaited
+                         here to keep this method sync.
+            execution_stats: Phase 15 — pre-computed session stats dict
+                         (from TradeJournal.compute_session_stats). Same rationale.
+        """
+        max_tier1 = max_symbols_override or self._claude_cfg.tier1_max_symbols
+        now_utc = datetime.now(timezone.utc)
+
+        # --- Current positions (always Tier 1) ---
+        # When skip_position_daily_signals=True (split mode), positions appear as a
+        # compact summary only — full reviews happen in the separate Call A.
+        # Claude still needs to know which symbols are held to avoid re-proposing them.
+        position_entries: list[dict] = []
+        for pos in portfolio.positions:
+            sig_summary = indicators.get(pos.symbol, {})
+            signals = sig_summary.get("signals", sig_summary)
+            current_price = signals.get("price")
+            unrealized_pnl = (
+                round((current_price - pos.avg_cost) * pos.shares, 2)
+                if current_price is not None
+                else None
+            )
+
+            if skip_position_daily_signals:
+                # Compact summary for split mode — just enough for Claude to know what's held.
+                pos_entry: dict = {
+                    "symbol": pos.symbol,
+                    "direction": pos.intention.direction,
+                    "strategy": pos.intention.strategy,
+                    "unrealized_pnl": unrealized_pnl,
+                }
+            else:
+                entry_date_str = pos.intention.entry_date or pos.entry_date
+                try:
+                    entry_dt = datetime.fromisoformat(entry_date_str)
+                    hold_hours = round(
+                        (now_utc - entry_dt).total_seconds() / 3600, 1
+                    )
+                except Exception:
+                    hold_hours = None
+                pos_entry = {
+                    "symbol": pos.symbol,
+                    "shares": pos.shares,
+                    "avg_cost": pos.avg_cost,
+                    "current_price": current_price,
+                    "unrealized_pnl": unrealized_pnl,
+                    "hold_hours": hold_hours,
+                    "intention": {
+                        "catalyst": pos.intention.catalyst,
+                        "direction": pos.intention.direction,
+                        "strategy": pos.intention.strategy,
+                        "expected_move": pos.intention.expected_move,
+                        "reasoning": pos.intention.reasoning,
+                        "exit_targets": {
+                            "profit_target": pos.intention.exit_targets.profit_target,
+                            "stop_loss": pos.intention.exit_targets.stop_loss,
+                        },
+                        "max_expected_loss": pos.intention.max_expected_loss,
+                        "entry_date": entry_date_str,
+                        "review_notes": pos.intention.review_notes[-3:],
+                    },
+                }
+                # Swing positions get daily-bar signals so Claude evaluates thesis health
+                # on the appropriate timeframe. Momentum positions use intraday signals only.
+                if (
+                    pos.intention.strategy == "swing"
+                    and daily_indicators
+                    and daily_indicators.get(pos.symbol)
+                ):
+                    pos_entry["daily_signals"] = daily_indicators[pos.symbol]
             position_entries.append(pos_entry)
 
         # --- Tier 1 watchlist candidates (fill remaining budget) ---
@@ -633,6 +807,18 @@ class ClaudeReasoningEngine:
         }
         market_data_filtered = {**market_data, "watchlist_news": _filtered_news}
 
+        # Phase 22: drop fields excluded for reduced-context tiers (Tier 2 drops
+        # last_view and sector_dispersion to shrink input by ~30%).
+        if skip_context_fields:
+            market_data_filtered = {
+                k: v for k, v in market_data_filtered.items()
+                if k not in skip_context_fields
+            }
+            # Also drop per-entry last_view when that field is excluded.
+            if "last_view" in skip_context_fields:
+                for entry in watchlist_tier1:
+                    entry.pop("last_view", None)
+
         _suppressed = session_suppressed or {}
         context: dict[str, Any] = {
             "portfolio": {
@@ -742,6 +928,7 @@ class ClaudeReasoningEngine:
         prompt_template: str,
         context: dict,
         max_tokens_override: int | None = None,
+        model_override: str | None = None,
     ) -> str:
         """
         Fill the prompt template with context values and call the Anthropic API.
@@ -832,7 +1019,7 @@ class ClaudeReasoningEngine:
                             t0 = time.monotonic()
                             response = await asyncio.wait_for(
                                 self._client.messages.create(
-                                    model=self._claude_cfg.model,
+                                    model=model_override or self._claude_cfg.model,
                                     max_tokens=max_tokens,
                                     messages=[{"role": "user", "content": prompt}],
                                 ),
@@ -946,6 +1133,12 @@ class ClaudeReasoningEngine:
         all_indicators: dict | None = None,
         regime_assessment: dict | None = None,
         sector_regimes: dict | None = None,
+        skip_position_reviews: bool = False,
+        max_symbols_override: int | None = None,
+        max_tokens_override: int | None = None,
+        model_override: str | None = None,
+        skip_context_fields: frozenset | None = None,
+        use_emergency_prompt: bool = False,
     ) -> Optional[ReasoningResult]:
         """
         Full reasoning cycle: check cache → [Haiku pre-screen] → assemble context
@@ -987,9 +1180,34 @@ class ClaudeReasoningEngine:
         all_candidates = [
             e for e in watchlist.entries if e.symbol not in open_syms
         ]
-        max_symbols_out = self._claude_cfg.compressor_max_symbols_out
+        # Phase 22: in Tier 3 (Haiku is the reasoner), skip the compressor entirely.
+        # Instead, take top N by composite score directly from all_candidates.
+        effective_max = max_symbols_override or self._claude_cfg.tier1_max_symbols
+        if model_override is not None:
+            def _tier1_score_simple(entry) -> float:
+                ind = (all_indicators or indicators).get(entry.symbol, {})
+                raw = ind.get("signals") or {}
+                if raw:
+                    ed = getattr(entry, "expected_direction", "either")
+                    if ed != "either":
+                        return compute_composite_score(raw, direction=ed)
+                    return max(
+                        compute_composite_score(raw, direction="long"),
+                        compute_composite_score(raw, direction="short"),
+                    )
+                return ind.get("composite_technical_score", 0.0)
+            selected_symbols = [
+                e.symbol for e in sorted(all_candidates, key=_tier1_score_simple, reverse=True)
+                [:effective_max]
+            ]
+            log.info(
+                "Tier 3 (Haiku): bypassing compressor — top %d by composite score",
+                len(selected_symbols),
+            )
+        else:
+            max_symbols_out = self._claude_cfg.compressor_max_symbols_out
 
-        if self._compressor is not None and len(all_candidates) > max_symbols_out:
+        if model_override is None and self._compressor is not None and len(all_candidates) > max_symbols_out:
             try:
                 comp_result = await self._compressor.compress(
                     all_candidates=all_candidates,
@@ -1034,11 +1252,39 @@ class ClaudeReasoningEngine:
             claude_soft_rejections=claude_soft_rejections,
             daily_indicators=daily_indicators,
             selected_symbols=selected_symbols,
+            skip_position_daily_signals=skip_position_reviews,
+            skip_context_fields=skip_context_fields,
+            max_symbols_override=max_symbols_override,
         )
         context_json = json.dumps(context, default=str)
-        template = self._load_prompt("reasoning.txt")
 
-        raw_text = await self.call_claude(template, {"context_json": context_json})
+        # Phase 22: select prompt and build context variables based on mode.
+        if use_emergency_prompt:
+            template = self._load_prompt("emergency_reasoning.txt")
+            prompt_context: dict = {"context_json": context_json}
+        else:
+            template = self._load_prompt("reasoning.txt")
+            if skip_position_reviews:
+                position_review_notice = (
+                    "NOTE (SPLIT MODE): Position reviews are handled in a separate "
+                    "dedicated call. Do NOT produce a position_reviews array in your "
+                    "response. Open positions below are a compact summary only — use "
+                    "them to avoid re-proposing held symbols. Do not include any held "
+                    "symbol in new_opportunities or rejected_opportunities.\n"
+                )
+            else:
+                position_review_notice = ""
+            prompt_context = {
+                "context_json": context_json,
+                "position_review_notice": position_review_notice,
+            }
+
+        raw_text = await self.call_claude(
+            template,
+            prompt_context,
+            max_tokens_override=max_tokens_override,
+            model_override=model_override,
+        )
         parsed = parse_claude_response(raw_text)
 
         self._cache.save(
