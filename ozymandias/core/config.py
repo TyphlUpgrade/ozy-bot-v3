@@ -80,6 +80,7 @@ class SchedulerConfig:
     watchlist_refresh_interval_min: int = 120        # proactive watchlist rebuild interval (minutes); 0 disables watchlist_stale trigger
     watchlist_rebuild_on_restart: bool = False       # if True, always rebuild watchlist on startup regardless of when the last build ran; overrides the persisted build timestamp
     no_opportunity_streak_warn_threshold: int = 8    # log a gate-breakdown WARN when this many consecutive medium loops produce zero ranked candidates; helps diagnose whether the watchlist or a specific gate is the bottleneck
+    pre_market_warmup_min: int = 10                  # minutes before next market open to run a cache-warming Claude cycle; 0 disables; allows starting bot hours early with no penalty
 
 
 @dataclass
@@ -98,7 +99,7 @@ class AIFallbackConfig:
 @dataclass
 class ClaudeConfig:
     model: str = "claude-sonnet-4-20250514"    # Anthropic model ID for all reasoning calls
-    max_tokens_per_cycle: int = 4096           # token budget per reasoning call; thesis challenge uses 512 via override
+    max_tokens_per_cycle: int = 8192           # hard ceiling for reasoning output — set to model max so it never truncates well-formed responses
     prompt_version: str = "v3.5.0"            # versioned subdirectory under config/prompts/ loaded for all templates
     tier1_max_symbols: int = 12               # max tier-1 watchlist symbols passed to Claude with full indicator detail
     tier2_max_symbols: int = 28               # max tier-2 symbols passed as watchlist replenishment candidates
@@ -126,7 +127,10 @@ class ClaudeConfig:
     compressor_enabled: bool = True              # when True, Haiku pre-screens watchlist candidates before Sonnet context assembly
     compressor_model: str = "claude-haiku-4-5-20251001"  # Haiku model ID for pre-screening
     compressor_max_symbols_out: int = 18         # max symbols Haiku returns; should match tier1_max_symbols
-    compressor_max_tokens: int = 512             # Haiku output token budget; compressor output is a short JSON list
+    compressor_max_tokens: int = 512             # Haiku output token budget; compressor output is selected_symbols + notes + needs_sonnet flags
+    last_view_max_age_days: int = 7              # max age (days) of WatchlistEntry.last_view before it is excluded from context as stale
+    api_call_timeout_sec: float = 200.0          # asyncio.wait_for timeout for Claude API calls; 8192-token responses can take 150-180s
+    macro_news_max_items: int = 2                # headline cap for SPY/QQQ macro_news; explains *why* broad indicators are moving (geopolitical, Fed, etc.)
 
 
 @dataclass
@@ -155,6 +159,12 @@ class RankerConfig:
     # filter_adj_min_composite: absolute minimum composite score floor (applied in _medium_try_entry)
     filter_adj_min_rvol: float = 0.5
     filter_adj_min_composite: float = 0.35
+    # filter_adjustment_decay_cycles: after this many consecutive Claude cycles where
+    # filter_adjustments were elevated AND no candidates passed the ranker, the
+    # adjustments are discarded and thresholds revert to config defaults. Prevents
+    # Claude from self-reinforcing an overly aggressive floor (seeing its own blocks
+    # as market evidence and re-raising the floor each cycle).
+    filter_adjustment_decay_cycles: int = 2
 
     no_entry_symbols: list = field(default_factory=lambda: [
         # Broad-market and volatility ETFs used as market-context monitors only.

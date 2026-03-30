@@ -1190,3 +1190,82 @@ Read the relevant phase section before modifying or debugging any module built i
 
 **Tests** · 39 new tests, all passing (1147 total)
 - `test_phase21.py`: `TestMultiTierPruner` (5), `TestClearDirectionalSuppression` (7), `TestRegimeResetEvictionLogic` (6), `TestUniverseScannerRegimeAware` (4), `TestPositionThesisMonitoring` (7), `TestConditionMet` (10).
+
+---
+
+### 2026-03-28 — Prompt v3.10.1: ContextCompressor rationale removal
+
+**Bug fix** · `config/prompts/v3.10.1/compress.txt`
+- **Problem:** Haiku was truncating its response mid-JSON. The `rationale` dict (~25 tokens per symbol × 18 symbols) consumed ~450 of the 512-token budget before `notes`/`needs_sonnet` could be written, leaving an unclosed JSON object. All four parse stages in `_parse_response` failed, triggering the fallback sort every cycle.
+- **Fix:** Removed `rationale` from the compress.txt response schema. `_parse_response` never read it — only `selected_symbols`, `needs_sonnet`, and `sonnet_reason` are consumed. The field was dead output.
+- **Prompt version bumped:** `v3.10.0` → `v3.10.1`. All other prompt files (`reasoning.txt`, `review.txt`, `watchlist.txt`, `thesis_challenge.txt`) copied unchanged.
+- **Token budget:** `compressor_max_tokens` left at 512. Without rationale, actual output is ~120 tokens (18 symbols + notes + 2 bool fields), giving substantial headroom.
+- **Debug improvement added in same session:** `_parse_response` now logs `raw=<first 500 chars>` at WARNING level on parse failure, enabling root-cause diagnosis.
+
+---
+
+### 2026-03-28 — Cross-session trade memory (last_view) + max_tokens fix
+
+**`WatchlistEntry.last_view`** · *(new field)* · `core/state_manager.py`
+- New optional fields: `last_view: Optional[str]` and `last_view_date: Optional[str]`.
+- `last_view` is a single synthesised string: `"{considered_reason} | blocked: {rejection_reason}"` for rejected symbols, or `"Proposed {action} {strategy} — {reasoning[:80]}"` for proposed entries. Capped at 120 chars.
+- `last_view_date` is ISO date of last update. Views older than `last_view_max_age_days` (default 7) are excluded from context.
+- Deserialization: `_from_dict_watchlist_entry` reads both via `d.get(...)` — backward compatible with existing state files that lack these fields.
+- **Why:** Each session previously started cold — Claude re-derived its view of every symbol from raw TA alone. `last_view` carries the prior cycle's reasoning (the bullish thesis and the specific blocker) across restarts.
+
+**Orchestrator writeback** · *(new logic)* · `core/orchestrator.py`
+- After each successful reasoning cycle, iterates `result.rejected_opportunities` and `result.new_opportunities` and writes synthesised `last_view` + `last_view_date` to matching `WatchlistEntry` objects.
+- Persisted automatically via the existing `save_watchlist` call in `_apply_watchlist_changes`, which is always invoked at the end of every successful reasoning cycle.
+
+**Context assembly** · *(new behaviour)* · `intelligence/claude_reasoning.py`
+- `assemble_reasoning_context` includes `last_view` in each tier-1 symbol dict when present and `last_view_date >= cutoff` (now − `last_view_max_age_days` days).
+- ~30 tokens per symbol × 18 symbols = ~540 additional input tokens per cycle when all views are populated.
+
+**`max_tokens_per_cycle` raised to 8192** · `core/config.py`, `config/config.json`
+- Was 4096 — too small for 18 tier-1 symbols + Phase 19 fields. Caused `stop_reason=max_tokens` truncation every cycle, breaking JSON parse and producing 0 candidates.
+- Set to 8192 (Sonnet model maximum). Treated as a hard ceiling that should never be reached in normal operation, not an active budget. Rate limit protections (backoff, circuit breaker) handle availability failures — token limits handle a completely different failure mode and serve no value when set below the model max.
+
+**New config key:** `ClaudeConfig.last_view_max_age_days: int = 7`
+
+---
+
+### 2026-03-30 — Pre-market warmup + Claude retry trigger fix
+
+**`pre_market_warmup` trigger** · *(new)* · `core/orchestrator.py`, `core/market_hours.py`, `core/config.py`
+- New `get_next_market_open()` in `market_hours.py`: pure datetime arithmetic (no broker call) — walks forward from now to the next NYSE trading day at 09:30 ET, respecting weekends and `_NYSE_HOLIDAYS`.
+- New `_is_pre_market_warmup()` on orchestrator: True when within `pre_market_warmup_min` minutes of the next open and `bypass_market_hours=False`.
+- `pre_market_warmup` trigger fires once per session (guarded by `SlowLoopTriggerState.last_warmup_session_date`) when entering the warmup window.
+- Medium loop gate changed from `_is_market_open()` to `_is_market_open() or _is_pre_market_warmup()` — allows TA fetching and indicator seeding during the warmup window.
+- Steps 5 & 6 (entries and `_medium_evaluate_positions`) remain gated on `_is_market_open()` — no orders placed during warmup.
+- Slow loop gate similarly updated — Claude reasoning allowed during warmup window.
+- **Effect:** bot can be started hours before open. At `pre_market_warmup_min` before 9:30 (default 10 min), one Sonnet cycle fires and warms the cache. At open, fresh candidates are ready within seconds of the first medium loop tick.
+- New config key: `SchedulerConfig.pre_market_warmup_min: int = 10`
+
+**`claude_retry_pending` trigger** · *(new)* · `core/orchestrator.py`
+- `SlowLoopTriggerState.claude_retry_pending: bool` set by `_handle_claude_failure`.
+- `_check_triggers` fires `claude_retry` trigger immediately after backoff expires, bypassing `time_ceiling` and `no_previous_call`.
+- **Why:** when `last_claude_call_utc` is restored from a prior-session cache at startup, a Claude failure can leave the bot waiting up to 60 minutes for `time_ceiling` to fire — `no_previous_call` doesn't trigger because the timestamp is not None. Observed in session 2026-03-28T03:11 (8+ empty medium loops, no retry).
+- New field: `SlowLoopTriggerState.claude_retry_pending: bool = False`
+
+---
+
+### 2026-03-28 — Context pruning + configurable API timeout
+
+**Removed `news_themes`** · `core/orchestrator.py` `_build_market_context`
+- Removed the Phase 19 `news_theme_synthesis` block that aggregated `WatchlistEntry.reason` strings by sector ETF.
+- **Why:** `news_themes` was derived from the same `reason` field already visible to Sonnet via `watchlist_tier1[].reason`. Pure duplication adding ~200–400 input tokens with no additional information.
+
+**Filter `watchlist_news` to evaluated symbols only** · `intelligence/claude_reasoning.py` `assemble_reasoning_context`
+- `_build_market_context` fetches news for all tier-1 symbols (up to 35) before Haiku runs. After Haiku selects 18, news for the excluded ~17 symbols was still sent to Sonnet.
+- News is now filtered in `assemble_reasoning_context` to symbols in `watchlist_tier1` (the Haiku-selected set) plus open positions. Excluded symbols' news cannot inform reasoning about entries that won't be considered.
+- Saves ~1,000–2,000 input tokens per cycle.
+
+**Removed 7 unused `ta_readiness` fields** · `intelligence/claude_reasoning.py` `assemble_reasoning_context`
+- Excluded from `ta_readiness` per symbol: `rsi_divergence`, `roc_deceleration`, `roc_negative_deceleration`, `bollinger_position`, `bb_squeeze`, `avg_daily_volume`, `vol_regime_ratio`.
+- None of these have corresponding `entry_conditions` schema keys in `reasoning.txt`. Sonnet cannot use them as structured gates. Saves ~500–800 input tokens per cycle.
+
+**Configurable API call timeout** · `intelligence/claude_reasoning.py`, `core/config.py`, `config/config.json`
+- Timeout was hardcoded at 120s in three places (`call_claude`, tools call, Gemini fallback).
+- Root cause of 120s timeouts: Sonnet generating 6,000–7,000 output tokens can take 150–180s. Timeout fired before response completed, producing 0 candidates — identical failure mode to truncation.
+- New config key: `ClaudeConfig.api_call_timeout_sec: float = 200.0`. All three `asyncio.wait_for` calls now use this value.
+- Token usage logging promoted from DEBUG to INFO in the primary call path.

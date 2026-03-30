@@ -20,7 +20,7 @@ import math
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -42,6 +42,14 @@ _CHARS_PER_TOKEN = 4
 # both measured in chars/4 units. 25,000 keeps full-prompt cost well under $0.10/call
 # while accommodating 30+ watchlist symbols without trimming.
 _TOTAL_TOKEN_BUDGET = 25_000
+
+# ta_readiness fields excluded from per-symbol context sent to Sonnet.
+# These have no corresponding entry_conditions schema keys in reasoning.txt and add
+# token overhead without enabling structured gates. To re-enable a field, remove it here.
+_TA_EXCLUDED = frozenset({
+    "rsi_divergence", "roc_deceleration", "roc_negative_deceleration",
+    "bollinger_position", "bb_squeeze", "avg_daily_volume", "vol_regime_ratio",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -511,18 +519,40 @@ class ClaudeReasoningEngine:
                     if raw_signals
                     else float(sig_summary.get("composite_technical_score") or 0.0)
                 )
-            # ta_readiness: pass through all live signals + direction-adjusted composite_score
-            ta_readiness: dict = dict(raw_signals) if raw_signals else {}
-            ta_readiness["composite_score"] = round(direction_score, 4)
+            # ta_readiness: pass through live signals + direction-adjusted composite_score.
+            # Excluded fields defined at module level in _TA_EXCLUDED.
+            # Token optimisations applied here (not in technical_analysis.py, which
+            # must retain full precision for the ranker and strategy gates):
+            #   - Strip False booleans (e.g. macd_histogram_expanding=False carries no
+            #     information; the prompt already says false should be omitted).
+            #   - Strip integer zeros (e.g. volume_trend_bars=0 = no signal).
+            #   - Round floats to 2 decimal places (Claude doesn't reason at 4-decimal
+            #     precision; saves ~1 token per numeric field × 13 fields × 18 symbols).
+            ta_readiness: dict = {
+                k: (round(v, 2) if isinstance(v, float) else v)
+                for k, v in raw_signals.items()
+                if k not in _TA_EXCLUDED
+                and v is not False
+                and not (isinstance(v, int) and not isinstance(v, bool) and v == 0)
+            } if raw_signals else {}
+            ta_readiness["composite_score"] = round(direction_score, 2)
 
-            watchlist_tier1.append({
+            entry_dict: dict = {
                 "symbol": sym,
                 "latest_price": raw_signals.get("price") if raw_signals else sig_summary.get("price"),
                 "ta_readiness": ta_readiness,
                 "strategy": entry.strategy,
                 "reason": entry.reason,
                 "expected_direction": ed,
-            })
+            }
+            # Include last_view when present and fresher than last_view_max_age_days.
+            # Gives Claude cross-session memory of its previous assessment without
+            # re-deriving context from raw TA alone.
+            _max_age = getattr(self._claude_cfg, "last_view_max_age_days", 7)
+            _cutoff = (datetime.now(timezone.utc) - timedelta(days=_max_age)).date().isoformat()
+            if entry.last_view and entry.last_view_date and entry.last_view_date >= _cutoff:
+                entry_dict["last_view"] = entry.last_view
+            watchlist_tier1.append(entry_dict)
 
         # --- Phase 15: recommendation_outcomes context list ---
         max_age_min = self._claude_cfg.recommendation_outcome_max_age_min
@@ -591,6 +621,18 @@ class ClaudeReasoningEngine:
             }
             recent_executions_context.append(exec_entry)
 
+        # Filter watchlist_news to only symbols being evaluated this cycle.
+        # market_data contains news for all tier-1 symbols (fetched before Haiku screening);
+        # symbols Haiku excluded won't be reasoned about, so their news is wasted tokens.
+        _evaluated_symbols = {e["symbol"] for e in watchlist_tier1}
+        _evaluated_symbols.update(pos.symbol for pos in portfolio.positions)
+        _filtered_news = {
+            sym: items
+            for sym, items in (market_data.get("watchlist_news") or {}).items()
+            if sym in _evaluated_symbols
+        }
+        market_data_filtered = {**market_data, "watchlist_news": _filtered_news}
+
         _suppressed = session_suppressed or {}
         context: dict[str, Any] = {
             "portfolio": {
@@ -599,7 +641,7 @@ class ClaudeReasoningEngine:
                 "positions": position_entries,
             },
             "watchlist_tier1": watchlist_tier1,
-            "market_context": market_data,
+            "market_context": market_data_filtered,
             "recommendation_outcomes": outcomes_list,
             "recent_executions": recent_executions_context,
             "execution_stats": execution_stats or {},
@@ -683,12 +725,13 @@ class ClaudeReasoningEngine:
             "Using Gemini %s as fallback provider (Claude unavailable)",
             fb.fallback_model,
         )
+        _timeout = getattr(self._claude_cfg, "api_call_timeout_sec", 200.0)
         response = await asyncio.wait_for(
             self._fallback_client.generate_content_async(
                 prompt,
                 generation_config={"max_output_tokens": max_tokens},
             ),
-            timeout=120.0,
+            timeout=_timeout,
         )
         text = response.text or ""
         log.info("Gemini fallback call succeeded (%d chars)", len(text))
@@ -783,6 +826,7 @@ class ClaudeReasoningEngine:
                     overload_attempt = 0
                     server_attempt = 0
 
+                    _timeout = getattr(self._claude_cfg, "api_call_timeout_sec", 200.0)
                     while True:
                         try:
                             t0 = time.monotonic()
@@ -792,7 +836,7 @@ class ClaudeReasoningEngine:
                                     max_tokens=max_tokens,
                                     messages=[{"role": "user", "content": prompt}],
                                 ),
-                                timeout=120.0,
+                                timeout=_timeout,
                             )
                             elapsed = time.monotonic() - t0
                             if elapsed > 60:
@@ -808,7 +852,7 @@ class ClaudeReasoningEngine:
 
                             self._last_input_tokens = response.usage.input_tokens
                             self._last_output_tokens = response.usage.output_tokens
-                            log.debug(
+                            log.info(
                                 "Token usage: %d input, %d output",
                                 self._last_input_tokens, self._last_output_tokens,
                             )
@@ -824,7 +868,7 @@ class ClaudeReasoningEngine:
                             return response.content[0].text
 
                         except asyncio.TimeoutError:
-                            log.error("Claude API call timed out after 120s (attempt %d)", overload_attempt + server_attempt + 1)
+                            log.error("Claude API call timed out after %.0fs (attempt %d)", _timeout, overload_attempt + server_attempt + 1)
                             raise
 
                         except anthropic.RateLimitError as exc:
@@ -991,7 +1035,7 @@ class ClaudeReasoningEngine:
             daily_indicators=daily_indicators,
             selected_symbols=selected_symbols,
         )
-        context_json = json.dumps(context, default=str, indent=2)
+        context_json = json.dumps(context, default=str)
         template = self._load_prompt("reasoning.txt")
 
         raw_text = await self.call_claude(template, {"context_json": context_json})
@@ -1173,6 +1217,7 @@ class ClaudeReasoningEngine:
 
                 overload_attempt = 0
                 server_attempt = 0
+                _timeout = getattr(self._claude_cfg, "api_call_timeout_sec", 200.0)
                 kwargs: dict = {"model": self._claude_cfg.model, "max_tokens": max_tokens, "messages": messages}
                 if tools is not None:
                     kwargs["tools"] = tools
@@ -1184,7 +1229,7 @@ class ClaudeReasoningEngine:
                         t0 = time.monotonic()
                         response = await asyncio.wait_for(
                             self._client.messages.create(**kwargs),
-                            timeout=120.0,
+                            timeout=_timeout,
                         )
                         elapsed = time.monotonic() - t0
                         if elapsed > 60:
@@ -1197,7 +1242,7 @@ class ClaudeReasoningEngine:
                         return response
 
                     except asyncio.TimeoutError:
-                        log.error("Claude API call (tools) timed out after 120s")
+                        log.error("Claude API call (tools) timed out after %.0fs", _timeout)
                         raise
 
                     except anthropic.RateLimitError as exc:

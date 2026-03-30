@@ -99,6 +99,12 @@ class WatchlistEntry:
     # "long" | "short" | "either" (default — no directional bias)
     # Never passed directly to compute_composite_score; callers map "either" → "long".
     expected_direction: str = "either"
+    # Cross-session trade memory: Claude's most recent assessment of this symbol,
+    # synthesised from considered_reason + rejection_reason (rejected symbols) or
+    # proposal reasoning (new_opportunities). Updated each successful reasoning cycle.
+    # Included in tier-1 context when fresher than last_view_max_age_days config value.
+    last_view: Optional[str] = None       # "{considered_reason} | blocked: {rejection_reason}" or "Proposed {action} {strategy} — {reasoning}"
+    last_view_date: Optional[str] = None  # ISO date string (YYYY-MM-DD) of last update
 
 
 @dataclass
@@ -207,6 +213,8 @@ def _from_dict_watchlist_entry(d: dict) -> WatchlistEntry:
         strategy=d.get("strategy", "both"),
         removal_candidate=d.get("removal_candidate", False),
         expected_direction=raw_ed,
+        last_view=d.get("last_view"),
+        last_view_date=d.get("last_view_date"),
     )
 
 

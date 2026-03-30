@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -25,7 +26,7 @@ from zoneinfo import ZoneInfo
 from ozymandias.core.config import Config, load_config
 from ozymandias.core.direction import EXIT_SIDE, direction_from_action, is_short
 from ozymandias.core.logger import setup_logging
-from ozymandias.core.market_hours import Session, get_current_session, is_last_five_minutes, is_market_open
+from ozymandias.core.market_hours import Session, get_current_session, get_next_market_open, is_last_five_minutes, is_market_open
 from ozymandias.core.reasoning_cache import ReasoningCache
 from ozymandias.core.state_manager import (
     OrderRecord,
@@ -244,12 +245,22 @@ class SlowLoopTriggerState:
     # None at startup → elapsed = ∞ → watchlist_stale fires on the first slow loop tick.
     # Reset after every successful build (both watchlist_small and watchlist_stale paths).
     last_watchlist_build_utc: Optional[datetime] = None
-    # Set by the medium loop when every symbol from the current reasoning cache has been
-    # suppressed by the hard-filter. Cleared by _check_triggers after firing once per
-    # cache generation (guarded by last_exhaustion_trigger_utc < last_claude_call_utc).
-    # To add another exhaustion-style trigger: follow this same flag+timestamp pattern.
+    # Set by the medium loop when every symbol from the current reasoning cache is either
+    # hard-filter suppressed OR already held as an open position. Cleared by _check_triggers
+    # after firing once per cache generation (guarded by last_exhaustion_trigger_utc <
+    # last_claude_call_utc). To add another exhaustion-style trigger: follow this pattern.
     candidates_exhausted: bool = False
     last_exhaustion_trigger_utc: Optional[datetime] = None
+    # Set by _handle_claude_failure so that _check_triggers fires a dedicated retry trigger
+    # once the backoff window expires. Without this, a failure when last_claude_call_utc is
+    # set from a restored cache can leave the bot waiting up to slow_loop_max_interval_sec
+    # (60 min) before any trigger fires — because no_previous_call won't fire (the cached
+    # timestamp is not None) and time_ceiling won't fire until 60 min after the cached call.
+    claude_retry_pending: bool = False
+    # ISO date string (YYYY-MM-DD) of the market open for which a pre_market_warmup trigger
+    # has already fired this cycle. Prevents re-firing every slow-loop tick once inside the
+    # warmup window. Cleared implicitly when date advances to the next trading day.
+    last_warmup_session_date: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +368,13 @@ class Orchestrator:
         # repopulation doesn't — thresholds fall back to config defaults until next
         # successful cycle. This is the correct safe behavior.
         self._filter_adjustments: dict | None = None
+
+        # Filter-adjustment decay: if Claude keeps elevating filter thresholds but
+        # no candidates pass for N consecutive Claude cycles, the adjustments are
+        # self-reinforcing (Claude sees its own blocks as market evidence). Reset
+        # to config defaults after filter_adjustment_decay_cycles consecutive empty cycles.
+        self._prev_filter_adjustments: dict | None = None  # saved before each cycle reset
+        self._consecutive_filter_empty_cycles: int = 0     # consecutive elevated+empty cycles
 
         # Phase 19: last regime assessment from Sonnet, for regime_condition trigger.
         # Updated after each successful reasoning cycle. Also consumed by Phase 21
@@ -659,6 +677,7 @@ class Orchestrator:
             len(watchlist.entries),
             tier1_count,
         )
+        log.info("Just me and the world.")
 
     # -----------------------------------------------------------------------
     # Startup reconciliation
@@ -838,9 +857,13 @@ class Orchestrator:
                         )
                     if _cached_result.sector_regimes:
                         self._last_sector_regimes = _cached_result.sector_regimes
-                        log.debug(
-                            "Step 4c — sector_regimes restored from cache (%d sectors)",
+                        log.info(
+                            "Step 4c — sector_regimes restored from cache (%d sectors): %s",
                             len(self._last_sector_regimes),
+                            "  ".join(
+                                f"{etf}={v.get('regime', '?')}/{v.get('bias', '?')}/{v.get('strength', '?')}"
+                                for etf, v in self._last_sector_regimes.items()
+                            ),
                         )
             except Exception as _exc:
                 log.debug("Step 4c — could not restore regime from cache: %s", _exc)
@@ -2023,8 +2046,8 @@ class Orchestrator:
         5. Execute top opportunity (one per cycle) if risk-validated.
         6. Re-evaluate open positions; exit if strategy recommends it.
         """
-        if not self._is_market_open():
-            return  # no data fetches or analysis outside regular hours
+        if not (self._is_market_open() or self._is_pre_market_warmup()):
+            return  # no data fetches or analysis outside regular hours or warmup window
 
         if self._degradation.market_data_available is False:
             log.warning("Medium loop: market data unavailable — skipping cycle")
@@ -2263,6 +2286,11 @@ class Orchestrator:
             # on stale recommendations while a position is held — not useful noise).
             if "already open in portfolio" in reason:
                 continue
+            # Skip time-gate rejections — "market not in regular hours" is transient
+            # and will resolve at open. Counting these toward session suppression would
+            # blacklist pre-market Claude candidates before they ever get evaluated.
+            if "market not in regular hours" in reason:
+                continue
             existing = self._recommendation_outcomes.get(symbol, {})
             new_count = existing.get("rejection_count", 0) + 1
             self._recommendation_outcomes[symbol] = {
@@ -2305,8 +2333,9 @@ class Orchestrator:
         )
 
         # -- Candidates exhaustion detection ----------------------------------
-        # When every symbol Claude recommended this cache generation has been
-        # suppressed, no recovery is possible without a fresh reasoning call.
+        # When every symbol Claude recommended this cache generation is either
+        # hard-filter suppressed OR already held as an open position, no new
+        # entry is possible without a fresh reasoning call.
         # Set a flag so _check_triggers fires "candidates_exhausted" immediately.
         # Guard: only set once per cache generation (cleared after trigger fires).
         cache_opps = {
@@ -2314,17 +2343,22 @@ class Orchestrator:
             for o in reasoning_result.new_opportunities
             if o.get("symbol")
         }
+        open_symbols = {p.symbol for p in portfolio.positions}
+        _unavailable = self._filter_suppressed.keys() | open_symbols
         if (
             cache_opps
-            and cache_opps.issubset(self._filter_suppressed)
+            and cache_opps.issubset(_unavailable)
             and not self._trigger_state.candidates_exhausted
         ):
             self._trigger_state.candidates_exhausted = True
+            suppressed = cache_opps & self._filter_suppressed.keys()
+            already_open = cache_opps & open_symbols
             log.info(
-                "Candidates exhausted — all %d Claude candidate(s) suppressed %s; "
-                "flagging for immediate re-reasoning",
+                "Candidates exhausted — all %d Claude candidate(s) unavailable "
+                "(suppressed=%s open=%s); flagging for immediate re-reasoning",
                 len(cache_opps),
-                sorted(cache_opps),
+                sorted(suppressed),
+                sorted(already_open),
             )
 
         # -- No-opportunity streak tracking (Finding 4 / Proposal B) ----------------
@@ -2364,15 +2398,19 @@ class Orchestrator:
                 )
             self._no_opportunity_streak = 0
 
-        # -- Step 5: try ranked opportunities in order (one entry per cycle) --------
-        if not self._degradation.safe_mode and ranked:
-            for candidate in ranked[:self._config.scheduler.entry_attempts_per_cycle]:
-                entered = await self._medium_try_entry(candidate, acct, portfolio, orders_state.orders)
-                if entered:
-                    break  # one entry per cycle; stop after first successful placement
+        # -- Steps 5 & 6: entries and position management (market hours only) --------
+        # During pre_market_warmup the medium loop runs TA and seeds the slow loop
+        # trigger, but never places orders or exits positions — market is still closed.
+        if self._is_market_open():
+            # -- Step 5: try ranked opportunities in order (one entry per cycle) --------
+            if not self._degradation.safe_mode and ranked:
+                for candidate in ranked[:self._config.scheduler.entry_attempts_per_cycle]:
+                    entered = await self._medium_try_entry(candidate, acct, portfolio, orders_state.orders)
+                    if entered:
+                        break  # one entry per cycle; stop after first successful placement
 
-        # -- Step 6: re-evaluate open positions ------------------------------
-        await self._medium_evaluate_positions(portfolio, bars, indicators, acct, orders_state.orders)
+            # -- Step 6: re-evaluate open positions ------------------------------
+            await self._medium_evaluate_positions(portfolio, bars, indicators, acct, orders_state.orders)
 
         # -- Phase 21: position thesis breach monitoring ---------------------
         # Haiku checks active_theses[symbol].thesis_breaking_conditions against live
@@ -3045,8 +3083,8 @@ class Orchestrator:
         starts a Claude reasoning cycle. The cycle is async — fast and medium
         loops continue uninterrupted while waiting for Claude's response.
         """
-        if not self._is_market_open():
-            return  # no Claude calls outside regular hours
+        if not (self._is_market_open() or self._is_pre_market_warmup()):
+            return  # no Claude calls outside regular hours or warmup window
 
         # Guard: don't call Claude until the medium loop has computed indicators at
         # least once. Without TA data the context is empty and Claude rejects everything.
@@ -3109,6 +3147,27 @@ class Orchestrator:
         triggers: list[str] = []
         now = now or datetime.now(timezone.utc)
         ts = self._trigger_state
+
+        # 0a. Retry after failure: _handle_claude_failure sets this flag so the next
+        # slow-loop tick after backoff expiry fires immediately, regardless of whether
+        # last_claude_call_utc (which may be a restored cache timestamp) would otherwise
+        # keep time_ceiling dormant for up to slow_loop_max_interval_sec minutes.
+        if ts.claude_retry_pending:
+            ts.claude_retry_pending = False
+            triggers.append("claude_retry")
+            log.debug("Trigger: claude_retry FIRED (backoff expired after API failure)")
+
+        # 0b. Pre-market warmup: fires once per upcoming market session when the bot
+        # enters the pre_market_warmup_min window before open. Warms the reasoning
+        # cache so fresh Claude candidates are available the moment market opens —
+        # identical effect to a manual 9:25 start regardless of actual bot start time.
+        if self._is_pre_market_warmup():
+            _next_open_date = get_next_market_open().date().isoformat()
+            if ts.last_warmup_session_date != _next_open_date:
+                ts.last_warmup_session_date = _next_open_date
+                triggers.append("pre_market_warmup")
+                _delta = (get_next_market_open().astimezone(timezone.utc) - now).total_seconds() / 60
+                log.info("Trigger: pre_market_warmup FIRED (%.1f min before open)", _delta)
 
         # 1. Time ceiling: 60+ minutes since last Claude call
         if ts.last_claude_call_utc is None:
@@ -3581,23 +3640,37 @@ class Orchestrator:
             })
         sector_performance.sort(key=lambda x: x["composite_score"], reverse=True)
 
-        # Fetch news for tier-1 watchlist symbols concurrently (best-effort).
+        # Fetch news for tier-1 watchlist symbols + macro instruments (SPY, QQQ) concurrently.
+        # Macro news gives Sonnet narrative context for *why* broad market indicators are moving
+        # (tariff shocks, Fed surprises, geopolitical events) — the per-symbol feed won't carry this.
         watchlist = await self._state_manager.load_watchlist()
         tier1 = [e.symbol for e in watchlist.entries if e.priority_tier == 1]
         max_items = self._config.claude.news_max_items_per_symbol
         max_age = self._config.claude.news_max_age_hours
-        news_results = await asyncio.gather(
+        macro_news_items = self._config.claude.macro_news_max_items  # tighter cap for broad-market symbols
+        _MACRO_NEWS_SYMBOLS = ["SPY", "QQQ"]
+        all_fetch_syms = tier1 + _MACRO_NEWS_SYMBOLS
+        all_news_results = await asyncio.gather(
             *[
-                self._data_adapter.fetch_news(s, max_items=max_items, max_age_hours=max_age)
-                for s in tier1
+                self._data_adapter.fetch_news(
+                    s,
+                    max_items=(macro_news_items if s in _MACRO_NEWS_SYMBOLS else max_items),
+                    max_age_hours=max_age,
+                )
+                for s in all_fetch_syms
             ],
             return_exceptions=True,
         )
         watchlist_news: dict[str, list] = {}
-        for sym, result in zip(tier1, news_results):
+        macro_news: dict[str, list] = {}
+        for sym, result in zip(all_fetch_syms, all_news_results):
             if isinstance(result, Exception):
                 continue
-            if result:
+            if not result:
+                continue
+            if sym in _MACRO_NEWS_SYMBOLS:
+                macro_news[sym] = result
+            else:
                 watchlist_news[sym] = result
 
         market_ctx: dict = {
@@ -3606,6 +3679,7 @@ class Orchestrator:
             "qqq_trend":         _classify_trend("QQQ"),
             "market_breadth":    market_breadth,
             "sector_performance": sector_performance,
+            "macro_news":        macro_news,
             "watchlist_news":    watchlist_news,
             "trading_session":   get_current_session().value,
             "pdt_trades_remaining": max(0, pdt_remaining),
@@ -3657,22 +3731,6 @@ class Orchestrator:
             market_ctx["recent_rejections"] = sorted(
                 _rejections, key=lambda x: x["cycles_rejected"], reverse=True
             )[:10]
-
-        # Phase 19: news_theme_synthesis — aggregate watchlist entry reasons by sector
-        # Pure string aggregation from WatchlistEntry.reason; no new Claude calls.
-        _news_themes: dict[str, str] = {}
-        for _wl_entry in watchlist.entries:
-            _etf = _SECTOR_MAP.get(_wl_entry.symbol)
-            if not _etf or not _wl_entry.reason:
-                continue
-            _snippet = _wl_entry.reason[:80].replace("\n", " ")
-            existing = _news_themes.get(_etf, "")
-            if not existing:
-                _news_themes[_etf] = _snippet
-            elif len(existing) < 160:
-                _news_themes[_etf] = existing + " | " + _snippet
-        if _news_themes:
-            market_ctx["news_themes"] = _news_themes
 
         return market_ctx
 
@@ -3895,6 +3953,13 @@ class Orchestrator:
 
         # Phase 19: reset filter_adjustments before the call so stale adjustments
         # never persist if this call fails. Repopulated from result after success.
+        # Decay tracking: if filter_adjustments were elevated AND no candidates passed
+        # since the last cycle, this is another empty cycle attributable to the filter.
+        if self._filter_adjustments and self._no_opportunity_streak > 0:
+            self._consecutive_filter_empty_cycles += 1
+        else:
+            self._consecutive_filter_empty_cycles = 0
+        self._prev_filter_adjustments = self._filter_adjustments
         self._filter_adjustments = None
 
         try:
@@ -3931,15 +3996,30 @@ class Orchestrator:
         self._trigger_state.last_claude_call_utc = datetime.now(timezone.utc)
         self._trigger_state.last_override_exit_count = self._override_exit_count
 
-        # Phase 19: store strategic output fields from this cycle
+        # Phase 19: store strategic output fields from this cycle.
+        # Decay rule: if filter_adjustments have been elevated for N consecutive
+        # Claude cycles with zero ranker-passing candidates, Claude is reading its
+        # own blocks as market evidence. Reset to config defaults to break the loop.
         if result.filter_adjustments:
-            self._filter_adjustments = result.filter_adjustments
-            log.info(
-                "Phase 19: filter_adjustments applied — min_rvol=%s min_composite=%s reason=%s",
-                result.filter_adjustments.get("min_rvol"),
-                result.filter_adjustments.get("min_composite_score"),
-                result.filter_adjustments.get("reason", ""),
-            )
+            decay_threshold = self._config.ranker.filter_adjustment_decay_cycles
+            if self._consecutive_filter_empty_cycles >= decay_threshold:
+                log.warning(
+                    "filter_adjustments decayed after %d consecutive empty Claude cycle(s) — "
+                    "ignoring proposed min_rvol=%s min_composite=%s and reverting to config defaults",
+                    self._consecutive_filter_empty_cycles,
+                    result.filter_adjustments.get("min_rvol"),
+                    result.filter_adjustments.get("min_composite_score"),
+                )
+                self._consecutive_filter_empty_cycles = 0
+                # _filter_adjustments stays None → ranker uses config defaults
+            else:
+                self._filter_adjustments = result.filter_adjustments
+                log.info(
+                    "Phase 19: filter_adjustments applied — min_rvol=%s min_composite=%s reason=%s",
+                    result.filter_adjustments.get("min_rvol"),
+                    result.filter_adjustments.get("min_composite_score"),
+                    result.filter_adjustments.get("reason", ""),
+                )
         if result.regime_assessment:
             self._last_regime_assessment = result.regime_assessment
             log.info(
@@ -3953,7 +4033,14 @@ class Orchestrator:
 
         if result.sector_regimes:
             self._last_sector_regimes = result.sector_regimes
-            log.debug("Phase 20: sector_regimes updated (%d sectors)", len(result.sector_regimes))
+            log.info(
+                "Sector regimes (%d): %s",
+                len(result.sector_regimes),
+                "  ".join(
+                    f"{etf}={v.get('regime', '?')}/{v.get('bias', '?')}/{v.get('strength', '?')}"
+                    for etf, v in result.sector_regimes.items()
+                ),
+            )
 
         # Detect regime changes and fire regime-reset watchlist build when needed.
         # Regime change = broad regime name change OR any sector's regime string changes.
@@ -3969,8 +4056,13 @@ class Orchestrator:
         changed_sectors: set[str] = set()
         if result.sector_regimes and _prev_sector_regimes:
             for etf, info in result.sector_regimes.items():
-                prev = _prev_sector_regimes.get(etf, {}).get("regime", "neutral")
-                if info.get("regime") != prev:
+                # Compare direction (long/short/neutral), not the regime label.
+                # Label changes within the same direction (e.g. uptrend → breaking_out,
+                # both long) are not actionable — only a direction flip warrants evicting
+                # and rebuilding watchlist entries for that sector.
+                prev_direction = _prev_sector_regimes.get(etf, {}).get("direction", "neutral")
+                new_direction = info.get("direction", "neutral")
+                if new_direction != prev_direction:
                     sector_regime_changed = True
                     changed_sectors.add(etf)
 
@@ -4039,6 +4131,44 @@ class Orchestrator:
                 self._claude_soft_rejections[sym] = self._claude_soft_rejections.get(sym, 0) + 1
             else:
                 self._claude_soft_rejections.pop(sym, None)
+
+        # Write back Claude's current view of each symbol to WatchlistEntry.last_view.
+        # Provides cross-session trade memory: next session Claude sees why it previously
+        # considered or rejected each symbol instead of re-deriving from raw TA alone.
+        # Persisted via the save_watchlist call in _apply_watchlist_changes below.
+        _today = datetime.now(timezone.utc).date().isoformat()
+        _rej_by_sym = {
+            r["symbol"]: r
+            for r in (result.rejected_opportunities or [])
+            if r.get("symbol")
+        }
+        _opp_by_sym = {
+            o["symbol"]: o
+            for o in (result.new_opportunities or [])
+            if o.get("symbol")
+        }
+        for entry in watchlist.entries:
+            sym = entry.symbol
+            if sym in _rej_by_sym:
+                r = _rej_by_sym[sym]
+                considered = (r.get("considered_reason") or "").strip()
+                rejection = (r.get("rejection_reason") or "").strip()
+                if considered and rejection:
+                    view = f"{considered} | blocked: {rejection}"
+                elif rejection:
+                    view = f"blocked: {rejection}"
+                else:
+                    view = considered
+                entry.last_view = view[:120] if view else None
+                entry.last_view_date = _today
+            elif sym in _opp_by_sym:
+                o = _opp_by_sym[sym]
+                action = o.get("action", "")
+                strategy = o.get("strategy", "")
+                reasoning = (o.get("reasoning") or "")[:80]
+                entry.last_view = f"Proposed {action} {strategy} — {reasoning}"[:120]
+                entry.last_view_date = _today
+
         # Phase 17 (Fix 2): snapshot prices anchored to this call for macro/sector move triggers.
         for sym, ind in self._all_indicators.items():
             price = ind.get("price") or ind.get("signals", {}).get("price")
@@ -4317,6 +4447,7 @@ class Orchestrator:
 
         backoff_sec = min(30 * (2 ** (self._claude_failure_count - 1)), 600)
         self._degradation.claude_backoff_until_utc = now + timedelta(seconds=backoff_sec)
+        self._trigger_state.claude_retry_pending = True  # ensures retry fires after backoff, regardless of time_ceiling state
         log.error(
             "Claude API failure (attempt %d): %s — quantitative-only mode, "
             "retry in %ds",
@@ -4691,6 +4822,23 @@ class Orchestrator:
         if self._config.scheduler.bypass_market_hours:
             return True
         return is_market_open()
+
+    def _is_pre_market_warmup(self) -> bool:
+        """
+        True during the pre_market_warmup_min window before the next market open.
+
+        Used to allow TA fetching and Claude reasoning before market opens so the
+        cache is warm at 9:30 — identical to a manual 9:25 start regardless of
+        when the bot was actually launched. Orders are never placed in this window
+        because the medium loop gates entries on _is_market_open(), not this method.
+        """
+        warmup_min = self._config.scheduler.pre_market_warmup_min
+        if warmup_min <= 0 or self._config.scheduler.bypass_market_hours:
+            return False
+        now_utc = datetime.now(timezone.utc)
+        next_open_utc = get_next_market_open().astimezone(timezone.utc)
+        delta_min = (next_open_utc - now_utc).total_seconds() / 60
+        return 0 < delta_min <= warmup_min
 
     def _mark_broker_available(self) -> None:
         if not self._degradation.broker_available:

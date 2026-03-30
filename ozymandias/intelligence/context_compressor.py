@@ -441,7 +441,10 @@ class ContextCompressor:
                     pass
 
         if not isinstance(parsed, dict):
-            log.warning("ContextCompressor: unparseable response — using fallback sort")
+            log.warning(
+                "ContextCompressor: unparseable response — using fallback sort | raw=%s",
+                raw_text[:500],
+            )
             return self._fallback_sort(all_candidates, indicators, max_symbols_out)
 
         selected_raw = parsed.get("selected_symbols", [])

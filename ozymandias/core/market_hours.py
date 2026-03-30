@@ -131,3 +131,25 @@ def is_trading_allowed(now: datetime | None = None) -> bool:
     """
     session = get_current_session(now)
     return session != Session.CLOSED
+
+
+def get_next_market_open(now: datetime | None = None) -> datetime:
+    """
+    Return the next NYSE regular market open as a timezone-aware ET datetime.
+
+    If the current time is before 09:30 ET on a trading day, returns today's open.
+    Otherwise advances day-by-day until a non-weekend, non-holiday date is found.
+    """
+    from datetime import timedelta
+    et = _now_et(now)
+    d = et.date()
+
+    # Today's open is still upcoming if it's a trading day and before 09:30
+    if d.weekday() < 5 and d not in _NYSE_HOLIDAYS and et.time() < _REGULAR_OPEN:
+        return datetime.combine(d, _REGULAR_OPEN).replace(tzinfo=ET)
+
+    # Advance to the next trading day
+    d = d + timedelta(days=1)
+    while d.weekday() >= 5 or d in _NYSE_HOLIDAYS:
+        d = d + timedelta(days=1)
+    return datetime.combine(d, _REGULAR_OPEN).replace(tzinfo=ET)

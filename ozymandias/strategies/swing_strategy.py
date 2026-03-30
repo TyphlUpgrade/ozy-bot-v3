@@ -141,23 +141,16 @@ class SwingStrategy(Strategy):
         #     if wrong_trend and signals.get("trend_structure", "") == wrong_trend:
         #         return False, f"swing {action} rejected — {wrong_trend} trend"
         """
-        # Phase 19: apply filter_adjustments.min_rvol when Claude has relaxed the floor.
-        # Clamping to the absolute config floor is done by the ranker before this call.
-        effective_rvol_floor = self._p("min_rvol_for_entry")
-        if filter_adjustments:
-            proposed = filter_adjustments.get("min_rvol")
-            if proposed is not None:
-                try:
-                    effective_rvol_floor = float(proposed)
-                except (TypeError, ValueError):
-                    pass
-
+        # Swing RVOL floor is always 0.0 (gate disabled by design — intraday RVOL
+        # is noise for multi-day swing theses). filter_adjustments.min_rvol is a
+        # momentum-specific adjustment and must not bleed into swing entries.
+        rvol_floor = self._p("min_rvol_for_entry")  # always 0.0
         rvol = signals.get("volume_ratio")
-        if rvol is not None and effective_rvol_floor > 0 and rvol < effective_rvol_floor:
+        if rvol is not None and rvol_floor > 0 and rvol < rvol_floor:
             return (
                 False,
                 f"swing {action} rejected — RVOL {rvol:.2f} below floor "
-                f"{effective_rvol_floor:.2f} (no volume participation)",
+                f"{rvol_floor:.2f} (no volume participation)",
             )
         return True, ""
 

@@ -50,15 +50,16 @@
     "macro_rsi_rearm_band": 5,
     "watchlist_refresh_interval_min": 240,
     "watchlist_rebuild_on_restart": false,
-    "no_opportunity_streak_warn_threshold": 8
+    "no_opportunity_streak_warn_threshold": 8,
+    "pre_market_warmup_min": 10
   },
   "claude": {
     "min_call_interval_sec": 3.0,
     "model": "claude-sonnet-4-6",
     "watchlist_max_entries": 60,
     "watchlist_build_target": 8,
-    "max_tokens_per_cycle": 4096,
-    "prompt_version": "v3.10.0",
+    "max_tokens_per_cycle": 8192,
+    "prompt_version": "v3.10.1",
     "tier1_max_symbols": 18,
     "tier2_max_symbols": 15,
     "news_max_age_hours": 168,
@@ -76,7 +77,10 @@
     "compressor_enabled": true,
     "compressor_model": "claude-haiku-4-5-20251001",
     "compressor_max_symbols_out": 18,
-    "compressor_max_tokens": 512
+    "compressor_max_tokens": 512,
+    "last_view_max_age_days": 7,
+    "api_call_timeout_sec": 200.0,
+    "macro_news_max_items": 2
   },
   "ai_fallback": {
     "enabled": false,
@@ -98,6 +102,7 @@
     "min_composite_score": 0.45,
     "filter_adj_min_rvol": 0.5,
     "filter_adj_min_composite": 0.35,
+    "filter_adjustment_decay_cycles": 2,
     "thesis_challenge_size_threshold": 0.20,
     "thesis_challenge_max_penalty": 0.35,
     "max_entry_drift_pct": 0.015,

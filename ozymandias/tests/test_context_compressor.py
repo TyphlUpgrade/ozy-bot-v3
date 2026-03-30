@@ -427,7 +427,7 @@ class TestAssembleContextSelectedSymbols:
     def _make_engine(self):
         from ozymandias.intelligence.claude_reasoning import ClaudeReasoningEngine
         from ozymandias.core.config import Config
-        prompts_dir = Path(__file__).resolve().parent.parent / "config" / "prompts" / "v3.10.0"
+        prompts_dir = Path(__file__).resolve().parent.parent / "config" / "prompts" / "v3.10.1"
         cfg = Config()
         cfg.claude.compressor_enabled = False  # disable compressor for direct context assembly tests
         return ClaudeReasoningEngine(cfg, prompts_dir=prompts_dir)
@@ -533,7 +533,7 @@ class TestCompressorConfigFields:
     def test_engine_creates_compressor_when_enabled(self):
         from ozymandias.intelligence.claude_reasoning import ClaudeReasoningEngine
         from ozymandias.core.config import Config
-        prompts_dir = Path(__file__).resolve().parent.parent / "config" / "prompts" / "v3.10.0"
+        prompts_dir = Path(__file__).resolve().parent.parent / "config" / "prompts" / "v3.10.1"
         cfg = Config()
         cfg.claude.compressor_enabled = True
         engine = ClaudeReasoningEngine(cfg, prompts_dir=prompts_dir)
