@@ -21,6 +21,9 @@ OPEN POSITIONS — DAILY SIGNALS:
 - `daily_signals.rsi_14d`: RSI(14) on daily closes. < 30 = oversold on daily timeframe; > 70 = extended.
 - `daily_signals.roc_5d`: 5-day return %. Positive for longs = recent momentum intact.
 
+Context notes: `intention.last_review_note` is the most recent prior review note (if any).
+Use it as prior-cycle context but do not echo it back — focus on the current price and thesis.
+
 adjusted_targets: only include fields you are actually changing. Omit fields whose value equals
 the current exit_targets. Use action="adjust" only when at least one field differs. Use "hold"
 if no target change is needed, even if thesis_intact is true.

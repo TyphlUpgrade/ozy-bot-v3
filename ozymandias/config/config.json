@@ -21,7 +21,7 @@
     "max_risk_per_trade_pct": 0.02
   },
   "scheduler": {
-    "bypass_market_hours": false,
+    "bypass_market_hours": true,
     "fast_loop_sec": 10,
     "medium_loop_sec": 120,
     "slow_loop_check_sec": 60,
@@ -82,7 +82,7 @@
     "api_call_timeout_sec": 200.0,
     "macro_news_max_items": 2,
     "split_reasoning_enabled": true,
-    "review_call_max_tokens": 2048,
+    "review_call_max_tokens": 4096,
     "review_call_verbose": false,
     "reasoning_tier2_max_symbols": 8,
     "reasoning_tier3_max_symbols": 5,

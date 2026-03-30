@@ -394,6 +394,12 @@ class ClaudeReasoningEngine:
                 )
             except Exception:
                 hold_hours = None
+            # Review context uses 1 most-recent note (not 3) to limit input token cost.
+            # The review call has current_price and exit_targets — full history is not needed.
+            # Each note is also capped at 250 chars (verbose old-style notes can be 500+ chars).
+            _recent_note = pos.intention.review_notes[-1:] if pos.intention.review_notes else []
+            _recent_note = [n[:250] for n in _recent_note]
+
             pos_entry: dict = {
                 "symbol": pos.symbol,
                 "shares": pos.shares,
@@ -413,7 +419,7 @@ class ClaudeReasoningEngine:
                     },
                     "max_expected_loss": pos.intention.max_expected_loss,
                     "entry_date": entry_date_str,
-                    "review_notes": pos.intention.review_notes[-3:],
+                    "last_review_note": _recent_note[0] if _recent_note else None,
                 },
             }
             if (

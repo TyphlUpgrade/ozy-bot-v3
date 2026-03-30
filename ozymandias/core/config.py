@@ -133,7 +133,7 @@ class ClaudeConfig:
     macro_news_max_items: int = 2                # headline cap for SPY/QQQ macro_news; explains *why* broad indicators are moving (geopolitical, Fed, etc.)
     # Phase 22 — split-call architecture
     split_reasoning_enabled: bool = True         # when True, position reviews run as a separate compact call before opportunity discovery
-    review_call_max_tokens: int = 2048           # output ceiling for the position review call; reviews are compact so 2048 is ample
+    review_call_max_tokens: int = 4096           # output ceiling for the position review call; 4096 safely covers up to ~20 positions at compact depth
     review_call_verbose: bool = False            # when True, position review prompt requests full prose reasoning (stop rationale, bear case, gain-protection analysis); compact two-sentence schema when False
     # Phase 22 — graceful degradation tiers (opportunity call only)
     # NOTE: reasoning_tier* uses the "reasoning_tier" prefix to avoid collision with
