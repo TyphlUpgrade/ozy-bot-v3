@@ -1266,11 +1266,13 @@ class ClaudeReasoningEngine:
             template = self._load_prompt("reasoning.txt")
             if skip_position_reviews:
                 position_review_notice = (
-                    "NOTE (SPLIT MODE): Position reviews are handled in a separate "
-                    "dedicated call. Do NOT produce a position_reviews array in your "
-                    "response. Open positions below are a compact summary only — use "
-                    "them to avoid re-proposing held symbols. Do not include any held "
-                    "symbol in new_opportunities or rejected_opportunities.\n"
+                    "⚠ SPLIT MODE — OVERRIDE INSTRUCTIONS STEP 1:\n"
+                    "Position reviews are handled in a separate dedicated call that already ran.\n"
+                    "DO NOT produce a position_reviews field. DO NOT review open positions.\n"
+                    "The position_reviews key shown in the response format below MUST be omitted entirely.\n"
+                    "Open positions appear below as a compact summary ONLY — their sole purpose is to\n"
+                    "prevent you from re-proposing held symbols in new_opportunities or rejected_opportunities.\n"
+                    "Skip directly to INSTRUCTIONS step 2 (evaluate watchlist_tier1 symbols).\n"
                 )
             else:
                 position_review_notice = ""

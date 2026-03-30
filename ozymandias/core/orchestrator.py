@@ -17,7 +17,7 @@ import os
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dc_replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -4075,9 +4075,14 @@ class Orchestrator:
         self._trigger_state.last_override_exit_count = self._override_exit_count
 
         # Phase 22: merge position reviews from Call A into result, then handle tier upgrade.
-        import dataclasses as _dc
-        if position_reviews_from_call_a and not result.position_reviews:
-            result = _dc.replace(result, position_reviews=position_reviews_from_call_a)
+        # When split mode is active, Call A reviews always take precedence — unconditionally
+        # replace even if Claude ignored the notice and produced position_reviews in Call B
+        # (Call B context is compact and lacks daily_signals; those reviews are lower quality).
+        if _split and position_reviews_from_call_a:
+            result = dc_replace(result, position_reviews=position_reviews_from_call_a)
+        elif position_reviews_from_call_a and not result.position_reviews:
+            # Non-split fallback: only fill if Call B produced no reviews
+            result = dc_replace(result, position_reviews=position_reviews_from_call_a)
 
         # Tier upgrade confirmation (or reset failure count on stable degraded tier)
         if active_tier < self._reasoning_tier:
