@@ -128,7 +128,8 @@ def _indicators(symbols: list[str] | None = None) -> dict:
                 "atr_14": 2.5,
                 "price": 105.0,
             },
-            "composite_technical_score": 0.72,
+            "long_score": 0.72,
+            "short_score": 0.45,
         }
     return ind
 
@@ -241,7 +242,7 @@ class TestAssembleReasoningContext:
         engine = _engine(tmp_path)
         portfolio = _portfolio(n_positions=1)
         sym = "SYM0"
-        ind = {sym: {"signals": {"price": 110.0}, "composite_technical_score": 0.65}}
+        ind = {sym: {"signals": {"price": 110.0}, "long_score": 0.65, "short_score": 0.4}}
         ctx = engine.assemble_reasoning_context(portfolio, _watchlist([]), _market_data(), ind)
         pos = ctx["portfolio"]["positions"][0]
         assert pos["current_price"] == 110.0
@@ -284,7 +285,8 @@ class TestAssembleReasoningContext:
         engine = _engine(tmp_path)
         md = _market_data()
         ctx = engine.assemble_reasoning_context(_portfolio(), _watchlist([]), md, {})
-        assert ctx["market_context"] == md
+        for key, value in md.items():
+            assert ctx["market_context"][key] == value
 
 
 # ---------------------------------------------------------------------------
@@ -971,12 +973,13 @@ class TestPhase19ReasoningResultParsing:
         raw = self._base_raw()
         raw["filter_adjustments"] = {
             "min_rvol": 0.6,
-            "min_composite_score": 0.40,
             "reason": "Low participation day",
         }
         result = _result_from_raw_reasoning(raw)
         assert result.filter_adjustments is not None
         assert result.filter_adjustments["min_rvol"] == 0.6
+        assert "min_composite_score"   not in (result.filter_adjustments or {})
+        assert "min_directional_score" not in (result.filter_adjustments or {})
 
     def test_active_theses_parsed_as_list_of_dicts(self):
         raw = self._base_raw()

@@ -15,9 +15,11 @@ import pytest
 
 from ozymandias.intelligence.technical_analysis import (
     classify_trend_structure,
+    compute_adx,
     compute_atr,
     compute_bollinger_bands,
     compute_composite_score,
+    compute_directional_scores,
     compute_ema,
     compute_macd,
     compute_roc,
@@ -679,7 +681,8 @@ class TestGenerateSignalSummary:
         assert result['symbol'] == 'TEST'
         assert 'timestamp' in result
         assert 'signals' in result
-        assert 'composite_technical_score' in result
+        assert 'long_score' in result
+        assert 'short_score' in result
         assert result['bars_available'] == 50
 
     def test_signal_keys_present(self):
@@ -702,9 +705,10 @@ class TestGenerateSignalSummary:
         result = generate_signal_summary("TEST", df)
         assert result['signals']['avg_daily_volume'] > 0
 
-    def test_composite_score_in_range(self):
+    def test_directional_scores_in_range(self):
         result = generate_signal_summary("TEST", self._df())
-        assert 0.0 <= result['composite_technical_score'] <= 1.0
+        assert 0.0 <= result['long_score'] <= 1.0
+        assert 0.0 <= result['short_score'] <= 1.0
 
     def test_rsi_in_valid_range(self):
         result = generate_signal_summary("TEST", self._df())
@@ -739,7 +743,8 @@ class TestGenerateSignalSummary:
         """generate_signal_summary must not raise even with very few bars."""
         df = _ohlcv([100.0, 101.0, 102.0])
         result = generate_signal_summary("TEST", df)
-        assert 0.0 <= result['composite_technical_score'] <= 1.0
+        assert 0.0 <= result['long_score'] <= 1.0
+        assert 0.0 <= result['short_score'] <= 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -1025,6 +1030,258 @@ class TestGenerateDailySignalSummary:
             "roc_5d", "volume_trend_daily", "macd_signal_daily",
         }
         assert required.issubset(result.keys())
+
+
+# ---------------------------------------------------------------------------
+# compute_adx
+# ---------------------------------------------------------------------------
+
+class TestComputeAdx:
+    """ADX measures trend strength regardless of direction."""
+
+    def _trending_df(self, n: int = 60) -> pd.DataFrame:
+        """Strongly trending series — monotone increasing closes."""
+        closes = [100.0 + i * 1.0 for i in range(n)]
+        return _ohlcv(closes)
+
+    def _ranging_df(self, n: int = 60) -> pd.DataFrame:
+        """Sideways oscillating series — alternates ±1 around 100."""
+        closes = [100.0 + (1.0 if i % 2 == 0 else -1.0) for i in range(n)]
+        return _ohlcv(closes)
+
+    def test_returns_series_with_correct_length(self):
+        df = self._trending_df(30)
+        adx = compute_adx(df, length=14)
+        assert len(adx) == 30
+
+    def test_trending_market_has_higher_adx_than_ranging(self):
+        """Strongly trending prices should produce higher ADX than sideways chop."""
+        trending = compute_adx(self._trending_df(60), length=14).iloc[-1]
+        ranging  = compute_adx(self._ranging_df(60),  length=14).iloc[-1]
+        assert trending > ranging
+
+    def test_adx_nonnegative(self):
+        adx = compute_adx(self._trending_df(40), length=14)
+        assert (adx.dropna() >= 0).all()
+
+    def test_adx_bounded_above(self):
+        """ADX is theoretically bounded at 100."""
+        adx = compute_adx(self._trending_df(60), length=14)
+        assert (adx.dropna() <= 100.0).all()
+
+    def test_ranging_prices_produce_low_adx(self):
+        """Oscillating prices with no net direction → low ADX."""
+        # Alternate between 100 and 101 — +DM and -DM cancel over time
+        closes = [100.0 + (i % 2) for i in range(60)]
+        df = _ohlcv(closes)
+        adx = compute_adx(df, length=14).dropna()
+        assert len(adx) > 0
+        assert float(adx.iloc[-1]) < 30.0
+
+
+# ---------------------------------------------------------------------------
+# Bollinger %B (bb_pct_b) — generate_signal_summary
+# ---------------------------------------------------------------------------
+
+class TestBbPctB:
+    """bb_pct_b = (close - lower) / (upper - lower); 0.0=lower band, 1.0=upper band."""
+
+    def _df_at_band(self, at_upper: bool, n: int = 25) -> pd.DataFrame:
+        """
+        Build a series where the last bar is at the upper or lower Bollinger band.
+        Uses a flat series (std → 0 → bands collapse to middle); instead build a
+        rising then flat series so bands have finite width.
+        """
+        # 20 bars trending up to create a band, then one bar at an extreme
+        closes = [100.0 + i * 0.5 for i in range(n - 1)]
+        if at_upper:
+            closes.append(closes[-1] + 20.0)   # far above → %B >> 1
+        else:
+            closes.append(closes[0] - 20.0)    # far below → %B << 0
+        return _ohlcv(closes)
+
+    def test_bb_pct_b_present_in_signals(self):
+        df = _ohlcv([100.0 + i * 0.5 for i in range(25)])
+        signals = generate_signal_summary("TEST", df)["signals"]
+        assert "bb_pct_b" in signals
+
+    def test_bb_pct_b_above_half_when_price_above_midline(self):
+        """Rising prices → close > midline → %B > 0.5."""
+        df = _ohlcv([100.0 + i * 0.5 for i in range(25)])
+        signals = generate_signal_summary("TEST", df)["signals"]
+        assert signals["bb_pct_b"] > 0.5
+
+    def test_bb_pct_b_below_half_when_price_below_midline(self):
+        """Falling prices → close < midline → %B < 0.5."""
+        df = _ohlcv([125.0 - i * 0.5 for i in range(25)])
+        signals = generate_signal_summary("TEST", df)["signals"]
+        assert signals["bb_pct_b"] < 0.5
+
+    def test_bb_pct_b_extreme_high_above_one(self):
+        """Price far above upper band → %B > 1.0."""
+        df = self._df_at_band(at_upper=True)
+        signals = generate_signal_summary("TEST", df)["signals"]
+        assert signals["bb_pct_b"] > 1.0
+
+    def test_bb_pct_b_extreme_low_below_zero(self):
+        """Price far below lower band → %B < 0.0."""
+        df = self._df_at_band(at_upper=False)
+        signals = generate_signal_summary("TEST", df)["signals"]
+        assert signals["bb_pct_b"] < 0.0
+
+    def test_bb_pct_b_fallback_when_bands_not_warmed_up(self):
+        """Fewer than 20 bars → bands NaN → bb_pct_b falls back to 0.5."""
+        df = _ohlcv([100.0] * 5)
+        signals = generate_signal_summary("TEST", df)["signals"]
+        assert signals["bb_pct_b"] == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# range_pct_20d and adx_14d — generate_daily_signal_summary
+# ---------------------------------------------------------------------------
+
+class TestDailyRangePctAndAdx:
+    """Tests for range_pct_20d and adx_14d added to generate_daily_signal_summary."""
+
+    def _daily_df(self, closes: list[float]) -> pd.DataFrame:
+        n = len(closes)
+        return pd.DataFrame(
+            {
+                "open":   [c - 0.5 for c in closes],
+                "high":   [c + 1.0 for c in closes],
+                "low":    [c - 1.0 for c in closes],
+                "close":  closes,
+                "volume": [1_000_000.0] * n,
+            },
+            index=pd.date_range(start="2025-01-01", periods=n, freq="D"),
+        )
+
+    def test_range_pct_20d_present(self):
+        closes = [100.0 + i * 0.5 for i in range(30)]
+        result = generate_daily_signal_summary("TEST", self._daily_df(closes))
+        assert "range_pct_20d" in result
+
+    def test_range_pct_20d_near_100_when_at_recent_high(self):
+        """Monotone rising series — last close is at the 20-day high → near 100%."""
+        closes = [100.0 + i * 1.0 for i in range(30)]
+        result = generate_daily_signal_summary("TEST", self._daily_df(closes))
+        # high = close + 1.0, low = close - 1.0
+        # last close = 129, 20d high = 129 + 1 = 130, 20d low = 110 - 1 = 109
+        # range_pct = (129 - 109) / (130 - 109) * 100 ≈ 95.2
+        assert result["range_pct_20d"] > 80.0
+
+    def test_range_pct_20d_near_0_when_at_recent_low(self):
+        """Monotone falling series — last close is at the 20-day low → near 0%."""
+        closes = [130.0 - i * 1.0 for i in range(30)]
+        result = generate_daily_signal_summary("TEST", self._daily_df(closes))
+        assert result["range_pct_20d"] < 20.0
+
+    def test_adx_14d_present_with_enough_bars(self):
+        """≥ 28 bars → adx_14d should be present."""
+        closes = [100.0 + i * 0.5 for i in range(40)]
+        result = generate_daily_signal_summary("TEST", self._daily_df(closes))
+        assert "adx_14d" in result
+
+    def test_adx_14d_absent_with_too_few_bars(self):
+        """< 28 bars → adx_14d omitted (insufficient warm-up)."""
+        closes = [100.0 + i * 0.5 for i in range(25)]
+        result = generate_daily_signal_summary("TEST", self._daily_df(closes))
+        assert "adx_14d" not in result
+
+    def test_adx_14d_higher_in_trend_than_range(self):
+        """Trending series should produce higher ADX than flat series."""
+        trending_closes = [100.0 + i * 1.0 for i in range(60)]
+        flat_closes     = [100.0 + (0.1 if i % 2 == 0 else -0.1) for i in range(60)]
+        trending = generate_daily_signal_summary("TEST", self._daily_df(trending_closes))
+        flat     = generate_daily_signal_summary("TEST", self._daily_df(flat_closes))
+        assert trending.get("adx_14d", 0) > flat.get("adx_14d", 100)
+
+    def test_adx_14d_nonnegative(self):
+        closes = [100.0 + i * 0.5 for i in range(40)]
+        result = generate_daily_signal_summary("TEST", self._daily_df(closes))
+        assert result.get("adx_14d", 0) >= 0
+
+
+# ---------------------------------------------------------------------------
+# compute_directional_scores
+# ---------------------------------------------------------------------------
+
+class TestComputeDirectionalScores:
+    """Tests for the directional swing-trading composite scorer."""
+
+    def test_returns_long_and_short_keys(self):
+        scores = compute_directional_scores({})
+        assert "long" in scores
+        assert "short" in scores
+
+    def test_scores_in_range(self):
+        signals = {
+            "rsi": 55.0, "macd_signal": "bullish", "volume_ratio": 1.5,
+            "rsi_slope_5": 2.0, "trend_structure": "bullish_aligned",
+        }
+        scores = compute_directional_scores(signals)
+        assert 0.0 <= scores["long"] <= 1.0
+        assert 0.0 <= scores["short"] <= 1.0
+
+    def test_oversold_favours_long(self):
+        """RSI 25 (oversold extension) should score higher for long than short."""
+        daily = {"rsi_14d": 25.0, "daily_trend": "uptrend", "range_pct_20d": 15.0}
+        scores = compute_directional_scores({"volume_ratio": 1.5}, daily_signals=daily)
+        assert scores["long"] > scores["short"]
+
+    def test_overbought_favours_short(self):
+        """RSI 78 (overbought extension) should score higher for short than long."""
+        daily = {"rsi_14d": 78.0, "daily_trend": "downtrend", "range_pct_20d": 90.0}
+        scores = compute_directional_scores({"volume_ratio": 1.5}, daily_signals=daily)
+        assert scores["short"] > scores["long"]
+
+    def test_bearish_exhaustion_lifts_short(self):
+        """Bearish MACD + negative RSI slope should improve short exhaustion score."""
+        bearish = {"macd_signal": "bearish", "rsi_slope_5": -3.0, "volume_ratio": 1.5}
+        bullish = {"macd_signal": "bullish", "rsi_slope_5":  3.0, "volume_ratio": 1.5}
+        s_bearish = compute_directional_scores(bearish)
+        s_bullish = compute_directional_scores(bullish)
+        assert s_bearish["short"] > s_bullish["short"]
+
+    def test_strong_volume_lifts_both(self):
+        """High volume ratio should boost both long and short scores equally (participation)."""
+        low_vol  = compute_directional_scores({"volume_ratio": 0.5})
+        high_vol = compute_directional_scores({"volume_ratio": 3.0})
+        assert high_vol["long"]  > low_vol["long"]
+        assert high_vol["short"] > low_vol["short"]
+
+    def test_empty_signals_returns_neutral_score(self):
+        """Empty signals → neutral defaults (RSI=50, no trend) → mid-range score, not zero."""
+        scores = compute_directional_scores({})
+        # Neutral RSI and no directional signals means both scores should be close and mid-range
+        assert 0.0 < scores["long"]  < 1.0
+        assert 0.0 < scores["short"] < 1.0
+        assert abs(scores["long"] - scores["short"]) < 0.3
+
+    def test_daily_rsi_overrides_intraday_rsi(self):
+        """When daily_signals has rsi_14d, it should be used for extension (not intraday rsi)."""
+        # Daily oversold; intraday RSI neutral
+        daily = {"rsi_14d": 22.0}
+        intraday = {"rsi": 55.0, "volume_ratio": 1.5}
+        scores_with_daily = compute_directional_scores(intraday, daily_signals=daily)
+        scores_no_daily   = compute_directional_scores(intraday)
+        # With daily oversold RSI, long score should be higher
+        assert scores_with_daily["long"] > scores_no_daily["long"]
+
+    def test_strong_trend_context_lifts_aligned_direction(self):
+        """uptrend daily_trend should score higher for long than downtrend."""
+        up_daily   = {"rsi_14d": 50.0, "daily_trend": "uptrend"}
+        down_daily = {"rsi_14d": 50.0, "daily_trend": "downtrend"}
+        intraday = {"volume_ratio": 1.5}
+        s_up   = compute_directional_scores(intraday, daily_signals=up_daily)
+        s_down = compute_directional_scores(intraday, daily_signals=down_daily)
+        assert s_up["long"] > s_down["long"]
+
+    def test_output_is_rounded(self):
+        """Scores should be rounded to avoid floating-point noise in downstream comparisons."""
+        scores = compute_directional_scores({"volume_ratio": 1.234567})
+        assert scores["long"]  == round(scores["long"],  4)
+        assert scores["short"] == round(scores["short"], 4)
 
 
 # ---------------------------------------------------------------------------

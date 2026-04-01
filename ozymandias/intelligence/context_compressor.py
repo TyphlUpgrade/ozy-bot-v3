@@ -25,7 +25,7 @@ from typing import Optional
 import anthropic
 
 from ozymandias.core.config import ClaudeConfig
-from ozymandias.intelligence.technical_analysis import compute_composite_score
+from ozymandias.intelligence.technical_analysis import compute_directional_scores
 
 log = logging.getLogger(__name__)
 
@@ -220,21 +220,18 @@ class ContextCompressor:
             tier = _attr(entry, "priority_tier", 1) or 1
             ind = indicators.get(sym, {})
             raw = ind.get("signals") or {}
-            if raw and ed != "either":
-                score = compute_composite_score(raw, direction=ed)
-            elif raw:
-                score = max(
-                    compute_composite_score(raw, direction="long"),
-                    compute_composite_score(raw, direction="short"),
-                )
+            if raw:
+                _scores = compute_directional_scores(raw)
+                score = _scores["long"] if ed == "long" else _scores["short"] if ed == "short" else max(_scores["long"], _scores["short"])
             else:
-                score = ind.get("composite_technical_score", 0.0) or 0.0
+                _pre = ind.get("long_score" if ed == "long" else "short_score", None)
+                score = float(_pre) if _pre is not None else max(float(ind.get("long_score", 0.0)), float(ind.get("short_score", 0.0)))
 
             item: dict = {
                 "symbol": sym,
                 "expected_direction": ed,
                 "tier": tier,
-                "composite_score": round(score, 3),
+                "directional_score": round(score, 3),
             }
             # Key signals only — avoids blowing out Haiku's context
             if raw:
@@ -260,15 +257,15 @@ class ContextCompressor:
             sym = _sym(entry)
             ind = indicators.get(sym, {})
             raw = ind.get("signals") or {}
+            ed = _attr(entry, "expected_direction", "either") or "either"
             if raw:
-                ed = _attr(entry, "expected_direction", "either") or "either"
-                if ed != "either":
-                    return compute_composite_score(raw, direction=ed)
-                return max(
-                    compute_composite_score(raw, direction="long"),
-                    compute_composite_score(raw, direction="short"),
-                )
-            return ind.get("composite_technical_score", 0.0) or 0.0
+                _scores = compute_directional_scores(raw)
+                if ed == "long":  return _scores["long"]
+                if ed == "short": return _scores["short"]
+                return max(_scores["long"], _scores["short"])
+            if ed == "long":  return float(ind.get("long_score",  0.0))
+            if ed == "short": return float(ind.get("short_score", 0.0))
+            return max(float(ind.get("long_score", 0.0)), float(ind.get("short_score", 0.0)))
 
         sorted_entries = sorted(all_candidates, key=_score, reverse=True)[:max_symbols_out]
         return CompressorResult(
@@ -277,140 +274,239 @@ class ContextCompressor:
         )
 
     # ------------------------------------------------------------------
-    # Phase 21: position thesis monitoring
+    # Position thesis monitoring (Haiku-based)
     # ------------------------------------------------------------------
 
-    def check_position_theses(
+    async def check_position_theses(
         self,
         positions: list,
         active_theses: Optional[list[dict]],
         indicators: dict,
+        daily_indicators: Optional[dict],
+        market_data: dict,
+        regime_assessment: Optional[dict],
+        sector_regimes: Optional[dict],
         cycle_id: str = "",
     ) -> Optional[CompressorResult]:
         """
-        Check whether any open position's thesis_breaking_conditions are now met.
+        Evaluate open position thesis_breaking_conditions using Haiku.
 
-        Called from the medium loop once per cycle. Returns a CompressorResult
-        with `needs_sonnet=True` and `sonnet_reason="position_thesis_breach"` if
-        any breach is detected, so the orchestrator can fire a Sonnet review cycle.
+        Called from the medium loop once per cycle. Haiku receives live signals,
+        recent news, and regime context so it can evaluate both numeric conditions
+        ("composite_score falls below 0.45") and narrative/event conditions
+        ("Iran ceasefire confirmed", "deal terminated").
 
-        Conditions are evaluated by substring match against live indicator values
-        (same approach as _check_regime_conditions in the orchestrator):
-          - "daily_trend becomes downtrend" → check daily_indicators.daily_trend == "downtrend"
-          - "sector_1w_return < -5%" → not evaluated (no live data available here)
-          - "rsi < 30" → check signals.rsi < 30
-        Unrecognized conditions are skipped (conservative — only fire on known matches).
+        Returns a CompressorResult with needs_sonnet=True if any condition is
+        clearly met, so the orchestrator can fire a targeted Sonnet review cycle.
 
-        Per-cycle guard: same `cycle_id` as the Haiku compress call prevents double-firing.
-
-        Args:
-            positions:      List of open Position objects (from PortfolioState.positions).
-            active_theses:  Sonnet's latest active_theses list (may be None).
-            indicators:     Merged indicator dict (_all_indicators), keyed by symbol.
-            cycle_id:       Unique cycle ID for per-cycle guard (same as compress()).
-
-        Returns:
-            CompressorResult with needs_sonnet=True on breach, or None if no breach.
+        Per-cycle guard: cycle_id prevents re-triggering within the same Sonnet cycle.
+        On any Haiku failure the method returns None (conservative — don't fire on error).
         """
         if not active_theses or not positions:
             return None
 
-        # Build symbol → thesis_breaking_conditions lookup
-        thesis_map: dict[str, list[str]] = {}
+        prompt_template = self._load_thesis_check_prompt()
+        if not prompt_template:
+            log.debug("ContextCompressor: no thesis_check.txt — skipping thesis monitoring")
+            return None
+
+        positions_payload, regime_payload, market_payload = self._build_thesis_check_payload(
+            positions, active_theses, indicators, daily_indicators, market_data,
+            regime_assessment, sector_regimes,
+        )
+
+        if not positions_payload or positions_payload == "[]":
+            return None  # no positions matched any active thesis
+
+        context = {
+            "positions_json": positions_payload,
+            "regime_json": regime_payload,
+            "market_context_json": market_payload,
+        }
+        prompt = self._fill_template(prompt_template, context)
+
+        try:
+            response = await asyncio.wait_for(
+                self._client.messages.create(
+                    model=self._cfg.compressor_model,
+                    max_tokens=128,
+                    messages=[{"role": "user", "content": prompt}],
+                ),
+                timeout=30.0,
+            )
+            raw_text = response.content[0].text if response.content else ""
+        except Exception as exc:
+            log.warning("ContextCompressor: thesis check Haiku call failed (%s) — skipping", exc)
+            return None
+
+        # Parse response — conservative: return None on any failure
+        cleaned = re.sub(r"```(?:json)?\s*", "", raw_text).strip()
+        cleaned = re.sub(r"```\s*$", "", cleaned).strip()
+        parsed: Optional[dict] = None
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError:
+            m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+            if m:
+                try:
+                    parsed = json.loads(m.group())
+                except json.JSONDecodeError:
+                    pass
+
+        if not isinstance(parsed, dict):
+            log.warning(
+                "ContextCompressor: thesis check unparseable response — skipping | raw=%s",
+                raw_text[:200],
+            )
+            return None
+
+        if not bool(parsed.get("needs_sonnet", False)):
+            return None
+
+        breach_detail = parsed.get("breach")
+        if not isinstance(breach_detail, str):
+            breach_detail = "position_thesis_breach (no detail)"
+
+        # Per-cycle guard: only fire once per Sonnet cycle
+        if cycle_id and self._last_needs_sonnet_cycle == cycle_id:
+            log.debug(
+                "ContextCompressor: thesis breach suppressed (already fired cycle %s)", cycle_id
+            )
+            return None
+        if cycle_id:
+            self._last_needs_sonnet_cycle = cycle_id
+
+        log.info("Position thesis breach detected — %s", breach_detail)
+        return CompressorResult(
+            symbols=[],
+            notes=breach_detail,
+            needs_sonnet=True,
+            sonnet_reason="position_thesis_breach",
+        )
+
+    def _load_thesis_check_prompt(self) -> Optional[str]:
+        if self._prompts_dir is None:
+            return None
+        path = self._prompts_dir / "thesis_check.txt"
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+    def _build_thesis_check_payload(
+        self,
+        positions: list,
+        active_theses: list[dict],
+        indicators: dict,
+        daily_indicators: Optional[dict],
+        market_data: dict,
+        regime_assessment: Optional[dict],
+        sector_regimes: Optional[dict],
+    ) -> tuple[str, str, str]:
+        """
+        Build three JSON strings for the thesis_check.txt prompt:
+        positions_json, regime_json, market_context_json.
+
+        positions_json: enriched list of open positions that have an active thesis.
+        Each entry includes thesis, conditions, live signals, and recent news.
+        """
+        # Build symbol → thesis lookup from active_theses
+        thesis_map: dict[str, dict] = {}
         for thesis in active_theses:
             if not isinstance(thesis, dict):
                 continue
             sym = thesis.get("symbol", "")
-            conditions = thesis.get("thesis_breaking_conditions", [])
-            if sym and isinstance(conditions, list):
-                thesis_map[sym] = [str(c) for c in conditions]
+            if sym:
+                thesis_map[sym] = thesis
 
-        if not thesis_map:
-            return None
+        daily = daily_indicators or {}
+        watchlist_news: dict = market_data.get("watchlist_news") or {}
 
-        open_syms = {p.symbol if hasattr(p, "symbol") else p.get("symbol", "") for p in positions}
-
-        for sym in open_syms:
-            conditions = thesis_map.get(sym)
-            if not conditions:
+        entries: list[dict] = []
+        for pos in positions:
+            sym = pos.symbol if hasattr(pos, "symbol") else pos.get("symbol", "")
+            if not sym or sym not in thesis_map:
                 continue
+
+            thesis = thesis_map[sym]
             ind = indicators.get(sym, {})
-            signals = ind.get("signals") or {}
-            daily = ind.get("daily_signals") or {}
+            raw_signals = ind.get("signals") or {}
+            daily_sig = daily.get(sym, {})
 
-            for cond in conditions:
-                if self._condition_met(cond, signals, daily):
-                    log.info(
-                        "Position thesis breach: %s — condition '%s' met",
-                        sym, cond,
-                    )
-                    # Per-cycle guard: only fire once per cycle
-                    if cycle_id and self._last_needs_sonnet_cycle == cycle_id:
-                        log.debug(
-                            "ContextCompressor: thesis breach suppressed (already fired cycle %s)",
-                            cycle_id,
-                        )
-                        return None
-                    if cycle_id:
-                        self._last_needs_sonnet_cycle = cycle_id
-                    return CompressorResult(
-                        symbols=[],
-                        notes=f"Position {sym}: condition '{cond}' met",
-                        from_fallback=True,
-                        needs_sonnet=True,
-                        sonnet_reason="position_thesis_breach",
-                    )
-        return None
+            # Live signals — include only non-None values to stay compact
+            live: dict = {}
+            _signal_keys = ("rsi", "volume_ratio", "vwap_position", "trend_structure", "roc_5")
+            for k in _signal_keys:
+                v = raw_signals.get(k)
+                if v is not None:
+                    live[k] = v
+            # directional scores for thesis monitoring context
+            if raw_signals:
+                _ds = compute_directional_scores(raw_signals, daily_sig)
+                live["long_score"]  = round(_ds["long"],  3)
+                live["short_score"] = round(_ds["short"], 3)
+            # price
+            price = raw_signals.get("price") or ind.get("price")
+            if price is not None:
+                live["price"] = price
+            # daily_trend from daily_indicators
+            dt = daily_sig.get("daily_trend")
+            if dt is not None:
+                live["daily_trend"] = dt
 
-    def _condition_met(self, condition: str, signals: dict, daily: dict) -> bool:
-        """
-        Evaluate a thesis_breaking_condition string against live signal values.
+            # News — up to 3 recent headlines for this symbol
+            news_items = watchlist_news.get(sym, [])
+            recent_news = [
+                {"title": n.get("title", ""), "publisher": n.get("publisher", ""),
+                 "age_hours": n.get("age_hours")}
+                for n in news_items[:3]
+                if isinstance(n, dict)
+            ]
 
-        Supports simple numeric comparisons on known indicator keys.
-        Returns False for unrecognized condition formats (conservative — don't fire on noise).
-        """
-        import re as _re
-        # Known condition patterns:
-        # "daily_trend becomes downtrend" → daily.daily_trend == "downtrend"
-        # "rsi < 30" → signals.rsi < 30
-        # "rsi > 70" → signals.rsi > 70
-        # "volume_ratio < 0.5" → signals.volume_ratio < 0.5
-        cond_lower = condition.lower().strip()
+            entry: dict = {
+                "symbol": sym,
+                "thesis": (thesis.get("thesis") or "")[:150],
+                "thesis_breaking_conditions": thesis.get("thesis_breaking_conditions") or [],
+                "live_signals": live,
+            }
+            if recent_news:
+                entry["recent_news"] = recent_news
+            entries.append(entry)
 
-        # Pattern: "daily_trend becomes <trend_value>"
-        # Handles all trend values (downtrend, uptrend, neutral, mixed) so both
-        # long-thesis breaking conditions ("becomes downtrend") and short-thesis
-        # breaking conditions ("becomes uptrend") are evaluated correctly.
-        if "daily_trend" in cond_lower:
-            for trend_val in ("downtrend", "uptrend", "neutral", "mixed"):
-                if trend_val in cond_lower:
-                    return daily.get("daily_trend") == trend_val
-            return False  # daily_trend present but no recognized value
+        positions_json = json.dumps(entries, default=str)
 
-        # Pattern: "<indicator> <op> <value>"
-        # Use search() instead of match() so leading whitespace (if any) is tolerated.
-        m = _re.search(r"(\w+)\s*([<>]=?)\s*([\d.]+)", cond_lower)
-        if m:
-            key, op, val_str = m.group(1), m.group(2), m.group(3)
-            # Check both intraday signals and daily signals
-            live_val = signals.get(key) if signals.get(key) is not None else daily.get(key)
-            if live_val is None:
-                return False
-            try:
-                threshold = float(val_str)
-                live = float(live_val)
-                if op == "<":
-                    return live < threshold
-                if op == ">":
-                    return live > threshold
-                if op == "<=":
-                    return live <= threshold
-                if op == ">=":
-                    return live >= threshold
-            except (ValueError, TypeError):
-                pass
+        regime_json = json.dumps(
+            {
+                "regime": regime_assessment.get("regime") if regime_assessment else None,
+                "confidence": regime_assessment.get("confidence") if regime_assessment else None,
+                "sector_regimes": sector_regimes,
+            },
+            default=str,
+        )
 
-        return False  # unrecognized — do not fire
+        # Macro news: up to 2 SPY headlines + 1 QQQ headline
+        macro_raw: dict = market_data.get("macro_news") or {}
+        macro_news = (
+            [{"title": n.get("title", ""), "publisher": n.get("publisher", ""),
+              "age_hours": n.get("age_hours")} for n in macro_raw.get("SPY", [])[:2]
+             if isinstance(n, dict)]
+            + [{"title": n.get("title", ""), "publisher": n.get("publisher", ""),
+                "age_hours": n.get("age_hours")} for n in macro_raw.get("QQQ", [])[:1]
+               if isinstance(n, dict)]
+        )
+
+        market_context_json = json.dumps(
+            {
+                "spy_trend": market_data.get("spy_trend"),
+                "spy_rsi": market_data.get("spy_rsi"),
+                "qqq_trend": market_data.get("qqq_trend"),
+                "spy_daily": market_data.get("spy_daily"),
+                "macro_news": macro_news,
+            },
+            default=str,
+        )
+
+        return positions_json, regime_json, market_context_json
 
     def _fill_template(self, template: str, context: dict) -> str:
         def _sub(m: re.Match) -> str:

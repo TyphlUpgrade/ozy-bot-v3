@@ -13,14 +13,14 @@ TASK: Select the top {max_symbols} most actionable candidates for strategic revi
 
 RANKING PRIORITIES:
 1. Regime alignment — candidates whose expected_direction matches sector_regimes bias score highest
-2. Signal readiness — higher composite_score, RSI in range (50-70 long, 30-50 short), RVOL ≥ 1.0
+2. Signal readiness — higher directional_score (score for the entry's expected_direction), RSI in range (50-70 long, 30-50 short), RVOL ≥ 1.0
 3. Catalyst freshness — prefer candidates with recent reason text indicating near-term events
 4. Tier — prefer tier-1 candidates over tier-2 (but surface tier-2 if signals are compelling)
 5. Diversity — include a mix of sectors and strategies when signal quality is similar
 
 NEEDS_SONNET flag: Set to true only if you observe one of these specific conditions:
 - "regime_shift": Multiple candidates show signals sharply inconsistent with the stated regime_assessment (e.g., broad selling across sectors when regime says "normal")
-- "all_candidates_failing": Fewer than 3 candidates have composite_score ≥ 0.40 AND RVOL ≥ 0.8 — candidate pool is structurally weak for the current market
+- "all_candidates_failing": Fewer than 3 candidates have directional_score ≥ 0.40 AND RVOL ≥ 0.8 — candidate pool is structurally weak for the current market
 - "watchlist_stale": The candidate pool appears heavily skewed in a direction the sector_regimes do not support (e.g., all long candidates in a correcting sector with no shorts)
 
 Do NOT set needs_sonnet for normal market conditions or routine signal variability.

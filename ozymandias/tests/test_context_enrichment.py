@@ -105,7 +105,8 @@ def _tech(symbol="AAPL", rvol=2.0, vwap_position="above", trend="bullish_aligned
     """Minimal technical signals dict that passes hard filters."""
     return {
         symbol: {
-            "composite_technical_score": 0.6,
+            "long_score": 0.6,
+            "short_score": 0.4,
             "signals": {
                 "avg_daily_volume": 2_000_000,
                 "volume_ratio": rvol,
@@ -161,7 +162,7 @@ class TestRankResult:
         r = _ranker()
         opp = _opportunity(symbol="LOWVOL")
         signals = {
-            "LOWVOL": {"composite_technical_score": 0.6, "signals": {"avg_daily_volume": 500}},
+            "LOWVOL": {"long_score": 0.6, "short_score": 0.4, "signals": {"avg_daily_volume": 500}},
         }
         rr = _reasoning_result(opportunities=[opp])
         result = r.rank_opportunities(
@@ -713,18 +714,17 @@ class TestTaReadiness:
         watchlist = WatchlistState(entries=[self._watchlist_entry("AAPL")])
         indicators = {
             "AAPL": {
-                "composite_technical_score": 0.6,
+                "long_score": 0.6,
+                "short_score": 0.4,
                 "signals": {
                     "above_vwap": True,
                     "rsi": 58.2,
                     "rsi_slope_5": 6.4,
                     "macd_signal": "bullish",
                     "macd_histogram_expanding": True,
-                    "roc_negative_deceleration": False,
                     "volume_ratio": 1.85,
                     "volume_trend_bars": 3,
                     "trend_structure": "bullish_aligned",
-                    "bb_squeeze": False,
                 },
             }
         }
@@ -736,9 +736,8 @@ class TestTaReadiness:
         assert "ta_readiness" in entry
         ta = entry["ta_readiness"]
         assert "macd_signal" in ta  # not "macd"
-        assert "roc_negative_deceleration" in ta
-        assert "composite_score" in ta
-        # Old standalone composite_score key must not be present alongside ta_readiness
+        # composite_score is intentionally absent from ta_readiness (ranker-only)
+        assert "composite_score" not in ta
         assert "composite_score" not in {k: v for k, v in entry.items() if k != "ta_readiness"}
 
     def test_ta_readiness_values_match_indicators(self, tmp_path):
@@ -746,7 +745,8 @@ class TestTaReadiness:
         watchlist = WatchlistState(entries=[self._watchlist_entry("AAPL")])
         indicators = {
             "AAPL": {
-                "composite_technical_score": 0.6,
+                "long_score": 0.6,
+                "short_score": 0.4,
                 "signals": {"rsi": 62.5, "volume_ratio": 2.1},
             }
         }
@@ -757,9 +757,8 @@ class TestTaReadiness:
         assert ta["rsi"] == pytest.approx(62.5)
         assert ta["volume_ratio"] == pytest.approx(2.1)
 
-    def test_ta_readiness_direction_adjusted_score_for_short(self, tmp_path):
-        """composite_score uses direction-adjusted scoring when expected_direction='short'."""
-        from ozymandias.intelligence.technical_analysis import compute_composite_score
+    def test_ta_readiness_no_composite_score_for_short(self, tmp_path):
+        """composite_score is NOT in ta_readiness — directional scoring is ranker-only."""
         engine = self._engine(tmp_path)
         signals = {
             "rsi": 35.0,
@@ -768,39 +767,32 @@ class TestTaReadiness:
             "trend_structure": "bearish_aligned",
             "volume_ratio": 1.5,
         }
-        indicators = {"NVDA": {"composite_technical_score": 0.4, "signals": signals}}
+        indicators = {"NVDA": {"long_score": 0.3, "short_score": 0.7, "signals": signals}}
         watchlist_short = WatchlistState(entries=[self._watchlist_entry("NVDA", "short")])
-        watchlist_long = WatchlistState(entries=[self._watchlist_entry("NVDA", "long")])
 
         ctx_short = engine.assemble_reasoning_context(
             PortfolioState(), watchlist_short, {}, indicators,
         )
-        ctx_long = engine.assemble_reasoning_context(
-            PortfolioState(), watchlist_long, {}, indicators,
-        )
-        score_short = ctx_short["watchlist_tier1"][0]["ta_readiness"]["composite_score"]
-        score_long = ctx_long["watchlist_tier1"][0]["ta_readiness"]["composite_score"]
-        # Short-direction should score higher on bearish signals
-        assert score_short != score_long
+        ta = ctx_short["watchlist_tier1"][0]["ta_readiness"]
+        # Composite score intentionally omitted from Claude's view
+        assert "composite_score" not in ta
+        # Raw signals are still passed through
+        assert ta["rsi"] == pytest.approx(35.0)
 
-    def test_ta_readiness_either_uses_best_direction_score(self, tmp_path):
-        """expected_direction='either' uses max(long_score, short_score) — not long-biased default."""
-        from ozymandias.intelligence.technical_analysis import compute_composite_score
+    def test_ta_readiness_either_passes_raw_signals_through(self, tmp_path):
+        """expected_direction='either' — ta_readiness still contains raw signals, not composite."""
         engine = self._engine(tmp_path)
         signals = {"rsi": 62.0, "macd_signal": "bullish", "volume_ratio": 2.0}
-        indicators = {"AAPL": {"composite_technical_score": 0.6, "signals": signals}}
+        indicators = {"AAPL": {"long_score": 0.6, "short_score": 0.4, "signals": signals}}
         watchlist = WatchlistState(entries=[self._watchlist_entry("AAPL", "either")])
 
         ctx = engine.assemble_reasoning_context(
             PortfolioState(), watchlist, {}, indicators,
         )
-        score_either = ctx["watchlist_tier1"][0]["ta_readiness"]["composite_score"]
-        # Should equal the best of long and short direction scores
-        expected = max(
-            compute_composite_score(signals, direction="long"),
-            compute_composite_score(signals, direction="short"),
-        )
-        assert score_either == pytest.approx(expected, abs=0.001)
+        ta = ctx["watchlist_tier1"][0]["ta_readiness"]
+        assert "composite_score" not in ta
+        assert ta["rsi"] == pytest.approx(62.0)
+        assert ta["volume_ratio"] == pytest.approx(2.0)
 
     def test_ta_readiness_empty_when_symbol_absent_from_indicators(self, tmp_path):
         """ta_readiness is empty dict when symbol not in indicators — no crash."""
@@ -819,7 +811,7 @@ class TestTaReadiness:
         engine = self._engine(tmp_path)
         entry = self._watchlist_entry("AAPL", "short")
         watchlist = WatchlistState(entries=[entry])
-        indicators = {"AAPL": {"composite_technical_score": 0.5, "signals": {"rsi": 40.0}}}
+        indicators = {"AAPL": {"long_score": 0.4, "short_score": 0.5, "signals": {"rsi": 40.0}}}
         ctx = engine.assemble_reasoning_context(
             PortfolioState(), watchlist, {}, indicators,
         )
@@ -987,7 +979,7 @@ class TestTokenBudgetOverflowWarning:
         entries = [self._watchlist_entry(s) for s in ["AAPL", "MSFT", "NVDA"]]
         watchlist = WatchlistState(entries=entries)
         signals = {"rsi": 55.0, "volume_ratio": 1.5}
-        indicators = {s: {"composite_technical_score": 0.5, "signals": signals} for s in ["AAPL", "MSFT", "NVDA"]}
+        indicators = {s: {"long_score": 0.5, "short_score": 0.5, "signals": signals} for s in ["AAPL", "MSFT", "NVDA"]}
         with caplog.at_level(logging.WARNING, logger="ozymandias.intelligence.claude_reasoning"):
             engine.assemble_reasoning_context(PortfolioState(), watchlist, {}, indicators)
         assert any("Token budget overflow" in r.message for r in caplog.records)

@@ -157,6 +157,62 @@ def compute_volume_sma(df: pd.DataFrame, length: int = 20) -> pd.Series:
     return df['volume'].rolling(length).mean().rename('volume_sma')
 
 
+def compute_adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    """
+    Average Directional Index (ADX) using Wilder's smoothing.
+
+    Measures trend strength independently of direction.
+    ADX < 20: ranging/consolidating. ADX > 30: strong directional trend.
+
+    Steps:
+      1. True Range and directional movement (+DM, -DM)
+      2. Wilder's EMA of TR, +DM, -DM (com = length - 1, same as ATR)
+      3. +DI = 100 * Smoothed+DM / SmoothedTR
+         -DI = 100 * Smoothed-DM / SmoothedTR
+      4. DX  = 100 * |+DI - -DI| / (+DI + -DI)
+      5. ADX = Wilder's EMA(DX, length)
+
+    Returns a Series of ADX values (NaN during warm-up).
+    Requires at least 2 bars; meaningful output needs ~2 × length bars.
+    """
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    prev_high = high.shift(1)
+    prev_low = low.shift(1)
+    prev_close = close.shift(1)
+
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    up_move = high - prev_high
+    down_move = prev_low - low
+
+    plus_dm = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
+        index=df.index,
+    )
+    minus_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
+        index=df.index,
+    )
+
+    atr_s = tr.ewm(com=length - 1, adjust=False).mean()
+    plus_dm_s = plus_dm.ewm(com=length - 1, adjust=False).mean()
+    minus_dm_s = minus_dm.ewm(com=length - 1, adjust=False).mean()
+
+    plus_di = 100.0 * plus_dm_s / atr_s.replace(0.0, np.nan)
+    minus_di = 100.0 * minus_dm_s / atr_s.replace(0.0, np.nan)
+
+    di_sum = plus_di + minus_di
+    dx = 100.0 * (plus_di - minus_di).abs() / di_sum.replace(0.0, np.nan)
+    adx = dx.ewm(com=length - 1, adjust=False).mean()
+
+    return adx.rename('adx')
+
+
 def compute_volatility_regime(
     df: pd.DataFrame,
     short: int = 20,
@@ -284,6 +340,174 @@ def classify_trend_structure(
     if bearish:
         return 'bearish_aligned'
     return 'mixed'
+
+
+# ---------------------------------------------------------------------------
+# Directional swing scores — long_score and short_score
+# ---------------------------------------------------------------------------
+
+def compute_directional_scores(
+    intraday_signals: dict,
+    daily_signals: dict | None = None,
+) -> dict[str, float]:
+    """
+    Compute swing-specific directional entry quality scores.
+
+    Returns {"long": float, "short": float} each clamped to [0.0, 1.0].
+
+    Designed for swing trading: rewards extension in the trade direction
+    (oversold for longs, overbought for shorts) rather than momentum
+    confirmation. High RSI 78 scores HIGH for shorts, LOW for longs.
+
+    Components (weights in config; extension point: add component + adjust weights):
+        Extension    (30%): daily RSI zone + Bollinger %B — is the move extended?
+        Exhaustion   (25%): MACD state + RSI slope/accel — is momentum fading?
+        Participation(25%): RVOL — did real volume confirm the move?
+        Trend context(20%): daily_trend + ADX — structural risk of counter-trend entry.
+
+    daily_signals (optional, from generate_daily_signal_summary):
+        rsi_14d, daily_trend, adx_14d, range_pct_20d.
+        Falls back to intraday RSI and trend_structure when absent.
+
+    Extension point: to add a component, add its computation below and adjust
+    the four component weights (must still sum to 1.0).
+    """
+    ds = daily_signals or {}
+
+    # --- Extension component (30%) ---
+    # Use daily RSI for swing evaluation; fall back to intraday RSI.
+    rsi = float(ds.get("rsi_14d") or intraday_signals.get("rsi", 50.0))
+    bb_pct_b = float(intraday_signals.get("bb_pct_b", 0.5))
+
+    # Long: peak score in the 20–30 oversold zone; zero above RSI 50.
+    if rsi <= 20:     ext_long = 0.50   # panic territory — risky
+    elif rsi <= 30:   ext_long = 0.90   # oversold sweet spot
+    elif rsi <= 40:   ext_long = 0.70   # mildly oversold
+    elif rsi <= 50:   ext_long = 0.30   # neutral
+    else:             ext_long = 0.00   # not a swing long setup
+
+    # Short: mirror — peak in 70–80 overbought zone; zero below RSI 50.
+    if rsi >= 80:     ext_short = 0.50  # parabolic territory — risky
+    elif rsi >= 70:   ext_short = 0.90  # overbought sweet spot
+    elif rsi >= 60:   ext_short = 0.70  # mildly overbought
+    elif rsi >= 50:   ext_short = 0.30  # neutral
+    else:             ext_short = 0.00  # not a swing short setup
+
+    # Bollinger %B modifier (±0.10): near the band reinforces the extension thesis.
+    if bb_pct_b < 0.2:
+        ext_long  = min(1.0, ext_long  + 0.10)
+        ext_short = max(0.0, ext_short - 0.10)
+    elif bb_pct_b > 0.8:
+        ext_short = min(1.0, ext_short + 0.10)
+        ext_long  = max(0.0, ext_long  - 0.10)
+
+    # --- Exhaustion component (25%) ---
+    # Is the prior directional move losing steam?
+    macd_sig       = intraday_signals.get("macd_signal", "bearish")
+    hist_expanding = bool(intraday_signals.get("macd_histogram_expanding", False))
+    rsi_slope      = float(intraday_signals.get("rsi_slope_5", 0.0))
+    rsi_accel      = float(intraday_signals.get("rsi_accel_3", 0.0))
+
+    # Long: selling pressure should be contracting or already reversing.
+    if macd_sig == "bullish_cross":
+        exh_long = 0.90   # fresh reversal — ideal entry timing
+    elif macd_sig == "bullish":
+        exh_long = 0.60   # reversal underway — decent
+    elif macd_sig == "bearish" and not hist_expanding:
+        exh_long = 0.65   # selling contracting — exhaustion signal
+    elif macd_sig == "bearish":
+        exh_long = 0.35   # active selling, not exhausted yet
+    else:  # bearish_cross
+        exh_long = 0.15   # selling just accelerated — too early
+
+    # Short: buying pressure should be contracting or reversing.
+    if macd_sig == "bearish_cross":
+        exh_short = 0.90
+    elif macd_sig == "bearish":
+        exh_short = 0.60
+    elif macd_sig == "bullish" and not hist_expanding:
+        exh_short = 0.65
+    elif macd_sig == "bullish":
+        exh_short = 0.35
+    else:  # bullish_cross
+        exh_short = 0.15
+
+    # RSI slope modifiers: slope direction confirms the exhaustion read.
+    if rsi_slope > 1.0:    exh_long  = min(1.0, exh_long  + 0.10)
+    elif rsi_slope < -2.0: exh_long  = max(0.0, exh_long  - 0.10)
+    if rsi_slope < -1.0:   exh_short = min(1.0, exh_short + 0.10)
+    elif rsi_slope > 2.0:  exh_short = max(0.0, exh_short - 0.10)
+
+    # RSI acceleration: positive = recovering (good for long), negative = rolling over (good for short)
+    if rsi_accel > 0: exh_long  = min(1.0, exh_long  + 0.05)
+    if rsi_accel < 0: exh_short = min(1.0, exh_short + 0.05)
+
+    # --- Participation component (25%) ---
+    # Volume confirms the move that created the oversold/overbought condition.
+    volume_ratio = float(intraday_signals.get("volume_ratio", 1.0))
+    if volume_ratio >= 3.0:   vol_s = 1.00
+    elif volume_ratio >= 2.0: vol_s = 0.85
+    elif volume_ratio >= 1.5: vol_s = 0.70
+    elif volume_ratio >= 1.0: vol_s = 0.50
+    elif volume_ratio >= 0.7: vol_s = 0.30
+    else:                      vol_s = 0.10
+
+    # --- Trend context component (20%) ---
+    # Pullback-in-uptrend is quality; counter-trend fades in strong trends are riskier.
+    daily_trend = ds.get("daily_trend") or intraday_signals.get("trend_structure", "mixed")
+    adx         = ds.get("adx_14d")
+    range_pct   = float(ds.get("range_pct_20d", 50.0))
+
+    # Long: pullback in uptrend ideal; downtrend counter-trend risky.
+    _TREND_LONG  = {
+        "uptrend":        0.80, "mixed": 0.65, "downtrend":       0.40,
+        "bullish_aligned": 0.75, "bearish_aligned": 0.35,
+    }
+    # Short: rally in downtrend ideal; uptrend counter-trend risky.
+    _TREND_SHORT = {
+        "downtrend":      0.80, "mixed": 0.65, "uptrend":         0.40,
+        "bearish_aligned": 0.75, "bullish_aligned": 0.35,
+    }
+    # Canonical values: "uptrend"/"downtrend"/"mixed" (from generate_daily_signal_summary) or
+    # "bullish_aligned"/"bearish_aligned"/"mixed" (intraday trend_structure fallback).
+    # Unrecognized labels fall through to 0.55 (neutral). Add new trend labels to both
+    # _TREND_LONG and _TREND_SHORT above — do NOT rely on the default for intentional cases.
+    if daily_trend not in _TREND_LONG:
+        import warnings
+        warnings.warn(
+            f"compute_directional_scores: unrecognized daily_trend {daily_trend!r} — "
+            "defaulting to 0.55. Add it to _TREND_LONG/_TREND_SHORT.",
+            stacklevel=2,
+        )
+    ctx_long  = _TREND_LONG.get(daily_trend,  0.55)
+    ctx_short = _TREND_SHORT.get(daily_trend, 0.55)
+
+    # ADX adjustment: strong trend (>30) makes counter-trend riskier;
+    # ranging (<20) makes fades safer.
+    if adx is not None:
+        adx_f = float(adx)
+        if adx_f > 30:
+            if daily_trend in ("downtrend", "bearish_aligned"): ctx_long  -= 0.15
+            if daily_trend in ("uptrend",   "bullish_aligned"): ctx_short -= 0.15
+        elif adx_f < 20:
+            if daily_trend in ("downtrend", "bearish_aligned"): ctx_long  += 0.10
+            if daily_trend in ("uptrend",   "bullish_aligned"): ctx_short += 0.10
+
+    # 20-day range extremes support the fade thesis.
+    if range_pct < 20.0: ctx_long  = min(1.0, ctx_long  + 0.05)
+    if range_pct > 80.0: ctx_short = min(1.0, ctx_short + 0.05)
+
+    ctx_long  = max(0.0, min(1.0, ctx_long))
+    ctx_short = max(0.0, min(1.0, ctx_short))
+
+    # --- Weighted composite ---
+    long_score  = 0.30 * ext_long  + 0.25 * exh_long  + 0.25 * vol_s + 0.20 * ctx_long
+    short_score = 0.30 * ext_short + 0.25 * exh_short + 0.25 * vol_s + 0.20 * ctx_short
+
+    return {
+        "long":  round(max(0.0, min(1.0, long_score)),  4),
+        "short": round(max(0.0, min(1.0, short_score)), 4),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +869,18 @@ def generate_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
     # --- Bollinger position ---
     bollinger_position = 'upper_half' if last_close >= last_bb_mid else 'lower_half'
 
+    # --- Bollinger %B (continuous price position within bands) ---
+    # %B = (close - lower) / (upper - lower)
+    # 0.0 = at lower band, 1.0 = at upper band; can exceed [0, 1] on extreme moves.
+    # Falls back to 0.5 (midpoint) when bands haven't warmed up.
+    _bb_upper = float(bb['upper'].iloc[-1]) if not pd.isna(bb['upper'].iloc[-1]) else None
+    _bb_lower = float(bb['lower'].iloc[-1]) if not pd.isna(bb['lower'].iloc[-1]) else None
+    if _bb_upper is not None and _bb_lower is not None:
+        _bb_range = _bb_upper - _bb_lower
+        bb_pct_b = (last_close - _bb_lower) / _bb_range if _bb_range > 0 else 0.5
+    else:
+        bb_pct_b = 0.5
+
     # Sum volume per calendar day, then average across days.
     # df contains 5-minute bars — df['volume'].mean() gives mean per-bar volume
     # (~1/78th of daily), not average daily volume. Resample to day first.
@@ -671,18 +907,23 @@ def generate_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
         'volume_trend_bars':          volume_trend_bars,
         'atr_14':                     round(last_atr, 4),
         'bollinger_position':         bollinger_position,
+        'bb_pct_b':                   round(bb_pct_b, 4),
         'bb_squeeze':                 bb_squeeze,
         'price':                      round(last_close, 4),
         'avg_daily_volume':           round(avg_daily_volume, 0),
         'vol_regime_ratio':           round(last_vol_regime, 4),
     }
 
+    # Compute intraday-only directional scores as a fallback baseline.
+    # The orchestrator enriches these with daily signals after the daily fetch completes.
+    _dir_scores = compute_directional_scores(signals)
     return {
-        'symbol':                   symbol,
-        'timestamp':                datetime.now(timezone.utc).isoformat(),
-        'signals':                  signals,
-        'composite_technical_score': round(compute_composite_score(signals), 4),
-        'bars_available':           len(df),  # raw bar count; used by orchestrator warm-up guard
+        'symbol':        symbol,
+        'timestamp':     datetime.now(timezone.utc).isoformat(),
+        'signals':       signals,
+        'long_score':    _dir_scores['long'],
+        'short_score':   _dir_scores['short'],
+        'bars_available': len(df),  # raw bar count; used by orchestrator warm-up guard
     }
 
 
@@ -756,6 +997,25 @@ def generate_daily_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
     last_signal = float(macd_df['signal'].iloc[-1])
     macd_signal_daily = 'bullish' if last_macd >= last_signal else 'bearish'
 
+    # 20-day range percentile: where is the current close within the last 20-day H/L range?
+    # 0.0 = at 20-day low, 100.0 = at 20-day high.
+    _n = min(20, len(df))
+    _high_20d = float(df['high'].iloc[-_n:].max())
+    _low_20d  = float(df['low'].iloc[-_n:].min())
+    _range_20d = _high_20d - _low_20d
+    range_pct_20d = round((last_close - _low_20d) / _range_20d * 100.0, 1) if _range_20d > 0 else 50.0
+
+    # Daily ADX — trend strength, direction-agnostic.
+    # < 20 = ranging/consolidating (good for swing entries).
+    # > 30 = strong directional trend (higher catching-a-knife risk for counter-trend swings).
+    # Requires ≥ 28 bars for a meaningful warm-up (2 × length).
+    adx_14d: float | None = None
+    if len(df) >= 28:
+        _adx_series = compute_adx(df, length=14)
+        _last_adx = _adx_series.iloc[-1]
+        if not pd.isna(_last_adx):
+            adx_14d = round(float(_last_adx), 1)
+
     result: dict = {
         'rsi_14d':            round(last_rsi, 1),
         'price_vs_ema20':     price_vs_ema20,
@@ -763,11 +1023,14 @@ def generate_daily_signal_summary(symbol: str, df: pd.DataFrame) -> dict:
         'roc_5d':             round(last_roc_5d, 2),
         'volume_trend_daily': volume_trend_daily,
         'macd_signal_daily':  macd_signal_daily,
+        'range_pct_20d':      range_pct_20d,
     }
     if price_vs_ema50 is not None:
         result['price_vs_ema50'] = price_vs_ema50
     if ema20_vs_ema50 is not None:
         result['ema20_vs_ema50'] = ema20_vs_ema50
+    if adx_14d is not None:
+        result['adx_14d'] = adx_14d
     return result
 
 

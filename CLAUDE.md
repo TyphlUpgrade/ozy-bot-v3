@@ -111,6 +111,14 @@ Last post-MVP phase completed: Phase 21 — Durability and Regime Response (Marc
 
 ### Decisions from completed phases that affect active development
 
+- **Directional TA scoring** (`compute_directional_scores`): `composite_technical_score` is fully
+  removed. All code uses `long_score`/`short_score` from `compute_directional_scores(intraday, daily)`.
+  The `_latest_indicators` cache is flat — both scores stored at the top level, no `"signals"` sub-key.
+  `ScoredOpportunity.composite_score` is a *different concept* (ranker weighted output: conviction ×
+  0.35 + tech × 0.30 + rar × 0.20 + liq × 0.15) and is correct/intentional — do not confuse the two.
+  Claude cannot adjust the ranker's `min_composite_score` floor via `filter_adjustments` (it never
+  sees the scores). The only Claude-adjustable filter parameter is `min_rvol`.
+
 - **Position sizing** (`_medium_try_entry`): Claude's `position_size_pct` is the primary sizing
   target (`equity × pct / price`), clamped by `max_position_pct`. The ATR formula applies as a
   risk cap on top — it does not drive size. Do not revert to ATR-first sizing.
@@ -133,7 +141,7 @@ Last post-MVP phase completed: Phase 21 — Durability and Regime Response (Marc
 
 - **Phase 19 — Sonnet Strategic Output**: see `phases/19_sonnet_strategic_output.md`
   - Richer Sonnet inputs: `sector_dispersion` (watchlist symbols vs sector ETF 1w return),
-    `recent_rejections` (filter kill feedback), `news_theme_synthesis`
+    `recent_rejections` (filter kill feedback)
   - New `ReasoningResult` fields: `regime_assessment`, `sector_regimes`, `filter_adjustments`,
     `active_theses` with `thesis_breaking_conditions`
   - `filter_adjustments` applied in ranker with config-floor guards; strategy trend gate yields
@@ -150,13 +158,15 @@ Last post-MVP phase completed: Phase 21 — Durability and Regime Response (Marc
 - **Phase 21 — Durability and Regime Response** *(complete, March 27)*
   - `_regime_reset_build`: fire-and-forget background task; evicts conflicting watchlist entries on
     regime/sector flip; clears directional suppression; rebuilds with `target_count=20`
-  - `_clear_directional_suppression(affected_sectors)`: clears rvol/composite_score/conviction_floor/
+  - `_clear_directional_suppression(affected_sectors)`: clears rvol/directional_score/conviction_floor/
     defer_expired suppressions for symbols in affected sectors; preserves fetch_failure/blacklist
-  - Multi-tier pruner eviction: tier-2 first, then direction-conflicting tier-1, then composite score
+  - Multi-tier pruner eviction: tier-2 first, then direction-conflicting tier-1, then directional score
   - Regime-aware universe scanner: `day_losers` screener for correcting/downtrend sectors;
     doubled price_move floor in broad panic; new params `sector_regimes`, `regime_assessment`, `sector_map`
-  - Position thesis monitoring: `ContextCompressor.check_position_theses` + `_condition_met`;
-    medium loop fires `thesis_breach` Sonnet cycle on condition match
+  - Position thesis monitoring: `ContextCompressor.check_position_theses` — async Haiku call
+    with enriched payload (live signals + news); dedicated `thesis_check.txt` prompt; medium loop
+    fires `thesis_breach` Sonnet cycle on `needs_sonnet=True`. (Deterministic `_condition_met`
+    removed — see 2026-03-31 DRIFT_LOG entry.)
   - Startup persistence: regime_assessment/sector_regimes restored from reasoning cache at startup
     Step 4c (via `_result_from_raw_reasoning`, not `bot_state.json`)
 

@@ -21,7 +21,7 @@
     "max_risk_per_trade_pct": 0.02
   },
   "scheduler": {
-    "bypass_market_hours": true,
+    "bypass_market_hours": false,
     "fast_loop_sec": 10,
     "medium_loop_sec": 120,
     "slow_loop_check_sec": 60,
@@ -111,7 +111,6 @@
     "min_conviction_threshold": 0.10,
     "min_composite_score": 0.45,
     "filter_adj_min_rvol": 0.5,
-    "filter_adj_min_composite": 0.35,
     "filter_adjustment_decay_cycles": 2,
     "thesis_challenge_size_threshold": 0.20,
     "thesis_challenge_max_penalty": 0.35,
@@ -130,7 +129,6 @@
   },
   "strategy": {
     "active_strategies": ["momentum", "swing"],
-    "swing_min_hold_hours": 4.0,
     "strategy_params": {
       "momentum": {
         "min_vol_regime_ratio": 0.85,

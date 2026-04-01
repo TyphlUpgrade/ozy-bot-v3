@@ -82,20 +82,14 @@ class TestMultiTierPruner:
 
     def _eviction_priority(self, entry, sector_regimes, indicators, sector_map):
         """Mirror the _eviction_priority logic from _apply_watchlist_changes for testing."""
-        from ozymandias.intelligence.technical_analysis import compute_composite_score
-
         def _composite(e) -> float:
             ind = indicators.get(e.symbol, {})
-            raw = ind.get("signals") or {}
-            if raw:
-                ed = getattr(e, "expected_direction", "either")
-                if ed != "either":
-                    return compute_composite_score(raw, direction=ed)
-                return max(
-                    compute_composite_score(raw, direction="long"),
-                    compute_composite_score(raw, direction="short"),
-                )
-            return 0.0
+            ed = getattr(e, "expected_direction", "either")
+            if ed == "long":
+                return float(ind.get("long_score", 0.0))
+            if ed == "short":
+                return float(ind.get("short_score", 0.0))
+            return max(float(ind.get("long_score", 0.0)), float(ind.get("short_score", 0.0)))
 
         def _direction_conflicts(e) -> bool:
             if not sector_regimes:
@@ -159,13 +153,13 @@ class TestMultiTierPruner:
         assert p[0] == 1  # conflicts with uptrend sector
 
     def test_within_same_tier_lowest_composite_evicted_first(self):
-        from ozymandias.intelligence.technical_analysis import compute_composite_score
         sector_map = {}
         high_score_entry = make_entry("HIGH", tier=1, ed="long")
         low_score_entry = make_entry("LOW", tier=1, ed="long")
+        # _latest_indicators is flat: long_score/short_score at top level, no "signals" sub-key
         indicators = {
-            "HIGH": {"signals": {"rsi": 65, "volume_ratio": 1.5, "vwap_position": "above", "trend_structure": "bullish_aligned", "roc_5": 2.0}},
-            "LOW": {"signals": {"rsi": 35, "volume_ratio": 0.5, "vwap_position": "below", "trend_structure": "bearish_aligned", "roc_5": -1.5}},
+            "HIGH": {"long_score": 0.75, "short_score": 0.30},
+            "LOW":  {"long_score": 0.25, "short_score": 0.65},
         }
         p_high = self._eviction_priority(high_score_entry, None, indicators, sector_map)
         p_low = self._eviction_priority(low_score_entry, None, indicators, sector_map)
@@ -220,7 +214,7 @@ class TestClearDirectionalSuppression:
     def test_none_affected_sectors_clears_all_directional(self):
         orch = self._make_orch_with_suppression({
             "NVDA": "rvol_too_low",
-            "XOM": "composite_score_too_low",
+            "XOM": "directional_score_too_low",
             "AAPL": "fetch_failure",
         })
         orch._clear_directional_suppression(None)  # broad panic — clear all sectors
@@ -375,139 +369,164 @@ class TestUniverseScannerRegimeAware:
 # ---------------------------------------------------------------------------
 
 class TestPositionThesisMonitoring:
-    """Tests ContextCompressor.check_position_theses and _condition_met."""
+    """Tests ContextCompressor.check_position_theses (Haiku-based evaluation)."""
 
     def setup_method(self):
-        self.compressor = make_compressor()
+        cfg = ClaudeConfig()
+        cfg.compressor_enabled = True
+        self.prompts_dir = MagicMock(spec=Path)
+        mock_thesis_path = MagicMock()
+        mock_thesis_path.read_text.return_value = (
+            "Evaluate theses. Positions: {positions_json}\n"
+            "Regime: {regime_json}\nMarket: {market_context_json}\n"
+            'Respond JSON: {"needs_sonnet": false, "breach": null}'
+        )
+        # _load_thesis_check_prompt looks for "thesis_check.txt"
+        self.prompts_dir.__truediv__ = MagicMock(return_value=mock_thesis_path)
+        self.compressor = ContextCompressor(cfg, prompts_dir=self.prompts_dir)
 
     def _make_position(self, symbol: str):
         return MagicMock(symbol=symbol)
 
-    def test_no_theses_returns_none(self):
+    def _make_haiku_response(self, needs_sonnet: bool, breach: str | None = None) -> MagicMock:
+        response = MagicMock()
+        content_block = MagicMock()
+        content_block.text = json.dumps({"needs_sonnet": needs_sonnet, "breach": breach})
+        response.content = [content_block]
+        return response
+
+    def _base_args(self, positions, theses, indicators=None, cycle_id=""):
+        return dict(
+            positions=positions,
+            active_theses=theses,
+            indicators=indicators or {},
+            daily_indicators=None,
+            market_data={},
+            regime_assessment=None,
+            sector_regimes=None,
+            cycle_id=cycle_id,
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_theses_returns_none(self):
         positions = [self._make_position("AAPL")]
-        result = self.compressor.check_position_theses(positions, None, {})
+        result = await self.compressor.check_position_theses(
+            **self._base_args(positions, None)
+        )
         assert result is None
 
-    def test_no_positions_returns_none(self):
+    @pytest.mark.asyncio
+    async def test_no_positions_returns_none(self):
         theses = [{"symbol": "AAPL", "thesis_breaking_conditions": ["rsi < 30"]}]
-        result = self.compressor.check_position_theses([], theses, {})
+        result = await self.compressor.check_position_theses(
+            **self._base_args([], theses)
+        )
         assert result is None
 
-    def test_breach_detected_fires_needs_sonnet(self):
+    @pytest.mark.asyncio
+    async def test_breach_detected_fires_needs_sonnet(self):
         positions = [self._make_position("AAPL")]
-        theses = [{"symbol": "AAPL", "thesis_breaking_conditions": ["rsi < 30"]}]
-        indicators = {
-            "AAPL": {"signals": {"rsi": 25.0}}  # below 30 threshold
-        }
-        result = self.compressor.check_position_theses(positions, theses, indicators, cycle_id="test-cycle")
+        theses = [{"symbol": "AAPL", "thesis": "momentum", "thesis_breaking_conditions": ["rsi < 30"]}]
+        with patch.object(
+            self.compressor._client.messages, "create",
+            new=AsyncMock(return_value=self._make_haiku_response(True, "AAPL: rsi < 30 met"))
+        ):
+            result = await self.compressor.check_position_theses(
+                **self._base_args(positions, theses, cycle_id="test-cycle")
+            )
         assert result is not None
         assert result.needs_sonnet is True
         assert result.sonnet_reason == "position_thesis_breach"
+        assert "AAPL" in result.notes
 
-    def test_no_breach_returns_none(self):
+    @pytest.mark.asyncio
+    async def test_no_breach_returns_none(self):
         positions = [self._make_position("AAPL")]
-        theses = [{"symbol": "AAPL", "thesis_breaking_conditions": ["rsi < 30"]}]
-        indicators = {
-            "AAPL": {"signals": {"rsi": 55.0}}  # above threshold — no breach
-        }
-        result = self.compressor.check_position_theses(positions, theses, indicators, cycle_id="test-cycle2")
+        theses = [{"symbol": "AAPL", "thesis": "momentum", "thesis_breaking_conditions": ["rsi < 30"]}]
+        with patch.object(
+            self.compressor._client.messages, "create",
+            new=AsyncMock(return_value=self._make_haiku_response(False))
+        ):
+            result = await self.compressor.check_position_theses(
+                **self._base_args(positions, theses, cycle_id="test-cycle2")
+            )
         assert result is None
 
-    def test_per_cycle_guard_prevents_double_fire(self):
+    @pytest.mark.asyncio
+    async def test_parse_failure_returns_none(self):
+        """Malformed Haiku response → conservative None, no crash."""
         positions = [self._make_position("AAPL")]
-        theses = [{"symbol": "AAPL", "thesis_breaking_conditions": ["rsi < 30"]}]
-        indicators = {"AAPL": {"signals": {"rsi": 25.0}}}
+        theses = [{"symbol": "AAPL", "thesis": "x", "thesis_breaking_conditions": ["rsi < 30"]}]
+        bad_response = MagicMock()
+        bad_response.content = [MagicMock(text="this is not json at all")]
+        with patch.object(
+            self.compressor._client.messages, "create",
+            new=AsyncMock(return_value=bad_response)
+        ):
+            result = await self.compressor.check_position_theses(
+                **self._base_args(positions, theses)
+            )
+        assert result is None
 
-        result1 = self.compressor.check_position_theses(positions, theses, indicators, cycle_id="cycle-X")
-        result2 = self.compressor.check_position_theses(positions, theses, indicators, cycle_id="cycle-X")
+    @pytest.mark.asyncio
+    async def test_api_failure_returns_none(self):
+        """Haiku API exception → conservative None, no crash."""
+        positions = [self._make_position("AAPL")]
+        theses = [{"symbol": "AAPL", "thesis": "x", "thesis_breaking_conditions": ["rsi < 30"]}]
+        with patch.object(
+            self.compressor._client.messages, "create",
+            side_effect=Exception("API timeout")
+        ):
+            result = await self.compressor.check_position_theses(
+                **self._base_args(positions, theses)
+            )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_per_cycle_guard_prevents_double_fire(self):
+        positions = [self._make_position("AAPL")]
+        theses = [{"symbol": "AAPL", "thesis": "x", "thesis_breaking_conditions": ["rsi < 30"]}]
+        with patch.object(
+            self.compressor._client.messages, "create",
+            new=AsyncMock(return_value=self._make_haiku_response(True, "AAPL: breach"))
+        ):
+            result1 = await self.compressor.check_position_theses(
+                **self._base_args(positions, theses, cycle_id="cycle-X")
+            )
+            result2 = await self.compressor.check_position_theses(
+                **self._base_args(positions, theses, cycle_id="cycle-X")
+            )
         assert result1 is not None and result1.needs_sonnet is True
         assert result2 is None  # suppressed same cycle
 
-    def test_different_cycle_fires_again(self):
+    @pytest.mark.asyncio
+    async def test_different_cycle_fires_again(self):
         positions = [self._make_position("AAPL")]
-        theses = [{"symbol": "AAPL", "thesis_breaking_conditions": ["rsi < 30"]}]
-        indicators = {"AAPL": {"signals": {"rsi": 25.0}}}
-
-        self.compressor.check_position_theses(positions, theses, indicators, cycle_id="cycle-A")
-        result = self.compressor.check_position_theses(positions, theses, indicators, cycle_id="cycle-B")
+        theses = [{"symbol": "AAPL", "thesis": "x", "thesis_breaking_conditions": ["rsi < 30"]}]
+        with patch.object(
+            self.compressor._client.messages, "create",
+            new=AsyncMock(return_value=self._make_haiku_response(True, "AAPL: breach"))
+        ):
+            await self.compressor.check_position_theses(
+                **self._base_args(positions, theses, cycle_id="cycle-A")
+            )
+            result = await self.compressor.check_position_theses(
+                **self._base_args(positions, theses, cycle_id="cycle-B")
+            )
         assert result is not None and result.needs_sonnet is True
 
-    def test_position_not_in_theses_ignored(self):
-        positions = [self._make_position("GOOG")]  # GOOG has no thesis
-        theses = [{"symbol": "AAPL", "thesis_breaking_conditions": ["rsi < 30"]}]
-        indicators = {"GOOG": {"signals": {"rsi": 25.0}}}
-        result = self.compressor.check_position_theses(positions, theses, indicators, cycle_id="cycle-C")
+    @pytest.mark.asyncio
+    async def test_position_not_in_theses_skips_haiku(self):
+        """Position with no matching thesis → payload is empty → Haiku not called."""
+        positions = [self._make_position("GOOG")]
+        theses = [{"symbol": "AAPL", "thesis": "x", "thesis_breaking_conditions": ["rsi < 30"]}]
+        mock_create = AsyncMock()
+        with patch.object(self.compressor._client.messages, "create", new=mock_create):
+            result = await self.compressor.check_position_theses(
+                **self._base_args(positions, theses)
+            )
         assert result is None
-
-
-# ---------------------------------------------------------------------------
-# TestConditionMet
-# ---------------------------------------------------------------------------
-
-class TestConditionMet:
-    """Tests the _condition_met helper in ContextCompressor."""
-
-    def setup_method(self):
-        self.compressor = make_compressor()
-
-    def test_rsi_less_than_threshold_met(self):
-        assert self.compressor._condition_met("rsi < 30", {"rsi": 25.0}, {}) is True
-
-    def test_rsi_less_than_threshold_not_met(self):
-        assert self.compressor._condition_met("rsi < 30", {"rsi": 35.0}, {}) is False
-
-    def test_rsi_greater_than_met(self):
-        assert self.compressor._condition_met("rsi > 70", {"rsi": 75.0}, {}) is True
-
-    def test_rsi_greater_than_not_met(self):
-        assert self.compressor._condition_met("rsi > 70", {"rsi": 65.0}, {}) is False
-
-    def test_daily_trend_downtrend_condition_met(self):
-        assert self.compressor._condition_met(
-            "daily_trend becomes downtrend", {}, {"daily_trend": "downtrend"}
-        ) is True
-
-    def test_daily_trend_downtrend_not_met(self):
-        assert self.compressor._condition_met(
-            "daily_trend becomes downtrend", {}, {"daily_trend": "uptrend"}
-        ) is False
-
-    def test_missing_indicator_returns_false(self):
-        """If indicator key not present, return False (conservative)."""
-        assert self.compressor._condition_met("rsi < 30", {}, {}) is False
-
-    def test_unrecognized_condition_returns_false(self):
-        """Unrecognized condition format never fires."""
-        assert self.compressor._condition_met("sector_1w_return < -5%", {}, {}) is False
-        assert self.compressor._condition_met("this is gibberish", {}, {}) is False
-
-    def test_volume_ratio_condition(self):
-        assert self.compressor._condition_met("volume_ratio < 0.5", {"volume_ratio": 0.3}, {}) is True
-
-    def test_daily_signals_checked_as_fallback(self):
-        """Indicator in daily dict (not intraday) is still evaluated."""
-        assert self.compressor._condition_met("rsi < 30", {}, {"rsi": 25.0}) is True
-
-    # Bug-fix tests: _condition_met uptrend/neutral patterns (BUG fix)
-    def test_daily_trend_uptrend_condition_met(self):
-        """'becomes uptrend' must fire for short-thesis monitoring."""
-        assert self.compressor._condition_met(
-            "daily_trend becomes uptrend", {}, {"daily_trend": "uptrend"}
-        ) is True
-
-    def test_daily_trend_uptrend_not_met_when_still_downtrend(self):
-        assert self.compressor._condition_met(
-            "daily_trend becomes uptrend", {}, {"daily_trend": "downtrend"}
-        ) is False
-
-    def test_daily_trend_neutral_condition_met(self):
-        assert self.compressor._condition_met(
-            "daily_trend becomes neutral", {}, {"daily_trend": "neutral"}
-        ) is True
-
-    def test_condition_with_leading_whitespace_parsed(self):
-        """Conditions with leading whitespace are tolerated (re.search vs match)."""
-        assert self.compressor._condition_met("  rsi < 30", {"rsi": 25.0}, {}) is True
+        mock_create.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -526,13 +545,14 @@ class TestSwingFilterAdjustments:
         assert not passed
         assert "0.80" in reason or "RVOL" in reason
 
-    def test_filter_adjustments_relaxes_floor(self):
-        """Claude lowers min_rvol to 0.4 → entry with RVOL=0.5 should pass."""
-        passed, reason = self.strategy.apply_entry_gate(
-            "buy", {"volume_ratio": 0.5},
-            filter_adjustments={"min_rvol": 0.4},
-        )
-        assert passed, f"Expected pass with relaxed floor, got: {reason}"
+    # def test_filter_adjustments_relaxes_floor(self):
+    #     """Disabled: filter_adjustments.min_rvol is momentum-only and intentionally
+    #     ignored for swing entries (intraday RVOL is noise for multi-day theses)."""
+    #     passed, reason = self.strategy.apply_entry_gate(
+    #         "buy", {"volume_ratio": 0.5},
+    #         filter_adjustments={"min_rvol": 0.4},
+    #     )
+    #     assert passed, f"Expected pass with relaxed floor, got: {reason}"
 
     def test_filter_adjustments_above_config_floor_still_blocks(self):
         """If filter_adjustments.min_rvol=0.9 (tighter), low RVOL still blocked."""

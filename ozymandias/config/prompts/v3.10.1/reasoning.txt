@@ -11,10 +11,6 @@ CONSTRAINTS IN EFFECT:
 - PDT limit: pdt_trades_remaining shows same-day round trips remaining. The system enforces PDT limits automatically, but be conservative with exit recommendations when this is 1 or 0 — those remaining trades may be needed for emergency exits.
 - Only enter during regular market hours (9:30 AM – 3:55 PM ET for momentum; 9:30 AM – 4:00 PM ET for swing)
 - Only recommend strategies listed in market_context.active_strategies — do not suggest a strategy that is not in that list
-- Swing position minimum hold: do NOT recommend exit for a swing position with hold_hours < 4 unless the stop-loss has been breached. Intraday signal deterioration (MACD cross, RSI dip, short-term price decline, SPY/QQQ RSI moves, sector composite score changes, broad market trend deterioration) is expected noise for a multi-day thesis and is not a valid exit reason. A swing position entered with a known macro backdrop is not invalidated by that backdrop worsening within the first few hours — the stop exists precisely to define the thesis risk in adverse conditions.
-  - Stop-loss breach for LONG positions: current_price has fallen below exit_targets.stop_loss → exit.
-  - Stop-loss breach for SHORT positions: current_price has risen above exit_targets.stop_loss → exit.
-  - If the stop has not been breached, hold regardless of intraday noise. Do not recommend exit for multiple positions simultaneously citing the same macro condition — that is a signal you are reacting to noise, not thesis failure.
 
 CONTEXT:
 {context_json}
@@ -28,7 +24,7 @@ INSTRUCTIONS:
 4. Suggest new symbols to add if the watchlist needs replenishing (target 15-40 tickers total). watchlist_tier1_shown is the number of symbols you are seeing; watchlist_tier1_total is the full tier-1 count. If watchlist_tier1_total is already near or above 30, only add symbols with a clear, specific catalyst — the list does not need padding.
 
 MACRO AND NEWS USAGE:
-- market_context.sector_performance is sorted by composite_score descending. Reference the leading and lagging sectors explicitly in market_assessment — name the ETF and describe the regime (e.g. "XLK leading with bullish-aligned trend; XLE lagging in bearish structure").
+- market_context.sector_performance is sorted by max(long_score, short_score) descending — sectors with the strongest directional setups appear first. Reference the leading and lagging sectors explicitly in market_assessment — name the ETF and describe the regime (e.g. "XLK leading with bullish-aligned trend; XLE lagging in bearish structure"). Use long_score and short_score to identify which direction each sector favours.
 - market_context.watchlist_news contains recent headlines per symbol. When a catalyst is present for a candidate, reflect it in the opportunity's reasoning field (e.g. "earnings beat catalyst per [publisher]"). When news signals deterioration (downgrade, guidance cut, adverse event), note it in rejection_reason or updated_reasoning. Absent news does not mean no catalyst — only note absence if it is a meaningful negative.
 - Rejected opportunities should note macro or sector headwinds when relevant (e.g. "XLE bearish structure creates sector headwind for energy names").
 
@@ -78,13 +74,16 @@ FIELD INSTRUCTIONS:
   Available keys:
     BOTH directions: rsi_min (float), rsi_max (float), rsi_accel_min (float — RSI acceleration ≥ value; positive confirms momentum still building; 0.0 requires non-negative acceleration), rsi_accel_max (float — RSI acceleration ≤ value; use negative e.g. -0.5 to confirm deceleration for fades or to block entries into peaking moves), require_volume_ratio_min (float), require_volume_trend_bars_min (int — consecutive bars of increasing volume), require_macd_histogram_expanding (bool — MACD histogram growing in current direction), require_above_vwap (bool — price must be above VWAP; use for longs OR mean-reversion shorts fading an extended move), require_below_vwap (bool — price must be below VWAP; use for breakdown shorts OR as a long stop gate)
     LONG only: rsi_slope_min (float — RSI rising at least this fast, e.g. 0.5), require_macd_bullish (bool)
-    SHORT only: rsi_slope_max (float — RSI must be falling; use negative value e.g. -0.5 means slope ≤ -0.5), require_macd_bearish (bool)
-  Long example (NVDA momentum): require_above_vwap: true, rsi_min: 52, rsi_max: 72, rsi_slope_min: 0.5, require_macd_histogram_expanding: true
-  Swing long at elevated RSI (e.g. RSI 67, catalyst-driven): rsi_max: 78, rsi_accel_min: 0.0 — blocks entry if RSI slope is already decelerating
-  Breakdown short example (META): require_below_vwap: true, rsi_max: 50, rsi_slope_max: -0.5, require_macd_bearish: true, require_volume_trend_bars_min: 2
-  Mean-reversion fade example (PLTR extended above VWAP, RSI 82 and flattening): require_above_vwap: true, rsi_min: 75, rsi_accel_max: -0.3 — confirms deceleration before entering the fade
-  Note: `require_macd_histogram_expanding: false` has no effect and should be omitted — there is no contracting-histogram gate. Use rsi_slope_max to confirm deteriorating momentum instead.
-  `rsi_accel_3` in `ta_readiness` shows the current value — check it when RSI is above 65 on a long candidate to decide whether to set rsi_accel_min.
+    SHORT only: rsi_slope_max (float — RSI must be falling at or below this rate; appropriate for breakdown shorts where RSI is already declining), require_macd_bearish (bool)
+  Choosing between rsi_slope_max and rsi_accel_max for shorts:
+    Breakdown short (price already breaking down, RSI in confirmed decline) → rsi_slope_max. You want RSI actively falling before entry.
+    Fade/mean-reversion short (price extended, RSI elevated but momentum visibly slowing) → rsi_accel_max with a negative value. This gates on deceleration rather than requiring RSI to already be falling — it fires at the inflection point. When rsi_accel_3 in ta_readiness is strongly negative but rsi_slope_5 is still positive, rsi_accel_max is the appropriate gate; rsi_slope_max would defer entry past the setup's optimal window.
+  Long example (momentum): require_above_vwap: true, rsi_min: 52, rsi_max: 72, rsi_slope_min: 0.5, require_macd_histogram_expanding: true
+  Swing long at elevated RSI (catalyst-driven): rsi_max: 78, rsi_accel_min: 0.0 — blocks entry if RSI slope is already decelerating
+  Breakdown short example: require_below_vwap: true, rsi_max: 50, rsi_slope_max: -0.5, require_macd_bearish: true, require_volume_trend_bars_min: 2
+  Fade short example (extended above VWAP, RSI elevated and flattening): require_above_vwap: true, rsi_min: 70, rsi_accel_max: -0.3 — confirms deceleration without requiring RSI to already be falling
+  Note: `require_macd_histogram_expanding: false` has no effect and should be omitted — there is no contracting-histogram gate. Use rsi_slope_max (breakdown) or rsi_accel_max (fade) to confirm deteriorating momentum instead.
+  `rsi_accel_3` in `ta_readiness` shows the current value — check it for both long and short setups: on longs, use it to confirm momentum is still building; on short fades, use it to confirm the move is losing steam before committing.
 - "session_veto": list of DIRECTIONS to suppress for the remainder of this session. Valid values: "long", "short". Example: ["long"] blocks all long entries while leaving short entries open; ["short"] does the reverse. Use when market regime makes one direction structurally invalid — e.g. confirmed distribution phase → veto "long" and focus on shorts; strong broad uptrend with no short setups → veto "short". Empty list is the default and correct choice in most sessions. NEVER put both "long" and "short" in the veto simultaneously — that disables all entries. If conditions are bad in all directions, lower conviction scores or return empty new_opportunities instead.
 
 PHASE 19 — MARKET CONTEXT ADDITIONS:
@@ -172,8 +171,7 @@ RESPONSE FORMAT:
   },
   "filter_adjustments": {
     "min_rvol": 0.6,
-    "min_composite_score": 0.40,
-    "reason": "Why you are adjusting these floors for current conditions — be specific"
+    "reason": "Why you are adjusting the RVOL floor for current conditions — be specific"
   },
   "active_theses": [
     {

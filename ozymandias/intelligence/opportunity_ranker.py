@@ -25,7 +25,7 @@ from ozymandias.core.state_manager import PortfolioState
 from ozymandias.execution.broker_interface import AccountInfo
 from ozymandias.execution.pdt_guard import PDTGuard
 from ozymandias.intelligence.claude_reasoning import ReasoningResult
-from ozymandias.intelligence.technical_analysis import compute_composite_score
+from ozymandias.intelligence.technical_analysis import compute_directional_scores
 
 logger = logging.getLogger(__name__)
 
@@ -267,11 +267,10 @@ def evaluate_entry_conditions(conditions: dict | None, signals: dict) -> tuple[b
 # Phase 19: filter_adjustments clamping helper
 # ---------------------------------------------------------------------------
 
-# Absolute floors on Claude-proposed threshold relaxation.
-# These match RankerConfig.filter_adj_min_* defaults; kept here to avoid
-# importing the config dataclass into the ranker module (circular-dep risk).
+# Absolute floor on Claude-proposed RVOL relaxation.
+# Kept here to avoid importing the config dataclass into the ranker module (circular-dep risk).
+# Directional score floor is NOT adjustable by Claude — scores are ranker-internal.
 _FILTER_ADJ_MIN_RVOL = 0.5
-_FILTER_ADJ_MIN_COMPOSITE = 0.35
 
 
 def _clamp_filter_adjustments(fa: dict | None) -> dict | None:
@@ -288,13 +287,10 @@ def _clamp_filter_adjustments(fa: dict | None) -> dict | None:
             result["min_rvol"] = max(_FILTER_ADJ_MIN_RVOL, float(result["min_rvol"]))
         except (TypeError, ValueError):
             del result["min_rvol"]
-    if "min_composite_score" in result:
-        try:
-            result["min_composite_score"] = max(
-                _FILTER_ADJ_MIN_COMPOSITE, float(result["min_composite_score"])
-            )
-        except (TypeError, ValueError):
-            del result["min_composite_score"]
+    # min_composite_score / min_directional_score intentionally not honoured —
+    # Claude does not observe directional scores so has no basis to set a floor.
+    result.pop("min_composite_score",   None)
+    result.pop("min_directional_score", None)
     return result or None
 
 
@@ -383,6 +379,7 @@ class OpportunityRanker:
         technical_signals: dict[str, dict],
         account_info: AccountInfo,
         portfolio: PortfolioState,
+        daily_signals: dict | None = None,
     ) -> ScoredOpportunity:
         """
         Compute and return a :class:`ScoredOpportunity` for one candidate.
@@ -393,12 +390,12 @@ class OpportunityRanker:
             One entry from :attr:`ReasoningResult.new_opportunities`.
         technical_signals:
             Mapping ``symbol → signal_dict`` from ``generate_signal_summary``.
-            Keys used: ``composite_technical_score``, ``avg_daily_volume`` (optional).
+            Keys used: ``long_score``, ``short_score``, ``avg_daily_volume`` (optional).
             The full output of ``generate_signal_summary()`` is expected per symbol
-            (top-level dict with ``composite_technical_score`` and nested ``signals``).
+            (top-level dict with ``long_score``/``short_score`` and nested ``signals``).
         """
         symbol = opportunity["symbol"]
-        # Full generate_signal_summary() output: top-level has composite_technical_score;
+        # Full generate_signal_summary() output: top-level has long_score/short_score;
         # per-indicator values live inside the nested "signals" sub-dict.
         sig_summary = technical_signals.get(symbol, {})
         nested_signals = sig_summary.get("signals", {})
@@ -409,11 +406,12 @@ class OpportunityRanker:
         # raw signals are unavailable (e.g. symbol missing from technical_signals).
         action = opportunity.get("action", "buy")
         direction = direction_from_action(action)
-        technical_score = (
-            compute_composite_score(nested_signals, direction=direction)
-            if nested_signals
-            else float(sig_summary.get("composite_technical_score", 0.0))
-        )
+        if nested_signals:
+            _scores = compute_directional_scores(nested_signals, daily_signals or {})
+            technical_score = _scores["long"] if direction == "long" else _scores["short"]
+        else:
+            _key = "long_score" if direction == "long" else "short_score"
+            technical_score = float(sig_summary.get(_key, 0.0))
 
         entry = float(opportunity.get("suggested_entry", 0.0))
         exit_ = float(opportunity.get("suggested_exit", 0.0))
@@ -463,6 +461,7 @@ class OpportunityRanker:
         technical_signals: dict[str, dict] | None = None,
         strategy_lookup: dict | None = None,
         filter_adjustments: dict | None = None,
+        daily_signals: dict | None = None,
     ) -> tuple[bool, str]:
         """
         Run pre-scoring hard filters.  Any failure removes the opportunity.
@@ -519,15 +518,16 @@ class OpportunityRanker:
             sig_summary = technical_signals.get(symbol, {})
             raw_signals = sig_summary.get("signals", {})
             direction = direction_from_action(opportunity.get("action", "buy"))
-            tech_score = (
-                compute_composite_score(raw_signals, direction=direction)
-                if raw_signals
-                else float(sig_summary.get("composite_technical_score", 0.0))
-            )
+            if raw_signals:
+                _scores = compute_directional_scores(raw_signals, daily_signals or {})
+                tech_score = _scores["long"] if direction == "long" else _scores["short"]
+            else:
+                _key = "long_score" if direction == "long" else "short_score"
+                tech_score = float(sig_summary.get(_key, 0.0))
             if tech_score < self._min_technical_score:
                 return (
                     False,
-                    f"{symbol}: composite_technical_score {tech_score:.2f} below floor "
+                    f"{symbol}: directional_score {tech_score:.2f} below floor "
                     f"{self._min_technical_score:.2f}",
                 )
 
@@ -645,6 +645,7 @@ class OpportunityRanker:
         strategy_lookup: dict | None = None,
         suppressed_symbols: dict[str, str] | None = None,
         filter_adjustments: dict | None = None,
+        daily_indicators: dict[str, dict] | None = None,
     ) -> RankResult:
         """
         Full ranking pipeline:
@@ -699,6 +700,7 @@ class OpportunityRanker:
                     symbol, opp.get("action", "buy"), opp_direction,
                 )
                 continue
+            _daily_sig = (daily_indicators or {}).get(symbol, {})
             passes, reason = self.apply_hard_filters(
                 opp,
                 account_info,
@@ -709,6 +711,7 @@ class OpportunityRanker:
                 technical_signals,
                 strategy_lookup,
                 filter_adjustments,
+                _daily_sig,
             )
             if not passes:
                 # Already-open rejections are expected every medium cycle while Claude's
@@ -718,7 +721,7 @@ class OpportunityRanker:
                 rejections.append((symbol, reason))
                 continue
             scored.append(
-                self.score_opportunity(opp, technical_signals, account_info, portfolio)
+                self.score_opportunity(opp, technical_signals, account_info, portfolio, _daily_sig)
             )
 
         scored.sort(key=lambda s: s.composite_score, reverse=True)
@@ -755,7 +758,12 @@ class OpportunityRanker:
             action = review.get("action", "hold").lower()
 
             signals = technical_signals.get(symbol, {})
-            tech_score = float(signals.get("composite_technical_score", 0.5))
+            # Use max(long_score, short_score) — direction unknown here; high score in
+            # either direction means TA quality is present, reducing exit urgency.
+            tech_score = max(
+                float(signals.get("long_score",  0.0)),
+                float(signals.get("short_score", 0.0)),
+            ) or 0.5  # default to neutral if no scores available
 
             if action == "exit":
                 urgency = 1.0

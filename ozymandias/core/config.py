@@ -161,18 +161,16 @@ class RankerConfig:
     thesis_challenge_max_penalty: float = 0.35  # max fractional size reduction from thesis challenge (0.35 = up to 35% smaller)
     max_entry_drift_pct: float = 0.015   # skip long buy if current price > suggested_entry × (1 + this); avoids chasing
     max_adverse_drift_pct: float = 0.020  # skip long buy if current price < suggested_entry × (1 - this); entry level broken
-    min_technical_score: float = 0.30    # hard filter floor: composite_technical_score below this rejects entry regardless of conviction
-    ta_size_factor_min: float = 0.60     # at composite_technical_score=0, enter at this fraction of risk-sized qty; scales linearly to 1.0
+    min_technical_score: float = 0.30    # hard filter floor: directional score (long_score or short_score) below this rejects entry regardless of conviction
+    ta_size_factor_min: float = 0.60     # at directional_score=0, enter at this fraction of risk-sized qty; scales linearly to 1.0
     momentum_min_rvol: float = 1.0           # momentum hard gate: reject if current volume_ratio < this (ensures participation)
     momentum_require_vwap_above: bool = True  # momentum hard gate: reject if price is below VWAP at entry
     swing_block_bearish_trend: bool = True    # swing hard gate: reject if trend_structure is bearish_aligned
     max_portfolio_deployment_pct: float = 0.85  # block new entries when buying_power/equity implies this fraction of capital is deployed; 0 = disabled. Allows more concurrent small positions without exceeding equity limits.
-    # Phase 19: absolute floors on Claude's filter_adjustments relaxation.
-    # Claude cannot lower thresholds below these values regardless of filter_adjustments output.
-    # filter_adj_min_rvol: absolute minimum RVOL floor (applied in apply_entry_gate)
-    # filter_adj_min_composite: absolute minimum composite score floor (applied in _medium_try_entry)
+    # Phase 19: absolute floor on Claude's filter_adjustments RVOL relaxation.
+    # Claude cannot lower min_rvol below this value regardless of filter_adjustments output.
+    # The ranker composite score floor (min_composite_score) is NOT adjustable by Claude.
     filter_adj_min_rvol: float = 0.5
-    filter_adj_min_composite: float = 0.35
     # filter_adjustment_decay_cycles: after this many consecutive Claude cycles where
     # filter_adjustments were elevated AND no candidates passed the ranker, the
     # adjustments are discarded and thresholds revert to config defaults. Prevents
@@ -221,7 +219,6 @@ class StrategyConfig:
     strategy_params: dict[str, dict] = field(default_factory=dict)
     # Maps strategy name → param overrides dict.  Add one entry here per new strategy;
     # no code changes needed.  Example: {"momentum": {"min_rvol": 1.2}, "scalp": {...}}
-    swing_min_hold_hours: float = 4.0  # block Claude review exits for swing positions held less than this many hours; prevents same-session exits on intraday signal noise
 
 
 @dataclass

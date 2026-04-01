@@ -111,20 +111,21 @@ class TestFallbackSort:
         assert result.from_fallback is True
 
     def test_sorts_by_composite_score_desc(self):
-        # Use directional expected_directions so ranking is deterministic.
-        # B=long with bullish signals ranks highest; C=long with bearish signals ranks lowest.
+        # Swing scoring: oversold RSI + high volume = strong long setup.
+        # B has deeply oversold RSI + high volume (best long setup).
+        # C has overbought RSI + low volume + bearish trend (worst long setup).
         entries = [
             make_entry("A", ed="long"),
             make_entry("B", ed="long"),
             make_entry("C", ed="long"),
         ]
         indicators = {
-            "A": {"signals": {"rsi": 55, "volume_ratio": 0.9, "vwap_position": "above", "trend_structure": "neutral", "roc_5": 0.5}},
-            "B": {"signals": {"rsi": 65, "volume_ratio": 1.5, "vwap_position": "above", "trend_structure": "bullish_aligned", "roc_5": 2.0}},
-            "C": {"signals": {"rsi": 40, "volume_ratio": 0.5, "vwap_position": "below", "trend_structure": "bearish_aligned", "roc_5": -1.0}},
+            "A": {"signals": {"rsi": 50, "volume_ratio": 1.0, "trend_structure": "mixed"}},
+            "B": {"signals": {"rsi": 26, "volume_ratio": 2.5, "trend_structure": "uptrend"}},
+            "C": {"signals": {"rsi": 75, "volume_ratio": 0.4, "trend_structure": "bearish_aligned"}},
         }
         result = self.compressor._fallback_sort(entries, indicators, 5)
-        # B should rank highest (strong bullish signals for a long), C lowest
+        # B should rank highest (deeply oversold + strong volume for long reversal), C lowest
         assert result.symbols[0] == "B"
         assert result.symbols[-1] == "C"
         assert result.from_fallback is True
@@ -136,14 +137,15 @@ class TestFallbackSort:
         assert len(result.symbols) == 3
 
     def test_direction_adjusted_score_long(self):
+        # Same raw signals: RSI 28 (oversold) is a strong long setup, weak short setup.
+        # L (expected_direction=long) should score higher than S (expected_direction=short).
         entries = [make_entry("L", ed="long"), make_entry("S", ed="short")]
+        oversold_signals = {"rsi": 28, "volume_ratio": 2.0, "trend_structure": "uptrend"}
         indicators = {
-            "L": {"signals": {"rsi": 65, "volume_ratio": 1.5, "vwap_position": "above", "trend_structure": "bullish_aligned", "roc_5": 3.0}},
-            "S": {"signals": {"rsi": 65, "volume_ratio": 1.5, "vwap_position": "above", "trend_structure": "bullish_aligned", "roc_5": 3.0}},
+            "L": {"signals": oversold_signals},
+            "S": {"signals": oversold_signals},
         }
-        # Both have same raw signals but L is long-aligned, S is short-aligned against bullish signals
         result = self.compressor._fallback_sort(entries, indicators, 5)
-        # L should rank higher than S (long candidate with bullish signals)
         assert result.symbols[0] == "L"
 
     def test_no_indicators_falls_back_to_zero(self):
@@ -553,3 +555,124 @@ class TestCompressorConfigFields:
         assert "all_candidates_failing" in NEEDS_SONNET_REASONS
         assert "position_thesis_breach" in NEEDS_SONNET_REASONS
         assert "watchlist_stale" in NEEDS_SONNET_REASONS
+
+
+# ---------------------------------------------------------------------------
+# TestThesisCheckPayloadBuilder
+# ---------------------------------------------------------------------------
+
+class TestThesisCheckPayloadBuilder:
+    """Tests _build_thesis_check_payload in ContextCompressor."""
+
+    def setup_method(self):
+        self.compressor = ContextCompressor(make_cfg(), prompts_dir=None)
+
+    def _make_position(self, symbol: str):
+        return MagicMock(symbol=symbol)
+
+    def _call(self, positions, theses, indicators=None, daily=None, market_data=None,
+              regime=None, sector_regimes=None):
+        return self.compressor._build_thesis_check_payload(
+            positions=positions,
+            active_theses=theses,
+            indicators=indicators or {},
+            daily_indicators=daily,
+            market_data=market_data or {},
+            regime_assessment=regime,
+            sector_regimes=sector_regimes,
+        )
+
+    def test_enriched_payload_includes_live_signals(self):
+        positions = [self._make_position("XLE")]
+        theses = [{"symbol": "XLE", "thesis": "energy long", "thesis_breaking_conditions": ["daily_trend turns downtrend"]}]
+        indicators = {"XLE": {"signals": {"rsi": 42.1, "volume_ratio": 1.3}, "long_score": 0.55, "short_score": 0.45}}
+        pos_json, _, _ = self._call(positions, theses, indicators=indicators)
+        entries = json.loads(pos_json)
+        assert len(entries) == 1
+        assert entries[0]["symbol"] == "XLE"
+        assert entries[0]["live_signals"]["rsi"] == 42.1
+        assert "long_score"  in entries[0]["live_signals"]
+        assert "short_score" in entries[0]["live_signals"]
+
+    def test_daily_trend_from_daily_indicators(self):
+        positions = [self._make_position("XLE")]
+        theses = [{"symbol": "XLE", "thesis": "x", "thesis_breaking_conditions": ["daily_trend turns downtrend"]}]
+        daily = {"XLE": {"daily_trend": "correcting"}}
+        pos_json, _, _ = self._call(positions, theses, daily=daily)
+        entries = json.loads(pos_json)
+        assert entries[0]["live_signals"]["daily_trend"] == "correcting"
+
+    def test_news_included_per_position(self):
+        positions = [self._make_position("OXY")]
+        theses = [{"symbol": "OXY", "thesis": "iran premium", "thesis_breaking_conditions": ["Iran ceasefire"]}]
+        market_data = {
+            "watchlist_news": {
+                "OXY": [
+                    {"title": "Iran peace talks resume", "publisher": "Reuters", "age_hours": 1.5},
+                    {"title": "Oil prices steady", "publisher": "Bloomberg", "age_hours": 3.0},
+                ]
+            }
+        }
+        pos_json, _, _ = self._call(positions, theses, market_data=market_data)
+        entries = json.loads(pos_json)
+        assert "recent_news" in entries[0]
+        assert entries[0]["recent_news"][0]["title"] == "Iran peace talks resume"
+
+    def test_missing_news_produces_no_recent_news_key(self):
+        """Symbol absent from watchlist_news → recent_news omitted (not an empty list key)."""
+        positions = [self._make_position("XLE")]
+        theses = [{"symbol": "XLE", "thesis": "x", "thesis_breaking_conditions": ["rsi < 30"]}]
+        pos_json, _, _ = self._call(positions, theses, market_data={"watchlist_news": {}})
+        entries = json.loads(pos_json)
+        assert "recent_news" not in entries[0]
+
+    def test_positions_without_thesis_entry_excluded(self):
+        """Position with no matching active_thesis is not in payload."""
+        positions = [self._make_position("GOOG"), self._make_position("AAPL")]
+        theses = [{"symbol": "AAPL", "thesis": "x", "thesis_breaking_conditions": ["rsi < 30"]}]
+        pos_json, _, _ = self._call(positions, theses)
+        entries = json.loads(pos_json)
+        syms = [e["symbol"] for e in entries]
+        assert "AAPL" in syms
+        assert "GOOG" not in syms
+
+    def test_thesis_text_truncated_at_150_chars(self):
+        long_thesis = "A" * 300
+        positions = [self._make_position("AAPL")]
+        theses = [{"symbol": "AAPL", "thesis": long_thesis, "thesis_breaking_conditions": []}]
+        pos_json, _, _ = self._call(positions, theses)
+        entries = json.loads(pos_json)
+        assert len(entries[0]["thesis"]) == 150
+
+    def test_empty_positions_returns_empty_list(self):
+        pos_json, _, _ = self._call([], [])
+        assert json.loads(pos_json) == []
+
+    def test_missing_indicators_produces_empty_live_signals(self):
+        """Symbol absent from indicators → live_signals is {} — no KeyError."""
+        positions = [self._make_position("XLE")]
+        theses = [{"symbol": "XLE", "thesis": "x", "thesis_breaking_conditions": ["rsi < 30"]}]
+        pos_json, _, _ = self._call(positions, theses, indicators={})
+        entries = json.loads(pos_json)
+        assert entries[0]["live_signals"] == {}
+
+    def test_macro_news_in_market_context(self):
+        positions = [self._make_position("XLE")]
+        theses = [{"symbol": "XLE", "thesis": "x", "thesis_breaking_conditions": ["rsi < 30"]}]
+        market_data = {
+            "spy_trend": "downtrend",
+            "spy_rsi": 38.0,
+            "macro_news": {
+                "SPY": [
+                    {"title": "Fed holds rates", "publisher": "CNBC", "age_hours": 2.0},
+                    {"title": "Stocks slide", "publisher": "WSJ", "age_hours": 4.0},
+                ],
+                "QQQ": [
+                    {"title": "Tech selloff", "publisher": "Bloomberg", "age_hours": 1.0},
+                ],
+            },
+        }
+        _, _, market_json = self._call(positions, theses, market_data=market_data)
+        ctx = json.loads(market_json)
+        assert ctx["spy_trend"] == "downtrend"
+        assert len(ctx["macro_news"]) == 3  # 2 SPY + 1 QQQ

@@ -30,6 +30,8 @@ def _make_trigger_orch(watchlist_refresh_interval_min: int = 120):
     orch._market_context_indicators = {}
     orch._override_exit_count = 0
     orch._state_manager = MagicMock()
+    orch._last_regime_assessment = None
+    orch._last_sector_regimes = None
     orch._state_manager.load_watchlist = AsyncMock(
         return_value=WatchlistState(entries=[])
     )

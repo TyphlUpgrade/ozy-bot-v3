@@ -129,7 +129,7 @@ class TestCurrentPriceSubstitution:
         """When _latest_indicators has a price, the limit order uses it, not suggested_entry."""
         top = _make_opportunity(suggested_entry=200.0)
         # 201.0 is 0.5% above suggested_entry — within drift tolerance (1.5%), distinct from 200.0
-        _stub_entry_guards(orch, indicators={"NVDA": {"price": 201.0, "composite_technical_score": 1.0}})
+        _stub_entry_guards(orch, indicators={"NVDA": {"price": 201.0, "long_score": 1.0, "short_score": 1.0}})
         acct = _stub_account()
         portfolio = PortfolioState(positions=[])
 
@@ -152,7 +152,7 @@ class TestCurrentPriceSubstitution:
         """When indicators lack a price, falls back to suggested_entry and logs WARNING."""
         top = _make_opportunity(suggested_entry=200.0)
         # No "price" key in indicators
-        _stub_entry_guards(orch, indicators={"NVDA": {"composite_technical_score": 1.0}})
+        _stub_entry_guards(orch, indicators={"NVDA": {"long_score": 1.0, "short_score": 1.0}})
         acct = _stub_account()
         portfolio = PortfolioState(positions=[])
 
@@ -189,7 +189,7 @@ class TestEntryDriftCheck:
         top = self._make_top(action="buy", suggested_entry=200.0)
         # 2.5% above suggested_entry; default max_entry_drift_pct=0.015
         current = 200.0 * 1.025
-        _stub_entry_guards(orch, indicators={"NVDA": {"price": current, "composite_technical_score": 1.0}})
+        _stub_entry_guards(orch, indicators={"NVDA": {"price": current, "long_score": 1.0, "short_score": 1.0}})
         acct = _stub_account()
         portfolio = PortfolioState(positions=[])
 
@@ -204,7 +204,7 @@ class TestEntryDriftCheck:
         top = self._make_top(action="buy", suggested_entry=200.0)
         # 3% below suggested_entry; default max_adverse_drift_pct=0.020
         current = 200.0 * 0.97
-        _stub_entry_guards(orch, indicators={"NVDA": {"price": current, "composite_technical_score": 1.0}})
+        _stub_entry_guards(orch, indicators={"NVDA": {"price": current, "long_score": 1.0, "short_score": 1.0}})
         acct = _stub_account()
         portfolio = PortfolioState(positions=[])
 
@@ -224,7 +224,7 @@ class TestEntryDriftCheck:
         )
         # 2.5% below suggested_entry — short already chased
         current = 200.0 * 0.975
-        _stub_entry_guards(orch, indicators={"NVDA": {"price": current, "composite_technical_score": 1.0}})
+        _stub_entry_guards(orch, indicators={"NVDA": {"price": current, "long_score": 1.0, "short_score": 1.0}})
         acct = _stub_account()
         portfolio = PortfolioState(positions=[])
 
@@ -239,7 +239,7 @@ class TestEntryDriftCheck:
         top = self._make_top(action="buy", suggested_entry=200.0)
         # 0.5% above — within max_entry_drift_pct=1.5%
         current = 200.0 * 1.005
-        _stub_entry_guards(orch, indicators={"NVDA": {"price": current, "composite_technical_score": 1.0}})
+        _stub_entry_guards(orch, indicators={"NVDA": {"price": current, "long_score": 1.0, "short_score": 1.0}})
         acct = _stub_account()
         portfolio = PortfolioState(positions=[])
 
@@ -296,10 +296,10 @@ class TestMinTechnicalScoreFilter:
         return pdt
 
     def _signals(self, score: float) -> dict:
-        return {"AAPL": {"composite_technical_score": score, "signals": {}}}
+        return {"AAPL": {"long_score": score, "short_score": score, "signals": {}}}
 
     def test_score_below_floor_rejects(self):
-        """composite_technical_score=0.25 < floor=0.30 → hard filter rejects."""
+        """directional_score=0.25 < floor=0.30 → hard filter rejects."""
         ranker = self._ranker(min_technical_score=0.30)
         opp = self._opportunity()
 
@@ -313,11 +313,11 @@ class TestMinTechnicalScoreFilter:
         )
 
         assert passes is False
-        assert "composite_technical_score" in reason
+        assert "directional_score" in reason
         assert "0.25" in reason
 
     def test_score_at_floor_passes(self):
-        """composite_technical_score=0.30 >= floor=0.30 → not rejected by this filter."""
+        """directional_score=0.30 >= floor=0.30 → not rejected by this filter."""
         ranker = self._ranker(min_technical_score=0.30)
         opp = self._opportunity()
 
@@ -333,7 +333,7 @@ class TestMinTechnicalScoreFilter:
         assert passes is True
 
     def test_score_above_floor_passes(self):
-        """composite_technical_score=0.55 >= floor=0.30 → passes."""
+        """directional_score=0.55 >= floor=0.30 → passes."""
         ranker = self._ranker(min_technical_score=0.30)
         opp = self._opportunity()
 
@@ -385,7 +385,8 @@ class TestTASizeModifier:
         """Helper: stub entry guards with given tech_score, return placed orders."""
         _stub_entry_guards(orch, indicators={"NVDA": {
             "price": top.suggested_entry,  # no drift
-            "composite_technical_score": tech_score,
+            "long_score": tech_score,
+            "short_score": tech_score,
         }})
         # Disable thesis challenge
         orch._claude.run_thesis_challenge = AsyncMock(
@@ -468,7 +469,7 @@ class TestMarketOrderPath:
         """conviction >= threshold AND strategy=momentum → market order, no limit_price."""
         top = _make_opportunity(suggested_entry=200.0)
         top = dataclasses.replace(top, ai_conviction=0.85)
-        _stub_entry_guards(orch, indicators={"NVDA": {"price": 200.5, "composite_technical_score": 1.0}})
+        _stub_entry_guards(orch, indicators={"NVDA": {"price": 200.5, "long_score": 1.0, "short_score": 1.0}})
         placed_orders = []
         async def capture(order):
             placed_orders.append(order)
@@ -484,7 +485,7 @@ class TestMarketOrderPath:
     async def test_below_threshold_uses_limit_order(self, orch):
         """conviction < threshold → limit order with limit_price set."""
         top = _make_opportunity(suggested_entry=200.0)  # ai_conviction=0.70 by default
-        _stub_entry_guards(orch, indicators={"NVDA": {"price": 200.5, "composite_technical_score": 1.0}})
+        _stub_entry_guards(orch, indicators={"NVDA": {"price": 200.5, "long_score": 1.0, "short_score": 1.0}})
         placed_orders = []
         async def capture(order):
             placed_orders.append(order)
@@ -501,7 +502,7 @@ class TestMarketOrderPath:
         """conviction >= threshold but strategy=swing → limit order (market only for momentum)."""
         top = _make_opportunity(suggested_entry=200.0)
         top = dataclasses.replace(top, ai_conviction=0.85, strategy="swing")
-        _stub_entry_guards(orch, indicators={"NVDA": {"price": 200.5, "composite_technical_score": 1.0}})
+        _stub_entry_guards(orch, indicators={"NVDA": {"price": 200.5, "long_score": 1.0, "short_score": 1.0}})
         placed_orders = []
         async def capture(order):
             placed_orders.append(order)

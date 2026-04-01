@@ -997,8 +997,8 @@ class TestThesisChallenge:
         """Mock risk_manager and fill_protection to allow entry."""
         orch._risk_manager.validate_entry = MagicMock(return_value=(True, ""))
         orch._fill_protection.can_place_order = MagicMock(return_value=True)
-        # composite_technical_score=1.0 → TA size factor=1.0, no quantity reduction
-        orch._latest_indicators = {"AAPL": {"composite_technical_score": 1.0}}
+        # long_score=1.0 → TA size factor=1.0, no quantity reduction
+        orch._latest_indicators = {"AAPL": {"long_score": 1.0, "short_score": 1.0}}
         orch._latest_market_context = {}
 
     @pytest.mark.asyncio
@@ -1132,8 +1132,8 @@ class TestThesisChallengeCache:
     def _stub_entry_guards(self, orch):
         orch._risk_manager.validate_entry = MagicMock(return_value=(True, ""))
         orch._fill_protection.can_place_order = MagicMock(return_value=True)
-        # composite_technical_score=1.0 → TA size factor=1.0, no quantity reduction
-        orch._latest_indicators = {"AAPL": {"composite_technical_score": 1.0}}
+        # long_score=1.0 → TA size factor=1.0, no quantity reduction
+        orch._latest_indicators = {"AAPL": {"long_score": 1.0, "short_score": 1.0}}
         orch._latest_market_context = {}
 
     @pytest.mark.asyncio
@@ -1756,115 +1756,6 @@ class TestApplyPositionReviewsExit:
 
         orch._broker.place_order.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_swing_exit_blocked_within_min_hold_window(self, orch):
-        """Swing exit recommended by Claude is blocked if position held < swing_min_hold_hours."""
-        from ozymandias.core.state_manager import ExitTargets
-
-        # Entry 30 minutes ago — well within 4h minimum hold
-        entry_dt = datetime.now(timezone.utc) - timedelta(minutes=30)
-        pos = Position(
-            symbol="XOM", shares=31.0, avg_cost=159.78,
-            entry_date=entry_dt.isoformat(),
-            intention=TradeIntention(
-                strategy="swing", direction="long",
-                exit_targets=ExitTargets(profit_target=166.0, stop_loss=155.2),
-            ),
-        )
-        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
-        portfolio = await orch._state_manager.load_portfolio()
-
-        orch._config.strategy.swing_min_hold_hours = 4.0
-        orch._broker.place_order = AsyncMock()
-
-        reviews = [{"symbol": "XOM", "action": "exit",
-                    "updated_reasoning": "MACD bearish cross — exit now."}]
-        await orch._apply_position_reviews(reviews)
-
-        orch._broker.place_order.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_swing_exit_allowed_after_min_hold_window(self, orch):
-        """Swing exit is allowed once swing_min_hold_hours have elapsed."""
-        from ozymandias.core.state_manager import ExitTargets
-        from ozymandias.execution.broker_interface import OrderResult
-
-        # Entry 5 hours ago — beyond 4h minimum hold
-        entry_dt = datetime.now(timezone.utc) - timedelta(hours=5)
-        pos = Position(
-            symbol="XOM", shares=31.0, avg_cost=159.78,
-            entry_date=entry_dt.isoformat(),
-            intention=TradeIntention(
-                strategy="swing", direction="long",
-                exit_targets=ExitTargets(profit_target=166.0, stop_loss=155.2),
-            ),
-        )
-        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
-        portfolio = await orch._state_manager.load_portfolio()
-
-        orch._config.strategy.swing_min_hold_hours = 4.0
-        orch._broker.place_order = AsyncMock(return_value=OrderResult(
-            order_id="exit-swing", status="pending_new",
-            submitted_at=datetime.now(timezone.utc),
-        ))
-        orch._fill_protection.record_order = AsyncMock()
-
-        reviews = [{"symbol": "XOM", "action": "exit",
-                    "updated_reasoning": "Target reached — exit."}]
-        await orch._apply_position_reviews(reviews)
-
-        orch._broker.place_order.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_unknown_strategy_exit_blocked_within_min_hold_window(self, orch):
-        """Adopted positions (strategy='unknown') are protected by the swing min-hold gate."""
-        entry_dt = datetime.now(timezone.utc) - timedelta(minutes=20)
-        pos = Position(
-            symbol="XLE", shares=85.0, avg_cost=58.88,
-            entry_date=entry_dt.isoformat(),
-            intention=TradeIntention(strategy="unknown", direction="long"),
-        )
-        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
-        portfolio = await orch._state_manager.load_portfolio()
-
-        orch._config.strategy.swing_min_hold_hours = 4.0
-        orch._broker.place_order = AsyncMock()
-
-        reviews = [{"symbol": "XLE", "action": "exit", "updated_reasoning": "Exit."}]
-        await orch._apply_position_reviews(reviews)
-
-        orch._broker.place_order.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_momentum_exit_not_blocked_by_swing_gate(self, orch):
-        """Momentum exits are NOT subject to the swing minimum hold gate."""
-        from ozymandias.core.state_manager import ExitTargets
-        from ozymandias.execution.broker_interface import OrderResult
-
-        # Entry only 5 minutes ago — would be blocked for swing, not for momentum
-        entry_dt = datetime.now(timezone.utc) - timedelta(minutes=5)
-        pos = Position(
-            symbol="NVDA", shares=10.0, avg_cost=900.0,
-            entry_date=entry_dt.isoformat(),
-            intention=TradeIntention(
-                strategy="momentum", direction="long",
-                exit_targets=ExitTargets(profit_target=920.0, stop_loss=888.0),
-            ),
-        )
-        await orch._state_manager.save_portfolio(PortfolioState(positions=[pos]))
-        portfolio = await orch._state_manager.load_portfolio()
-
-        orch._config.strategy.swing_min_hold_hours = 4.0
-        orch._broker.place_order = AsyncMock(return_value=OrderResult(
-            order_id="exit-mom", status="pending_new",
-            submitted_at=datetime.now(timezone.utc),
-        ))
-        orch._fill_protection.record_order = AsyncMock()
-
-        reviews = [{"symbol": "NVDA", "action": "exit", "updated_reasoning": "Override exit."}]
-        await orch._apply_position_reviews(reviews)
-
-        orch._broker.place_order.assert_called_once()
 
 
 # ===========================================================================

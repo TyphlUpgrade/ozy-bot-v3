@@ -1172,9 +1172,9 @@ Read the relevant phase section before modifying or debugging any module built i
 - **Impl:** Step 4c of startup reconciliation restores `_last_regime_assessment` and `_last_sector_regimes` from the persisted reasoning cache (`state/reasoning_cache.json`) if cache is not expired. Uses top-level `_result_from_raw_reasoning` import (no inline imports — see Phase 20 bug note).
 - **Why:** Without restoration, the first post-restart medium loop runs Haiku with no regime context. Haiku cannot align candidates with sector biases until Sonnet fires, which may not happen for several minutes.
 
-**Position thesis monitoring** · *(new logic)* · `intelligence/context_compressor.py`, `core/orchestrator.py`
-- `ContextCompressor.check_position_theses(positions, active_theses, indicators, cycle_id)`: for each open position with a matching `active_theses` entry, evaluates each `thesis_breaking_conditions` string against live `indicators` and daily signals. Returns `CompressorResult(needs_sonnet=True, sonnet_reason="position_thesis_breach")` on first breach.
-- `_condition_met(condition, signals, daily)`: parses condition strings of the form `field op value` (e.g. `daily_trend becomes downtrend`, `rsi_14d < 35`). Operators: `==`, `!=`, `<`, `>`, `<=`, `>=`, `becomes`. Returns `False` on parse errors or missing fields (safe default).
+**Position thesis monitoring** · *(new logic — later superseded, see 2026-03-31 entry)* · `intelligence/context_compressor.py`, `core/orchestrator.py`
+- `ContextCompressor.check_position_theses(positions, active_theses, indicators, cycle_id)`: for each open position with a matching `active_theses` entry, evaluates each `thesis_breaking_conditions` string against live `indicators` using `_condition_met`.
+- `_condition_met(condition, signals, daily)`: parses condition strings of the form `field op value` (e.g. `daily_trend becomes downtrend`, `rsi_14d < 35`). Only handles simple `key op value` patterns — narrative/event conditions silently return `False`. **This was found to fail on 87/87 production conditions in the 2026-03-31 session and was replaced.**
 - Medium loop Step 6: calls `check_position_theses` each cycle; if breach, fires `_run_claude_cycle("thesis_breach")` immediately.
 - Per-cycle guard (inherited from Phase 20): `_last_needs_sonnet_cycle` prevents re-triggering within the same Sonnet cycle.
 
@@ -1282,7 +1282,7 @@ Read the relevant phase section before modifying or debugging any module built i
 - Call A failure is non-fatal: positions continue under quant rules; bot continues to Call B.
 - Results merged into a single `ReasoningResult` before downstream processing (no change to consumers).
 - Context JSON for Call B excludes `daily_signals` from positions (compact summary only), saving ~40% of per-position token cost.
-- New config: `split_reasoning_enabled: bool = True` (kill switch), `review_call_max_tokens: int = 2048`, `review_call_verbose: bool = False`.
+- New config: `split_reasoning_enabled: bool = True` (kill switch), `review_call_max_tokens: int = 4096`, `review_call_verbose: bool = False`.
 - When `review_call_verbose=True`, position review prompt requests full prose (stop-adjustment rationale, explicit bear case). Default compact = two sentences max.
 
 **New prompt files:**
@@ -1305,3 +1305,129 @@ Read the relevant phase section before modifying or debugging any module built i
 **`reasoning.txt` modification** · `config/prompts/v3.10.1/reasoning.txt`
 - Added `{position_review_notice}` template variable injected before INSTRUCTIONS.
 - When split mode is active, this instructs Claude not to produce `position_reviews` output and that positions are shown as a compact summary only.
+
+---
+
+### 2026-03-31 — Thesis Monitoring Rewrite: Haiku-Based Async Evaluation
+
+**Root cause:** Phase 21's `_condition_met()` deterministic evaluator failed silently on 87/87 thesis-breaking conditions in the 2026-03-31 production session. Claude writes conditions as natural-language sentences describing catalysts (e.g. `"Iran ceasefire announced — removes geopolitical risk premium from energy"`). The regex parser only handled `key op value` patterns; all geopolitical, event-driven, and narrative conditions returned `False` without any breach signal. Thesis breach detection was effectively disabled for the entire session.
+
+**Fix: `check_position_theses()` rebuilt as async Haiku call** · `intelligence/context_compressor.py`
+- **Old:** Synchronous method calling `_condition_met()` for each condition string via regex parser.
+- **New:** Async method making a dedicated Haiku API call (`max_tokens=128`, 30s timeout). Haiku receives enriched payload and evaluates conditions using natural-language reasoning — the approach originally intended in Phase 20.
+- New signature:
+  ```
+  async def check_position_theses(
+      positions, active_theses, indicators, daily_indicators,
+      market_data, regime_assessment, sector_regimes, cycle_id
+  ) -> Optional[CompressorResult]
+  ```
+- `_condition_met()` deleted entirely. No replacement — Haiku handles all condition types.
+
+**New prompt: `config/prompts/v3.10.1/thesis_check.txt`**
+- Dedicated minimal prompt for thesis breach evaluation. Template variables: `{positions_json}`, `{regime_json}`, `{market_context_json}`.
+- Conservative evaluation instructions: fire on concrete evidence, not speculation; narrative/event conditions only fire when current signals and news corroborate the scenario.
+- Output: `{"needs_sonnet": false, "breach": null}` or `{"needs_sonnet": true, "breach": "SYMBOL: condition that is met"}`.
+- Token budget: ~2,530 input tokens (12 positions × ~165 tokens + regime + market context). 128 output tokens trivially sufficient.
+
+**New `_build_thesis_check_payload()` helper** · `intelligence/context_compressor.py`
+- Returns three JSON strings for the template: `positions_json`, `regime_json`, `market_context_json`.
+- Per-position payload: `symbol`, `thesis[:150]`, `thesis_breaking_conditions`, `live_signals` (rsi/daily_trend/composite_score/price/trend_structure/volume_ratio — None values omitted), `recent_news` (up to 3 headlines from `market_data["watchlist_news"][sym]`).
+- `daily_trend` sourced from `daily_indicators[sym]` if provided; otherwise omitted from live_signals.
+- `regime_json`: `{regime, confidence, sector_regimes}`.
+- `market_context_json`: `{spy_trend, spy_rsi, qqq_trend, spy_daily, macro_news}` (2 SPY + 1 QQQ macro headlines).
+- Positions with no matching `active_theses` entry are excluded — nothing to evaluate.
+
+**Orchestrator call site updated** · `core/orchestrator.py`
+- Medium loop call now `await`s `check_position_theses` and passes: `indicators=self._all_indicators`, `daily_indicators=self._daily_indicators`, `market_data=self._latest_market_context or {}`, `regime_assessment=self._last_regime_assessment`, `sector_regimes=self._last_sector_regimes`.
+- `cycle_id` pattern unchanged: `f"medium_{self._trigger_state.last_claude_call_utc}"`.
+- Per-cycle guard (`_last_needs_sonnet_cycle`) and downstream `_run_claude_cycle("thesis_breach")` trigger unchanged.
+
+**Tests updated** · `tests/test_phase21.py`, `tests/test_context_compressor.py`
+- `TestConditionMet` deleted (class gone).
+- `TestPositionThesisMonitoring` rewritten as async tests with mocked Haiku client: breach detected, no breach, parse failure (→ None), API failure (→ None), per-cycle guard, no active theses / no positions (→ skip), position not in theses (→ Haiku not called).
+- `TestThesisCheckPayloadBuilder` added to `test_context_compressor.py`: 9 tests covering live signals enrichment, daily_trend from daily_indicators, news inclusion, missing news, thesis exclusion when no matching entry, thesis truncation at 150 chars, empty positions, missing indicators, macro news.
+
+---
+
+### 2026-04-01 — Composite Score Redesign: Direction-Aware TA Scoring
+
+**Root cause / motivation:** `compute_composite_score(signals, direction=...)` was a single scalar used for both long and short candidates. It was direction-aware at call time but never stored directionally — the `_latest_indicators` cache merged it in as `composite_technical_score` using the long direction unconditionally. Short candidates were therefore always scored against a long-biased TA metric. Additionally, the score was exposed to Claude as a filter_adjustments target (`min_composite_score`), which was architecturally incoherent — Claude never sees the scores and cannot usefully advise on the floor.
+
+**`compute_directional_scores(intraday_signals, daily_signals)`** · *(new function)* · `intelligence/technical_analysis.py`
+- **Spec:** *(not defined)*
+- **Impl:** Replaces `compute_composite_score`. Returns `(long_score, short_score)` tuple. Four components: Extension (30%), Exhaustion (25%), Participation (25%), Trend context (20%). Swing-aware — oversold RSI is a positive signal for longs, a negative one for shorts; overbought RSI is the reverse.
+- `compute_composite_score` kept in `technical_analysis.py` for `universe_scanner.py` backward compatibility (universe scanner computes directional scores separately as `composite_score_long`/`composite_score_short`).
+- Added `warnings.warn` for unrecognized `daily_trend` or `intraday_trend` labels; canonical daily values are `"uptrend"/"downtrend"/"mixed"`, canonical intraday are `"bullish_aligned"/"bearish_aligned"/"mixed"`.
+
+**`_latest_indicators` cache** · `core/orchestrator.py`
+- **Old:** `"composite_technical_score": v.get("composite_technical_score", 0.0)` (long-direction only)
+- **New:** `"long_score": v.get("long_score", 0.0), "short_score": v.get("short_score", 0.0)` — both directions stored flat alongside merged signals; no `"signals"` sub-key in the cache.
+
+**`_medium_try_entry` position sizing** · `core/orchestrator.py`
+- **Old:** `ind.get("composite_technical_score", 0.5)` — always defaulted to 0.5 since the key was never in the flat cache (bug)
+- **New:** `ind.get("short_score" if is_short(entry_direction) else "long_score", 0.5)` — direction-correct score used for the TA size factor
+
+**Exit urgency** · `intelligence/opportunity_ranker.py`
+- **Old:** `float(signals.get("composite_technical_score", 0.5))` — always defaulted to 0.5 (bug)
+- **New:** `max(float(signals.get("long_score", 0.0)), float(signals.get("short_score", 0.0))) or 0.5`
+
+**`min_composite_score` advisory removed** · `intelligence/opportunity_ranker.py`, `core/config.py`, `core/orchestrator.py`
+- `filter_adj_min_composite = 0.35` config constant removed from `RankerConfig`; `"filter_adj_min_composite": 0.35` removed from `config.json`.
+- `_clamp_filter_adjustments` silently pops both `min_composite_score` and `min_directional_score` from Claude's output. Claude cannot lower this floor because it never observes the scores.
+- `min_composite_score` in `RankerConfig` (line 158) is retained as the *ranker's own composite score floor* (conviction × 0.35 + tech × 0.30 + rar × 0.20 + liq × 0.15 ≥ 0.45) — this is a different concept and is NOT adjustable by Claude.
+
+**`_DIRECTION_DEPENDENT_PATTERNS`** · `core/orchestrator.py`
+- Entry `"composite_score"` renamed to `"directional_score"` — the suppression reason written at entry time is now `"directional_score_too_low"`, so the clear-on-regime-reset pattern must match.
+
+**`_regime_reset_build` observability** · `core/orchestrator.py`
+- Added `_direction_summary(entries)` inline helper (returns `"N total — XL / YS / Zeither"` string).
+- Three log points: before-eviction composition, per-eviction log, after-rebuild composition. Makes bad-tape adaptation visible in logs without a full state audit.
+
+**`assemble_reasoning_context` / `context_compressor.py`** · `intelligence/claude_reasoning.py`, `intelligence/context_compressor.py`
+- `_tier1_score_simple` (Tier 3 bypass): replaced `compute_composite_score` calls with `compute_directional_scores`.
+- `_build_candidates_payload` and `_fallback_sort`: replaced `composite_score` key with `directional_score`; scoring now direction-aware.
+- Thesis payload: `daily_sig` was not passed to `compute_directional_scores` (bug); now correctly passed.
+- `run_position_review`: exposes `long_score`/`short_score` in signals summary instead of dead `composite_technical_score` key.
+
+**Prompt updates** · `config/prompts/v3.10.1/reasoning.txt`, `config/prompts/v3.10.1/compress.txt`
+- `sector_performance` description updated to reference `long_score`/`short_score`.
+- `filter_adjustments` schema: `min_composite_score` removed; only `min_rvol` remains.
+- SHORT entry conditions: added explicit guidance distinguishing breakdown shorts (`rsi_slope_max`) from fade/mean-reversion shorts (`rsi_accel_max` with negative value). Explains when RSI is decelerating but still positive, `rsi_accel_max` is the correct gate.
+- `compress.txt`: `composite_score` → `directional_score` in candidate payload description.
+
+---
+
+### 2026-04-01 — Breach Context Propagation: Passing Detected Breach to Sonnet
+
+**Root cause:** When Haiku detected a thesis breach via `check_position_theses`, the orchestrator fired a `thesis_breach` Sonnet cycle, but Sonnet received no information about *which* condition was detected. Without the breach detail, Sonnet would re-examine the position using only its prior context and often reaffirm its prior hold recommendation unchanged.
+
+**`_thesis_breach_context`** · *(new field)* · `core/orchestrator.py`
+- `self._thesis_breach_context: str | None = None` — stores the breach detail string (from `CompressorResult.notes`) between the medium loop (where breach is detected) and the next `_run_claude_cycle` invocation (where it is consumed).
+- Cleared before `await` to prevent double-use if concurrent slow loops fire.
+
+**Medium loop writeback** · `core/orchestrator.py`
+- On thesis breach: `self._thesis_breach_context = _breach.notes` before firing `asyncio.ensure_future(_run_claude_cycle("thesis_breach"))`.
+
+**`_run_claude_cycle` — breach context routing** · `core/orchestrator.py`
+- Reads and clears `_pending_breach = self._thesis_breach_context; self._thesis_breach_context = None` before any Claude calls.
+- Split mode (Call A): passed as `breach_context=_pending_breach` to `run_position_review_call`.
+- Non-split mode (Call B/only): passed as `breach_context=_pending_breach if not _split else None` to `run_reasoning_cycle`.
+
+**`run_position_review_call` breach injection** · `intelligence/claude_reasoning.py`
+- Accepts `breach_context: str | None = None`.
+- Builds `thesis_breach_notice` string with the detected condition and instructions to re-examine; injected as `{thesis_breach_notice}` template variable.
+- When no breach, `thesis_breach_notice = ""` (template variable resolves to empty string).
+
+**`position_reviews.txt`** · `config/prompts/v3.10.1/position_reviews.txt`
+- Added `{thesis_breach_notice}` placeholder between the opening description and CONSTRAINTS section.
+
+**`run_reasoning_cycle` breach injection (non-split path)** · `intelligence/claude_reasoning.py`
+- Accepts `breach_context: str | None = None`.
+- When `not skip_position_reviews and breach_context`: prepends breach notice to `position_review_notice`, which maps to the existing `{position_review_notice}` placeholder in `reasoning.txt`. No prompt file changes needed.
+
+**Swing minimum hold guard removed** · `core/orchestrator.py`, `config/prompts/v3.10.1/position_reviews.txt`, `config/prompts/v3.10.1/reasoning.txt`
+- Removed the `hold_hours < swing_min_hold_hours` guard in `_apply_position_reviews` that blocked Claude-recommended exits for swing positions held < 4h.
+- Removed corresponding constraints from both prompt files.
+- **Why:** A thesis breach is a concrete invalidation event, not intraday noise — holding a position through a detected breach because of an arbitrary time gate defeats the entire purpose of thesis monitoring. The stop-loss is the correct mechanical guard for genuine noise; the swing hold constraint was duplicating that protection at the cost of blocking legitimate exits.
+- Tests for swing hold guard behavior (`test_swing_exit_blocked_within_min_hold_window`, `test_swing_exit_allowed_after_min_hold_window`) removed from `test_orchestrator.py`.

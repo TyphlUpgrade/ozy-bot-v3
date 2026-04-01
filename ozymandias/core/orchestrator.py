@@ -50,7 +50,7 @@ from ozymandias.intelligence.claude_reasoning import (
 )
 from ozymandias.intelligence.opportunity_ranker import OpportunityRanker, RankResult, evaluate_entry_conditions
 from ozymandias.intelligence.universe_scanner import UniverseScanner
-from ozymandias.intelligence.technical_analysis import compute_composite_score, compute_sector_dispersion, generate_daily_signal_summary, generate_signal_summary
+from ozymandias.intelligence.technical_analysis import compute_sector_dispersion, generate_daily_signal_summary, generate_signal_summary
 from ozymandias.strategies.base_strategy import Strategy, get_strategy
 
 log = logging.getLogger(__name__)
@@ -77,7 +77,7 @@ def _rejection_gate_category(reason: str) -> str:
         return "already_open"
     if "conviction" in r:
         return "conviction_floor"
-    if "composite_technical_score" in r or "technical score" in r:
+    if "directional_score" in r or "technical score" in r:
         return "technical_score_floor"
     if "rvol" in r or "volume_ratio" in r:
         return "rvol_gate"
@@ -393,6 +393,10 @@ class Orchestrator:
         # Compared against new regime_assessment.regime after each Sonnet cycle.
         # When they differ, a regime-reset watchlist build fires immediately.
         self._prior_regime_name: str | None = None
+        # Thesis breach context: set by the medium loop when Haiku detects a breach.
+        # Consumed and cleared by the next _run_claude_cycle invocation so Sonnet
+        # knows which condition was detected and can re-examine the affected position.
+        self._thesis_breach_context: str | None = None
 
         # Phase 17: UTC timestamp of the last completed medium loop cycle.
         # Used by the medium-loop gate in _slow_loop_cycle to prevent Claude from
@@ -980,6 +984,16 @@ class Orchestrator:
                 "Startup: reloaded %d recommendation outcome(s) from previous session",
                 reloaded_outcomes,
             )
+
+        # Restore fetch_failure suppression so symbols that were failing at shutdown
+        # don't re-enter Claude's context before the first failed fetch re-fires.
+        reloaded_ff = 0
+        for sym in portfolio.fetch_failure_suppressed:
+            if sym not in self._filter_suppressed:
+                self._filter_suppressed[sym] = "fetch_failure"
+                reloaded_ff += 1
+        if reloaded_ff:
+            log.info("Startup: restored fetch_failure suppression for %d symbol(s)", reloaded_ff)
 
         log.info("=== Startup reconciliation complete ===")
 
@@ -2122,9 +2136,16 @@ class Orchestrator:
                 # on the watchlist and their fetch failures are normal and expected.
                 if sym in scan_symbols:
                     self._fetch_failure_counts[sym] = self._fetch_failure_counts.get(sym, 0) + 1
+                    # Suppress from Claude's candidate list immediately — don't let null/0.00
+                    # data flow into context. Guard preserves existing session_veto/blacklist.
+                    if sym not in self._filter_suppressed:
+                        self._filter_suppressed[sym] = "fetch_failure"
                 continue
-            # Successful fetch — reset any failure streak for this symbol.
+            # Successful fetch — reset any failure streak and clear fetch_failure suppression.
             self._fetch_failure_counts.pop(sym, None)
+            if self._filter_suppressed.get(sym) == "fetch_failure":
+                self._filter_suppressed.pop(sym, None)
+                log.info("Medium loop: cleared fetch_failure suppression for %s (data restored)", sym)
             indicators[sym] = summary
             bars[sym] = df
 
@@ -2171,7 +2192,8 @@ class Orchestrator:
         self._latest_indicators = {
             sym: {
                 **v["signals"],
-                "composite_technical_score": v.get("composite_technical_score", 0.0),
+                "long_score":  v.get("long_score",  0.0),
+                "short_score": v.get("short_score", 0.0),
                 "bars_available": v.get("bars_available", 0),
             }
             for sym, v in indicators.items()
@@ -2282,6 +2304,7 @@ class Orchestrator:
             strategy_lookup=self._strategy_lookup,
             suppressed_symbols=self._filter_suppressed,
             filter_adjustments=self._filter_adjustments,
+            daily_indicators=self._daily_indicators,
         )
         ranked = rank_result.candidates
 
@@ -2424,10 +2447,10 @@ class Orchestrator:
             # -- Step 6: re-evaluate open positions ------------------------------
             await self._medium_evaluate_positions(portfolio, bars, indicators, acct, orders_state.orders)
 
-        # -- Phase 21: position thesis breach monitoring ---------------------
-        # Haiku checks active_theses[symbol].thesis_breaking_conditions against live
-        # indicators. On breach, flags needs_sonnet="position_thesis_breach" so the
-        # slow loop fires a targeted Sonnet review.
+        # -- Position thesis breach monitoring ----------------------------------
+        # Haiku evaluates active_theses[symbol].thesis_breaking_conditions against
+        # live signals, recent news, and regime context. On breach, flags
+        # needs_sonnet="position_thesis_breach" so the slow loop fires a Sonnet review.
         if (
             self._claude._compressor is not None
             and portfolio.positions
@@ -2442,19 +2465,35 @@ class Orchestrator:
                     _active_theses = _cached_result.active_theses
 
                 if _active_theses:
-                    _breach = self._claude._compressor.check_position_theses(
-                        positions=portfolio.positions,
+                    # Exclude positions with an active order — an exit order may
+                    # have just been placed and the fill not yet processed, which
+                    # causes the breach to re-fire for a symbol already being exited.
+                    _pending_syms = {o.symbol for o in self._fill_protection.get_pending_orders()}
+                    _thesischeck_positions = [
+                        p for p in portfolio.positions
+                        if (p.symbol if hasattr(p, "symbol") else p.get("symbol", "")) not in _pending_syms
+                    ]
+                    _breach = await self._claude._compressor.check_position_theses(
+                        positions=_thesischeck_positions,
                         active_theses=_active_theses,
                         indicators=self._all_indicators,
+                        daily_indicators=self._daily_indicators,
+                        market_data=self._latest_market_context or {},
+                        regime_assessment=self._last_regime_assessment,
+                        sector_regimes=self._last_sector_regimes,
                         cycle_id=f"medium_{self._trigger_state.last_claude_call_utc}",
                     )
                     if _breach and _breach.needs_sonnet:
                         log.warning(
-                            "Phase 21: position thesis breach detected — "
+                            "Position thesis breach detected — "
                             "scheduling Sonnet review [%s]",
                             _breach.notes,
                         )
-                        # Add to slow-loop triggers for next check cycle
+                        # Store breach detail so the next _run_claude_cycle can pass
+                        # it to Sonnet's position review. Without this, Sonnet receives
+                        # no signal about which condition was detected and reruns its
+                        # prior analysis unchanged.
+                        self._thesis_breach_context = _breach.notes
                         asyncio.ensure_future(
                             self._run_claude_cycle(trigger_name="thesis_breach")
                         )
@@ -2482,18 +2521,9 @@ class Orchestrator:
             )
             return False
 
-        # Composite score floor — prevents marginal entries where each individual component
-        # clears its gate but the combined score is too weak to justify capital deployment.
-        # Phase 19: Claude may relax this floor via filter_adjustments.min_composite_score,
-        # but never below the absolute config floor (filter_adj_min_composite).
+        # Directional score floor — static config value only. Claude does not see the scores
+        # so cannot advise on the floor; it is not adjustable via filter_adjustments.
         min_score = self._config.ranker.min_composite_score
-        if self._filter_adjustments and "min_composite_score" in self._filter_adjustments:
-            try:
-                proposed = float(self._filter_adjustments["min_composite_score"])
-                abs_floor = self._config.ranker.filter_adj_min_composite
-                min_score = max(abs_floor, proposed)
-            except (TypeError, ValueError):
-                pass
         if top.composite_score < min_score:
             log.info(
                 "Medium loop: skipping %s — composite score %.3f < floor %.2f",
@@ -2708,9 +2738,10 @@ class Orchestrator:
             )
             return False
 
-        # Scale quantity by TA signal quality.
-        # At composite_technical_score=0 → ta_size_factor_min of base qty; at 1.0 → 100% of base qty.
-        tech_score = ind.get("composite_technical_score", 0.5)
+        # Scale quantity by TA signal quality — use directional score for this entry's direction.
+        # At score=0 → ta_size_factor_min of base qty; at 1.0 → 100% of base qty.
+        _score_key = "short_score" if is_short(entry_direction) else "long_score"
+        tech_score = ind.get(_score_key, 0.5)
         size_factor = (
             self._config.ranker.ta_size_factor_min
             + (1.0 - self._config.ranker.ta_size_factor_min) * tech_score
@@ -3644,13 +3675,18 @@ class Orchestrator:
             ind = ctx.get(etf)
             if not ind:
                 continue
+            # Sort sectors by best directional score — max(long_score, short_score) gives
+            # a regime-neutral strength signal for ranking sectors without direction bias.
+            _sort_score = max(ind.get("long_score", 0.0), ind.get("short_score", 0.0))
             sector_performance.append({
                 "sector":          sector,
                 "etf":             etf,
                 "trend":           ind.get("signals", {}).get("trend_structure", "unknown"),
-                "composite_score": ind.get("composite_technical_score", 0.0),
+                "long_score":      round(ind.get("long_score",  0.0), 3),
+                "short_score":     round(ind.get("short_score", 0.0), 3),
+                "_sort_score":     _sort_score,
             })
-        sector_performance.sort(key=lambda x: x["composite_score"], reverse=True)
+        sector_performance.sort(key=lambda x: x.pop("_sort_score"), reverse=True)
 
         # Fetch news for tier-1 watchlist symbols + macro instruments (SPY, QQQ) concurrently.
         # Macro news gives Sonnet narrative context for *why* broad market indicators are moving
@@ -3977,6 +4013,12 @@ class Orchestrator:
         # --- Phase 22: Call A — position reviews (split mode) ---
         # When split_reasoning_enabled, reviews run as a separate compact call.
         # Failure is non-fatal: positions continue to be managed by quant rules.
+        #
+        # Consume any pending thesis breach context here. It is cleared before
+        # awaiting to prevent double-use if another slow loop fires concurrently.
+        _pending_breach = self._thesis_breach_context
+        self._thesis_breach_context = None
+
         position_reviews_from_call_a: list[dict] = []
         _split = self._config.claude.split_reasoning_enabled
         if _split and portfolio.positions:
@@ -3986,6 +4028,7 @@ class Orchestrator:
                 indicators=indicators,
                 market_data=market_data,
                 daily_indicators=self._daily_indicators or None,
+                breach_context=_pending_breach,
             )
             self._claude._last_call_end_time = 0.0  # reset again before Call B
 
@@ -4054,6 +4097,9 @@ class Orchestrator:
                 model_override=_opp_model,
                 skip_context_fields=_opp_skip_fields,
                 use_emergency_prompt=_opp_emergency,
+                # Thesis breach context (non-split mode only — in split mode Call A already
+                # received it above; when split is off, position reviews run inside this call).
+                breach_context=_pending_breach if not _split else None,
             )
         except Exception as exc:
             self._handle_claude_failure(exc, tier=active_tier)
@@ -4103,19 +4149,17 @@ class Orchestrator:
             if self._consecutive_filter_empty_cycles >= decay_threshold:
                 log.warning(
                     "filter_adjustments decayed after %d consecutive empty Claude cycle(s) — "
-                    "ignoring proposed min_rvol=%s min_composite=%s and reverting to config defaults",
+                    "ignoring proposed min_rvol=%s and reverting to config defaults",
                     self._consecutive_filter_empty_cycles,
                     result.filter_adjustments.get("min_rvol"),
-                    result.filter_adjustments.get("min_composite_score"),
                 )
                 self._consecutive_filter_empty_cycles = 0
                 # _filter_adjustments stays None → ranker uses config defaults
             else:
                 self._filter_adjustments = result.filter_adjustments
                 log.info(
-                    "Phase 19: filter_adjustments applied — min_rvol=%s min_composite=%s reason=%s",
+                    "Phase 19: filter_adjustments applied — min_rvol=%s reason=%s",
                     result.filter_adjustments.get("min_rvol"),
-                    result.filter_adjustments.get("min_composite_score"),
                     result.filter_adjustments.get("reason", ""),
                 )
         if result.regime_assessment:
@@ -4341,12 +4385,16 @@ class Orchestrator:
         if result.position_reviews:
             await self._apply_position_reviews(result.position_reviews)
 
-        # Persist recommendation_outcomes so rejection counts survive restarts within
-        # the same trading day. Load a fresh portfolio to avoid clobbering any
-        # concurrent fast-loop or medium-loop writes.
+        # Persist recommendation_outcomes and fetch_failure suppression so both survive
+        # restarts within the same trading day. Load a fresh portfolio to avoid clobbering
+        # any concurrent fast-loop or medium-loop writes.
         try:
             _pf_for_outcomes = await self._state_manager.load_portfolio()
             _pf_for_outcomes.recommendation_outcomes = dict(self._recommendation_outcomes)
+            _pf_for_outcomes.fetch_failure_suppressed = [
+                sym for sym, reason in self._filter_suppressed.items()
+                if reason == "fetch_failure"
+            ]
             await self._state_manager.save_portfolio(_pf_for_outcomes)
         except Exception as _exc:
             log.warning("Slow loop: failed to persist recommendation_outcomes: %s", _exc)
@@ -4400,7 +4448,7 @@ class Orchestrator:
             affected_sectors: ETF keys whose regime changed. Pass None to clear
                               all sectors (broad panic flip).
 
-        Direction-dependent reasons (cleared): rvol, composite_score, conviction_floor,
+        Direction-dependent reasons (cleared): rvol, directional_score, conviction_floor,
                                                 defer_expired
         Direction-neutral reasons (preserved): fetch_failure, blacklist, no_entry
         """
@@ -4410,7 +4458,7 @@ class Orchestrator:
         # Extension point: add new reason patterns here if new suppression reasons
         # are added that are direction-dependent.
         _DIRECTION_DEPENDENT_PATTERNS = (
-            "rvol", "composite_score", "conviction_floor", "defer_expired",
+            "rvol", "directional_score", "conviction_floor", "defer_expired",
         )
 
         to_clear: list[str] = []
@@ -4461,6 +4509,20 @@ class Orchestrator:
             open_syms = {p.symbol for p in portfolio.positions}
 
             broad_panic = new_regime == "risk-off panic"
+
+            # Log watchlist direction breakdown before eviction so we can compare after rebuild.
+            def _direction_summary(entries) -> str:
+                longs  = sum(1 for e in entries if e.expected_direction == "long")
+                shorts = sum(1 for e in entries if e.expected_direction == "short")
+                either = sum(1 for e in entries if e.expected_direction == "either")
+                return f"{len(entries)} total — {longs}L / {shorts}S / {either}either"
+
+            log.info(
+                "Regime reset triggered: %s → %s | changed_sectors=%s | watchlist before: %s",
+                new_regime, "broad_panic" if broad_panic else "sector_granular",
+                sorted(changed_sectors) if changed_sectors else "[]",
+                _direction_summary(watchlist.entries),
+            )
 
             # Determine which entries to evict
             to_evict: list[str] = []
@@ -4517,12 +4579,21 @@ class Orchestrator:
                     no_entry_symbols=self._config.ranker.no_entry_symbols,
                 )
                 if wl_result is not None:
+                    symbols_before = {e.symbol for e in watchlist.entries}
                     await self._apply_watchlist_changes(
                         watchlist, wl_result.watchlist, [], open_syms
                     )
+                    added = [e for e in watchlist.entries if e.symbol not in symbols_before]
+                    added_longs  = [e.symbol for e in added if e.expected_direction == "long"]
+                    added_shorts = [e.symbol for e in added if e.expected_direction == "short"]
+                    added_either = [e.symbol for e in added if e.expected_direction == "either"]
                     log.info(
-                        "Regime reset build complete — %d suggestions applied",
-                        len(wl_result.watchlist),
+                        "Regime reset build complete — %d added (L:%s S:%s either:%s) | watchlist after: %s",
+                        len(added),
+                        added_longs or "[]",
+                        added_shorts or "[]",
+                        added_either or "[]",
+                        _direction_summary(watchlist.entries),
                     )
                     # Only stamp timestamp when a build actually completed (not on None
                     # return or exception — those don't count as successful builds).
@@ -4684,9 +4755,9 @@ class Orchestrator:
         # Phase 21: multi-tier eviction order:
         #   1. Tier-2 entries (exploratory; lower conviction than tier-1)
         #   2. Tier-1 entries whose expected_direction conflicts with current sector_regimes
-        #   3. Remaining tier-1 entries by lowest composite score (existing behavior)
+        #   3. Remaining tier-1 entries by lowest directional score (existing behavior)
         # This prevents the pruner from evicting deliberate swing setups (e.g. oversold
-        # mean-reversion theses) which legitimately have low intraday composite scores.
+        # mean-reversion theses) which legitimately have low intraday directional scores.
         max_entries = self._config.claude.watchlist_max_entries
         if len(watchlist.entries) > max_entries:
             # Newly-added symbols are protected for this cycle: they haven't been
@@ -4699,17 +4770,13 @@ class Orchestrator:
             protected = (open_symbols or set()) | newly_added
 
             def _composite(e) -> float:
+                # _latest_indicators has signals merged flat (no "signals" sub-key),
+                # so use pre-computed long_score/short_score directly.
                 ind = self._latest_indicators.get(e.symbol, {})
-                raw = ind.get("signals") or {}
-                if raw:
-                    ed = getattr(e, "expected_direction", "either")
-                    if ed != "either":
-                        return compute_composite_score(raw, direction=ed)
-                    return max(
-                        compute_composite_score(raw, direction="long"),
-                        compute_composite_score(raw, direction="short"),
-                    )
-                return ind.get("composite_technical_score", 0.0)
+                ed = getattr(e, "expected_direction", "either")
+                if ed == "long":  return float(ind.get("long_score",  0.0))
+                if ed == "short": return float(ind.get("short_score", 0.0))
+                return max(float(ind.get("long_score", 0.0)), float(ind.get("short_score", 0.0)))
 
             def _direction_conflicts(e) -> bool:
                 """True if this entry's direction conflicts with current sector_regimes."""
@@ -4868,27 +4935,6 @@ class Orchestrator:
                 # Claude recommends exiting — place a market exit order immediately.
                 # thesis_intact=False is a hard signal; action="exit" is sufficient.
                 if action == "exit":
-                    # Guard: swing positions must be held for a minimum time before
-                    # Claude review exits are honoured. Intraday signal deterioration
-                    # is expected noise for a multi-day strategy; acting on it causes
-                    # same-session exits that defeat the swing thesis entirely.
-                    # Positions with strategy="unknown" (broker-adopted) are treated
-                    # as swing for this gate — conservative default.
-                    swing_strategies = {"swing", "unknown"}
-                    if pos.intention.strategy in swing_strategies:
-                        min_hold = self._config.strategy.swing_min_hold_hours
-                        try:
-                            entry_dt = datetime.fromisoformat(pos.entry_date)
-                            hold_hours = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 3600
-                        except Exception:
-                            hold_hours = 9999.0  # unparseable date → assume held long enough
-                        if hold_hours < min_hold:
-                            log.info(
-                                "Claude review exit blocked for %s (%s) — "
-                                "held %.1fh < swing_min_hold_hours=%.1fh",
-                                symbol, pos.intention.strategy, hold_hours, min_hold,
-                            )
-                            break
                     # Guard against the override-vs-Claude race: if this symbol was
                     # closed by the fast loop (override/stop) while Claude's API call
                     # was in flight, the position no longer exists — skip the exit.

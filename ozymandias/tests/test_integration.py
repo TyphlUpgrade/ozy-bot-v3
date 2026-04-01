@@ -386,7 +386,8 @@ class TestOverrideExit:
                 "rsi_divergence": False,
                 "roc_5": -0.03,
                 "atr_14": 3.5,
-                "composite_technical_score": 0.25,
+                "long_score": 0.25,
+                "short_score": 0.60,
                 "signals": {
                     "vwap_position": "below",
                     "volume_ratio": 1.8,
@@ -394,7 +395,6 @@ class TestOverrideExit:
                     "rsi_divergence": False,
                     "roc_5": -0.03,
                     "atr_14": 3.5,
-                    "composite_technical_score": 0.25,
                 },
             }
         }

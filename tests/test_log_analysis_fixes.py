@@ -245,6 +245,8 @@ class TestOverrideExitTrigger:
         orch._latest_indicators = {}
         orch._all_indicators = {}
         orch._market_context_indicators = {}
+        orch._last_regime_assessment = None
+        orch._last_sector_regimes = None
         orch._state_manager = MagicMock()
         orch._state_manager.load_watchlist = AsyncMock(return_value=WatchlistState(entries=[]))
         orch._state_manager.load_portfolio = AsyncMock(return_value=PortfolioState())

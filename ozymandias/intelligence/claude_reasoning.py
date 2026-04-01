@@ -30,7 +30,7 @@ from ozymandias.core.config import ClaudeConfig, Config
 from ozymandias.core.reasoning_cache import ReasoningCache
 from ozymandias.core.state_manager import PortfolioState, Position, WatchlistState
 from ozymandias.intelligence.context_compressor import ContextCompressor
-from ozymandias.intelligence.technical_analysis import compute_composite_score
+from ozymandias.intelligence.technical_analysis import compute_directional_scores
 
 log = logging.getLogger(__name__)
 
@@ -75,7 +75,7 @@ class ReasoningResult:
     sector_regimes: dict | None = None
     # {ETF: {regime, bias, strength}} — only sectors with watchlist symbols
     filter_adjustments: dict | None = None
-    # {min_rvol, min_composite_score, reason} — Claude-proposed threshold relaxations
+    # {min_rvol, reason} — Claude-proposed RVOL relaxation only; score floor is non-adjustable
     active_theses: list[dict] | None = None
     # [{symbol, thesis, thesis_breaking_conditions}] — open position thesis durability
 
@@ -452,12 +452,18 @@ class ClaudeReasoningEngine:
         indicators: dict,
         market_data: dict,
         daily_indicators: dict[str, dict] | None = None,
+        breach_context: str | None = None,
     ) -> list[dict]:
         """
         Phase 22 split-call: compact position review using position_reviews.txt.
 
         Returns a list of position_review dicts on success, or [] on any failure.
         Never raises — the orchestrator continues to the opportunity call regardless.
+
+        breach_context: if set, a thesis breach was detected by Haiku before this call.
+        Injected as a prominent notice in the prompt so Sonnet knows which condition
+        was detected and can re-examine the affected position instead of reaffirming
+        its prior hold recommendation.
         """
         if not portfolio.positions:
             return []
@@ -470,6 +476,18 @@ class ClaudeReasoningEngine:
             self._REVIEW_VERBOSE_SCHEMA if verbose else self._REVIEW_COMPACT_SCHEMA
         )
 
+        thesis_breach_notice = ""
+        if breach_context:
+            thesis_breach_notice = (
+                "⚠ THESIS BREACH DETECTED BY MONITORING SYSTEM:\n"
+                f"{breach_context}\n\n"
+                "A condition specified as thesis-breaking has been concretely detected in current "
+                "signals or news. Re-examine the affected position carefully. Do not simply "
+                "reaffirm your prior hold recommendation — evaluate whether this specific "
+                "condition warrants exit, stop adjustment, or target revision given current "
+                "price and context.\n\n"
+            )
+
         try:
             context = self.assemble_position_review_context(
                 portfolio, indicators, market_data, daily_indicators
@@ -479,8 +497,8 @@ class ClaudeReasoningEngine:
             max_tokens = getattr(self._claude_cfg, "review_call_max_tokens", 2048)
 
             log.info(
-                "Slow loop: Claude call [position review]  positions=%d  verbose=%s",
-                len(portfolio.positions), verbose,
+                "Slow loop: Claude call [position review]  positions=%d  verbose=%s  breach=%s",
+                len(portfolio.positions), verbose, bool(breach_context),
             )
             raw_text = await self.call_claude(
                 template,
@@ -488,6 +506,7 @@ class ClaudeReasoningEngine:
                     "context_json": context_json,
                     "reasoning_depth_instructions": depth_instructions,
                     "updated_reasoning_schema": reasoning_schema,
+                    "thesis_breach_notice": thesis_breach_notice,
                 },
                 max_tokens_override=max_tokens,
             )
@@ -628,9 +647,12 @@ class ClaudeReasoningEngine:
         # this filter should be removed or conditioned on whether the strategy supports
         # pyramiding — held symbols would legitimately need to appear as candidates again.
         open_position_symbols = {pos.symbol for pos in portfolio.positions}
+        _suppressed_set = set(session_suppressed or {})
         all_tier1 = [
             e for e in watchlist.entries
-            if e.priority_tier == 1 and e.symbol not in open_position_symbols
+            if e.priority_tier == 1
+            and e.symbol not in open_position_symbols
+            and e.symbol not in _suppressed_set
         ]
         total_tier1 = len(all_tier1)
 
@@ -641,6 +663,7 @@ class ClaudeReasoningEngine:
             sym_to_entry = {
                 e.symbol: e for e in watchlist.entries
                 if e.symbol not in open_position_symbols
+                and e.symbol not in _suppressed_set
             }
             tier1_watch = []
             for sym in selected_symbols:
@@ -656,24 +679,24 @@ class ClaudeReasoningEngine:
             def _tier1_score(entry) -> float:
                 ind = indicators.get(entry.symbol, {})
                 raw = ind.get("signals") or {}
+                ed = getattr(entry, "expected_direction", "either")
                 if raw:
-                    # Phase 15: use direction-adjusted score when expected_direction is set;
-                    # fall back to max(long, short) for "either" so any directional setup
-                    # ranks appropriately regardless of bias.
-                    ed = getattr(entry, "expected_direction", "either")
-                    if ed != "either":
-                        return compute_composite_score(raw, direction=ed)
-                    return max(
-                        compute_composite_score(raw, direction="long"),
-                        compute_composite_score(raw, direction="short"),
-                    )
-                return ind.get("composite_technical_score", 0.0)
+                    _daily = (daily_indicators or {}).get(entry.symbol, {})
+                    scores = compute_directional_scores(raw, _daily)
+                    if ed == "long":  return scores["long"]
+                    if ed == "short": return scores["short"]
+                    return max(scores["long"], scores["short"])
+                # Fall back to pre-computed intraday-only scores
+                if ed == "long":  return float(ind.get("long_score",  0.0))
+                if ed == "short": return float(ind.get("short_score", 0.0))
+                return max(float(ind.get("long_score", 0.0)), float(ind.get("short_score", 0.0)))
 
             tier1_watch = sorted(all_tier1, key=_tier1_score, reverse=True)[:slots]
 
         # Phase 15: build ta_readiness dict replacing technical_summary string.
-        # ta_readiness is a direct pass-through of indicators[symbol]["signals"]
-        # with a direction-adjusted composite_score added.
+        # ta_readiness is a direct pass-through of indicators[symbol]["signals"].
+        # Directional scores (long_score/short_score) are intentionally excluded —
+        # Claude reasons from raw signals; scores are used by the ranker only.
         # _make_technical_summary is retained for run_position_review (not removed).
         watchlist_tier1: list[dict] = []
         for entry in tier1_watch:
@@ -681,33 +704,11 @@ class ClaudeReasoningEngine:
             sig_summary = indicators.get(sym, {})
             raw_signals = sig_summary.get("signals", {})
             ed = getattr(entry, "expected_direction", "either")
-            # Direction-adjusted composite score: mirror the tier-1 sort-key logic so
-            # Claude sees the same score used for ranking. "either" takes the better of
-            # long/short rather than defaulting to long (which understates bearish setups).
-            if ed == "either":
-                direction_score = (
-                    max(
-                        compute_composite_score(raw_signals, direction="long"),
-                        compute_composite_score(raw_signals, direction="short"),
-                    )
-                    if raw_signals
-                    else float(sig_summary.get("composite_technical_score") or 0.0)
-                )
-            else:
-                direction_score = (
-                    compute_composite_score(raw_signals, direction=ed)
-                    if raw_signals
-                    else float(sig_summary.get("composite_technical_score") or 0.0)
-                )
-            # ta_readiness: pass through live signals + direction-adjusted composite_score.
+            # ta_readiness: live signals passed through for Claude's qualitative use.
+            # Composite score is intentionally omitted — Claude reasons from raw signals;
+            # the score is used by the ranker only (ranker has its own signal access).
             # Excluded fields defined at module level in _TA_EXCLUDED.
-            # Token optimisations applied here (not in technical_analysis.py, which
-            # must retain full precision for the ranker and strategy gates):
-            #   - Strip False booleans (e.g. macd_histogram_expanding=False carries no
-            #     information; the prompt already says false should be omitted).
-            #   - Strip integer zeros (e.g. volume_trend_bars=0 = no signal).
-            #   - Round floats to 2 decimal places (Claude doesn't reason at 4-decimal
-            #     precision; saves ~1 token per numeric field × 13 fields × 18 symbols).
+            # Token optimisations: strip False booleans, integer zeros; round floats to 2dp.
             ta_readiness: dict = {
                 k: (round(v, 2) if isinstance(v, float) else v)
                 for k, v in raw_signals.items()
@@ -715,7 +716,6 @@ class ClaudeReasoningEngine:
                 and v is not False
                 and not (isinstance(v, int) and not isinstance(v, bool) and v == 0)
             } if raw_signals else {}
-            ta_readiness["composite_score"] = round(direction_score, 2)
 
             entry_dict: dict = {
                 "symbol": sym,
@@ -1145,6 +1145,7 @@ class ClaudeReasoningEngine:
         model_override: str | None = None,
         skip_context_fields: frozenset | None = None,
         use_emergency_prompt: bool = False,
+        breach_context: str | None = None,
     ) -> Optional[ReasoningResult]:
         """
         Full reasoning cycle: check cache → [Haiku pre-screen] → assemble context
@@ -1193,15 +1194,15 @@ class ClaudeReasoningEngine:
             def _tier1_score_simple(entry) -> float:
                 ind = (all_indicators or indicators).get(entry.symbol, {})
                 raw = ind.get("signals") or {}
+                ed = getattr(entry, "expected_direction", "either")
                 if raw:
-                    ed = getattr(entry, "expected_direction", "either")
-                    if ed != "either":
-                        return compute_composite_score(raw, direction=ed)
-                    return max(
-                        compute_composite_score(raw, direction="long"),
-                        compute_composite_score(raw, direction="short"),
-                    )
-                return ind.get("composite_technical_score", 0.0)
+                    scores = compute_directional_scores(raw)
+                    if ed == "long":  return scores["long"]
+                    if ed == "short": return scores["short"]
+                    return max(scores["long"], scores["short"])
+                if ed == "long":  return float(ind.get("long_score",  0.0))
+                if ed == "short": return float(ind.get("short_score", 0.0))
+                return max(float(ind.get("long_score", 0.0)), float(ind.get("short_score", 0.0)))
             selected_symbols = [
                 e.symbol for e in sorted(all_candidates, key=_tier1_score_simple, reverse=True)
                 [:effective_max]
@@ -1281,7 +1282,21 @@ class ClaudeReasoningEngine:
                     "Skip directly to INSTRUCTIONS step 2 (evaluate watchlist_tier1 symbols).\n"
                 )
             else:
-                position_review_notice = ""
+                # Non-split mode: position reviews are embedded in this call.
+                # Prepend any thesis breach notice so Sonnet knows which condition
+                # triggered this cycle before reviewing positions.
+                if breach_context:
+                    position_review_notice = (
+                        "⚠ THESIS BREACH DETECTED BY MONITORING SYSTEM:\n"
+                        f"{breach_context}\n\n"
+                        "A condition specified as thesis-breaking has been concretely detected in "
+                        "current signals or news. Re-examine the affected position carefully. Do not "
+                        "simply reaffirm your prior hold recommendation — evaluate whether this "
+                        "specific condition warrants exit, stop adjustment, or target revision given "
+                        "current price and context.\n\n"
+                    )
+                else:
+                    position_review_notice = ""
             prompt_context = {
                 "context_json": context_json,
                 "position_review_notice": position_review_notice,
@@ -1649,7 +1664,8 @@ class ClaudeReasoningEngine:
                 {
                     "symbol": position.symbol,
                     "signals": signals,
-                    "composite_score": sig_summary.get("composite_technical_score"),
+                    "long_score":  sig_summary.get("long_score"),
+                    "short_score": sig_summary.get("short_score"),
                     "summary": tech_summary,
                 },
                 indent=2,

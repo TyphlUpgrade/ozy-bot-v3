@@ -24,7 +24,6 @@ from ozymandias.intelligence.opportunity_ranker import (
     _MAX_REWARD_RISK_RATIO,
 )
 from ozymandias.intelligence.claude_reasoning import ReasoningResult
-from ozymandias.intelligence.technical_analysis import compute_composite_score
 from ozymandias.execution.broker_interface import AccountInfo
 from ozymandias.core.state_manager import PortfolioState, Position
 
@@ -107,12 +106,12 @@ def _market_open(open_: bool = True):
 def _tech(symbol: str, composite: float = 0.7, avg_vol: float | None = 1_000_000.0) -> dict:
     """
     Build a mock technical_signals entry matching the real generate_signal_summary() schema:
-        {symbol: {"composite_technical_score": ..., "signals": {"avg_daily_volume": ...}}}
+        {symbol: {"long_score": ..., "short_score": ..., "signals": {"avg_daily_volume": ...}}}
     """
     nested: dict = {}
     if avg_vol is not None:
         nested["avg_daily_volume"] = avg_vol
-    return {symbol: {"composite_technical_score": composite, "signals": nested}}
+    return {symbol: {"long_score": composite, "short_score": composite, "signals": nested}}
 
 
 # ---------------------------------------------------------------------------
@@ -228,10 +227,11 @@ class TestCompositeScore:
             "bollinger_position": "upper_half",
             "rsi_divergence": False,
         }
-        signals = {"AAPL": {"composite_technical_score": 0.7, "signals": raw}}
+        signals = {"AAPL": {"long_score": 0.7, "short_score": 0.5, "signals": raw}}
         result = r.score_opportunity(opp, signals, _account(), _portfolio())
 
-        expected_tech = compute_composite_score(raw, direction="long")
+        from ozymandias.intelligence.technical_analysis import compute_directional_scores
+        expected_tech = compute_directional_scores(raw)["long"]
         expected = (
             0.8 * _W_AI
             + expected_tech * _W_TECH
@@ -259,14 +259,14 @@ class TestCompositeScore:
             suggested_exit=200.0,
             suggested_stop=80.0,
         )
-        signals = {"AAPL": {"composite_technical_score": 1.0, "signals": {"avg_daily_volume": 5_000_000}}}
+        signals = {"AAPL": {"long_score": 1.0, "short_score": 1.0, "signals": {"avg_daily_volume": 5_000_000}}}
         result = r.score_opportunity(opp, signals, _account(), _portfolio())
         assert result.composite_score <= 1.0
 
     def test_weight_override_via_config(self):
         r = OpportunityRanker({"w_ai": 1.0, "w_tech": 0.0, "w_risk": 0.0, "w_liq": 0.0})
         opp = _opportunity(conviction=0.6)
-        signals = {"AAPL": {"composite_technical_score": 0.9, "signals": {"avg_daily_volume": 2_000_000}}}
+        signals = {"AAPL": {"long_score": 0.9, "short_score": 0.9, "signals": {"avg_daily_volume": 2_000_000}}}
         result = r.score_opportunity(opp, signals, _account(), _portfolio())
         # Only AI conviction matters
         assert result.composite_score == pytest.approx(0.6, abs=1e-6)
@@ -329,27 +329,27 @@ class TestHardFilters:
 
     def test_low_volume_in_signals_rejects(self):
         # avg_daily_volume lives in the nested "signals" sub-dict of the TA output
-        signals = {"AAPL": {"composite_technical_score": 0.7, "signals": {"avg_daily_volume": 50_000}}}
+        signals = {"AAPL": {"long_score": 0.7, "short_score": 0.5, "signals": {"avg_daily_volume": 50_000}}}
         passes, reason = self._filter(signals=signals)
         assert passes is False
         assert "volume" in reason.lower()
 
     def test_low_volume_in_opportunity_rejects(self):
         opp = _opportunity(avg_daily_volume=30_000)
-        # No volume in signals → falls back to opportunity dict
-        signals = {"AAPL": {"composite_technical_score": 0.7, "signals": {}}}
+        # No volume in signals → falls back to opportunity dict; score above floor so volume filter fires
+        signals = {"AAPL": {"long_score": 0.7, "short_score": 0.5, "signals": {}}}
         passes, reason = self._filter(opp=opp, signals=signals)
         assert passes is False
         assert "volume" in reason.lower()
 
     def test_volume_at_100k_passes(self):
-        signals = {"AAPL": {"composite_technical_score": 0.7, "signals": {"avg_daily_volume": 100_000}}}
+        signals = {"AAPL": {"long_score": 0.7, "short_score": 0.5, "signals": {"avg_daily_volume": 100_000}}}
         passes, _ = self._filter(signals=signals)
         assert passes is True
 
     def test_no_volume_info_passes(self):
-        # Unknown volume: filter skipped (neutral)
-        signals = {"AAPL": {"composite_technical_score": 0.7, "signals": {}}}
+        # Unknown volume: filter skipped (neutral); score above floor so we reach volume check
+        signals = {"AAPL": {"long_score": 0.7, "short_score": 0.5, "signals": {}}}
         passes, _ = self._filter(signals=signals)
         assert passes is True
 
@@ -389,7 +389,7 @@ class TestRankOpportunities:
                          suggested_entry=100.0, suggested_exit=120.0, suggested_stop=90.0)
             for i in range(1, 6)  # convictions: 0.2, 0.4, 0.6, 0.8, 1.0
         ]
-        signals = {f"S{i}": {"composite_technical_score": 0.5, "signals": {"avg_daily_volume": 500_000}}
+        signals = {f"S{i}": {"long_score": 0.5, "short_score": 0.5, "signals": {"avg_daily_volume": 500_000}}
                    for i in range(1, 6)}
         ranked = self._rank(opps, signals)
         assert len(ranked) == 5
@@ -403,10 +403,9 @@ class TestRankOpportunities:
             _opportunity(symbol="TSLA"),
         ]
         # AAPL has low volume → rejected; TSLA is fine
-        # Use real TA output schema: composite_technical_score at top, avg_daily_volume nested
         signals = {
-            "AAPL": {"composite_technical_score": 0.8, "signals": {"avg_daily_volume": 10_000}},
-            "TSLA": {"composite_technical_score": 0.7, "signals": {"avg_daily_volume": 2_000_000}},
+            "AAPL": {"long_score": 0.8, "short_score": 0.8, "signals": {"avg_daily_volume": 10_000}},
+            "TSLA": {"long_score": 0.7, "short_score": 0.7, "signals": {"avg_daily_volume": 2_000_000}},
         }
         ranked = self._rank(opps, signals)
         assert len(ranked) == 1
@@ -452,32 +451,32 @@ class TestRankExitActions:
 
     def test_exit_has_maximum_urgency(self):
         reviews = [{"symbol": "AAPL", "action": "exit", "updated_reasoning": "thesis broken"}]
-        actions = self._rank_exits(reviews, {"AAPL": {"composite_technical_score": 0.9}})
+        actions = self._rank_exits(reviews, {"AAPL": {"long_score": 0.9, "short_score": 0.9}})
         assert actions[0].urgency == pytest.approx(1.0)
         assert actions[0].action == "exit"
 
     def test_hold_has_lower_urgency_when_tech_strong(self):
         reviews = [{"symbol": "AAPL", "action": "hold", "updated_reasoning": "all good"}]
         # tech score = 0.9 → urgency = max(0, 1 - 0.9) = 0.1
-        actions = self._rank_exits(reviews, {"AAPL": {"composite_technical_score": 0.9}})
+        actions = self._rank_exits(reviews, {"AAPL": {"long_score": 0.9, "short_score": 0.9}})
         assert actions[0].urgency == pytest.approx(0.1)
 
     def test_hold_has_higher_urgency_when_tech_weak(self):
         reviews = [{"symbol": "AAPL", "action": "hold", "updated_reasoning": "uncertain"}]
         # tech score = 0.2 → urgency = 0.8
-        actions = self._rank_exits(reviews, {"AAPL": {"composite_technical_score": 0.2}})
+        actions = self._rank_exits(reviews, {"AAPL": {"long_score": 0.2, "short_score": 0.2}})
         assert actions[0].urgency == pytest.approx(0.8)
 
     def test_adjust_urgency_higher_when_tech_weak(self):
         reviews = [{"symbol": "AAPL", "action": "adjust", "updated_reasoning": "tighten stop"}]
         # tech score = 0.2 → urgency = 0.5 + 0.5*(1-0.2) = 0.9
-        actions = self._rank_exits(reviews, {"AAPL": {"composite_technical_score": 0.2}})
+        actions = self._rank_exits(reviews, {"AAPL": {"long_score": 0.2, "short_score": 0.2}})
         assert actions[0].urgency == pytest.approx(0.9)
 
     def test_adjust_urgency_lower_when_tech_strong(self):
         reviews = [{"symbol": "AAPL", "action": "adjust", "updated_reasoning": "tweak"}]
         # tech score = 0.9 → urgency = 0.5 + 0.5*0.1 = 0.55
-        actions = self._rank_exits(reviews, {"AAPL": {"composite_technical_score": 0.9}})
+        actions = self._rank_exits(reviews, {"AAPL": {"long_score": 0.9, "short_score": 0.9}})
         assert actions[0].urgency == pytest.approx(0.55)
 
     def test_mixed_hold_exit_adjust_sorted_by_urgency(self):
@@ -487,9 +486,9 @@ class TestRankExitActions:
             {"symbol": "C", "action": "adjust", "updated_reasoning": "tweak"},
         ]
         signals = {
-            "A": {"composite_technical_score": 0.8},
-            "B": {"composite_technical_score": 0.5},
-            "C": {"composite_technical_score": 0.5},
+            "A": {"long_score": 0.8, "short_score": 0.8},
+            "B": {"long_score": 0.5, "short_score": 0.5},
+            "C": {"long_score": 0.5, "short_score": 0.5},
         }
         actions = self._rank_exits(reviews, signals)
         # exit (1.0) > adjust (0.75) > hold (0.2)
@@ -597,7 +596,8 @@ def _signals_with(symbol: str, vwap_position: str = "above", trend: str = "beari
                   rvol: float = 1.5) -> dict:
     return {
         symbol: {
-            "composite_technical_score": 0.7,
+            "long_score": 0.7,
+            "short_score": 0.5,
             "signals": {
                 "avg_daily_volume": 1_000_000,
                 "vwap_position": vwap_position,
@@ -988,14 +988,14 @@ class TestClampFilterAdjustments:
         result = _clamp_filter_adjustments({"min_rvol": 0.2})
         assert result["min_rvol"] == 0.5
 
-    def test_min_composite_below_floor_clamped(self):
-        """Values below _FILTER_ADJ_MIN_COMPOSITE (0.35) are raised."""
-        result = _clamp_filter_adjustments({"min_composite_score": 0.20})
-        assert result["min_composite_score"] == 0.35
-
-    def test_min_composite_above_floor_unchanged(self):
-        result = _clamp_filter_adjustments({"min_composite_score": 0.42})
-        assert result["min_composite_score"] == 0.42
+    def test_composite_score_stripped_from_adjustments(self):
+        """min_composite_score and min_directional_score are silently removed — not honoured."""
+        result = _clamp_filter_adjustments({
+            "min_composite_score": 0.20, "min_directional_score": 0.40, "min_rvol": 0.6,
+        })
+        assert "min_composite_score"   not in result
+        assert "min_directional_score" not in result
+        assert result["min_rvol"] == 0.6
 
     def test_invalid_value_removed(self):
         result = _clamp_filter_adjustments({"min_rvol": "bad", "reason": "x"})

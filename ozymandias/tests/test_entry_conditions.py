@@ -39,7 +39,8 @@ def _full_signals(**overrides) -> dict:
         "price": 150.0,
         "avg_daily_volume": 2_000_000,
         "atr_14": 3.0,
-        "composite_technical_score": 0.72,
+        "long_score": 0.72,
+    "short_score": 0.45,
     }
     base.update(overrides)
     return base
@@ -238,7 +239,7 @@ def _make_portfolio():
     return PortfolioState()
 
 def _make_signals(symbol="AAPL"):
-    return {symbol: {"composite_technical_score": 0.7, "signals": _full_signals()}}
+    return {symbol: {"long_score": 0.7, "short_score": 0.45, "signals": _full_signals()}}
 
 
 class TestScoredOpportunityPropagation:

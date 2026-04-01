@@ -84,6 +84,10 @@ class PortfolioState:
     # Saved at the end of each slow-loop reasoning cycle so rejection counts survive
     # restarts within the same trading day. Entries from prior dates are discarded on load.
     recommendation_outcomes: dict = field(default_factory=dict)
+    # Persisted fetch_failure suppression list. Symbols with repeated yfinance failures
+    # are suppressed from Claude context mid-session; this list restores that suppression
+    # on restart so they don't re-enter context before the first failed fetch re-fires.
+    fetch_failure_suppressed: list = field(default_factory=list)
 
 
 @dataclass
@@ -400,6 +404,7 @@ class StateManager:
                 last_updated=data["last_updated"],
                 recently_closed=data.get("recently_closed", {}),
                 recommendation_outcomes=data.get("recommendation_outcomes", {}),
+                fetch_failure_suppressed=data.get("fetch_failure_suppressed", []),
             )
 
     async def save_portfolio(self, state: PortfolioState) -> None:

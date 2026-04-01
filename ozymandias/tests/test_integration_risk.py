@@ -289,13 +289,14 @@ class TestSignalSummaryToOverridePipeline:
                 f"volume_ratio={signals['volume_ratio']:.2f}"
             )
 
-    def test_composite_score_present_in_signal_summary(self):
-        """composite_technical_score is produced by TA and is separate from signals dict."""
+    def test_directional_scores_present_in_signal_summary(self):
+        """long_score and short_score are produced by TA and are separate from signals dict."""
         df = _intraday_ohlcv(40)
         result = generate_signal_summary("AAPL", df)
-        assert "composite_technical_score" in result
-        score = result["composite_technical_score"]
-        assert 0.0 <= score <= 1.0
+        assert "long_score" in result
+        assert "short_score" in result
+        assert 0.0 <= result["long_score"] <= 1.0
+        assert 0.0 <= result["short_score"] <= 1.0
 
     def test_generate_signal_summary_returns_symbol_and_timestamp(self):
         """Metadata fields returned alongside signals."""
