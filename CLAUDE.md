@@ -190,3 +190,6 @@ See `NOTES.md`. A living register of open concerns, deferred work, and engineeri
 
 ## Spec Drift Log
 See `DRIFT_LOG.md`. Read the relevant phase section of DRIFT_LOG.md before modifying or debugging any module built in a previous phase.
+
+- **Update when:** a module's interface changes, a new method or field is added to an existing module, a behavioral contract changes (e.g. a method's return value, side effects, or failure mode changes), or a non-obvious architectural decision is made. Every meaningful implementation change should have a drift log entry — if it would surprise a future reader of the code, it belongs here.
+- **Do not update for:** test-only changes, documentation fixes, or changes that are fully self-evident from reading the code and commit message.
