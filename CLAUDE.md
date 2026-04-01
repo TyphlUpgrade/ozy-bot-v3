@@ -181,5 +181,12 @@ Last post-MVP phase completed: Phase 21 — Durability and Regime Response (Marc
   - Watchlist build section removed from `_run_claude_cycle`. `_run_claude_cycle` now receives only
     reasoning triggers and runs Call A + Call B with no watchlist mutation.
 
+## Engineering Notes
+See `NOTES.md`. A living register of open concerns, deferred work, and engineering analyses that motivated architectural decisions.
+
+- **Read before:** starting work on any component with an open concern, debugging a known systemic pattern, or planning a new architectural change (check whether a related analysis already exists).
+- **Update when:** an engineering analysis session surfaces a lasting concern (open it); a concern is resolved by implementation (mark resolved, note the phase/date); a non-obvious architectural trade-off is made that isn't captured in DRIFT_LOG.md.
+- **Do not use for:** session logs, transient debugging notes, or content that belongs in DRIFT_LOG.md (what changed and why) or CLAUDE.md (conventions that affect all future development).
+
 ## Spec Drift Log
 See `DRIFT_LOG.md`. Read the relevant phase section of DRIFT_LOG.md before modifying or debugging any module built in a previous phase.
