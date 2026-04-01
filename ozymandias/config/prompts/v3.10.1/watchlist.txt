@@ -78,7 +78,8 @@ RESPONSE FORMAT:
       "reason": "<two sentences max: why this ticker, what is the catalyst or setup>",
       "priority_tier": 1,
       "strategy": "momentum|swing|both",
-      "expected_direction": "long|short|either"
+      "expected_direction": "long|short|either",
+      "catalyst_expiry_utc": "<ISO 8601 UTC — set ONLY for event-driven entries where the thesis becomes moot after a specific event (earnings, FDA decision, data release). Use market close on the event day: 21:00:00+00:00 (EDT) or 22:00:00+00:00 (EST). Example: earnings Thursday April 3 → '2026-04-03T21:00:00+00:00'. Omit entirely for thesis-driven entries (technical setups, sector rotation, structural momentum) with no hard deadline.>"
     }
   ],
   "market_notes": "<brief assessment of current market conditions and sector opportunities>"

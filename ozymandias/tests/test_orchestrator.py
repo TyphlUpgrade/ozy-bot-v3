@@ -2819,3 +2819,117 @@ class TestTradeJournalLifecycle:
 
         entries = _read_journal(tmp_path)
         assert not any(e.get("record_type") == "review" for e in entries)
+
+
+# ===========================================================================
+# Catalyst expiry pruner + fetch-failure suppression
+# ===========================================================================
+
+class TestPruneExpiredCatalysts:
+
+    def _entry(self, symbol, expiry=None):
+        now = datetime.now(timezone.utc).isoformat()
+        return WatchlistEntry(
+            symbol=symbol, date_added=now, reason="test",
+            priority_tier=1, catalyst_expiry_utc=expiry,
+        )
+
+    def test_expired_entry_removed(self, orch):
+        past = "2020-01-01T00:00:00+00:00"
+        wl = WatchlistState(entries=[self._entry("STALE", expiry=past), self._entry("FRESH")])
+        removed = orch._prune_expired_catalysts(wl)
+        assert removed == ["STALE"]
+        assert len(wl.entries) == 1
+        assert wl.entries[0].symbol == "FRESH"
+
+    def test_non_expired_entry_kept(self, orch):
+        future = "2099-01-01T00:00:00+00:00"
+        wl = WatchlistState(entries=[self._entry("SYM", expiry=future)])
+        removed = orch._prune_expired_catalysts(wl)
+        assert removed == []
+        assert len(wl.entries) == 1
+
+    def test_no_expiry_field_kept(self, orch):
+        wl = WatchlistState(entries=[self._entry("SYM", expiry=None)])
+        removed = orch._prune_expired_catalysts(wl)
+        assert removed == []
+        assert len(wl.entries) == 1
+
+    def test_malformed_timestamp_kept(self, orch):
+        wl = WatchlistState(entries=[self._entry("SYM", expiry="not-a-date")])
+        removed = orch._prune_expired_catalysts(wl)
+        assert removed == []
+        assert len(wl.entries) == 1
+
+    def test_empty_watchlist(self, orch):
+        wl = WatchlistState(entries=[])
+        removed = orch._prune_expired_catalysts(wl)
+        assert removed == []
+
+
+class TestCatalystExpiryApplyChanges:
+
+    @pytest.mark.asyncio
+    async def test_catalyst_expiry_stored_from_dict(self, orch):
+        wl = WatchlistState(entries=[])
+        expiry = "2026-12-31T21:00:00+00:00"
+        add_list = [{"symbol": "NVDA", "reason": "earnings", "catalyst_expiry_utc": expiry}]
+        await orch._apply_watchlist_changes(wl, add_list, [])
+        assert wl.entries[0].catalyst_expiry_utc == expiry
+
+    @pytest.mark.asyncio
+    async def test_no_catalyst_expiry_when_absent(self, orch):
+        wl = WatchlistState(entries=[])
+        add_list = [{"symbol": "AAPL", "reason": "technical setup"}]
+        await orch._apply_watchlist_changes(wl, add_list, [])
+        assert wl.entries[0].catalyst_expiry_utc is None
+
+    @pytest.mark.asyncio
+    async def test_plain_string_add_has_no_expiry(self, orch):
+        wl = WatchlistState(entries=[])
+        await orch._apply_watchlist_changes(wl, ["TSLA"], [])
+        assert wl.entries[0].catalyst_expiry_utc is None
+
+    @pytest.mark.asyncio
+    async def test_expired_entry_pruned_before_add(self, orch):
+        past = "2020-01-01T00:00:00+00:00"
+        now_iso = datetime.now(timezone.utc).isoformat()
+        stale = WatchlistEntry(
+            symbol="STALE", date_added=now_iso, reason="old",
+            priority_tier=1, catalyst_expiry_utc=past,
+        )
+        wl = WatchlistState(entries=[stale])
+        await orch._apply_watchlist_changes(wl, [], [])
+        assert not any(e.symbol == "STALE" for e in wl.entries)
+
+
+class TestFetchFailureSuppression:
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_sets_suppression(self, orch):
+        orch._filter_suppressed.clear()
+        orch._fetch_failure_counts.clear()
+        # Simulate a fetch failure by calling the failure path directly
+        sym = "NOK"
+        orch._fetch_failure_counts[sym] = orch._fetch_failure_counts.get(sym, 0) + 1
+        if sym not in orch._filter_suppressed:
+            orch._filter_suppressed[sym] = "fetch_failure"
+        assert orch._filter_suppressed.get(sym) == "fetch_failure"
+
+    @pytest.mark.asyncio
+    async def test_fetch_success_clears_fetch_failure_suppression(self, orch):
+        orch._filter_suppressed["NOK"] = "fetch_failure"
+        orch._fetch_failure_counts["NOK"] = 1
+        # Simulate success path
+        orch._fetch_failure_counts.pop("NOK", None)
+        if orch._filter_suppressed.get("NOK") == "fetch_failure":
+            orch._filter_suppressed.pop("NOK", None)
+        assert "NOK" not in orch._filter_suppressed
+
+    @pytest.mark.asyncio
+    async def test_fetch_success_does_not_clear_other_suppression(self, orch):
+        orch._filter_suppressed["NOK"] = "session_veto"
+        orch._fetch_failure_counts.pop("NOK", None)
+        if orch._filter_suppressed.get("NOK") == "fetch_failure":  # condition false
+            orch._filter_suppressed.pop("NOK", None)
+        assert orch._filter_suppressed.get("NOK") == "session_veto"

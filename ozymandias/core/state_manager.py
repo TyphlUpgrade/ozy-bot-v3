@@ -109,6 +109,7 @@ class WatchlistEntry:
     # Included in tier-1 context when fresher than last_view_max_age_days config value.
     last_view: Optional[str] = None       # "{considered_reason} | blocked: {rejection_reason}" or "Proposed {action} {strategy} — {reasoning}"
     last_view_date: Optional[str] = None  # ISO date string (YYYY-MM-DD) of last update
+    catalyst_expiry_utc: Optional[str] = None  # ISO 8601 UTC; entry pruned after this time (event-driven entries only)
 
 
 @dataclass
@@ -219,6 +220,7 @@ def _from_dict_watchlist_entry(d: dict) -> WatchlistEntry:
         expected_direction=raw_ed,
         last_view=d.get("last_view"),
         last_view_date=d.get("last_view_date"),
+        catalyst_expiry_utc=d.get("catalyst_expiry_utc"),
     )
 
 

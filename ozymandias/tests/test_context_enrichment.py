@@ -1034,3 +1034,62 @@ class TestExpectedDirectionValidation:
         add_list = [{"symbol": "TSLA", "reason": "test", "expected_direction": "sideways"}]
         await orch._apply_watchlist_changes(watchlist, add_list, [])
         assert watchlist.entries[0].expected_direction == "either"
+
+
+# ---------------------------------------------------------------------------
+# Fetch-failure suppression: context assembly filters suppressed symbols
+# ---------------------------------------------------------------------------
+
+class TestFetchFailureContextSuppression:
+
+    def _engine(self, tmp_path):
+        return _make_engine(tmp_path)
+
+    def _entry(self, symbol):
+        return WatchlistEntry(
+            symbol=symbol, date_added="2026-04-01", reason="test",
+            priority_tier=1, expected_direction="either",
+        )
+
+    def test_suppressed_symbol_excluded_from_tier1_direct_path(self, tmp_path):
+        engine = self._engine(tmp_path)
+        watchlist = WatchlistState(entries=[self._entry("AAPL"), self._entry("NOK")])
+        ctx = engine.assemble_reasoning_context(
+            PortfolioState(), watchlist, {}, {},
+            session_suppressed={"NOK": "fetch_failure"},
+        )
+        symbols = {e["symbol"] for e in ctx["watchlist_tier1"]}
+        assert "NOK" not in symbols
+        assert "AAPL" in symbols
+
+    def test_unsuppressed_symbol_present_in_tier1(self, tmp_path):
+        engine = self._engine(tmp_path)
+        watchlist = WatchlistState(entries=[self._entry("AAPL")])
+        ctx = engine.assemble_reasoning_context(
+            PortfolioState(), watchlist, {}, {},
+            session_suppressed={},
+        )
+        symbols = {e["symbol"] for e in ctx["watchlist_tier1"]}
+        assert "AAPL" in symbols
+
+    def test_suppressed_symbol_excluded_from_haiku_path(self, tmp_path):
+        engine = self._engine(tmp_path)
+        watchlist = WatchlistState(entries=[self._entry("AAPL"), self._entry("NOK")])
+        # Pass selected_symbols to exercise the Haiku pre-screener path
+        ctx = engine.assemble_reasoning_context(
+            PortfolioState(), watchlist, {}, {},
+            session_suppressed={"NOK": "fetch_failure"},
+            selected_symbols=["NOK", "AAPL"],
+        )
+        symbols = {e["symbol"] for e in ctx["watchlist_tier1"]}
+        assert "NOK" not in symbols
+        assert "AAPL" in symbols
+
+    def test_none_suppressed_does_not_crash(self, tmp_path):
+        engine = self._engine(tmp_path)
+        watchlist = WatchlistState(entries=[self._entry("AAPL")])
+        ctx = engine.assemble_reasoning_context(
+            PortfolioState(), watchlist, {}, {},
+            session_suppressed=None,
+        )
+        assert any(e["symbol"] == "AAPL" for e in ctx["watchlist_tier1"])

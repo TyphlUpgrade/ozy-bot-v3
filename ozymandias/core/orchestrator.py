@@ -2082,6 +2082,9 @@ class Orchestrator:
         # -- Step 1: gather symbols to scan ----------------------------------
         _medium_loop_start = time.monotonic()
         watchlist = await self._state_manager.load_watchlist()
+        _expired = self._prune_expired_catalysts(watchlist)
+        if _expired:
+            await self._state_manager.save_watchlist(watchlist)
         portfolio = await self._state_manager.load_portfolio()
         orders_state = await self._state_manager.load_orders()
 
@@ -4675,6 +4678,26 @@ class Orchestrator:
                 self._tier_failure_count = 0
                 log.warning("Tier downgrade → 3 (Haiku emergency) due to 529 overload")
 
+    def _prune_expired_catalysts(self, watchlist: "WatchlistState") -> list[str]:
+        """Remove entries whose catalyst_expiry_utc has passed. Returns removed symbols."""
+        now_utc = datetime.now(timezone.utc)
+        expired, kept = [], []
+        for e in watchlist.entries:
+            if e.catalyst_expiry_utc:
+                try:
+                    if datetime.fromisoformat(e.catalyst_expiry_utc) <= now_utc:
+                        expired.append(e.symbol)
+                        log.info("Watchlist: pruned %s — catalyst expired at %s", e.symbol, e.catalyst_expiry_utc)
+                        continue
+                except Exception:
+                    log.warning(
+                        "Watchlist: malformed catalyst_expiry_utc for %s: %r — keeping entry",
+                        e.symbol, e.catalyst_expiry_utc,
+                    )
+            kept.append(e)
+        watchlist.entries = kept
+        return expired
+
     async def _apply_watchlist_changes(
         self,
         watchlist: "WatchlistState",
@@ -4698,6 +4721,7 @@ class Orchestrator:
             "INDU", "NYA", "XAX", "OEX", "MID", "SML",
         }
 
+        self._prune_expired_catalysts(watchlist)  # caller saves; no separate save needed here
         existing_symbols = {e.symbol for e in watchlist.entries}
         added = 0
 
@@ -4709,6 +4733,7 @@ class Orchestrator:
                 tier = 1
                 strategy = "both"
                 expected_direction = "either"
+                catalyst_expiry_utc = None
             else:
                 symbol = item.get("symbol", "").upper()
                 reason = item.get("reason", "Added by Claude")
@@ -4724,6 +4749,7 @@ class Orchestrator:
                     )
                     _raw_ed = "either"
                 expected_direction = _raw_ed
+                catalyst_expiry_utc = item.get("catalyst_expiry_utc")
             if not symbol or symbol in existing_symbols:
                 continue
             if symbol in _INDEX_BLACKLIST or symbol.startswith("^"):
@@ -4736,6 +4762,7 @@ class Orchestrator:
                 priority_tier=tier,
                 strategy=strategy,
                 expected_direction=expected_direction,
+                catalyst_expiry_utc=catalyst_expiry_utc,
             ))
             existing_symbols.add(symbol)
             added += 1
