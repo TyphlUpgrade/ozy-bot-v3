@@ -485,6 +485,9 @@ class Orchestrator:
         # watchlist_small trigger within the same session.
         self._last_universe_scan: list[dict] = []
         self._last_universe_scan_time: float = 0.0
+        # Guard: True while a background watchlist build task is running.
+        # Separate from claude_call_in_flight — a build in progress never blocks reasoning.
+        self._watchlist_build_in_flight: bool = False
 
         # Shutdown flag — set by _shutdown(), checked by loops
         self._stopping = False
@@ -3176,10 +3179,24 @@ class Orchestrator:
 
         log.info("Slow loop: triggers fired — %s", triggers)
 
+        is_watchlist_build = any(t in ("watchlist_small", "watchlist_stale") for t in triggers)
+        reasoning_triggers = [t for t in triggers if t not in ("watchlist_small", "watchlist_stale")]
+
+        if is_watchlist_build:
+            if not self._watchlist_build_in_flight:
+                self._watchlist_build_in_flight = True
+                asyncio.ensure_future(self._run_watchlist_build_task())
+            else:
+                log.debug("Slow loop: watchlist build already in-flight — build trigger skipped")
+
+        if not reasoning_triggers:
+            await self._update_trigger_prices()
+            return
+
         # Mark in-flight before the await so concurrent checks skip
         self._trigger_state.claude_call_in_flight = True
         try:
-            await self._run_claude_cycle(trigger_name="|".join(triggers))
+            await self._run_claude_cycle(trigger_name="|".join(reasoning_triggers))
         finally:
             self._trigger_state.claude_call_in_flight = False
 
@@ -3401,7 +3418,7 @@ class Orchestrator:
         # watchlist_small and watchlist_stale paths update last_watchlist_build_utc).
         # interval_min = 0 disables this trigger entirely (no overhead).
         # To add a new time-based watchlist trigger: add an entry here and route it
-        # through is_watchlist_build in _run_claude_cycle.
+        # through the is_watchlist_build check in _slow_loop_cycle.
         interval_min = self._config.scheduler.watchlist_refresh_interval_min
         if interval_min > 0:
             last_build = ts.last_watchlist_build_utc
@@ -3874,117 +3891,6 @@ class Orchestrator:
             if _dsig:
                 self._daily_indicators[_sym] = _dsig
 
-        # -- Phase 18: watchlist_small → dedicated build cycle ----------------
-        # When watchlist_small fires, run the universe scanner and a focused
-        # watchlist build (with live RVOL candidates + optional Brave Search).
-        # If watchlist_small is the only trigger, apply results and return early
-        # (skipping the heavier run_reasoning_cycle). If other triggers also
-        # fired, the build runs first and then reasoning continues with the
-        # freshly-updated watchlist.
-        triggers_list = [t for t in trigger_name.split("|") if t]
-        # Both watchlist_small and watchlist_stale route through the same build path.
-        # To add another watchlist-build trigger: add it to this condition and to _check_triggers.
-        is_watchlist_build = "watchlist_small" in triggers_list or "watchlist_stale" in triggers_list
-        other_triggers = [t for t in triggers_list if t not in ("watchlist_small", "watchlist_stale")]
-
-        if is_watchlist_build:
-            # Universe scan (with session cache)
-            if self._config.universe_scanner.enabled and self._universe_scanner is not None:
-                cache_age_min = (time.monotonic() - self._last_universe_scan_time) / 60
-                if cache_age_min > self._config.universe_scanner.cache_ttl_min or not self._last_universe_scan:
-                    existing_symbols = {e.symbol for e in watchlist.entries}
-                    blacklist_symbols = set(self._config.ranker.no_entry_symbols)
-                    try:
-                        self._last_universe_scan = await self._universe_scanner.get_top_candidates(
-                            n=self._config.universe_scanner.max_candidates,
-                            exclude=existing_symbols,
-                            blacklist=blacklist_symbols,
-                            # Phase 21: pass regime context for regime-aware screener selection
-                            sector_regimes=self._last_sector_regimes,
-                            regime_assessment=self._last_regime_assessment,
-                            sector_map=_SECTOR_MAP,
-                        )
-                        self._last_universe_scan_time = time.monotonic()
-                        log.info(
-                            "Universe scan: %d candidates (top RVOL: %s)",
-                            len(self._last_universe_scan),
-                            [c["symbol"] for c in self._last_universe_scan[:5]],
-                        )
-                    except Exception as exc:
-                        log.warning("Universe scan failed — proceeding without candidates: %s", exc)
-                else:
-                    log.debug("Universe scan: cache still fresh (%.1f min old)", cache_age_min)
-
-            # Derive trigger name for logging (may be watchlist_small, watchlist_stale, or both)
-            wl_build_triggers = [t for t in triggers_list if t in ("watchlist_small", "watchlist_stale")]
-            log.info(
-                "Slow loop: running watchlist build [trigger=%s]  "
-                "candidates=%d  search=%s",
-                "|".join(wl_build_triggers),
-                len(self._last_universe_scan),
-                "enabled" if (self._search_adapter and self._search_adapter.enabled) else "disabled",
-            )
-            try:
-                # Slice to max_candidates_to_claude before passing to Claude.
-                # The scanner ranks by RVOL descending; the slice keeps the highest-
-                # activity names and reduces prompt size / token pressure.
-                _n = self._config.universe_scanner.max_candidates_to_claude
-                _candidates_for_claude = (self._last_universe_scan or [])[:_n] or None
-                wl_result = await self._claude.run_watchlist_build(
-                    market_context=market_data,
-                    current_watchlist=watchlist,
-                    target_count=self._config.claude.watchlist_build_target,
-                    candidates=_candidates_for_claude,
-                    search_adapter=self._search_adapter,
-                    no_entry_symbols=self._config.ranker.no_entry_symbols,
-                )
-                if wl_result is not None:
-                    open_symbols = {p.symbol for p in portfolio.positions}
-                    await self._apply_watchlist_changes(
-                        watchlist, wl_result.watchlist, [], open_symbols
-                    )
-                    log.info(
-                        "Slow loop: watchlist build complete — %d suggestions applied",
-                        len(wl_result.watchlist),
-                    )
-                    # Reload so subsequent reasoning call sees the updated watchlist
-                    watchlist = await self._state_manager.load_watchlist()
-                # Stamp the build timestamp regardless of result — even a failed/empty build
-                # should reset the cooldown so watchlist_stale doesn't re-fire every tick.
-                self._trigger_state.last_watchlist_build_utc = datetime.now(timezone.utc)
-                log.debug("Watchlist build complete — last_watchlist_build_utc updated")
-            except Exception as exc:
-                log.error("Watchlist build failed: %s", exc, exc_info=True)
-                # Back-date last_watchlist_build_utc so watchlist_stale re-fires after the
-                # circuit-breaker probe interval (circuit_breaker_probe_min) rather than on
-                # every slow-loop tick. Without this, a sustained 529 outage generates one
-                # failed build attempt per minute until the probe clears.
-                probe_sec = self._config.ai_fallback.circuit_breaker_probe_min * 60
-                interval_sec = self._config.scheduler.watchlist_refresh_interval_min * 60
-                self._trigger_state.last_watchlist_build_utc = (
-                    datetime.now(timezone.utc) - timedelta(seconds=interval_sec - probe_sec)
-                )
-                log.debug(
-                    "Watchlist build failed — next retry in ~%d min",
-                    self._config.ai_fallback.circuit_breaker_probe_min,
-                )
-
-            if not other_triggers:
-                # Watchlist build was the only trigger — update prices and return.
-                # Do NOT set last_claude_call_utc (watchlist build is not a reasoning call;
-                # the time-ceiling trigger should still fire normally).
-                await self._update_trigger_prices()
-                return
-
-            # Other triggers also fired — continue with run_reasoning_cycle below,
-            # using the refreshed watchlist.
-            # Reset the inter-call gap so the reasoning call doesn't wait 3 seconds for
-            # the watchlist build to expire. Both calls are sequential steps in the same
-            # cycle — the min_call_interval_sec guard is intended to prevent rapid bursts
-            # across independent cycles, not within a single _run_claude_cycle invocation.
-            self._claude._last_call_end_time = 0.0
-            trigger_name = "|".join(other_triggers)
-
         log.info(
             "Slow loop: calling Claude reasoning [trigger=%s]  "
             "positions=%d  watchlist=%d  session=%s",
@@ -4377,12 +4283,12 @@ class Orchestrator:
         await self._update_trigger_prices()
 
         # -- Apply watchlist changes ------------------------------------------
+        # Adds are ignored here — new symbols come exclusively from _run_watchlist_build_task.
         changes = result.watchlist_changes
-        add_list    = changes.get("add", [])
         remove_list = changes.get("remove", [])
         open_symbols = {p.symbol for p in portfolio.positions}
         # Always call — enforces the size cap even when Claude suggests no changes.
-        actual_adds = await self._apply_watchlist_changes(watchlist, add_list, remove_list, open_symbols)
+        actual_adds = await self._apply_watchlist_changes(watchlist, [], remove_list, open_symbols)
 
         # -- Apply position review notes -------------------------------------
         if result.position_reviews:
@@ -4606,6 +4512,88 @@ class Orchestrator:
 
         except Exception as exc:
             log.error("_regime_reset_build failed: %s", exc, exc_info=True)
+
+    async def _run_watchlist_build_task(self) -> None:
+        """Background watchlist build — fires from _slow_loop_cycle, never blocks reasoning."""
+        try:
+            watchlist = await self._state_manager.load_watchlist()
+            portfolio = await self._state_manager.load_portfolio()
+            open_syms = {p.symbol for p in portfolio.positions}
+            market_data = self._latest_market_context or {}
+
+            # Universe scan (session cache; second call within cache_ttl_min is free)
+            if self._config.universe_scanner.enabled and self._universe_scanner is not None:
+                cache_age_min = (time.monotonic() - self._last_universe_scan_time) / 60
+                if cache_age_min > self._config.universe_scanner.cache_ttl_min or not self._last_universe_scan:
+                    existing_symbols = {e.symbol for e in watchlist.entries}
+                    blacklist_symbols = set(self._config.ranker.no_entry_symbols)
+                    try:
+                        self._last_universe_scan = await self._universe_scanner.get_top_candidates(
+                            n=self._config.universe_scanner.max_candidates,
+                            exclude=existing_symbols,
+                            blacklist=blacklist_symbols,
+                            sector_regimes=self._last_sector_regimes,
+                            regime_assessment=self._last_regime_assessment,
+                            sector_map=_SECTOR_MAP,
+                        )
+                        self._last_universe_scan_time = time.monotonic()
+                        log.info(
+                            "Watchlist build: universe scan %d candidates (top RVOL: %s)",
+                            len(self._last_universe_scan),
+                            [c["symbol"] for c in self._last_universe_scan[:5]],
+                        )
+                    except Exception as exc:
+                        log.warning("Watchlist build: universe scan failed — proceeding without candidates: %s", exc)
+                else:
+                    log.debug("Watchlist build: universe scan cache fresh (%.1f min old)", cache_age_min)
+
+            _n = self._config.universe_scanner.max_candidates_to_claude
+            _candidates = (self._last_universe_scan or [])[:_n] or None
+
+            log.info(
+                "Watchlist build: starting [candidates=%d  search=%s]",
+                len(_candidates) if _candidates else 0,
+                "enabled" if (self._search_adapter and self._search_adapter.enabled) else "disabled",
+            )
+
+            wl_result = await self._claude.run_watchlist_build(
+                market_context=market_data,
+                current_watchlist=watchlist,
+                target_count=self._config.claude.watchlist_build_target,
+                candidates=_candidates,
+                search_adapter=self._search_adapter,
+                no_entry_symbols=self._config.ranker.no_entry_symbols,
+            )
+
+            if wl_result is None:
+                probe_min = self._config.ai_fallback.circuit_breaker_probe_min
+                interval_min = self._config.scheduler.watchlist_refresh_interval_min
+                back_min = max(0, interval_min - probe_min)
+                self._trigger_state.last_watchlist_build_utc = (
+                    datetime.now(timezone.utc) - timedelta(minutes=back_min)
+                )
+                log.warning("Watchlist build: failed — will retry in ~%d min", probe_min)
+                return
+
+            added = await self._apply_watchlist_changes(
+                watchlist, wl_result.watchlist, [], open_syms,
+            )
+            self._trigger_state.last_watchlist_build_utc = datetime.now(timezone.utc)
+            log.info("Watchlist build: complete — %d added", added)
+
+        except Exception as exc:
+            probe_min = self._config.ai_fallback.circuit_breaker_probe_min
+            interval_min = self._config.scheduler.watchlist_refresh_interval_min
+            back_min = max(0, interval_min - probe_min)
+            self._trigger_state.last_watchlist_build_utc = (
+                datetime.now(timezone.utc) - timedelta(minutes=back_min)
+            )
+            log.error(
+                "Watchlist build: unexpected error — will retry in ~%d min: %s",
+                probe_min, exc, exc_info=True,
+            )
+        finally:
+            self._watchlist_build_in_flight = False
 
     # ------------------------------------------------------------------
     # Phase 22 — reasoning tier management (opportunity call degradation)

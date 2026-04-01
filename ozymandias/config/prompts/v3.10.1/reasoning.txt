@@ -21,7 +21,7 @@ INSTRUCTIONS:
    When a position has meaningful unrealised gains (visible in current_price vs avg_cost), explicitly assess whether the current stop_loss still reflects the thesis risk — or whether it should be raised to protect a portion of those gains. Raising the stop is appropriate when the primary catalyst has triggered, a key resistance or thesis milestone has been reached, or the gain is large enough that returning to the original entry level would represent a significant missed opportunity. Do not adjust mechanically on every profit — when the thesis has substantial remaining upside and no milestone has been reached, hold with original stops is correct. The decision should be driven by thesis progress, not by price movement alone.
 2. Evaluate every symbol in watchlist_tier1. Each symbol must appear in exactly one of: new_opportunities (valid setup) or rejected_opportunities (no valid setup). Do not silently omit any visible symbol. IMPORTANT: if a symbol already appears in the portfolio (open position), do NOT include it in new_opportunities or rejected_opportunities — it is handled exclusively by position_reviews above. Adding a symbol you already hold to new_opportunities is always wrong and wastes a reasoning slot.
 3. Flag any watchlist symbols for removal if they have lost relevance or momentum. You can only remove symbols you can see — do not assume symbols absent from watchlist_tier1 have been removed.
-4. Suggest new symbols to add if the watchlist needs replenishing (target 15-40 tickers total). watchlist_tier1_shown is the number of symbols you are seeing; watchlist_tier1_total is the full tier-1 count. If watchlist_tier1_total is already near or above 30, only add symbols with a clear, specific catalyst — the list does not need padding.
+4. Flag any watchlist symbols for removal if they have lost relevance. New symbols are added exclusively through the dedicated watchlist build — do not add symbols here.
 
 MACRO AND NEWS USAGE:
 - market_context.sector_performance is sorted by max(long_score, short_score) descending — sectors with the strongest directional setups appear first. Reference the leading and lagging sectors explicitly in market_assessment — name the ETF and describe the regime (e.g. "XLK leading with bullish-aligned trend; XLE lagging in bearish structure"). Use long_score and short_score to identify which direction each sector favours.
@@ -52,7 +52,7 @@ CONTEXT FIELDS (Phase 15 additions):
 - `recent_executions`: use to calibrate. If recent momentum trades stopped out at high frequency, consider raising conviction thresholds or tightening entry conditions in new opportunities.
 - `ta_readiness`: the dict in each watchlist entry shows current indicator values. Use these to calibrate `entry_conditions` in your opportunities — e.g., if current `rsi` is 58 and you want upward momentum confirmed, specify `rsi_min: 60`. All values are live at the time of this reasoning call.
 - `execution_stats`: use to calibrate conviction and position sizing. If `short_win_rate_pct` is below 40%, reduce short opportunity conviction or tighten entry conditions. If `high_conviction_win_rate_pct` is below 50%, your conviction scores are not predictive — consider using the full conviction range rather than clustering near 0.8+.
-- `expected_direction`: shows the directional thesis you assigned when adding a symbol. Confirm or revise it in your position reviews. When adding symbols via `watchlist_changes.add`, always specify `expected_direction` — it affects how TA scores and entry conditions are evaluated.
+- `expected_direction`: shows the directional thesis you assigned when adding a symbol. Confirm or revise it in your position reviews.
 
 OPEN POSITIONS — DAILY SIGNALS:
 - Swing positions include a `daily_signals` block derived from daily OHLCV bars. Momentum positions do not have this block (intraday signals are the correct timeframe for them).
@@ -133,18 +133,8 @@ RESPONSE FORMAT:
     }
   ],
   "watchlist_changes": {
-    "add": [
-      {
-        "symbol": "<SYMBOL>",
-        "reason": "<catalyst or thesis for adding>",
-        "priority_tier": 1,
-        "strategy": "momentum|swing|both",
-        "expected_direction": "long|short|either",
-        "catalyst_expiry_utc": "<ISO 8601 UTC — set ONLY for event-driven entries where the thesis becomes moot after a specific event (earnings, FDA decision, data release). Use market close on the event day: 21:00:00+00:00 (EDT) or 22:00:00+00:00 (EST). Example: earnings Thursday April 3 → '2026-04-03T21:00:00+00:00'. Omit entirely for thesis-driven entries (technical setups, sector rotation, structural momentum) with no hard deadline.>"
-      }
-    ],
     "remove": ["<SYMBOL>"],
-    "rationale": "<brief reason for changes>"
+    "rationale": "<brief reason for removals>"
   },
   "market_assessment": "<1-2 sentence macro view and risk posture>",
   "risk_flags": ["<any systemic risk observations that should affect sizing or timing>"],

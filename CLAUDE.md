@@ -170,5 +170,16 @@ Last post-MVP phase completed: Phase 21 — Durability and Regime Response (Marc
   - Startup persistence: regime_assessment/sector_regimes restored from reasoning cache at startup
     Step 4c (via `_result_from_raw_reasoning`, not `bot_state.json`)
 
+- **Post-Phase 21 — Watchlist Build Decoupled from Reasoning Cycle** *(2026-04-01)*
+  - `_run_watchlist_build_task()`: new background method (fire-and-forget via `asyncio.ensure_future`
+    from `_slow_loop_cycle`). Owns universe scan, `run_watchlist_build`, `_apply_watchlist_changes`,
+    `last_watchlist_build_utc` update, and failure back-date logic.
+  - `_watchlist_build_in_flight: bool`: guard separate from `claude_call_in_flight`. A running build
+    never blocks the next reasoning cycle.
+  - `watchlist_changes.add` removed from reasoning output: new symbols added exclusively through the
+    build task. `watchlist_changes.remove` preserved — Claude still flags dead candidates.
+  - Watchlist build section removed from `_run_claude_cycle`. `_run_claude_cycle` now receives only
+    reasoning triggers and runs Call A + Call B with no watchlist mutation.
+
 ## Spec Drift Log
 See `DRIFT_LOG.md`. Read the relevant phase section of DRIFT_LOG.md before modifying or debugging any module built in a previous phase.

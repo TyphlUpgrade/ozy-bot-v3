@@ -473,6 +473,148 @@ class TestSlowLoopCycle:
 
 
 # ===========================================================================
+# Watchlist build decoupling — background task + slow loop split
+# ===========================================================================
+
+class TestWatchlistBuildDecoupling:
+    """
+    Verify that watchlist builds fire as background tasks from _slow_loop_cycle
+    and never block the reasoning cycle.
+    """
+
+    @pytest.fixture(autouse=True)
+    def market_open(self, orch):
+        orch._latest_indicators = {"TEST": {"price": 100.0}}
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_watchlist_only_trigger_fires_build_not_reasoning(self, orch):
+        """watchlist_stale alone: ensure_future called, _run_claude_cycle never called."""
+        with patch.object(orch, "_check_triggers", AsyncMock(return_value=["watchlist_stale"])):
+            with patch.object(orch, "_run_claude_cycle", AsyncMock()) as mock_reasoning:
+                with patch.object(orch, "_run_watchlist_build_task", AsyncMock()) as mock_build:
+                    with patch("ozymandias.core.orchestrator.asyncio.ensure_future") as mock_ef:
+                        await orch._slow_loop_cycle()
+
+        mock_reasoning.assert_not_called()
+        assert orch._trigger_state.claude_call_in_flight is False
+        mock_ef.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_combined_triggers_fires_both(self, orch):
+        """watchlist_stale + price_move: ensure_future called AND reasoning runs."""
+        with patch.object(orch, "_check_triggers",
+                          AsyncMock(return_value=["watchlist_stale", "price_move"])):
+            with patch.object(orch, "_run_claude_cycle", AsyncMock()) as mock_reasoning:
+                with patch("ozymandias.core.orchestrator.asyncio.ensure_future") as mock_ef:
+                    await orch._slow_loop_cycle()
+
+        mock_ef.assert_called_once()
+        mock_reasoning.assert_called_once()
+        # reasoning call uses only non-build triggers
+        call_args = mock_reasoning.call_args
+        assert "price_move" in call_args.kwargs.get("trigger_name", call_args.args[0] if call_args.args else "")
+        assert "watchlist_stale" not in call_args.kwargs.get("trigger_name", call_args.args[0] if call_args.args else "")
+
+    @pytest.mark.asyncio
+    async def test_build_in_flight_skips_new_build(self, orch):
+        """_watchlist_build_in_flight=True: build trigger skipped, reasoning still runs."""
+        orch._watchlist_build_in_flight = True
+        with patch.object(orch, "_check_triggers",
+                          AsyncMock(return_value=["watchlist_stale", "price_move"])):
+            with patch.object(orch, "_run_claude_cycle", AsyncMock()) as mock_reasoning:
+                with patch("ozymandias.core.orchestrator.asyncio.ensure_future") as mock_ef:
+                    await orch._slow_loop_cycle()
+
+        mock_ef.assert_not_called()
+        mock_reasoning.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_build_task_success_updates_timestamp(self, orch):
+        """_run_watchlist_build_task success: timestamp updated, in_flight cleared."""
+        from ozymandias.intelligence.claude_reasoning import WatchlistResult
+        await _set_watchlist(orch, tier1=["AAPL"])
+        wl_result = WatchlistResult(watchlist=[], market_notes="", raw={})
+        orch._claude.run_watchlist_build = AsyncMock(return_value=wl_result)
+        orch._watchlist_build_in_flight = True
+        orch._trigger_state.last_watchlist_build_utc = None
+
+        before = datetime.now(timezone.utc)
+        await orch._run_watchlist_build_task()
+        after = datetime.now(timezone.utc)
+
+        ts = orch._trigger_state.last_watchlist_build_utc
+        assert ts is not None
+        assert before <= ts <= after
+        assert not orch._watchlist_build_in_flight
+
+    @pytest.mark.asyncio
+    async def test_build_task_none_result_backdates_timestamp(self, orch):
+        """wl_result is None: timestamp backdated (retry in probe_min), in_flight cleared."""
+        await _set_watchlist(orch, tier1=["AAPL"])
+        orch._claude.run_watchlist_build = AsyncMock(return_value=None)
+        orch._watchlist_build_in_flight = True
+        orch._trigger_state.last_watchlist_build_utc = None
+
+        await orch._run_watchlist_build_task()
+
+        ts = orch._trigger_state.last_watchlist_build_utc
+        assert ts is not None
+        # Back-dated: should be in the past
+        assert ts < datetime.now(timezone.utc)
+        assert not orch._watchlist_build_in_flight
+
+    @pytest.mark.asyncio
+    async def test_build_task_exception_clears_in_flight(self, orch):
+        """Exception in _run_watchlist_build_task: in_flight cleared in finally."""
+        await _set_watchlist(orch, tier1=["AAPL"])
+        orch._claude.run_watchlist_build = AsyncMock(side_effect=RuntimeError("boom"))
+        orch._watchlist_build_in_flight = True
+
+        await orch._run_watchlist_build_task()
+
+        assert not orch._watchlist_build_in_flight
+
+    @pytest.mark.asyncio
+    async def test_reasoning_ignores_add_list_from_claude(self, orch):
+        """Reasoning result add_list is discarded; _apply_watchlist_changes called with []."""
+        from ozymandias.intelligence.claude_reasoning import ReasoningResult
+        add_calls = []
+
+        async def capture_apply(watchlist, add_list, remove_list, open_symbols=None):
+            add_calls.append(add_list)
+            return 0
+
+        orch._apply_watchlist_changes = capture_apply
+
+        result = ReasoningResult(
+            timestamp="2026-04-01T12:00:00+00:00",
+            position_reviews=[],
+            new_opportunities=[],
+            watchlist_changes={"add": [{"symbol": "NVDA", "reason": "test"}], "remove": []},
+            market_assessment="",
+            risk_flags=[],
+            session_veto=[],
+            rejected_opportunities=[],
+            raw={},
+        )
+        orch._claude.run_reasoning_cycle = AsyncMock(return_value=result)
+        orch._claude.run_position_review_call = AsyncMock(return_value=result)
+
+        with patch.object(orch, "_build_market_context", AsyncMock(return_value={"trading_session": "regular"})):
+            with patch.object(orch, "_update_trigger_prices", AsyncMock()):
+                with patch.object(orch, "_apply_position_reviews", AsyncMock()):
+                    with patch.object(orch._trade_journal, "load_recent", AsyncMock(return_value=[])):
+                        with patch.object(orch._trade_journal, "compute_session_stats", AsyncMock(return_value={})):
+                            await orch._run_claude_cycle("price_move")
+
+        assert all(lst == [] for lst in add_calls), (
+            f"add_list must always be [] from reasoning path, got: {add_calls}"
+        )
+
+
+# ===========================================================================
 # Claude API failure → quantitative-only mode
 # ===========================================================================
 

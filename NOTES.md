@@ -255,3 +255,73 @@ This is the same issue as LOG-FINDING-B in the plan (Brave Search 429s hitting t
 4. **XLF and BAC**: Narrow stop buffers after 5+ day holds. Any sector rotation triggers stops.
 5. **PFE defer expiry bug**: Should be fixed before next session to prevent zombie candidates consuming pipeline capacity.
 6. **Dead zone / swing interaction**: If a good swing candidate appears in the morning `time_ceiling` cycle, verify it isn't going to be blocked and then pruned before 2:30 PM.
+
+---
+
+# Engineering Analysis — 2026-04-01
+
+## Concern 1: Slow Loop Latency
+
+### Root Cause
+
+A full slow loop cycle with all triggers active can make **four sequential Claude round-trips** before returning:
+
+```
+account fetch (500ms)
+→ daily bars, parallel gather (2s)
+→ watchlist build if stale    ← Claude call 1: 30–120s
+→ position reviews, split Call A  ← Claude call 2: 2–5s
+→ Haiku pre-screen            ← Claude call 3: 2–3s
+→ Sonnet reasoning, Call B    ← Claude call 4: 15–45s
+```
+
+Worst-case total: ~200s in a single blocking cycle.
+
+### Two Main Offenders
+
+**1. Watchlist build blocks reasoning when co-triggered.**
+`_run_claude_cycle` handles both the watchlist build path and the reasoning path sequentially. When `watchlist_stale` co-fires with any reasoning trigger (the common case given a 60-minute max interval), the build call — including web search tool-use rounds — runs to completion before position reviews or opportunity discovery begins. The reasoning cycle waits behind a 60-second watchlist refresh even though it could proceed with the existing watchlist immediately.
+
+The build correctly returns early when it's the *only* trigger. But when combined with other triggers, there's no short-circuit. The reasoning cycle has no awareness it's waiting behind a build.
+
+**2. Split-call overhead when there are no positions.**
+Call A (`run_position_review_call`) was designed to be compact and fast. It is — ~2–5s. But it runs unconditionally even when there are no open positions, in which case it makes an API handshake, waits, and returns an empty list. There is no guard that skips Call A when the portfolio is flat.
+
+### Recommendation
+
+- **Decouple watchlist builds from `_run_claude_cycle` entirely.** The build should always run as a background task scheduled independently. When a reasoning trigger fires and a build is already in progress, reasoning proceeds with the existing watchlist. The watchlist is 120 minutes stale either way — waiting another 30–60s doesn't improve the reasoning quality.
+- **Short term (lower effort):** When reasoning triggers co-fire with `watchlist_stale`, defer the build to *after* reasoning returns, not before.
+- **Skip Call A when no positions are open.** One-line guard, removes 5s of unnecessary overhead on every cycle with a flat book.
+
+---
+
+## Concern 2: Watchlist Churn
+
+### Root Cause
+
+The watchlist is treated as a scratchpad rather than a conviction ledger. Entries have no lifecycle semantics — no expiry, no minimum dwell time, no distinction between "actively monitoring" and "thesis expired." Three distinct churn sources:
+
+**1. Time-bounded catalyst entries with no expiry.**
+The canonical case: WRB held on an "imminent earnings catalyst" for 109 hours after the catalyst window passed. Claude kept including it as a valid tier-1 entry because nothing removed it. It competed for watchlist slots against live setups and consumed reasoning tokens every cycle. Without `catalyst_expiry_utc`, any time-sensitive entry lingers indefinitely.
+
+**2. Data-unavailable symbols consuming tier-1 slots.**
+When yfinance fails for a symbol, it appears to Claude with `latest_price: null` and `long_score: 0.0`. Claude still proposes it — it's on the watchlist, so it appears in `watchlist_tier1` context. The ranker rejects it immediately (zero score), but Claude spent reasoning budget on it and it blocks a slot that could go to a scorable candidate.
+
+**3. Regime-reset overshooting.**
+`_regime_reset_build` evicts direction-conflicting entries, then immediately rebuilds with `target_count=20`. The newly-added symbols haven't been scanned yet, so they enter the watchlist with `long_score: 0.0`. In the next pruning pass they're evicted because their score is 0 or their direction conflicts with an adjacent sector. The next regime reset adds 20 more. This is the active churn cycle: add 20 → scan → prune → add 20 again.
+
+### Recommendation
+
+**Priority 1 — Implement the plan already written** (`catalyst_expiry_utc` + fetch-failure suppression). These directly address churn sources 1 and 2 without architectural risk. The plan is documented and the implementation is straightforward.
+
+**Priority 2 — Reduce `_regime_reset_build` target_count.** Rebuilding to 20 entries immediately after an eviction run overshoots. Lower to 8 (matching `watchlist_build_target`) and let subsequent builds fill in as TA data arrives. The current behavior overshoots, the pruner corrects, the next reset overshoots again.
+
+### Priority Order
+
+| # | Change | Impact | Effort |
+|---|--------|--------|--------|
+| 1 | `catalyst_expiry_utc` + fetch-failure suppression | Eliminates churn sources 1 and 2 | Medium |
+| 2 | Skip `run_position_review_call` when no positions | Removes 5s overhead per cycle | Trivial |
+| 3 | Defer watchlist build to after reasoning when co-triggered | Removes worst-case latency spike | Low |
+| 4 | Decouple watchlist build from `_run_claude_cycle` entirely | Eliminates build-blocks-reasoning structurally | Medium |
+| 5 | Lower `_regime_reset_build` target_count to 8 | Reduces overshoot/prune cycle | Trivial |

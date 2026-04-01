@@ -1431,3 +1431,43 @@ Read the relevant phase section before modifying or debugging any module built i
 - Removed corresponding constraints from both prompt files.
 - **Why:** A thesis breach is a concrete invalidation event, not intraday noise — holding a position through a detected breach because of an arbitrary time gate defeats the entire purpose of thesis monitoring. The stop-loss is the correct mechanical guard for genuine noise; the swing hold constraint was duplicating that protection at the cost of blocking legitimate exits.
 - Tests for swing hold guard behavior (`test_swing_exit_blocked_within_min_hold_window`, `test_swing_exit_allowed_after_min_hold_window`) removed from `test_orchestrator.py`.
+
+---
+
+### 2026-04-01 — Catalyst Expiry and Fetch Failure Context Suppression
+
+**`catalyst_expiry_utc`** · *(new field)* · `core/state_manager.py`, `core/orchestrator.py`, `config/prompts/v3.10.1/watchlist.txt`, `config/prompts/v3.10.1/reasoning.txt`
+- **Spec:** *(not defined)*
+- **Impl:** `catalyst_expiry_utc: Optional[str]` added to `WatchlistEntry`. ISO 8601 UTC string. Set by the watchlist build prompt when an entry is event-driven (earnings, FDA, data release). Absent for thesis-driven entries (technical setups, sector rotation). Hard limit — not modified after creation.
+- **Why:** Event-driven entries become noise after their catalysts resolve. Without expiry, stale earnings plays sit in tier 1 occupying a slot and receiving full Claude analysis every cycle, while their thesis is moot.
+- **Convention:** Market close on event day = `21:00:00+00:00` (EDT) / `22:00:00+00:00` (EST). Re-adding after expiry = fresh evaluation — intentional correct behavior.
+
+**`_prune_expired_catalysts`** · *(new method)* · `core/orchestrator.py`
+- Runs at top of `_apply_watchlist_changes` and in the medium loop after loading the watchlist.
+- Iterates entries, parses `catalyst_expiry_utc` via `datetime.fromisoformat`, removes entries where expiry ≤ now. Malformed timestamps log WARNING and keep the entry (safe default).
+- Medium loop: saves watchlist only if at least one entry was pruned.
+
+**Fetch failure context suppression** · *(new behavior)* · `core/orchestrator.py`, `intelligence/claude_reasoning.py`
+- **Spec:** *(not defined)*
+- **Impl:** First yfinance fetch failure for a symbol immediately sets `_filter_suppressed[sym] = "fetch_failure"`. Clears on next successful fetch. Existing 3-failure watchlist removal unchanged.
+- `assemble_reasoning_context` filters `_suppressed_set` from both `all_tier1` and `sym_to_entry` — suppressed symbols are excluded from Claude's context payload entirely.
+- **Why:** A symbol with a failed data feed produces stale or zero indicators. Sending it to Claude with zeros causes false signals; Claude may recommend entry on a symbol the system cannot price. Suppressing from context immediately on first failure prevents this without waiting for the 3-failure removal threshold.
+
+---
+
+### 2026-04-01 — Watchlist Build Decoupled from Reasoning Cycle
+
+**`_run_claude_cycle` watchlist build path removed** · `core/orchestrator.py`
+- **Old:** `_run_claude_cycle` ran `run_watchlist_build` as a blocking `await` before reasoning. When `watchlist_stale` co-triggered with any reasoning trigger, the build blocked Call A and Call B for 30–120s.
+- **New:** Build fires as `asyncio.ensure_future(_run_watchlist_build_task())` from `_slow_loop_cycle` before the reasoning cycle starts. Reasoning proceeds immediately. The existing `_call_lock` in `ClaudeReasoningEngine` serializes the build's API call after reasoning completes.
+- **Why:** Watchlist curation and opportunity evaluation are independent concerns with different latency requirements. The build never needed to block reasoning — reasoning reads from whatever watchlist state exists at cycle start.
+
+**`_run_watchlist_build_task()`** · *(new method)* · `core/orchestrator.py`
+- Background task following `_regime_reset_build` pattern. Owns the universe scan, `run_watchlist_build` call, `_apply_watchlist_changes`, `last_watchlist_build_utc` update, and failure back-date logic. Clears `_watchlist_build_in_flight` in `finally`.
+
+**`_watchlist_build_in_flight: bool`** · *(new field)* · `core/orchestrator.py`
+- Separate guard from `claude_call_in_flight`. The slow loop checks for reasoning triggers only against `claude_call_in_flight`. A build running in the background does not block the next reasoning cycle.
+
+**`watchlist_changes.add` removed from reasoning output** · `config/prompts/v3.10.1/reasoning.txt`, `core/orchestrator.py`
+- Claude no longer adds symbols during the reasoning call. Adds go exclusively through `_run_watchlist_build_task` (dedicated build call with universe scan context and web search). `watchlist_changes.remove` is preserved — Claude can still flag dead candidates for removal as a byproduct of evaluation.
+- **Why:** The reasoning call had no universe scan context, no news search, and no candidate pool awareness. Adds from reasoning bypassed the research process and created a dual-path watchlist mutation pattern. The build call is the correct and only entry point for new symbols.
