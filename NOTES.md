@@ -49,29 +49,7 @@ The fix is trivial: lower `target_count` in the reset build to `watchlist_build_
 
 ## Resolved Concerns
 
-### ~~FINDING-4 / Concern 1: watchlist_stale hammers circuit breaker during outages~~
-**Status:** `resolved` — Phase 23 (2026-04-01)  
-After a failed build, `last_watchlist_build_utc` is now backdated to `now - (interval - probe_min)` so `watchlist_stale` re-fires after ~`probe_min` minutes rather than every slow-loop tick. Both `wl_result is None` and exception paths apply the backdate.
-
-### ~~Concern 1: Watchlist build blocks reasoning when co-triggered~~
-**Status:** `resolved` — Phase 23 (2026-04-01)  
-`_run_watchlist_build_task()` fires as `asyncio.ensure_future` from `_slow_loop_cycle`. Reasoning proceeds immediately with the existing watchlist. The `_call_lock` in `ClaudeReasoningEngine` serializes the build's API call after reasoning completes.
-
-### ~~Concern 2a: Time-bounded catalyst entries with no expiry~~
-**Status:** `resolved` — 2026-04-01  
-`catalyst_expiry_utc` added to `WatchlistEntry`. `_prune_expired_catalysts` runs in medium loop and at top of `_apply_watchlist_changes`.
-
-### ~~Concern 2b: Data-unavailable symbols consuming tier-1 slots~~
-**Status:** `resolved` — 2026-04-01  
-First yfinance fetch failure immediately sets `_filter_suppressed[sym] = "fetch_failure"`. `assemble_reasoning_context` filters suppressed symbols from Claude's context payload.
-
-### ~~FINDING-7: PFE defer expiry bug — opportunities persist past max_entry_defer_cycles~~
-**Status:** `resolved` — 2026-03-25  
-On expiry, symbol added to `_filter_suppressed` with reason `"stale thesis gate: entry conditions expired after N consecutive defers"`. Immediately stops ranker evaluation and Claude re-nomination for the session.
-
-### ~~FINDING-8: Dead zone blocks swing entries~~
-**Status:** `resolved` — 2026-03-25  
-`dead_zone_exempt = True` on `SwingStrategy`. `validate_entry` and `_check_market_hours` in `risk_manager.py` skip dead zone check when flag is set.
+Resolved items are deleted after one session. See `DRIFT_LOG.md` for the permanent record of what was implemented and why.
 
 ---
 

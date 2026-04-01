@@ -185,11 +185,11 @@ Last post-MVP phase completed: Phase 21 — Durability and Regime Response (Marc
 See `NOTES.md`. A living register of open concerns, deferred work, and engineering analyses that motivated architectural decisions.
 
 - **Read before:** starting work on any component with an open concern, debugging a known systemic pattern, or planning a new architectural change (check whether a related analysis already exists).
-- **Update when:** an engineering analysis session surfaces a lasting concern (open it); a concern is resolved by implementation (mark resolved, note the phase/date); a non-obvious architectural trade-off is made that isn't captured in DRIFT_LOG.md.
+- **Update when:** an engineering analysis session surfaces a lasting concern (open it); a concern is resolved by implementation (mark it resolved briefly, then delete it after the next session — the drift log owns the permanent record); a non-obvious architectural trade-off is made that isn't captured in DRIFT_LOG.md.
 - **Do not use for:** session logs, transient debugging notes, or content that belongs in DRIFT_LOG.md (what changed and why) or CLAUDE.md (conventions that affect all future development).
 
 ## Spec Drift Log
 See `DRIFT_LOG.md`. Read the relevant phase section of DRIFT_LOG.md before modifying or debugging any module built in a previous phase.
 
-- **Update when:** a module's interface changes, a new method or field is added to an existing module, a behavioral contract changes (e.g. a method's return value, side effects, or failure mode changes), or a non-obvious architectural decision is made. Every meaningful implementation change should have a drift log entry — if it would surprise a future reader of the code, it belongs here.
-- **Do not update for:** test-only changes, documentation fixes, or changes that are fully self-evident from reading the code and commit message.
+- **Update when:** a change would not be fully explained by reading the code and the commit message together — a behavioral contract change, a non-obvious trade-off, a deviation from an established pattern, or a decision whose *why* isn't visible in the implementation.
+- **Do not update for:** test-only changes, documentation fixes, new private methods with self-evident purpose, or anything a reader would immediately understand from the code alone. The drift log's value is its signal-to-noise ratio — it is not a commit log.
