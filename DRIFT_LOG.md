@@ -4,6 +4,18 @@ Deviations from `ozymandias_v3_spec_revised.md` introduced during implementation
 
 Read the relevant phase section before modifying or debugging any module built in that phase.
 
+## File Index
+
+Maps key source files to the sections that contain relevant drift entries. Use this to find what changed in a module before touching it. Omits test files and one-off prompt version entries — those are searchable.
+
+**Update when adding an entry:** add the new section name to the row(s) for the file(s) it touches.
+
+| File | Relevant sections |
+|------|-------------------|
+| *(index to be built next session)* | |
+
+---
+
 ### Entry format
 ```
 **`identifier`** · spec §X.Y · `path/to/file.py`
