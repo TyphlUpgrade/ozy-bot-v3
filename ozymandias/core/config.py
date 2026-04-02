@@ -52,6 +52,11 @@ class SchedulerConfig:
     # Dead zone: block new entries during midday low-volume window (ET times, "HH:MM" format)
     dead_zone_start_et: str = "11:30"
     dead_zone_end_et: str = "14:30"
+    # RVOL-conditional dead zone bypass: lifts the time gate when SPY volume is elevated,
+    # indicating an active market session despite midday hours (Fed, macro events, catalysts).
+    dead_zone_rvol_bypass_enabled: bool = True
+    dead_zone_rvol_bypass_threshold: float = 1.5        # SPY RVOL must be >= this to lift the dead zone for all symbols
+    dead_zone_symbol_rvol_bypass_threshold: float = 2.0  # per-symbol RVOL must be >= this to lift the dead zone for that symbol only (sector spikes, individual catalysts)
     entry_attempts_per_cycle: int = 3                # max ranked candidates to attempt per medium cycle before giving up
     limit_order_timeout_sec: int = 300               # cancel unfilled limit orders after this many seconds (default 5 min)
     swing_limit_order_timeout_sec: int = 1200        # longer timeout for swing strategy limit entries (default 20 min); swing theses are multi-day and need more time to fill at a tight spread
@@ -79,6 +84,8 @@ class SchedulerConfig:
     macro_rsi_rearm_band: int = 5                    # RSI must recover by this many points before the extreme trigger can re-fire
     watchlist_refresh_interval_min: int = 120        # proactive watchlist rebuild interval (minutes); 0 disables watchlist_stale trigger
     watchlist_rebuild_on_restart: bool = False       # if True, always rebuild watchlist on startup regardless of when the last build ran; overrides the persisted build timestamp
+    watchlist_build_parse_failure_retry_min: int = 3  # retry interval after a parse failure (Claude returned prose instead of JSON); shorter than probe_min because parse failures are transient
+    require_watchlist_before_reasoning: bool = False  # if True, defer reasoning until the watchlist build completes when both co-fire; ensures Claude reasons on fresh candidates
     no_opportunity_streak_warn_threshold: int = 8    # log a gate-breakdown WARN when this many consecutive medium loops produce zero ranked candidates; helps diagnose whether the watchlist or a specific gate is the bottleneck
     pre_market_warmup_min: int = 10                  # minutes before next market open to run a cache-warming Claude cycle; 0 disables; allows starting bot hours early with no penalty
 

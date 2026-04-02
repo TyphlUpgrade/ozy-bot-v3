@@ -86,6 +86,7 @@ class WatchlistResult:
     watchlist: list[dict]             # [{symbol, reason, priority_tier, strategy}]
     market_notes: str
     raw: dict
+    removes: list[str] = field(default_factory=list)  # symbols to remove from current watchlist
 
 
 @dataclass
@@ -190,10 +191,12 @@ def _result_from_raw_reasoning(raw: dict) -> ReasoningResult:
 
 
 def _result_from_raw_watchlist(raw: dict) -> WatchlistResult:
+    removes = [s for s in raw.get("remove", []) if isinstance(s, str)]
     return WatchlistResult(
         watchlist=raw.get("watchlist", []),
         market_notes=raw.get("market_notes", ""),
         raw=raw,
+        removes=removes,
     )
 
 
@@ -1568,8 +1571,11 @@ class ClaudeReasoningEngine:
 
         Returns None if parsing fails.
         """
-        current_symbols = [e.symbol for e in current_watchlist.entries]
-        watchlist_str = ", ".join(current_symbols) if current_symbols else "none"
+        # Include expected_direction so the build can identify direction-conflicting entries
+        # and remove them when the sector regime has flipped since they were added.
+        def _fmt_wl_entry(e) -> str:
+            return f"{e.symbol}(dir:{getattr(e, 'expected_direction', 'either')},tier:{e.priority_tier})"
+        watchlist_str = ", ".join(_fmt_wl_entry(e) for e in current_watchlist.entries) if current_watchlist.entries else "none"
         market_ctx_str = json.dumps(market_context, default=str, indent=2)
         candidates_str = json.dumps(candidates, indent=2) if candidates else "none"
 

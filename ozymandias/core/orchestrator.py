@@ -488,6 +488,9 @@ class Orchestrator:
         # Guard: True while a background watchlist build task is running.
         # Separate from claude_call_in_flight — a build in progress never blocks reasoning.
         self._watchlist_build_in_flight: bool = False
+        # Set when candidates_exhausted or require_watchlist_before_reasoning defers a reasoning
+        # cycle until after the next successful build. Cleared by _run_watchlist_build_task.
+        self._reasoning_needed_after_build: bool = False
 
         # Shutdown flag — set by _shutdown(), checked by loops
         self._stopping = False
@@ -2240,6 +2243,18 @@ class Orchestrator:
         # Consumed by _check_triggers (macro/sector baseline) and Phase 19 compressor.
         self._all_indicators = {**self._latest_indicators, **self._market_context_indicators}
 
+        # Log once per cycle when the dead zone is globally lifted by high SPY RVOL.
+        # Per-symbol bypasses are logged at entry time (call site 3). Only log global
+        # here — per-symbol fires per-candidate and belongs closer to the entry attempt.
+        if self._risk_manager.in_dead_zone():
+            _spy_ind = self._all_indicators.get("SPY", {})
+            _spy_rvol = _spy_ind.get("volume_ratio", _spy_ind.get("signals", {}).get("volume_ratio", 0.0))
+            if _spy_rvol > 0.0 and _spy_rvol >= self._config.scheduler.dead_zone_rvol_bypass_threshold:
+                log.info(
+                    "Dead zone RVOL bypass (global): SPY RVOL %.2f >= %.2f — dead zone lifted for all symbols",
+                    _spy_rvol, self._config.scheduler.dead_zone_rvol_bypass_threshold,
+                )
+
         _medium_loop_elapsed = time.monotonic() - _medium_loop_start
         log.info(
             "Medium loop: TA complete — %d watchlist + %d context symbols  elapsed=%.1fs",
@@ -2332,6 +2347,13 @@ class Orchestrator:
             # blacklist pre-market Claude candidates before they ever get evaluated.
             if "market not in regular hours" in reason:
                 continue
+            # Skip dead zone rejections — RVOL and momentum filters fail during the
+            # 11:30–2:30 ET quiet window by design, not because the thesis is broken.
+            # When the RVOL bypass is active the market is genuinely open; failures
+            # are real signal failures and should count toward suppression.
+            if self._risk_manager.in_dead_zone() and not self._dead_zone_rvol_bypass(symbol):
+                log.debug("Ranker rejection for %s during dead zone — not counting toward suppression", symbol)
+                continue
             existing = self._recommendation_outcomes.get(symbol, {})
             new_count = existing.get("rejection_count", 0) + 1
             self._recommendation_outcomes[symbol] = {
@@ -2420,16 +2442,21 @@ class Orchestrator:
                     if cat == "already_open":
                         continue
                     gate_counts[cat] = gate_counts.get(cat, 0) + 1
-                breakdown = ", ".join(
-                    f"{g}={c}" for g, c in sorted(gate_counts.items(), key=lambda x: -x[1])
-                ) or "no hard-filter rejections (zero Claude candidates?)"
+                if gate_counts:
+                    breakdown = ", ".join(
+                        f"{g}={c}" for g, c in sorted(gate_counts.items(), key=lambda x: -x[1])
+                    )
+                    breakdown_label = f"ranker blocking all candidates: [{breakdown}]"
+                elif _opp_by_symbol:
+                    breakdown_label = "ranker passed 0 — all Claude candidates rejected at hard filter (no gate counts recorded)"
+                else:
+                    breakdown_label = "zero Claude candidates output — check watchlist quality or Claude calibration"
                 log.warning(
-                    "No-opportunity streak: %d consecutive empty medium loops. "
-                    "Gate breakdown: [%s]. "
+                    "No-opportunity streak: %d consecutive empty medium loops. %s. "
                     "Consider reviewing the watchlist or relaxing entry gates if "
                     "market conditions remain favorable.",
                     self._no_opportunity_streak,
-                    breakdown,
+                    breakdown_label,
                 )
         else:
             if self._no_opportunity_streak > 0:
@@ -2643,6 +2670,24 @@ class Orchestrator:
         if entry_conds:
             conds_met, conds_reason = evaluate_entry_conditions(entry_conds, ind)
             if not conds_met:
+                # Do not consume defer budget during the dead zone — entries are
+                # structurally blocked by time, not by a stale thesis. Burning through
+                # defer cycles during 11:30–14:30 would suppress valid setups before
+                # they ever get a chance to enter in the afternoon session.
+                _dead_zone_exempt = (
+                    strategy_obj.dead_zone_exempt if strategy_obj is not None else False
+                )
+                _in_dead_zone = (
+                    self._risk_manager.in_dead_zone()
+                    and not _dead_zone_exempt
+                    and not self._dead_zone_rvol_bypass(symbol)
+                )
+                if _in_dead_zone:
+                    log.debug(
+                        "Entry conditions not met for %s during dead zone — defer count frozen at %d",
+                        symbol, self._entry_defer_counts.get(symbol, 0),
+                    )
+                    return False
                 max_defers = self._config.scheduler.max_entry_defer_cycles
                 self._entry_defer_counts[symbol] = self._entry_defer_counts.get(symbol, 0) + 1
                 count = self._entry_defer_counts[symbol]
@@ -2776,13 +2821,29 @@ class Orchestrator:
                 )
                 quantity = max_shares_by_atr
 
+        _dz_exempt = (strategy_obj.dead_zone_exempt if strategy_obj is not None else False)
+        _dz_bypass = self._dead_zone_rvol_bypass(symbol)
+        if _dz_bypass and self._risk_manager.in_dead_zone() and not _dz_exempt:
+            _sym_rvol = self._latest_indicators.get(symbol, {}).get("volume_ratio", 0.0)
+            _spy_ind = self._all_indicators.get("SPY", {})
+            _spy_rvol = _spy_ind.get("volume_ratio", _spy_ind.get("signals", {}).get("volume_ratio", 0.0))
+            if _sym_rvol >= self._config.scheduler.dead_zone_symbol_rvol_bypass_threshold:
+                log.info(
+                    "Dead zone RVOL bypass (symbol): %s RVOL %.2f >= %.2f — dead zone lifted for this entry",
+                    symbol, _sym_rvol, self._config.scheduler.dead_zone_symbol_rvol_bypass_threshold,
+                )
+            else:
+                log.debug(
+                    "Dead zone RVOL bypass (global) applies to %s entry: SPY RVOL %.2f",
+                    symbol, _spy_rvol,
+                )
         allowed, reason = self._risk_manager.validate_entry(
             symbol=symbol,
             side=order_side,
             quantity=quantity,
             price=entry_price,
             blocks_eod_entries=strategy_obj.blocks_eod_entries if strategy_obj is not None else False,
-            dead_zone_exempt=strategy_obj.dead_zone_exempt if strategy_obj is not None else False,
+            dead_zone_exempt=_dz_exempt or _dz_bypass,
             account=acct,
             portfolio=portfolio,
             orders=orders,
@@ -3179,8 +3240,13 @@ class Orchestrator:
 
         log.info("Slow loop: triggers fired — %s", triggers)
 
-        is_watchlist_build = any(t in ("watchlist_small", "watchlist_stale") for t in triggers)
-        reasoning_triggers = [t for t in triggers if t not in ("watchlist_small", "watchlist_stale")]
+        _BUILD_TRIGGERS = {"watchlist_small", "watchlist_stale", "candidates_exhausted"}
+        is_watchlist_build = any(t in _BUILD_TRIGGERS for t in triggers)
+        reasoning_triggers = [t for t in triggers if t not in _BUILD_TRIGGERS]
+
+        if "candidates_exhausted" in triggers:
+            self._reasoning_needed_after_build = True
+            log.info("Slow loop: candidates exhausted — deferring reasoning until build completes")
 
         if is_watchlist_build:
             if not self._watchlist_build_in_flight:
@@ -3188,6 +3254,17 @@ class Orchestrator:
                 asyncio.ensure_future(self._run_watchlist_build_task())
             else:
                 log.debug("Slow loop: watchlist build already in-flight — build trigger skipped")
+
+        if (
+            is_watchlist_build
+            and reasoning_triggers
+            and self._config.scheduler.require_watchlist_before_reasoning
+        ):
+            self._reasoning_needed_after_build = True
+            reasoning_triggers = []
+            log.info(
+                "Slow loop: require_watchlist_before_reasoning=True — deferring reasoning until build completes"
+            )
 
         if not reasoning_triggers:
             await self._update_trigger_prices()
@@ -4283,12 +4360,10 @@ class Orchestrator:
         await self._update_trigger_prices()
 
         # -- Apply watchlist changes ------------------------------------------
-        # Adds are ignored here — new symbols come exclusively from _run_watchlist_build_task.
-        changes = result.watchlist_changes
-        remove_list = changes.get("remove", [])
+        # Watchlist removals moved to _run_watchlist_build_task — reasoning is read-only on watchlist.
         open_symbols = {p.symbol for p in portfolio.positions}
         # Always call — enforces the size cap even when Claude suggests no changes.
-        actual_adds = await self._apply_watchlist_changes(watchlist, [], remove_list, open_symbols)
+        await self._apply_watchlist_changes(watchlist, [], [], open_symbols)
 
         # -- Apply position review notes -------------------------------------
         if result.position_reviews:
@@ -4310,14 +4385,9 @@ class Orchestrator:
 
         opp_symbols = [o.get("symbol") or o.get("ticker", "?") for o in result.new_opportunities]
         log.info(
-            "Slow loop: Claude cycle complete — %d new opportunities %s  "
-            "%d watchlist adds %s  %d removes %s  %d position reviews",
+            "Slow loop: Claude cycle complete — %d new opportunities %s  %d position reviews",
             len(result.new_opportunities),
             opp_symbols or "",
-            actual_adds,
-            [e.get("symbol") for e in add_list[:actual_adds]] if actual_adds else "",
-            len(remove_list),
-            remove_list or "",
             len(result.position_reviews),
         )
 
@@ -4409,8 +4479,9 @@ class Orchestrator:
           with the new sector bias:
             long entry + "correcting" / "downtrend" sector → evict
             short entry + "breaking_out" / "uptrend" sector → evict
-        After eviction: run a targeted watchlist build with target_count=20 (full rebuild
-        semantics) to fill with aligned candidates.
+        After eviction: run a targeted watchlist build with target_count=watchlist_build_target
+        to fill with aligned candidates. Subsequent scheduled builds fill remaining capacity
+        as TA data arrives — avoids add→prune→add churn from overshooting the stable capacity.
         """
         try:
             watchlist = await self._state_manager.load_watchlist()
@@ -4482,7 +4553,7 @@ class Orchestrator:
                 wl_result = await self._claude.run_watchlist_build(
                     market_context=market_data,
                     current_watchlist=watchlist,
-                    target_count=20,  # regime reset: full rebuild semantics (bypasses watchlist_build_target)
+                    target_count=self._config.claude.watchlist_build_target,  # use standard target; avoids add→prune→add churn (new entries have no TA data)
                     candidates=_candidates,
                     search_adapter=self._search_adapter,
                     no_entry_symbols=self._config.ranker.no_entry_symbols,
@@ -4490,7 +4561,7 @@ class Orchestrator:
                 if wl_result is not None:
                     symbols_before = {e.symbol for e in watchlist.entries}
                     await self._apply_watchlist_changes(
-                        watchlist, wl_result.watchlist, [], open_syms
+                        watchlist, wl_result.watchlist, wl_result.removes, open_syms
                     )
                     added = [e for e in watchlist.entries if e.symbol not in symbols_before]
                     added_longs  = [e.symbol for e in added if e.expected_direction == "long"]
@@ -4512,6 +4583,23 @@ class Orchestrator:
 
         except Exception as exc:
             log.error("_regime_reset_build failed: %s", exc, exc_info=True)
+
+    async def _post_build_reasoning(self, trigger_name: str) -> None:
+        """Fire a reasoning cycle after a successful build — skips if market closed or call in-flight."""
+        if not (self._is_market_open() or self._is_pre_market_warmup()):
+            log.debug("Post-build reasoning: market not open — skipping")
+            return
+        if not self._latest_indicators:
+            log.debug("Post-build reasoning: no indicator data yet — skipping")
+            return
+        if self._trigger_state.claude_call_in_flight:
+            log.debug("Post-build reasoning: Claude call already in-flight — skipping")
+            return
+        self._trigger_state.claude_call_in_flight = True
+        try:
+            await self._run_claude_cycle(trigger_name=trigger_name)
+        finally:
+            self._trigger_state.claude_call_in_flight = False
 
     async def _run_watchlist_build_task(self) -> None:
         """Background watchlist build — fires from _slow_loop_cycle, never blocks reasoning."""
@@ -4566,20 +4654,35 @@ class Orchestrator:
             )
 
             if wl_result is None:
-                probe_min = self._config.ai_fallback.circuit_breaker_probe_min
+                parse_retry_min = self._config.scheduler.watchlist_build_parse_failure_retry_min
                 interval_min = self._config.scheduler.watchlist_refresh_interval_min
-                back_min = max(0, interval_min - probe_min)
+                back_min = max(0, interval_min - parse_retry_min)
                 self._trigger_state.last_watchlist_build_utc = (
                     datetime.now(timezone.utc) - timedelta(minutes=back_min)
                 )
-                log.warning("Watchlist build: failed — will retry in ~%d min", probe_min)
+                self._reasoning_needed_after_build = False
+                log.warning(
+                    "Watchlist build: response unparseable — will retry in ~%d min", parse_retry_min
+                )
                 return
 
             added = await self._apply_watchlist_changes(
-                watchlist, wl_result.watchlist, [], open_syms,
+                watchlist, wl_result.watchlist, wl_result.removes, open_syms,
             )
             self._trigger_state.last_watchlist_build_utc = datetime.now(timezone.utc)
             log.info("Watchlist build: complete — %d added", added)
+
+            if self._reasoning_needed_after_build:
+                self._reasoning_needed_after_build = False
+                if added > 0:
+                    log.info(
+                        "Watchlist build: new candidates available — firing post-build reasoning"
+                    )
+                    asyncio.ensure_future(self._post_build_reasoning("post_build_candidates"))
+                else:
+                    log.info(
+                        "Watchlist build: no new candidates added — skipping post-build reasoning"
+                    )
 
         except Exception as exc:
             probe_min = self._config.ai_fallback.circuit_breaker_probe_min
@@ -4588,6 +4691,7 @@ class Orchestrator:
             self._trigger_state.last_watchlist_build_utc = (
                 datetime.now(timezone.utc) - timedelta(minutes=back_min)
             )
+            self._reasoning_needed_after_build = False
             log.error(
                 "Watchlist build: unexpected error — will retry in ~%d min: %s",
                 probe_min, exc, exc_info=True,
@@ -4757,13 +4861,18 @@ class Orchestrator:
             log.info("Watchlist: added %s (tier=%s direction=%s)", symbol, tier, expected_direction)
 
         if remove_list:
+            # Never remove a symbol that currently has an open position.
+            _safe_removes = set(remove_list) - (open_symbols or set())
+            _protected = set(remove_list) & (open_symbols or set())
+            if _protected:
+                log.debug("Watchlist: skipped removal of open position symbol(s): %s", sorted(_protected))
             before = len(watchlist.entries)
             watchlist.entries = [
-                e for e in watchlist.entries if e.symbol not in remove_list
+                e for e in watchlist.entries if e.symbol not in _safe_removes
             ]
             removed = before - len(watchlist.entries)
             if removed:
-                log.info("Watchlist: removed %d symbol(s): %s", removed, remove_list)
+                log.info("Watchlist: removed %d symbol(s): %s", removed, sorted(_safe_removes))
 
         # Hard size cap — prune lowest-value entries beyond the limit.
         # Open positions and newly-added symbols are always protected.
@@ -5033,6 +5142,35 @@ class Orchestrator:
         if self._config.scheduler.bypass_market_hours:
             return True
         return is_market_open()
+
+    def _dead_zone_rvol_bypass(self, symbol: str | None = None) -> bool:
+        """True when RVOL is high enough to lift the dead zone entry block.
+
+        Two-tier check:
+        - Tier 1 (global): SPY RVOL >= dead_zone_rvol_bypass_threshold lifts the dead
+          zone for all symbols (broad market active — Fed, macro event, panic).
+        - Tier 2 (per-symbol): individual symbol RVOL >= dead_zone_symbol_rvol_bypass_threshold
+          lifts the dead zone for that symbol only (sector spike, individual catalyst,
+          earnings reaction). Only checked when `symbol` is provided.
+
+        Returns False (keep dead zone) when disabled or data is absent — fail-safe.
+        """
+        if not self._config.scheduler.dead_zone_rvol_bypass_enabled:
+            return False
+        # Tier 1: broad market check via SPY.
+        # SPY is a context symbol stored with nested "signals"; watchlist-path symbols
+        # are flat. Use the same try-flat-then-nested fallback as _check_triggers and
+        # _update_trigger_prices (lines 3315–3319, 3689–3691).
+        spy_ind = self._all_indicators.get("SPY", {})
+        spy_rvol = spy_ind.get("volume_ratio", spy_ind.get("signals", {}).get("volume_ratio", 0.0))
+        if spy_rvol > 0.0 and spy_rvol >= self._config.scheduler.dead_zone_rvol_bypass_threshold:
+            return True
+        # Tier 2: per-symbol check. Watchlist symbols are flat in _latest_indicators.
+        if symbol:
+            sym_rvol = self._latest_indicators.get(symbol, {}).get("volume_ratio", 0.0)
+            if sym_rvol > 0.0 and sym_rvol >= self._config.scheduler.dead_zone_symbol_rvol_bypass_threshold:
+                return True
+        return False
 
     def _is_pre_market_warmup(self) -> bool:
         """

@@ -29,6 +29,8 @@ correcting setups, "long" for breakout setups) so the system evaluates TA correc
 
 CURRENT WATCHLIST (may be empty or small):
 {current_watchlist}
+Each entry is shown as: SYMBOL(dir:expected_direction,tier:N). The `dir` field is the directional thesis
+the symbol was added with — "long", "short", or "either". Use this when evaluating removals (see below).
 
 LIVE SCREENER CANDIDATES — SYMBOLS ACTIVE TODAY:
 The following symbols were pre-screened from a live universe (S&P 500, Nasdaq 100, today's most-active list) for elevated relative volume or significant price displacement right now. Each entry shows: symbol, RVOL, current technical summary, composite_score_long (how well the setup scores as a long entry), composite_score_short (how well it scores as a short/fade entry), recent news, and days until earnings (if within 10 days). Use the composite score that matches your intended direction thesis.
@@ -66,7 +68,27 @@ Do NOT add any symbol from the NO-ENTRY list above — broad-market ETFs and vol
 Do NOT put sector ETFs or broad-market ETFs in tier 1 — they belong in tier 2 at most.
 Do NOT add non-tradeable index tickers (VIX, VXN, SPX, NDX, RUT, DJI, COMP, or any caret-prefixed ^symbol).
   Indices cannot be ordered on Alpaca. Use tradeable proxies instead (e.g. UVXY or VIXY for volatility).
-Do NOT repeat symbols already in the current watchlist unless you are re-tiering them.
+Do NOT repeat symbols already in the current watchlist unless you are re-tiering them OR you are
+  first removing them (direction flip — see below). A symbol removed in this build may be re-added
+  in the same build with the corrected expected_direction.
+
+WATCHLIST REMOVALS:
+Evaluate each symbol in CURRENT WATCHLIST. Two categories warrant removal:
+
+1. **Permanently invalidated thesis**: catalyst confirmed and already passed, company event resolved,
+   setup structurally broken by a named event with no recovery path. Be conservative: a symbol with
+   no valid setup today is NOT a removal candidate — it may be valid next session.
+
+2. **Direction reversal**: a symbol's `dir` field directly conflicts with today's sector regime or
+   a clear named catalyst that has reversed the directional thesis.
+   Remove `dir:short` entries when their sector bias is long (regime = uptrend, breaking_out, or
+   neutral with bias=long) OR when a named catalyst (earnings beat, geopolitical event, sector
+   rotation) has clearly reversed the fundamental direction since the entry was added.
+   Remove `dir:long` entries when their sector bias is short (regime = downtrend, correcting, or
+   neutral with bias=short) OR when a named catalyst has invalidated the long thesis.
+   This is the most actionable removal category — act on it when the conflict is unambiguous from
+   today's market context. After removing, you may re-add the symbol in the same build with the
+   correct expected_direction if the new setup warrants it.
 
 Return ONLY a JSON object. No markdown, no explanation outside the JSON.
 
@@ -82,6 +104,7 @@ RESPONSE FORMAT:
       "catalyst_expiry_utc": "<ISO 8601 UTC — set ONLY for event-driven entries where the thesis becomes moot after a specific event (earnings, FDA decision, data release). Use market close on the event day: 21:00:00+00:00 (EDT) or 22:00:00+00:00 (EST). Example: earnings Thursday April 3 → '2026-04-03T21:00:00+00:00'. Omit entirely for thesis-driven entries (technical setups, sector rotation, structural momentum) with no hard deadline.>"
     }
   ],
+  "remove": ["<SYMBOL>"],
   "market_notes": "<brief assessment of current market conditions and sector opportunities>"
 }
 

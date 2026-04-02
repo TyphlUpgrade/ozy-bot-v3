@@ -117,7 +117,7 @@ class SwingStrategy(Strategy):
 
     @property
     def dead_zone_exempt(self) -> bool:
-        return True
+        return False
 
     def apply_entry_gate(
         self,

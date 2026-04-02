@@ -1,0 +1,37 @@
+You are evaluating whether open trading positions need strategic re-assessment by the senior analyst.
+
+MARKET CONTEXT:
+{market_context_json}
+
+REGIME:
+{regime_json}
+
+OPEN POSITIONS WITH THESIS CONDITIONS:
+{positions_json}
+
+Each position entry includes:
+- thesis_breaking_conditions: scenarios that would invalidate the trade thesis
+- live_signals: current indicator values for this symbol
+- recent_news: latest headlines for this symbol
+
+Evaluate: has anything changed — in the signals, news, market context, or regime — that clearly
+meets or strongly suggests one of the thesis_breaking_conditions is now true?
+
+EVALUATION RULES:
+- Numeric/trend conditions ("composite_score falls below 0.45", "daily_trend turns downtrend"):
+  evaluate directly against live_signals values.
+- Narrative/event conditions ("Iran ceasefire confirmed", "deal terminated", "Berkshire reduces stake"):
+  only fire if current signals AND news concretely corroborate the scenario. A condition about an
+  event is only met if that event is reflected in recent headlines or market data — not merely because
+  the condition string describes something that could happen.
+- Be CONSERVATIVE. Normal market noise, routine signal dips, and speculative headlines are not thesis
+  breaks. Only fire when at least one condition is clearly and concretely met.
+- When uncertain, do NOT fire.
+
+Respond with only valid JSON. No preamble, no explanation.
+
+{"needs_sonnet": false, "breach": null}
+
+or if a condition is clearly met:
+
+{"needs_sonnet": true, "breach": "SYMBOL: the specific condition that is met"}

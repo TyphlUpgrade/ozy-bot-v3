@@ -1464,6 +1464,7 @@ Read the relevant phase section before modifying or debugging any module built i
 
 **`_run_watchlist_build_task()`** · *(new method)* · `core/orchestrator.py`
 - Background task following `_regime_reset_build` pattern. Owns the universe scan, `run_watchlist_build` call, `_apply_watchlist_changes`, `last_watchlist_build_utc` update, and failure back-date logic. Clears `_watchlist_build_in_flight` in `finally`.
+- **Backdate policy change:** Old code stamped full timestamp on `wl_result is None` (treating it as a completed-but-empty build). New code backdates on both `wl_result is None` AND exception — both are failure modes that warrant retry after `probe_min` minutes, not a full `watchlist_refresh_interval_min` cooldown.
 
 **`_watchlist_build_in_flight: bool`** · *(new field)* · `core/orchestrator.py`
 - Separate guard from `claude_call_in_flight`. The slow loop checks for reasoning triggers only against `claude_call_in_flight`. A build running in the background does not block the next reasoning cycle.
@@ -1471,3 +1472,50 @@ Read the relevant phase section before modifying or debugging any module built i
 **`watchlist_changes.add` removed from reasoning output** · `config/prompts/v3.10.1/reasoning.txt`, `core/orchestrator.py`
 - Claude no longer adds symbols during the reasoning call. Adds go exclusively through `_run_watchlist_build_task` (dedicated build call with universe scan context and web search). `watchlist_changes.remove` is preserved — Claude can still flag dead candidates for removal as a byproduct of evaluation.
 - **Why:** The reasoning call had no universe scan context, no news search, and no candidate pool awareness. Adds from reasoning bypassed the research process and created a dual-path watchlist mutation pattern. The build call is the correct and only entry point for new symbols.
+
+---
+
+### 2026-04-02 — Watchlist/Reasoning Full Separation + Build Reliability (Phase 23)
+
+Root cause: 2026-04-02T14:00Z session showed 4 watchlist removals in 8 minutes from reasoning, depleting the watchlist to 4 symbols and triggering `candidates_exhausted`, which fired more reasoning on the same depleted pool — a negative feedback spiral.
+
+**`watchlist_changes.remove` removed from reasoning output** · `config/prompts/v3.10.1/reasoning.txt`, `core/orchestrator.py`
+- **Old:** Reasoning could remove watchlist entries via `watchlist_changes.remove`. During a bad session, Claude removed live candidates as "no valid setup today" — exhausting the pool and starving future reasoning cycles.
+- **New:** Reasoning is fully read-only on the watchlist. `_run_claude_cycle` calls `_apply_watchlist_changes(watchlist, [], [], open_symbols)` — no adds, no removes.
+- **Why:** The reasoning cycle evaluates opportunities, not watchlist health. Removal authority belongs to the build, which has full watchlist context and conservative removal criteria.
+
+**`remove` field moved to watchlist build** · `config/prompts/v3.10.1/watchlist.txt`, `intelligence/claude_reasoning.py`, `core/orchestrator.py`
+- Build now returns an optional `remove` list. `WatchlistResult` gains `removes: list[str]`. `_run_watchlist_build_task` and `_regime_reset_build` pass `wl_result.removes` to `_apply_watchlist_changes`.
+- Removal criteria in watchlist prompt: permanently invalidated theses only (catalyst confirmed and passed, company event resolved). "No valid setup today" is explicitly not a removal criterion.
+- `_apply_watchlist_changes` remove path already guarded against open positions (added in same session, pre-Phase-23).
+
+**`candidates_exhausted` rerouted to build trigger** · `core/orchestrator.py` → `_slow_loop_cycle`
+- **Old:** `candidates_exhausted` fired a reasoning cycle on the existing (depleted) watchlist.
+- **New:** Treated as a build trigger (`_BUILD_TRIGGERS = {"watchlist_small", "watchlist_stale", "candidates_exhausted"}`). Fires `_run_watchlist_build_task`. Sets `_reasoning_needed_after_build = True`.
+- **Why:** Exhausted candidates means the watchlist is depleted. The correct response is new candidates (build), not more reasoning on the same empty pool.
+
+**`_reasoning_needed_after_build: bool`** · *(new field)* · `core/orchestrator.py`
+- Set by `_slow_loop_cycle` when `candidates_exhausted` fires or `require_watchlist_before_reasoning=True` defers reasoning. Cleared by `_run_watchlist_build_task` on any exit path (success, parse failure, exception). On success with `added > 0`, fires `_post_build_reasoning("post_build_candidates")` before clearing.
+
+**`_post_build_reasoning(trigger_name: str)`** · *(new method)* · `core/orchestrator.py`
+- Fires a reasoning cycle after a successful build that added new candidates. Guards: market must be open or pre-market warmup; `_latest_indicators` must be populated; `claude_call_in_flight` must be False. Uses `ensure_future` pattern consistent with `_run_watchlist_build_task`.
+
+**Parse failure vs API failure retry** · `core/orchestrator.py`, `core/config.py`, `config/config.json`
+- **Old:** Both `wl_result is None` (parse failure) and `except Exception` (API failure) used `probe_min` (10 min) for the backdate interval.
+- **New:** Parse failure uses `watchlist_build_parse_failure_retry_min` (default 3 min). API exception keeps `probe_min` (10 min). Parse failures are transient (almost always succeed next attempt); API failures need meaningful backoff.
+
+**`require_watchlist_before_reasoning: bool`** · *(new config)* · `core/config.py`, `config/config.json`
+- Default `false`. When `true`, if a watchlist build and reasoning trigger co-fire at startup, reasoning is deferred until after the build completes (via `_reasoning_needed_after_build`). Prevents Sonnet evaluating a stale/empty watchlist before the first build runs.
+
+**`valid_until_conditions` must not be currently true** · `config/prompts/v3.10.1/reasoning.txt`
+- Added explicit instruction: each condition must be a threshold NOT currently met. Example: if SPY RSI is currently 38, do not write "SPY daily RSI > 40" (nearly already true). Write "SPY daily RSI > 50". Prevents spurious regime flips within seconds of being written.
+
+
+---
+
+### Post-Phase-23 — RVOL-Conditional Dead Zone (2026-04-02)
+
+**`_dead_zone_rvol_bypass()` + `dead_zone_rvol_bypass_enabled/threshold` config** · *(not in spec)* · `core/orchestrator.py`, `core/config.py`, `config/config.json`
+- **Spec:** *(not defined)*
+- **Impl:** The dead zone (11:30–2:30 ET) entry block now lifts when SPY RVOL ≥ `dead_zone_rvol_bypass_threshold` (default 1.5). Pure predicate `_dead_zone_rvol_bypass()` on the orchestrator reads `_all_indicators["SPY"]` with the try-flat-then-nested fallback (SPY is a context symbol stored with nested `"signals"`). `risk_manager.py` is not modified — bypass is expressed via the existing `dead_zone_exempt` parameter to `validate_entry`. All three dead zone call sites updated: ranker rejection suppression loop, entry defer count guard in `_medium_try_entry`, and `validate_entry` call. One-per-cycle log in `_medium_loop_cycle` after `_all_indicators` is populated.
+- **Why:** The dead zone was a static time proxy for "low volume = bad entries." On volatile days (Fed, macro events, sector catalysts) midday is the most active window of the session. Phase 23 decoupled suppression from the dead zone; this change makes the entry block itself data-driven.

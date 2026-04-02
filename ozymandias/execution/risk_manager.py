@@ -222,6 +222,14 @@ class RiskManager:
 
         return True, "All risk checks passed"
 
+    def in_dead_zone(self, now: datetime | None = None) -> bool:
+        """Return True if the current ET time falls within the configured dead zone window."""
+        if self._bypass_market_hours:
+            return False
+        _now = now or datetime.now(ET)
+        t = _now.astimezone(ET).time()
+        return self._dead_zone_start <= t < self._dead_zone_end
+
     def _check_market_hours(
         self,
         blocks_eod_entries: bool,

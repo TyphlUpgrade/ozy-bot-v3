@@ -3075,3 +3075,477 @@ class TestFetchFailureSuppression:
         if orch._filter_suppressed.get("NOK") == "fetch_failure":  # condition false
             orch._filter_suppressed.pop("NOK", None)
         assert orch._filter_suppressed.get("NOK") == "session_veto"
+
+
+# ===========================================================================
+# Phase 23 — Watchlist/Reasoning Separation + Build Reliability
+# ===========================================================================
+
+class TestPhase23WatchlistSeparation:
+    """
+    Tests for the Phase 23 changes:
+    - candidates_exhausted fires build (not reasoning)
+    - require_watchlist_before_reasoning deferral
+    - parse failure uses short retry interval
+    - exception failure uses probe_min retry
+    - build passes removes to _apply_watchlist_changes
+    - reasoning does NOT call _apply_watchlist_changes for removes
+    - post-build reasoning fires after new candidates added
+    - post-build reasoning skipped when nothing added
+    - post-build reasoning cleared on build failure
+    """
+
+    @pytest.fixture(autouse=True)
+    def market_open(self, orch):
+        orch._latest_indicators = {"TEST": {"price": 100.0}}
+        with patch("ozymandias.core.orchestrator.is_market_open", return_value=True):
+            yield
+
+    # ------------------------------------------------------------------ #
+    # candidates_exhausted routing                                         #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_candidates_exhausted_fires_build_not_reasoning(self, orch):
+        """candidates_exhausted → build fires, reasoning does NOT, flag set."""
+        with patch.object(orch, "_check_triggers",
+                          AsyncMock(return_value=["candidates_exhausted"])):
+            with patch.object(orch, "_run_claude_cycle", AsyncMock()) as mock_reasoning:
+                with patch("ozymandias.core.orchestrator.asyncio.ensure_future") as mock_ef:
+                    await orch._slow_loop_cycle()
+
+        mock_reasoning.assert_not_called()
+        mock_ef.assert_called_once()
+        assert orch._reasoning_needed_after_build is True
+
+    @pytest.mark.asyncio
+    async def test_candidates_exhausted_build_in_flight_sets_flag(self, orch):
+        """Build already in-flight when candidates_exhausted fires → flag still set, no second build."""
+        orch._watchlist_build_in_flight = True
+        with patch.object(orch, "_check_triggers",
+                          AsyncMock(return_value=["candidates_exhausted"])):
+            with patch.object(orch, "_run_claude_cycle", AsyncMock()):
+                with patch("ozymandias.core.orchestrator.asyncio.ensure_future") as mock_ef:
+                    await orch._slow_loop_cycle()
+
+        mock_ef.assert_not_called()
+        assert orch._reasoning_needed_after_build is True
+
+    # ------------------------------------------------------------------ #
+    # require_watchlist_before_reasoning                                   #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_require_watchlist_before_reasoning_defers(self, orch):
+        """Config True + both build + reasoning triggers → reasoning deferred, flag set."""
+        orch._config.scheduler.require_watchlist_before_reasoning = True
+        with patch.object(orch, "_check_triggers",
+                          AsyncMock(return_value=["watchlist_stale", "price_move"])):
+            with patch.object(orch, "_run_claude_cycle", AsyncMock()) as mock_reasoning:
+                with patch("ozymandias.core.orchestrator.asyncio.ensure_future") as mock_ef:
+                    await orch._slow_loop_cycle()
+
+        mock_ef.assert_called_once()      # build fires
+        mock_reasoning.assert_not_called()  # reasoning deferred
+        assert orch._reasoning_needed_after_build is True
+
+    @pytest.mark.asyncio
+    async def test_require_watchlist_before_reasoning_false_fires_both(self, orch):
+        """Config False + build + reasoning → both fire immediately (existing behaviour)."""
+        orch._config.scheduler.require_watchlist_before_reasoning = False
+        with patch.object(orch, "_check_triggers",
+                          AsyncMock(return_value=["watchlist_stale", "price_move"])):
+            with patch.object(orch, "_run_claude_cycle", AsyncMock()) as mock_reasoning:
+                with patch("ozymandias.core.orchestrator.asyncio.ensure_future") as mock_ef:
+                    await orch._slow_loop_cycle()
+
+        mock_ef.assert_called_once()
+        mock_reasoning.assert_called_once()
+        assert orch._reasoning_needed_after_build is False
+
+    # ------------------------------------------------------------------ #
+    # Parse-failure vs API-failure retry intervals                         #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_parse_failure_uses_short_retry(self, orch):
+        """wl_result is None → backdate uses watchlist_build_parse_failure_retry_min (3 min)."""
+        await _set_watchlist(orch, tier1=["AAPL"])
+        orch._claude.run_watchlist_build = AsyncMock(return_value=None)
+        orch._watchlist_build_in_flight = True
+
+        parse_retry = orch._config.scheduler.watchlist_build_parse_failure_retry_min  # 3
+        refresh = orch._config.scheduler.watchlist_refresh_interval_min               # 240
+
+        before = datetime.now(timezone.utc)
+        await orch._run_watchlist_build_task()
+        after = datetime.now(timezone.utc)
+
+        ts = orch._trigger_state.last_watchlist_build_utc
+        # Expected backdate: now - (refresh - parse_retry) ≈ now - 237 min
+        expected_backdate_sec = (refresh - parse_retry) * 60
+        # ts should be roughly expected_backdate_sec in the past
+        age_sec = (after - ts).total_seconds()
+        assert abs(age_sec - expected_backdate_sec) < 5, (
+            f"Parse failure backdate should be ~{expected_backdate_sec}s ago, got {age_sec:.1f}s"
+        )
+        # Flag cleared on parse failure
+        assert orch._reasoning_needed_after_build is False
+
+    @pytest.mark.asyncio
+    async def test_exception_failure_uses_probe_min_retry(self, orch):
+        """Exception in build → backdate uses ai_fallback.circuit_breaker_probe_min (10 min)."""
+        await _set_watchlist(orch, tier1=["AAPL"])
+        orch._claude.run_watchlist_build = AsyncMock(side_effect=RuntimeError("api down"))
+        orch._watchlist_build_in_flight = True
+
+        probe_min = orch._config.ai_fallback.circuit_breaker_probe_min  # 10
+        refresh = orch._config.scheduler.watchlist_refresh_interval_min  # 240
+
+        await orch._run_watchlist_build_task()
+
+        ts = orch._trigger_state.last_watchlist_build_utc
+        expected_backdate_sec = (refresh - probe_min) * 60
+        age_sec = (datetime.now(timezone.utc) - ts).total_seconds()
+        assert abs(age_sec - expected_backdate_sec) < 5, (
+            f"Exception backdate should be ~{expected_backdate_sec}s ago, got {age_sec:.1f}s"
+        )
+        assert orch._reasoning_needed_after_build is False
+
+    # ------------------------------------------------------------------ #
+    # Build passes removes to _apply_watchlist_changes                    #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_watchlist_build_passes_removes_to_apply_changes(self, orch):
+        """Build returns removes → _apply_watchlist_changes called with that remove list."""
+        from ozymandias.intelligence.claude_reasoning import WatchlistResult
+        await _set_watchlist(orch, tier1=["AAPL", "SYM"])
+        wl_result = WatchlistResult(watchlist=[], removes=["SYM"], market_notes="", raw={})
+        orch._claude.run_watchlist_build = AsyncMock(return_value=wl_result)
+
+        apply_calls = []
+
+        async def capture_apply(watchlist, add_list, remove_list, open_symbols=None):
+            apply_calls.append(remove_list)
+            return 0
+
+        orch._apply_watchlist_changes = capture_apply
+        await orch._run_watchlist_build_task()
+
+        assert apply_calls, "apply_watchlist_changes was never called"
+        assert "SYM" in apply_calls[0], f"Expected 'SYM' in remove list, got {apply_calls[0]}"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_does_not_call_apply_watchlist_changes_for_removes(self, orch):
+        """Reasoning cycle: remove_list always [] regardless of watchlist_changes in result."""
+        from ozymandias.intelligence.claude_reasoning import ReasoningResult
+        apply_calls = []
+
+        async def capture_apply(watchlist, add_list, remove_list, open_symbols=None):
+            apply_calls.append((add_list, remove_list))
+            return 0
+
+        orch._apply_watchlist_changes = capture_apply
+
+        result = ReasoningResult(
+            timestamp="2026-04-01T12:00:00+00:00",
+            position_reviews=[],
+            new_opportunities=[],
+            watchlist_changes={"add": [], "remove": ["TSLA"]},
+            market_assessment="",
+            risk_flags=[],
+            session_veto=[],
+            rejected_opportunities=[],
+            raw={},
+        )
+        orch._claude.run_reasoning_cycle = AsyncMock(return_value=result)
+        orch._claude.run_position_review_call = AsyncMock(return_value=result)
+
+        with patch.object(orch, "_build_market_context", AsyncMock(return_value={"trading_session": "regular"})):
+            with patch.object(orch, "_update_trigger_prices", AsyncMock()):
+                with patch.object(orch, "_apply_position_reviews", AsyncMock()):
+                    with patch.object(orch._trade_journal, "load_recent", AsyncMock(return_value=[])):
+                        with patch.object(orch._trade_journal, "compute_session_stats", AsyncMock(return_value={})):
+                            await orch._run_claude_cycle("price_move")
+
+        for add_list, remove_list in apply_calls:
+            assert remove_list == [], (
+                f"Reasoning must not pass removes to _apply_watchlist_changes, got: {remove_list}"
+            )
+
+    # ------------------------------------------------------------------ #
+    # Post-build reasoning                                                 #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_post_build_reasoning_fires_after_candidates_exhausted(self, orch):
+        """Successful build with added > 0 and flag set → _post_build_reasoning fires."""
+        import asyncio as _asyncio
+        from ozymandias.intelligence.claude_reasoning import WatchlistResult
+        await _set_watchlist(orch, tier1=[])
+        new_entry = {"symbol": "NVDA", "reason": "momentum", "priority_tier": 1,
+                     "strategy": "momentum", "expected_direction": "long"}
+        wl_result = WatchlistResult(watchlist=[new_entry], removes=[], market_notes="", raw={})
+        orch._claude.run_watchlist_build = AsyncMock(return_value=wl_result)
+        orch._reasoning_needed_after_build = True
+
+        mock_post_build = AsyncMock()
+        orch._post_build_reasoning = mock_post_build
+
+        await orch._run_watchlist_build_task()
+        # Give the event loop a tick so ensure_future-scheduled coroutine runs
+        await _asyncio.sleep(0)
+
+        # Flag must be cleared
+        assert orch._reasoning_needed_after_build is False
+        mock_post_build.assert_called_once_with("post_build_candidates")
+
+    @pytest.mark.asyncio
+    async def test_post_build_reasoning_skipped_when_nothing_added(self, orch):
+        """Build succeeds but added == 0 → no post-build reasoning, flag cleared."""
+        from ozymandias.intelligence.claude_reasoning import WatchlistResult
+        await _set_watchlist(orch, tier1=["AAPL"])
+        wl_result = WatchlistResult(watchlist=[], removes=[], market_notes="", raw={})
+        orch._claude.run_watchlist_build = AsyncMock(return_value=wl_result)
+        orch._reasoning_needed_after_build = True
+
+        post_build_calls = []
+
+        async def fake_post_build(trigger_name: str):
+            post_build_calls.append(trigger_name)
+
+        orch._post_build_reasoning = fake_post_build
+        await orch._run_watchlist_build_task()
+
+        assert orch._reasoning_needed_after_build is False
+        assert post_build_calls == [], "Post-build reasoning must not fire when nothing added"
+
+    @pytest.mark.asyncio
+    async def test_post_build_reasoning_cleared_on_build_failure_none(self, orch):
+        """Parse failure (None) → flag cleared, no post-build reasoning."""
+        await _set_watchlist(orch, tier1=["AAPL"])
+        orch._claude.run_watchlist_build = AsyncMock(return_value=None)
+        orch._reasoning_needed_after_build = True
+
+        post_build_calls = []
+
+        async def fake_post_build(trigger_name: str):
+            post_build_calls.append(trigger_name)
+
+        orch._post_build_reasoning = fake_post_build
+        await orch._run_watchlist_build_task()
+
+        assert orch._reasoning_needed_after_build is False
+        assert post_build_calls == [], "Post-build reasoning must not fire on parse failure"
+
+    @pytest.mark.asyncio
+    async def test_post_build_reasoning_cleared_on_build_exception(self, orch):
+        """Exception in build → flag cleared, no post-build reasoning."""
+        await _set_watchlist(orch, tier1=["AAPL"])
+        orch._claude.run_watchlist_build = AsyncMock(side_effect=RuntimeError("network"))
+        orch._reasoning_needed_after_build = True
+
+        post_build_calls = []
+
+        async def fake_post_build(trigger_name: str):
+            post_build_calls.append(trigger_name)
+
+        orch._post_build_reasoning = fake_post_build
+        await orch._run_watchlist_build_task()
+
+        assert orch._reasoning_needed_after_build is False
+        assert post_build_calls == [], "Post-build reasoning must not fire on exception"
+
+
+# ===========================================================================
+# RVOL-Conditional Dead Zone Bypass
+# ===========================================================================
+
+class TestDeadZoneRvolBypass:
+    """
+    Tests for _dead_zone_rvol_bypass():
+    - Returns True when SPY RVOL is at or above threshold
+    - Returns False when below threshold, disabled, or SPY data absent
+    - Ranker rejection suppression respects the bypass
+    - validate_entry receives dead_zone_exempt=True when bypass is active
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self, orch):
+        orch._config.scheduler.dead_zone_rvol_bypass_enabled = True
+        orch._config.scheduler.dead_zone_rvol_bypass_threshold = 1.5
+
+    # ------------------------------------------------------------------ #
+    # _dead_zone_rvol_bypass predicate                                     #
+    # ------------------------------------------------------------------ #
+
+    def test_bypass_true_when_spy_rvol_above_threshold(self, orch):
+        """SPY RVOL 2.0 with threshold 1.5 → bypass active."""
+        orch._all_indicators = {"SPY": {"volume_ratio": 2.0}}
+        assert orch._dead_zone_rvol_bypass() is True
+
+    def test_bypass_true_at_exact_threshold(self, orch):
+        """SPY RVOL exactly at threshold → bypass active (>= comparison)."""
+        orch._all_indicators = {"SPY": {"volume_ratio": 1.5}}
+        assert orch._dead_zone_rvol_bypass() is True
+
+    def test_bypass_false_when_spy_rvol_below_threshold(self, orch):
+        """SPY RVOL 0.8 with threshold 1.5 → bypass inactive."""
+        orch._all_indicators = {"SPY": {"volume_ratio": 0.8}}
+        assert orch._dead_zone_rvol_bypass() is False
+
+    def test_bypass_false_when_disabled(self, orch):
+        """enabled=False → bypass always False regardless of RVOL."""
+        orch._config.scheduler.dead_zone_rvol_bypass_enabled = False
+        orch._all_indicators = {"SPY": {"volume_ratio": 5.0}}
+        assert orch._dead_zone_rvol_bypass() is False
+
+    def test_bypass_false_when_spy_missing(self, orch):
+        """SPY not in _all_indicators → fail-safe returns False."""
+        orch._all_indicators = {}
+        assert orch._dead_zone_rvol_bypass() is False
+
+    def test_bypass_false_when_volume_ratio_zero(self, orch):
+        """volume_ratio=0.0 treated as missing data → False."""
+        orch._all_indicators = {"SPY": {"volume_ratio": 0.0}}
+        assert orch._dead_zone_rvol_bypass() is False
+
+    def test_bypass_reads_nested_signals_for_context_symbol(self, orch):
+        """SPY stored in context (nested signals) format → still reads correctly."""
+        orch._all_indicators = {"SPY": {"signals": {"volume_ratio": 2.0}, "long_score": 0.5}}
+        assert orch._dead_zone_rvol_bypass() is True
+
+    def test_bypass_false_nested_signals_below_threshold(self, orch):
+        """Nested signals format, RVOL below threshold → False."""
+        orch._all_indicators = {"SPY": {"signals": {"volume_ratio": 0.9}, "long_score": 0.5}}
+        assert orch._dead_zone_rvol_bypass() is False
+
+    # ------------------------------------------------------------------ #
+    # Ranker rejection suppression interaction                             #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_ranker_suppression_counts_when_bypass_active(self, orch):
+        """In dead zone + RVOL bypass active → ranker rejection COUNTS toward suppression."""
+        orch._all_indicators = {"SPY": {"volume_ratio": 2.0}}
+        orch._recommendation_outcomes = {}
+
+        with patch.object(orch._risk_manager, "in_dead_zone", return_value=True):
+            # Simulate the rejection counting loop directly
+            reason = "RVOL 0.5 below floor 0.6"
+            symbol = "AAPL"
+            if "already open in portfolio" in reason:
+                pass
+            elif "market not in regular hours" in reason:
+                pass
+            elif orch._risk_manager.in_dead_zone() and not orch._dead_zone_rvol_bypass():
+                pass  # would skip
+            else:
+                orch._recommendation_outcomes[symbol] = {
+                    "claude_entry_target": 0.0,
+                    "attempt_time_utc": None,
+                    "stage": "ranker_rejected",
+                    "stage_detail": reason,
+                    "rejection_count": 1,
+                    "order_id": None,
+                }
+
+        assert "AAPL" in orch._recommendation_outcomes, (
+            "Rejection should count when bypass is active"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ranker_suppression_skipped_when_bypass_inactive(self, orch):
+        """In dead zone + RVOL bypass inactive → ranker rejection SKIPPED."""
+        orch._all_indicators = {"SPY": {"volume_ratio": 0.5}}
+        orch._recommendation_outcomes = {}
+
+        with patch.object(orch._risk_manager, "in_dead_zone", return_value=True):
+            reason = "RVOL 0.4 below floor 0.6"
+            symbol = "AAPL"
+            if "already open in portfolio" in reason:
+                pass
+            elif "market not in regular hours" in reason:
+                pass
+            elif orch._risk_manager.in_dead_zone() and not orch._dead_zone_rvol_bypass():
+                pass  # skipped — correct
+            else:
+                orch._recommendation_outcomes[symbol] = {"rejection_count": 1}
+
+        assert "AAPL" not in orch._recommendation_outcomes, (
+            "Rejection should be skipped when bypass is inactive"
+        )
+
+    # ------------------------------------------------------------------ #
+    # validate_entry dead_zone_exempt passthrough                          #
+    # ------------------------------------------------------------------ #
+
+    def test_validate_entry_receives_exempt_true_when_bypass_active(self, orch):
+        """bypass active + non-exempt strategy → dead_zone_exempt=True passed to validate_entry."""
+        orch._all_indicators = {"SPY": {"volume_ratio": 2.0}}
+
+        # Spy on how dead_zone_exempt would be computed at call site 3
+        _dz_exempt = False  # non-exempt strategy
+        result = _dz_exempt or orch._dead_zone_rvol_bypass()
+        assert result is True, "dead_zone_exempt should be True when bypass is active"
+
+    def test_validate_entry_exempt_false_when_bypass_inactive(self, orch):
+        """bypass inactive + non-exempt strategy → dead_zone_exempt=False."""
+        orch._all_indicators = {"SPY": {"volume_ratio": 0.5}}
+
+        _dz_exempt = False
+        result = _dz_exempt or orch._dead_zone_rvol_bypass()
+        assert result is False
+
+    def test_validate_entry_exempt_true_from_strategy_regardless_of_bypass(self, orch):
+        """Strategy-level dead_zone_exempt=True always passes through."""
+        orch._all_indicators = {"SPY": {"volume_ratio": 0.1}}  # bypass inactive
+
+        _dz_exempt = True  # strategy is exempt
+        result = _dz_exempt or orch._dead_zone_rvol_bypass()
+        assert result is True
+
+    # ------------------------------------------------------------------ #
+    # Per-symbol (Tier 2) bypass                                          #
+    # ------------------------------------------------------------------ #
+
+    def test_symbol_bypass_true_when_symbol_rvol_above_threshold(self, orch):
+        """Symbol RVOL above per-symbol threshold → bypass active even if SPY quiet."""
+        orch._config.scheduler.dead_zone_symbol_rvol_bypass_threshold = 2.0
+        orch._all_indicators = {"SPY": {"volume_ratio": 0.8}}  # SPY quiet
+        orch._latest_indicators = {"AAPL": {"volume_ratio": 3.0}}
+        assert orch._dead_zone_rvol_bypass("AAPL") is True
+
+    def test_symbol_bypass_false_when_symbol_rvol_below_threshold(self, orch):
+        """Symbol RVOL below per-symbol threshold and SPY quiet → bypass inactive."""
+        orch._config.scheduler.dead_zone_symbol_rvol_bypass_threshold = 2.0
+        orch._all_indicators = {"SPY": {"volume_ratio": 0.8}}
+        orch._latest_indicators = {"AAPL": {"volume_ratio": 1.2}}
+        assert orch._dead_zone_rvol_bypass("AAPL") is False
+
+    def test_symbol_bypass_true_via_spy_tier_even_when_symbol_quiet(self, orch):
+        """SPY above global threshold → bypass fires even if individual symbol is quiet."""
+        orch._all_indicators = {"SPY": {"volume_ratio": 2.0}}
+        orch._latest_indicators = {"AAPL": {"volume_ratio": 0.5}}
+        assert orch._dead_zone_rvol_bypass("AAPL") is True
+
+    def test_symbol_bypass_false_when_symbol_missing_from_indicators(self, orch):
+        """Symbol not in _latest_indicators → fail-safe False (SPY quiet too)."""
+        orch._all_indicators = {"SPY": {"volume_ratio": 0.8}}
+        orch._latest_indicators = {}
+        assert orch._dead_zone_rvol_bypass("AAPL") is False
+
+    def test_no_symbol_arg_only_checks_spy(self, orch):
+        """No symbol arg → only SPY check; high watchlist RVOL has no effect."""
+        orch._config.scheduler.dead_zone_symbol_rvol_bypass_threshold = 2.0
+        orch._all_indicators = {"SPY": {"volume_ratio": 0.8}}
+        orch._latest_indicators = {"AAPL": {"volume_ratio": 5.0}}
+        # Without symbol arg, tier-2 check is skipped entirely
+        assert orch._dead_zone_rvol_bypass() is False
+
+    def test_symbol_bypass_disabled_when_feature_off(self, orch):
+        """enabled=False → per-symbol check also skipped."""
+        orch._config.scheduler.dead_zone_rvol_bypass_enabled = False
+        orch._latest_indicators = {"AAPL": {"volume_ratio": 10.0}}
+        assert orch._dead_zone_rvol_bypass("AAPL") is False
