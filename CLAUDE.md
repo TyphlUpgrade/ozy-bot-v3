@@ -133,53 +133,11 @@ Last post-MVP phase completed: Phase 21 — Durability and Regime Response (Marc
   — intraday timeframe is wrong for swing reviews. The commented code is preserved for future
   re-entry/repositioning logic. Do not delete it or restore it as an active gate.
 
-### Post-MVP Roadmap: Phases 19–21
+### Post-MVP Completed Work
 
-- **Context Compression** *(historical spec, superseded — see `phases/context_compression_historical.md`)*:
-  Original plan for a Haiku pre-screener. Replaced by the two-tier architecture below, which
-  incorporates pre-screening as part of a broader regime-aware operator layer.
+Full narrative history in `COMPLETED_PHASES.md`. Read the relevant entry before modifying any module built in a post-MVP phase.
 
-- **Phase 19 — Sonnet Strategic Output**: see `phases/19_sonnet_strategic_output.md`
-  - Richer Sonnet inputs: `sector_dispersion` (watchlist symbols vs sector ETF 1w return),
-    `recent_rejections` (filter kill feedback)
-  - New `ReasoningResult` fields: `regime_assessment`, `sector_regimes`, `filter_adjustments`,
-    `active_theses` with `thesis_breaking_conditions`
-  - `filter_adjustments` applied in ranker with config-floor guards; strategy trend gate yields
-    to `entry_conditions` when Claude explicitly specified TA gates; regime condition expiry;
-    prompt v3.10.0
-
-- **Phase 20 — Haiku Operational Layer**: see `phases/20_haiku_operational_layer.md`
-  - `ContextCompressor`: Haiku pre-screener consuming Sonnet's `regime_assessment` +
-    `sector_regimes`; regime-aware candidate ranking; `needs_sonnet` escalation flag with typed
-    reasons (`regime_shift`, `all_candidates_failing`, `position_thesis_breach`, `watchlist_stale`)
-  - `run_reasoning_cycle` returns `(ReasoningResult, CompressorResult)`; `assemble_reasoning_context`
-    accepts `selected_symbols`; `_needs_sonnet_fired` guard; candidates exhaustion trigger
-
-- **Phase 21 — Durability and Regime Response** *(complete, March 27)*
-  - `_regime_reset_build`: fire-and-forget background task; evicts conflicting watchlist entries on
-    regime/sector flip; clears directional suppression; rebuilds with `target_count=20`
-  - `_clear_directional_suppression(affected_sectors)`: clears rvol/directional_score/conviction_floor/
-    defer_expired suppressions for symbols in affected sectors; preserves fetch_failure/blacklist
-  - Multi-tier pruner eviction: tier-2 first, then direction-conflicting tier-1, then directional score
-  - Regime-aware universe scanner: `day_losers` screener for correcting/downtrend sectors;
-    doubled price_move floor in broad panic; new params `sector_regimes`, `regime_assessment`, `sector_map`
-  - Position thesis monitoring: `ContextCompressor.check_position_theses` — async Haiku call
-    with enriched payload (live signals + news); dedicated `thesis_check.txt` prompt; medium loop
-    fires `thesis_breach` Sonnet cycle on `needs_sonnet=True`. (Deterministic `_condition_met`
-    removed — see 2026-03-31 DRIFT_LOG entry.)
-  - Startup persistence: regime_assessment/sector_regimes restored from reasoning cache at startup
-    Step 4c (via `_result_from_raw_reasoning`, not `bot_state.json`)
-
-- **Post-Phase 21 — Watchlist Build Decoupled from Reasoning Cycle** *(2026-04-01)*
-  - `_run_watchlist_build_task()`: new background method (fire-and-forget via `asyncio.ensure_future`
-    from `_slow_loop_cycle`). Owns universe scan, `run_watchlist_build`, `_apply_watchlist_changes`,
-    `last_watchlist_build_utc` update, and failure back-date logic.
-  - `_watchlist_build_in_flight: bool`: guard separate from `claude_call_in_flight`. A running build
-    never blocks the next reasoning cycle.
-  - `watchlist_changes.add` removed from reasoning output: new symbols added exclusively through the
-    build task. `watchlist_changes.remove` preserved — Claude still flags dead candidates.
-  - Watchlist build section removed from `_run_claude_cycle`. `_run_claude_cycle` now receives only
-    reasoning triggers and runs Call A + Call B with no watchlist mutation.
+**When completing a phase or post-phase feature:** document it in `COMPLETED_PHASES.md`, not here. CLAUDE.md is for active conventions that affect all future development — not a history log. Add a one-line entry here only if a completed phase introduced a convention that future developers must know about when touching live code (e.g., a field that must not be added back, or a method whose purpose is non-obvious from the name alone).
 
 ## Engineering Notes
 See `NOTES.md`. A living register of open concerns, deferred work, and engineering analyses that motivated architectural decisions.

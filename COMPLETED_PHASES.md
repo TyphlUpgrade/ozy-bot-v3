@@ -170,3 +170,23 @@ consult DRIFT_LOG.md. For active design rules and constraints see CLAUDE.md.
     wholesale refresh. Wired through `ClaudeConfig` and orchestrator.
   - *Watchlist prompt framing fixed*: "TARGET WATCHLIST SIZE: N" → "ADD UP TO N NEW TICKERS THIS
     BUILD" — disambiguates additive vs. rebuild semantics.
+
+- **Post-Phase 21 — Watchlist Build Decoupled from Reasoning Cycle** *(2026-04-01)*
+  - `_run_watchlist_build_task()`: new background method (fire-and-forget via `asyncio.ensure_future`
+    from `_slow_loop_cycle`). Owns universe scan, `run_watchlist_build`, `_apply_watchlist_changes`,
+    `last_watchlist_build_utc` update, and failure back-date logic.
+  - `_watchlist_build_in_flight: bool`: guard separate from `claude_call_in_flight`. A running build
+    never blocks the next reasoning cycle.
+  - `watchlist_changes.add` removed from reasoning output: new symbols added exclusively through the build task.
+  - Watchlist build section removed from `_run_claude_cycle`. `_run_claude_cycle` now receives only
+    reasoning triggers and runs Call A + Call B with no watchlist mutation.
+
+- **Post-Phase 23 — Watchlist/Reasoning Full Separation + Dead Zone Rework** *(2026-04-02)*
+  - Reasoning fully read-only on watchlist: `watchlist_changes.remove` also removed from reasoning output. Removes now exclusively in `_run_watchlist_build_task` via `WatchlistResult.removes`. Build sees `expected_direction` per entry (format: `SYMBOL(dir:long,tier:1)`) and has explicit instructions to remove and re-add direction-conflicting entries.
+  - `candidates_exhausted` rerouted to build trigger; `_reasoning_needed_after_build` flag coordinates post-build reasoning; `_post_build_reasoning` fires after successful build adds candidates.
+  - Parse failure retries in 3 min (`watchlist_build_parse_failure_retry_min`); API failure keeps 10 min.
+  - `require_watchlist_before_reasoning: bool` config — defers reasoning until build completes on co-fire.
+  - Dead zone suppression fixes: ranker rejections and entry condition defer counts no longer accumulate during dead zone. `SwingStrategy.dead_zone_exempt` changed `True` → `False`.
+  - RVOL-conditional dead zone bypass: `_dead_zone_rvol_bypass(symbol=None)` — two-tier predicate. Tier 1: SPY RVOL ≥ 1.5 lifts block globally. Tier 2: individual symbol RVOL ≥ 2.0 lifts block for that entry only. `risk_manager.py` untouched — bypass via existing `dead_zone_exempt` param on `validate_entry`. Config: `dead_zone_rvol_bypass_enabled`, `dead_zone_rvol_bypass_threshold`, `dead_zone_symbol_rvol_bypass_threshold`.
+  - Prompt: `rsi_slope_5`/`rsi_accel_3` indicator reference — units, noise floors, typical ranges, calibration instruction against live `ta_readiness` values.
+  - CONCERN-1 resolved: no-opportunity streak WARN now distinguishes zero-Claude-output vs. ranker-blocking all candidates.
