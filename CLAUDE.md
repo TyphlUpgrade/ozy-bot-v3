@@ -1,10 +1,10 @@
 # Ozymandias v3 — Automated Trading Bot
 
 ## What This Is
-An automated stock trading bot using Claude API for strategic reasoning + quantitative technical analysis for execution. Targets aggressive momentum and swing trading on high-volatility, high-liquidity equities. Alpaca paper trading initially.
+An automated stock trading bot using Claude API for strategic reasoning + quantitative technical analysis for execution. Trades momentum and swing setups on high-volatility, high-liquidity equities, adapting strategy and risk posture to current market regime. Alpaca paper trading initially.
 
 ## Full Spec
-The complete specification is in `ozymandias_v3_spec_revised.md` at the project root. Consult relevant spec sections to resolve ambiguities. The Spec Drift Log (see below) takes precedence where it contradicts the spec.
+The complete specification is in `ozymandias_v3_spec_revised.md` at the project root. Consult relevant spec sections to resolve ambiguities. DRIFT_LOG.md takes precedence where it contradicts the spec.
 
 ## Architecture (Mental Model)
 ```
@@ -53,6 +53,12 @@ Concrete rules that enforce this:
 When a new feature requires touching more than two modules to add a single new value to an existing
 category (direction, strategy type, signal name), that is a signal the abstraction is wrong — fix
 the abstraction first, then add the value.
+
+**Adaptability over static gates.** The bot must match market conditions, not impose fixed rules
+on them. Static time gates, hardcoded thresholds, and unconditional blocks should be replaced with
+signal-driven equivalents whenever market data provides a better proxy. The dead zone RVOL bypass
+is the canonical example: the gate was built as a proxy for low volume, so when volume data says
+otherwise, the gate yields. Apply the same logic to any future time-based or condition-based block.
 
 ## Key Design Rules
 - Modules communicate via interfaces and JSON, never direct coupling
@@ -105,11 +111,7 @@ Features not described in the spec may be requested. When implementing them, fol
 
 ## Post-MVP Status
 
-All 10 spec phases complete per `ozymandias_v3_spec_revised.md`. Post-MVP phases (11–18) complete.
-Full narrative history in `COMPLETED_PHASES.md`.
-
-Last spec phase completed: Phase 10 (March 15)
-Last post-MVP phase completed: Phase 21 — Durability and Regime Response (March 27)
+All 10 spec phases complete. Ongoing post-MVP work documented in `COMPLETED_PHASES.md` — consult it for the full narrative history of what was built and why.
 
 ### Decisions from completed phases that affect active development
 
