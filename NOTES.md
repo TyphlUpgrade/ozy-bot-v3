@@ -21,6 +21,20 @@ The inconsistency allows stale thesis candidates to compete for entries indefini
 
 ---
 
+---
+
+### DEFERRED-1: DRIFT_LOG File Index needs to be built
+**Status:** `deferred`  
+**Effort:** ~30–45 minutes
+
+`DRIFT_LOG.md` has 47 sections with no index. Finding what's relevant to a given file currently requires reading across multiple sections. A File Index table (file → relevant section names) is stubbed at the top of DRIFT_LOG with a maintenance instruction, but the table itself is empty.
+
+Build the index by reading each section and mapping file references. The instruction to update it on each new entry is already in place. Focus on the files developers actually touch — `orchestrator.py`, `risk_manager.py`, `claude_reasoning.py`, `opportunity_ranker.py`, `strategy` modules — not test files or one-off prompt entries. `orchestrator.py` and `config.py` will list nearly every section; for those, consider whether a row is useful or just noise.
+
+**Do at the start of a fresh session — not as an end-of-day addition.**
+
+---
+
 ## Resolved Concerns
 
 Resolved items are deleted after one session. See `DRIFT_LOG.md` for the permanent record of what was implemented and why.

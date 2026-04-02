@@ -135,25 +135,35 @@ Last post-MVP phase completed: Phase 21 — Durability and Regime Response (Marc
 
 ### Post-MVP Completed Work
 
-Full narrative history in `COMPLETED_PHASES.md`. Read the relevant entry before modifying any module built in a post-MVP phase.
+See `COMPLETED_PHASES.md`. When completing a phase or named feature session, document it there — not here. CLAUDE.md is for active conventions that affect future development, not history.
 
-**When completing a phase or post-phase feature:** document it in `COMPLETED_PHASES.md`, not here. CLAUDE.md is for active conventions that affect all future development — not a history log. Add a one-line entry here only if a completed phase introduced a convention that future developers must know about when touching live code (e.g., a field that must not be added back, or a method whose purpose is non-obvious from the name alone).
+## Reference Documents
 
-## Completed Phase History
-See `COMPLETED_PHASES.md`. Narrative history of every post-MVP phase and named feature session.
+Four documents together form the complete knowledge base. Each has a distinct purpose — read the right one for the job:
 
-- **Read before:** modifying a module built in a post-MVP phase, or when trying to understand why a feature works the way it does. Start here for the "what was built"; go to DRIFT_LOG for the "how it deviated."
-- **Update when:** a post-MVP phase or named feature session completes. Document here, not in CLAUDE.md.
+### `COMPLETED_PHASES.md` — What was built and why
+Phase-level narrative history. Answers: *"What did this phase introduce? What are the key methods, fields, and behaviors it added? What constraints must I respect when touching this area?"* One entry per phase or named feature session. Written for someone who is about to work in that area and needs a mental model of what exists and why.
 
-## Engineering Notes
-See `NOTES.md`. A living register of open concerns, deferred work, and engineering analyses that motivated architectural decisions.
+- **Read before:** modifying a module built in a post-MVP phase, or when you need to understand the intent behind an existing feature.
+- **Update when:** a post-MVP phase or named feature session completes.
+- **Does not belong here:** individual method signatures, interface deviations, or per-change rationale — those go in DRIFT_LOG.
 
-- **Read before:** starting work on any component with an open concern, debugging a known systemic pattern, or planning a new architectural change (check whether a related analysis already exists).
-- **Update when:** an engineering analysis session surfaces a lasting concern (open it); a concern is resolved by implementation (mark it resolved briefly, then delete it after the next session — the drift log owns the permanent record); a non-obvious architectural trade-off is made that isn't captured in DRIFT_LOG.md.
-- **Do not use for:** session logs, transient debugging notes, or content that belongs in DRIFT_LOG.md (what changed and why) or CLAUDE.md (conventions that affect all future development).
+### `DRIFT_LOG.md` — How specific changes deviate from the spec
+Change-level technical record. Answers: *"How does this method's signature or behavior differ from what the spec said? What is the exact interface contract? What edge case was decided during implementation?"* One entry per non-obvious deviation, keyed to a file and spec section. Written for someone debugging unexpected behavior or verifying a method's contract.
 
-## Spec Drift Log
-See `DRIFT_LOG.md`. Read the relevant phase section before modifying or debugging any module built in a previous phase.
+- **Read before:** modifying or debugging any method whose behavior might differ from a naive spec reading — especially signatures, return types, and behavioral edge cases.
+- **Update when:** a change would not be fully explained by reading the code and commit message together — a behavioral contract change, a non-obvious trade-off, or a decision whose *why* isn't visible in the implementation. Update the File Index when adding an entry.
+- **Does not belong here:** phase narratives, session summaries, or anything a reader would immediately understand from the code alone. Signal-to-noise ratio is the drift log's value.
 
-- **Update when:** a change would not be fully explained by reading the code and the commit message together — a behavioral contract change, a non-obvious trade-off, a deviation from an established pattern, or a decision whose *why* isn't visible in the implementation.
-- **Do not update for:** test-only changes, documentation fixes, new private methods with self-evident purpose, or anything a reader would immediately understand from the code alone. The drift log's value is its signal-to-noise ratio — it is not a commit log.
+### `NOTES.md` — Open concerns and engineering analyses
+Living register of open problems and the reasoning behind past architectural decisions. Answers: *"Is there a known issue in this area? Has this problem been analyzed before?"*
+
+- **Read before:** starting work on any component with an open concern, or planning a new architectural change.
+- **Update when:** a lasting concern surfaces (open it) or resolves (mark resolved; delete next session — DRIFT_LOG owns the permanent record).
+- **Does not belong here:** resolved concerns older than one session, session logs, or content that belongs in DRIFT_LOG or CLAUDE.md.
+
+### `CLAUDE.md` (this file) — Active conventions for all future development
+The rules that apply right now, every session. Answers: *"What must I know before touching this codebase?"* Covers architecture, hard constraints, design rules, and decisions from past phases that still govern live code.
+
+- **Update when:** a convention changes, a new constraint is established, or a past phase decision continues to govern how new code must be written.
+- **Does not belong here:** history, resolved issues, or anything captured more precisely in the other three documents.
