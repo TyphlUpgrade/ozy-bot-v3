@@ -91,12 +91,8 @@ the abstraction first, then add the value.
 - **Never modify phase documents or the spec file.** `phases/` files and `ozymandias_v3_spec_revised.md`
   are immutable historical records. All deviations, decisions, and post-MVP additions belong in
   DRIFT_LOG.md and CLAUDE.md only. Only create new phase files when explicitly instructed to do so.
-- **Saving plan files:** When plan mode produces an approved design for non-trivial architectural
-  work (anything that would be too complex to re-derive from the commit history alone), save it to
-  `plans/YYYY-MM-DD-feature-name.md` before implementing. Small fixes (≤2 files, self-evident)
-  go directly to DRIFT_LOG. Formal phases get a `phases/` spec file. Everything in between gets
-  a `plans/` file. Plan files are permanent — they capture the design rationale and key trade-offs
-  that DRIFT_LOG entries and commit messages don't have room for.
+- **Saving plan files:** Save approved designs to `plans/YYYY-MM-DD-feature-name.md` before
+  implementing. See Reference Documents → `plans/` for the full decision rule.
 
 ## Adding Features Beyond the Spec
 Features not described in the spec may be requested. When implementing them, follow existing patterns:
@@ -145,7 +141,7 @@ See `COMPLETED_PHASES.md`. When completing a phase or named feature session, doc
 
 ## Reference Documents
 
-Four documents together form the complete knowledge base. Each has a distinct purpose — read the right one for the job:
+Five documents together form the complete knowledge base. Each has a distinct purpose — read the right one for the job:
 
 ### `COMPLETED_PHASES.md` — What was built and why
 Phase-level narrative history. Answers: *"What did this phase introduce? What are the key methods, fields, and behaviors it added? What constraints must I respect when touching this area?"* One entry per phase or named feature session. Written for someone who is about to work in that area and needs a mental model of what exists and why.
@@ -168,8 +164,15 @@ Living register of open problems and the reasoning behind past architectural dec
 - **Update when:** a lasting concern surfaces (open it) or resolves (mark resolved; delete next session — DRIFT_LOG owns the permanent record).
 - **Does not belong here:** resolved concerns older than one session, session logs, or content that belongs in DRIFT_LOG or CLAUDE.md.
 
+### `plans/` — Approved architectural designs (before implementation)
+Design rationale for non-trivial architectural work. Answers: *"What were the key trade-offs and constraints considered before this feature was built? Why was it designed this way?"* One file per feature, named `YYYY-MM-DD-feature-name.md`, saved before implementation begins.
+
+- **Read before:** extending or reworking a feature that had a plan file — the rationale explains choices that aren't visible in the code.
+- **Update when:** plan mode produces an approved design. Decision rule: small fixes (≤2 files, self-evident) → DRIFT_LOG only; formal phases → `phases/` spec file; everything in between → `plans/` file.
+- **Does not belong here:** post-implementation notes, resolved bugs, or anything already captured by commit messages and DRIFT_LOG.
+
 ### `CLAUDE.md` (this file) — Active conventions for all future development
 The rules that apply right now, every session. Answers: *"What must I know before touching this codebase?"* Covers architecture, hard constraints, design rules, and decisions from past phases that still govern live code.
 
 - **Update when:** a convention changes, a new constraint is established, or a past phase decision continues to govern how new code must be written.
-- **Does not belong here:** history, resolved issues, or anything captured more precisely in the other three documents.
+- **Does not belong here:** history, resolved issues, or anything captured more precisely in the other four documents.
