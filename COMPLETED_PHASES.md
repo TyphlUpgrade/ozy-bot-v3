@@ -3,6 +3,14 @@
 Narrative history of completed phases and paper session fixes. For per-module interface changes
 consult DRIFT_LOG.md. For active design rules and constraints see CLAUDE.md.
 
+**Read before:** modifying a module built in a post-MVP phase, or when trying to understand why a
+feature works the way it does. Start here for the "what was built"; go to DRIFT_LOG for the "how
+it deviated from the plan."
+
+**Update when:** a post-MVP phase or named feature session completes. Document here, not in
+CLAUDE.md. One entry per phase/feature with bullet points covering the key implementation
+decisions, new methods/fields, and any non-obvious constraints future work must respect.
+
 ---
 
 ## Phases 11–18

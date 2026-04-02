@@ -9,22 +9,6 @@ Not a session log — session-specific observations belong here only if they sur
 
 ## Open Concerns
 
-### CONCERN-1: No-opportunity streak WARN does not distinguish zero-Claude-output vs. ranker-blocked
-**Status:** `resolved`  
-**Severity:** Low (logging quality / diagnostic clarity)
-
-When Claude returns zero new candidates, the streak WARN message says "no hard-filter rejections (zero Claude candidates?)". When Claude returns candidates that all fail the ranker, it says the same thing. These are different problems requiring different interventions:
-- Zero Claude output → watchlist quality issue or Claude calibration
-- Ranker blocking all Claude candidates → filter thresholds may be too tight
-
-The parenthetical `(zero Claude candidates?)` is a guess, not a diagnosis. The WARN should inspect `_opp_by_symbol` at WARN time and emit a distinct label for each case.
-
-**Note (2026-04-02):** The Phase 23 `candidates_exhausted` → build routing partially mitigates the symptom. When Claude outputs zero candidates and the streak reaches threshold, `candidates_exhausted` now triggers a fresh build instead of more reasoning. However, the log message itself still doesn't distinguish the two cases at WARN time. Fixed 2026-04-02.
-
-**First observed:** 2026-03-25 session log (FINDING-1, FINDING-9)
-
----
-
 ### CONCERN-2: Entry conditions path bypasses composite score floor
 **Status:** `open`  
 **Severity:** Low (inconsistency, not a bug)

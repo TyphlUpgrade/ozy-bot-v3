@@ -139,6 +139,12 @@ Full narrative history in `COMPLETED_PHASES.md`. Read the relevant entry before 
 
 **When completing a phase or post-phase feature:** document it in `COMPLETED_PHASES.md`, not here. CLAUDE.md is for active conventions that affect all future development — not a history log. Add a one-line entry here only if a completed phase introduced a convention that future developers must know about when touching live code (e.g., a field that must not be added back, or a method whose purpose is non-obvious from the name alone).
 
+## Completed Phase History
+See `COMPLETED_PHASES.md`. Narrative history of every post-MVP phase and named feature session.
+
+- **Read before:** modifying a module built in a post-MVP phase, or when trying to understand why a feature works the way it does. Start here for the "what was built"; go to DRIFT_LOG for the "how it deviated."
+- **Update when:** a post-MVP phase or named feature session completes. Document here, not in CLAUDE.md.
+
 ## Engineering Notes
 See `NOTES.md`. A living register of open concerns, deferred work, and engineering analyses that motivated architectural decisions.
 
@@ -147,7 +153,7 @@ See `NOTES.md`. A living register of open concerns, deferred work, and engineeri
 - **Do not use for:** session logs, transient debugging notes, or content that belongs in DRIFT_LOG.md (what changed and why) or CLAUDE.md (conventions that affect all future development).
 
 ## Spec Drift Log
-See `DRIFT_LOG.md`. Read the relevant phase section of DRIFT_LOG.md before modifying or debugging any module built in a previous phase.
+See `DRIFT_LOG.md`. Read the relevant phase section before modifying or debugging any module built in a previous phase.
 
 - **Update when:** a change would not be fully explained by reading the code and the commit message together — a behavioral contract change, a non-obvious trade-off, a deviation from an established pattern, or a decision whose *why* isn't visible in the implementation.
 - **Do not update for:** test-only changes, documentation fixes, new private methods with self-evident purpose, or anything a reader would immediately understand from the code alone. The drift log's value is its signal-to-noise ratio — it is not a commit log.
