@@ -91,6 +91,12 @@ the abstraction first, then add the value.
 - **Never modify phase documents or the spec file.** `phases/` files and `ozymandias_v3_spec_revised.md`
   are immutable historical records. All deviations, decisions, and post-MVP additions belong in
   DRIFT_LOG.md and CLAUDE.md only. Only create new phase files when explicitly instructed to do so.
+- **Saving plan files:** When plan mode produces an approved design for non-trivial architectural
+  work (anything that would be too complex to re-derive from the commit history alone), save it to
+  `plans/YYYY-MM-DD-feature-name.md` before implementing. Small fixes (≤2 files, self-evident)
+  go directly to DRIFT_LOG. Formal phases get a `phases/` spec file. Everything in between gets
+  a `plans/` file. Plan files are permanent — they capture the design rationale and key trade-offs
+  that DRIFT_LOG entries and commit messages don't have room for.
 
 ## Adding Features Beyond the Spec
 Features not described in the spec may be requested. When implementing them, follow existing patterns:
