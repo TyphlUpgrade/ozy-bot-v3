@@ -267,6 +267,11 @@ class SlowLoopTriggerState:
     # has already fired this cycle. Prevents re-firing every slow-loop tick once inside the
     # warmup window. Cleared implicitly when date advances to the next trading day.
     last_warmup_session_date: Optional[str] = None
+    # Prevents approaching_close from firing more than once per regular session.
+    # The trigger window is 4 minutes (15:28–15:32 ET) but slow_loop_check_sec is 60s,
+    # so without this flag the trigger fires on every tick within the window.
+    # Cleared when session transitions away from REGULAR_HOURS.
+    approaching_close_fired: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -2363,6 +2368,7 @@ class Orchestrator:
                 "stage_detail": reason,
                 "rejection_count": new_count,
                 "order_id": None,
+                "strategy": _opp_by_symbol.get(symbol, {}).get("strategy", ""),
             }
             # Finding 6: journal the first conviction_floor rejection per symbol
             # per session so calibration data accumulates across sessions.
@@ -2724,7 +2730,7 @@ class Orchestrator:
                         **self._recommendation_outcomes.get(symbol, {}),
                         "stage": "conditions_waiting",
                         "stage_detail": (
-                            f"defer_count={count}, conditions={top.entry_conditions}"
+                            f"defer_count={count}, last_block_reason={conds_reason!r}, conditions={top.entry_conditions}"
                         ),
                         "attempt_time_utc": (
                             self._recommendation_outcomes.get(symbol, {}).get("attempt_time_utc")
@@ -3468,22 +3474,27 @@ class Orchestrator:
         if last_session != current_session.value:
             if current_session == Session.REGULAR_HOURS:
                 triggers.append("session_open")
+                ts.approaching_close_fired = False  # re-arm for the new session
                 log.debug("Trigger: session_open FIRED  prev_session=%s", last_session)
             elif current_session == Session.POST_MARKET and last_session == Session.REGULAR_HOURS:
                 triggers.append("session_close")
+                ts.approaching_close_fired = False  # clear for next day
                 log.debug("Trigger: session_close FIRED")
             # Always update last_session regardless of whether we fire
             ts.last_session = current_session.value
 
-        # Also fire ~30 min before close (3:30 PM ET) while still in regular hours
-        if current_session == Session.REGULAR_HOURS:
+        # Also fire once ~30 min before close (3:28–3:32 PM ET) while still in regular hours.
+        # approaching_close_fired ensures this fires exactly once per session regardless of
+        # how many slow-loop ticks fall inside the 4-minute window.
+        if current_session == Session.REGULAR_HOURS and not ts.approaching_close_fired:
             from datetime import time as _time
             from zoneinfo import ZoneInfo as _ZI
             et = now.astimezone(_ZI("America/New_York"))
             if _time(15, 28) <= et.time() <= _time(15, 32):
-                # Only fire once in the ~5-min window; use time_ceiling or a flag
                 if "session_open" not in triggers and "time_ceiling" not in triggers:
                     triggers.append("approaching_close")
+                    ts.approaching_close_fired = True
+                    log.debug("Trigger: approaching_close FIRED")
 
         # 6. Watchlist critically small
         if len(watchlist.entries) < 10:
@@ -3868,6 +3879,7 @@ class Orchestrator:
                 "symbol": sym,
                 "reason": data["stage_detail"],
                 "cycles_rejected": data["rejection_count"],
+                **({"strategy": data["strategy"]} if data.get("strategy") else {}),
             }
             for sym, data in self._recommendation_outcomes.items()
             if data.get("rejection_count", 0) >= 1 and data.get("stage_detail")

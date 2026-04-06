@@ -677,7 +677,7 @@ class TestWatchlistBuildFailureBackdate:
         await orch._run_watchlist_build_task()
 
         assert orch._trigger_state.last_watchlist_build_utc is not None
-        assert not orch._watchlist_build_in_flight  # cleared in finally
+        assert not orch._watchlist_build_in_flight  # cleared in finally (first)
 
     @pytest.mark.asyncio
     async def test_failed_build_backdate_prevents_immediate_refire(self, orch):
@@ -752,4 +752,101 @@ class TestWatchlistBuildFailureBackdate:
         assert (after - ts).total_seconds() < 5, (
             "Successful build must stamp current time, not the failure back-date"
         )
-        assert not orch._watchlist_build_in_flight  # cleared in finally
+        assert not orch._watchlist_build_in_flight  # cleared in finally (last)
+
+
+# ===========================================================================
+# approaching_close one-shot fix
+# ===========================================================================
+
+class TestApproachingCloseTrigger:
+    """
+    approaching_close must fire exactly once per regular session.
+    The trigger window is 15:28–15:32 ET (4 min); slow_loop_check_sec=60 means
+    up to 4 consecutive ticks can fall inside the window.  The
+    approaching_close_fired flag prevents re-entry until the next session.
+    """
+
+    # 19:29:00 UTC = 3:29 PM ET — solidly inside the window
+    _IN_WINDOW = datetime(2026, 4, 2, 19, 29, 0, tzinfo=timezone.utc)
+    # 19:20:00 UTC = 3:20 PM ET — outside the window
+    _OUT_WINDOW = datetime(2026, 4, 2, 19, 20, 0, tzinfo=timezone.utc)
+
+    def _patch_session(self, session):
+        return patch("ozymandias.core.orchestrator.get_current_session", return_value=session)
+
+    @pytest.mark.asyncio
+    async def test_fires_once_in_window(self, orch):
+        """approaching_close fires and sets the flag on first in-window tick."""
+        from ozymandias.core.market_hours import Session
+        await _seed_watchlist(orch, ["AAPL"])
+        await _seed_portfolio(orch)
+
+        orch._trigger_state.last_session = Session.REGULAR_HOURS.value
+        orch._trigger_state.approaching_close_fired = False
+        # Suppress time_ceiling by keeping last_claude_call_utc recent
+        orch._trigger_state.last_claude_call_utc = self._IN_WINDOW - timedelta(minutes=10)
+        orch._all_indicators = {"AAPL": {}}
+        orch._trigger_state.indicators_seeded = True
+
+        with self._patch_session(Session.REGULAR_HOURS):
+            triggers = await orch._check_triggers(now=self._IN_WINDOW)
+
+        assert "approaching_close" in triggers
+        assert orch._trigger_state.approaching_close_fired is True
+
+    @pytest.mark.asyncio
+    async def test_does_not_refire_in_window(self, orch):
+        """approaching_close does NOT fire on a second tick still inside the window."""
+        from ozymandias.core.market_hours import Session
+        await _seed_watchlist(orch, ["AAPL"])
+        await _seed_portfolio(orch)
+
+        orch._trigger_state.last_session = Session.REGULAR_HOURS.value
+        orch._trigger_state.approaching_close_fired = True  # already fired
+        orch._trigger_state.last_claude_call_utc = self._IN_WINDOW - timedelta(minutes=10)
+        orch._all_indicators = {"AAPL": {}}
+        orch._trigger_state.indicators_seeded = True
+
+        with self._patch_session(Session.REGULAR_HOURS):
+            triggers = await orch._check_triggers(now=self._IN_WINDOW)
+
+        assert "approaching_close" not in triggers
+
+    @pytest.mark.asyncio
+    async def test_does_not_fire_outside_window(self, orch):
+        """approaching_close does not fire before 15:28 ET."""
+        from ozymandias.core.market_hours import Session
+        await _seed_watchlist(orch, ["AAPL"])
+        await _seed_portfolio(orch)
+
+        orch._trigger_state.last_session = Session.REGULAR_HOURS.value
+        orch._trigger_state.approaching_close_fired = False
+        orch._trigger_state.last_claude_call_utc = self._OUT_WINDOW - timedelta(minutes=10)
+        orch._all_indicators = {"AAPL": {}}
+        orch._trigger_state.indicators_seeded = True
+
+        with self._patch_session(Session.REGULAR_HOURS):
+            triggers = await orch._check_triggers(now=self._OUT_WINDOW)
+
+        assert "approaching_close" not in triggers
+        assert orch._trigger_state.approaching_close_fired is False
+
+    @pytest.mark.asyncio
+    async def test_rearmed_on_session_open(self, orch):
+        """approaching_close_fired is cleared when session_open fires (next day)."""
+        from ozymandias.core.market_hours import Session
+        await _seed_watchlist(orch, ["AAPL"])
+        await _seed_portfolio(orch)
+
+        orch._trigger_state.last_session = Session.PRE_MARKET.value
+        orch._trigger_state.approaching_close_fired = True  # leftover from yesterday
+        orch._trigger_state.last_claude_call_utc = None
+        orch._all_indicators = {"AAPL": {}}
+        orch._trigger_state.indicators_seeded = True
+
+        with self._patch_session(Session.REGULAR_HOURS):
+            triggers = await orch._check_triggers(now=self._OUT_WINDOW)
+
+        assert "session_open" in triggers
+        assert orch._trigger_state.approaching_close_fired is False

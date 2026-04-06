@@ -71,7 +71,7 @@
     "news_max_items_per_symbol": 3,
     "recommendation_outcome_max_age_min": 60,
     "recent_executions_count": 5,
-    "execution_stats_min_trades": 3,
+    "execution_stats_min_trades": 5,
     "cache_max_age_default_min": 60,
     "cache_max_age_stressed_min": 20,
     "cache_max_age_panic_min": 10,
@@ -94,8 +94,8 @@
     "reasoning_tier2_max_tokens": 4096,
     "reasoning_tier3_max_tokens": 1024,
     "reasoning_tier3_model": "claude-haiku-4-5-20251001",
-    "tier_downgrade_failures": 2,
-    "tier_upgrade_probe_min": 15
+    "tier_downgrade_failures": 3,
+    "tier_upgrade_probe_min": 5
   },
   "ai_fallback": {
     "enabled": false,

@@ -119,8 +119,10 @@ class ClaudeConfig:
     recommendation_outcome_max_age_min: int = 60
     # Phase 15: number of recent close records included in Claude's execution history context
     recent_executions_count: int = 5
-    # Phase 15: minimum trades required before compute_session_stats returns non-empty stats
-    execution_stats_min_trades: int = 3
+    # Phase 15: minimum trades required before compute_session_stats returns non-empty stats.
+    # Raised from 3→5: a 0/3 streak was triggering global filter changes from a sample too
+    # small to be statistically meaningful.
+    execution_stats_min_trades: int = 5
     min_call_interval_sec: float = 3.0   # minimum seconds between successive Claude API calls; proactively prevents RPM rate-limit hits from burst of position reviews or thesis challenges
     # Phase 17 — adaptive reasoning cache TTL (minutes) by market regime
     cache_max_age_default_min: int = 60    # normal market conditions

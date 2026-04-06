@@ -680,7 +680,11 @@ class TestClaudeDegradation:
         orch._claude.run_reasoning_cycle = AsyncMock(return_value=result)
         orch._broker.get_account = AsyncMock(return_value=_stub_account())
 
-        await orch._run_claude_cycle("time_ceiling")
+        # _run_claude_cycle may fire ensure_future(_run_watchlist_build_task()) on
+        # the success path. Mock it so the background task doesn't outlive the test
+        # and leave unawaited coroutines when the event loop closes.
+        with patch.object(orch, "_run_watchlist_build_task", AsyncMock()):
+            await orch._run_claude_cycle("time_ceiling")
 
         assert orch._degradation.claude_available is True
         assert orch._degradation.claude_backoff_until_utc is None

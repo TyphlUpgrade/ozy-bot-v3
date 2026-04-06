@@ -164,14 +164,18 @@ class MomentumStrategy(Strategy):
                    (no ceiling — RSI 80 falling is a valid short entry).
         """
         # Phase 19: compute effective RVOL floor.
-        # filter_adjustments.min_rvol is already clamped to the absolute config floor
-        # by the ranker before this call. Strategy uses it directly when present.
+        # filter_adjustments.min_rvol can only LOWER the strategy floor (its intended
+        # purpose: relax the gate on low-participation days). It may never raise the
+        # floor above the configured strategy default — that would let Claude tighten
+        # momentum entries globally in response to poor win rate, which builds a
+        # self-reinforcing cage. Per-opportunity tightening belongs in entry_conditions
+        # (require_volume_ratio_min), not the global filter.
         strategy_rvol_floor = self._p("min_rvol_for_entry")
         if filter_adjustments:
             proposed = filter_adjustments.get("min_rvol")
             if proposed is not None:
                 try:
-                    effective_rvol_floor = float(proposed)
+                    effective_rvol_floor = min(strategy_rvol_floor, float(proposed))
                 except (TypeError, ValueError):
                     effective_rvol_floor = strategy_rvol_floor
             else:

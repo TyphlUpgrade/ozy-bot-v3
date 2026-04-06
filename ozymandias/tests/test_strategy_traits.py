@@ -337,6 +337,20 @@ class TestPhase19EntryGate:
         )
         assert passed_adj is True
 
+    def test_momentum_filter_adjustments_cannot_raise_rvol_floor(self):
+        """filter_adjustments.min_rvol cannot raise the floor above the strategy default."""
+        strat = MomentumStrategy({"min_rvol_for_entry": 1.0})
+        # volume_ratio=1.1 passes the default 1.0 floor
+        signals = _signals(volume_ratio=1.1, vwap_position="above")
+        passed_default, _ = strat.apply_entry_gate("buy", signals)
+        assert passed_default is True
+        # filter_adjustments proposes 1.5 — must be clamped to 1.0, so 1.1 still passes
+        passed_adj, reason = strat.apply_entry_gate(
+            "buy", signals,
+            filter_adjustments={"min_rvol": 1.5},
+        )
+        assert passed_adj is True, f"Raise above config floor should be clamped; got: {reason}"
+
     def test_momentum_filter_adjustments_none_uses_strategy_default(self):
         """filter_adjustments=None falls back to strategy RVOL floor."""
         strat = MomentumStrategy({"min_rvol_for_entry": 1.0})
