@@ -2674,7 +2674,11 @@ class Orchestrator:
         # Log at INFO — blocked conditions are normal expected behaviour, not errors.
         entry_conds = getattr(top, "entry_conditions", {}) or {}
         if entry_conds:
-            conds_met, conds_reason = evaluate_entry_conditions(entry_conds, ind)
+            conds_met, conds_reason = evaluate_entry_conditions(
+                entry_conds,
+                ind,
+                rsi_level_tolerance=self._config.claude.entry_condition_rsi_level_tolerance,
+            )
             if not conds_met:
                 # Do not consume defer budget during the dead zone — entries are
                 # structurally blocked by time, not by a stale thesis. Burning through

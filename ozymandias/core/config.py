@@ -123,6 +123,12 @@ class ClaudeConfig:
     # Raised from 3→5: a 0/3 streak was triggering global filter changes from a sample too
     # small to be statistically meaningful.
     execution_stats_min_trades: int = 5
+    # Entry condition sanity check: how many RSI points below current RSI an rsi_max may be
+    # set (for shorts) before it is flagged as a calibration error rather than a valid level
+    # gate. Similarly, how many points above current RSI an rsi_min may be set (for longs).
+    # A value of 5.0 means rsi_max=40 with current RSI=46 triggers the error (6 > 5).
+    # Set to 0.0 to disable the check. To add: one entry here and one in config.json.
+    entry_condition_rsi_level_tolerance: float = 5.0
     min_call_interval_sec: float = 3.0   # minimum seconds between successive Claude API calls; proactively prevents RPM rate-limit hits from burst of position reviews or thesis challenges
     # Phase 17 — adaptive reasoning cache TTL (minutes) by market regime
     cache_max_age_default_min: int = 60    # normal market conditions

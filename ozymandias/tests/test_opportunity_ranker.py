@@ -1005,3 +1005,101 @@ class TestClampFilterAdjustments:
     def test_reason_field_preserved(self):
         result = _clamp_filter_adjustments({"min_rvol": 0.6, "reason": "low participation"})
         assert result["reason"] == "low participation"
+
+
+# ---------------------------------------------------------------------------
+# RSI level calibration error detector
+# ---------------------------------------------------------------------------
+
+class TestRsiLevelCalibrationError:
+    """
+    evaluate_entry_conditions detects rsi_max set materially below current RSI
+    (short miscalibration) and rsi_min set materially above current RSI (long
+    miscalibration), returning a distinct _calibration_error reason string
+    instead of the generic exceeded/not-met message.
+
+    The check is governed by rsi_level_tolerance (default 5.0).  Within the
+    tolerance band the standard level check applies without the error label.
+    """
+
+    def _eval(self, conditions, signals, tolerance=5.0):
+        from ozymandias.intelligence.opportunity_ranker import evaluate_entry_conditions
+        return evaluate_entry_conditions(conditions, signals, rsi_level_tolerance=tolerance)
+
+    # --- rsi_max (short) calibration error -----------------------------------
+
+    def test_rsi_max_well_below_current_rsi_is_calibration_error(self):
+        """rsi_max=40 with current RSI=46 (6 pts below, > tolerance 5) → calibration_error."""
+        passed, reason = self._eval({"rsi_max": 40}, {"rsi": 46})
+        assert passed is False
+        assert "rsi_max_calibration_error" in reason
+        assert "rsi_slope_max" in reason  # diagnostic must suggest the fix
+
+    def test_rsi_max_exactly_at_tolerance_boundary_is_standard_check(self):
+        """rsi_max=41 with current RSI=46 (5 pts below, == tolerance) → standard exceeded msg."""
+        passed, reason = self._eval({"rsi_max": 41}, {"rsi": 46})
+        assert passed is False
+        assert "rsi_max_calibration_error" not in reason
+        assert "rsi_max exceeded" in reason
+
+    def test_rsi_max_within_tolerance_is_standard_check(self):
+        """rsi_max=43 with current RSI=46 (3 pts below, < tolerance 5) → standard exceeded."""
+        passed, reason = self._eval({"rsi_max": 43}, {"rsi": 46})
+        assert passed is False
+        assert "rsi_max_calibration_error" not in reason
+        assert "rsi_max exceeded" in reason
+
+    def test_rsi_max_at_or_above_current_rsi_passes(self):
+        """rsi_max=50 with current RSI=46 → condition satisfied, entry allowed."""
+        passed, _ = self._eval({"rsi_max": 50}, {"rsi": 46})
+        assert passed is True
+
+    def test_rsi_max_calibration_error_disabled_when_tolerance_zero(self):
+        """tolerance=0.0 disables the calibration check; standard rsi_max exceeded applies."""
+        passed, reason = self._eval({"rsi_max": 30}, {"rsi": 60}, tolerance=0.0)
+        assert passed is False
+        assert "rsi_max_calibration_error" not in reason
+        assert "rsi_max exceeded" in reason
+
+    # --- rsi_min (long) calibration error ------------------------------------
+
+    def test_rsi_min_well_above_current_rsi_is_calibration_error(self):
+        """rsi_min=60 with current RSI=52 (8 pts above, > tolerance 5) → calibration_error."""
+        passed, reason = self._eval({"rsi_min": 60}, {"rsi": 52})
+        assert passed is False
+        assert "rsi_min_calibration_error" in reason
+        assert "rsi_slope_min" in reason  # diagnostic must suggest the fix
+
+    def test_rsi_min_exactly_at_tolerance_boundary_is_standard_check(self):
+        """rsi_min=57 with current RSI=52 (5 pts above, == tolerance) → standard not-met msg."""
+        passed, reason = self._eval({"rsi_min": 57}, {"rsi": 52})
+        assert passed is False
+        assert "rsi_min_calibration_error" not in reason
+        assert "rsi_min not met" in reason
+
+    def test_rsi_min_within_tolerance_is_standard_check(self):
+        """rsi_min=55 with current RSI=52 (3 pts above, < tolerance 5) → standard not-met."""
+        passed, reason = self._eval({"rsi_min": 55}, {"rsi": 52})
+        assert passed is False
+        assert "rsi_min_calibration_error" not in reason
+        assert "rsi_min not met" in reason
+
+    def test_rsi_min_at_or_below_current_rsi_passes(self):
+        """rsi_min=48 with current RSI=52 → condition satisfied, entry allowed."""
+        passed, _ = self._eval({"rsi_min": 48}, {"rsi": 52})
+        assert passed is True
+
+    def test_rsi_min_calibration_error_disabled_when_tolerance_zero(self):
+        """tolerance=0.0 disables the calibration check; standard rsi_min not-met applies."""
+        passed, reason = self._eval({"rsi_min": 80}, {"rsi": 30}, tolerance=0.0)
+        assert passed is False
+        assert "rsi_min_calibration_error" not in reason
+        assert "rsi_min not met" in reason
+
+    # --- signal unavailable --------------------------------------------------
+
+    def test_rsi_unavailable_returns_signal_unavailable(self):
+        """Missing rsi signal returns the standard unavailable message regardless of tolerance."""
+        passed, reason = self._eval({"rsi_max": 40}, {})
+        assert passed is False
+        assert "unavailable" in reason

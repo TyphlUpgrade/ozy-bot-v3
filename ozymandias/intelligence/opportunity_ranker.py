@@ -93,7 +93,11 @@ class ExitAction:
 # Entry conditions evaluator (Phase 14)
 # ---------------------------------------------------------------------------
 
-def evaluate_entry_conditions(conditions: dict | None, signals: dict) -> tuple[bool, str]:
+def evaluate_entry_conditions(
+    conditions: dict | None,
+    signals: dict,
+    rsi_level_tolerance: float = 5.0,
+) -> tuple[bool, str]:
     """Check Claude's per-trade entry conditions against current live signals.
 
     Parameters
@@ -104,6 +108,12 @@ def evaluate_entry_conditions(conditions: dict | None, signals: dict) -> tuple[b
     signals:
         Flat signals dict from ``_latest_indicators[symbol]`` (same shape as
         ``generate_signal_summary()["signals"]``).
+    rsi_level_tolerance:
+        How many RSI points below current RSI an ``rsi_max`` may be set (for
+        shorts) before it is flagged as a calibration error rather than a valid
+        level gate.  Symmetric: applies to ``rsi_min`` set above current RSI
+        (for longs).  Set to 0.0 to disable.  Controlled by
+        ``entry_condition_rsi_level_tolerance`` in config.json.
 
     Returns
     -------
@@ -135,20 +145,42 @@ def evaluate_entry_conditions(conditions: dict | None, signals: dict) -> tuple[b
             return False, f"require_below_vwap not met: vwap_position={val!r}"
 
     # rsi_min --------------------------------------------------------------
+    # Calibration check: rsi_min set materially above current RSI for a long
+    # can never be satisfied from the current level — flag as miscalibration so
+    # Claude receives a diagnostic rather than a silent stream of defers.
     if "rsi_min" in conditions:
         val = signals.get("rsi")
         if val is None:
             return False, "signal 'rsi' unavailable"
-        if float(val) < float(conditions["rsi_min"]):
-            return False, f"rsi_min not met: RSI {float(val):.1f} < {float(conditions['rsi_min']):.1f}"
+        current_rsi = float(val)
+        rsi_min_val = float(conditions["rsi_min"])
+        if rsi_level_tolerance > 0 and rsi_min_val > current_rsi + rsi_level_tolerance:
+            return False, (
+                f"rsi_min_calibration_error: rsi_min={rsi_min_val} is "
+                f"{rsi_min_val - current_rsi:.1f} points above current RSI {current_rsi:.1f} — "
+                f"use rsi_slope_min to gate on upward momentum instead of waiting for a level"
+            )
+        if current_rsi < rsi_min_val:
+            return False, f"rsi_min not met: RSI {current_rsi:.1f} < {rsi_min_val:.1f}"
 
     # rsi_max --------------------------------------------------------------
+    # Calibration check: rsi_max set materially below current RSI for a short
+    # creates a "wait for RSI to fall to X" gate that stalls for many cycles.
+    # Flag as miscalibration so Claude can self-correct on the next cycle.
     if "rsi_max" in conditions:
         val = signals.get("rsi")
         if val is None:
             return False, "signal 'rsi' unavailable"
-        if float(val) > float(conditions["rsi_max"]):
-            return False, f"rsi_max exceeded: RSI {float(val):.1f} > {float(conditions['rsi_max']):.1f}"
+        current_rsi = float(val)
+        rsi_max_val = float(conditions["rsi_max"])
+        if rsi_level_tolerance > 0 and current_rsi > rsi_max_val + rsi_level_tolerance:
+            return False, (
+                f"rsi_max_calibration_error: rsi_max={rsi_max_val} is "
+                f"{current_rsi - rsi_max_val:.1f} points below current RSI {current_rsi:.1f} — "
+                f"use rsi_slope_max to gate on downward momentum instead of waiting for a level"
+            )
+        if current_rsi > rsi_max_val:
+            return False, f"rsi_max exceeded: RSI {current_rsi:.1f} > {rsi_max_val:.1f}"
 
     # rsi_slope_min — longs: RSI must be rising at least this fast ----------
     # Use rsi_slope_min with a positive value (e.g. 0.5) to confirm upward RSI momentum.
