@@ -88,6 +88,16 @@ class SchedulerConfig:
     require_watchlist_before_reasoning: bool = False  # if True, defer reasoning until the watchlist build completes when both co-fire; ensures Claude reasons on fresh candidates
     no_opportunity_streak_warn_threshold: int = 8    # log a gate-breakdown WARN when this many consecutive medium loops produce zero ranked candidates; helps diagnose whether the watchlist or a specific gate is the bottleneck
     pre_market_warmup_min: int = 10                  # minutes before next market open to run a cache-warming Claude cycle; 0 disables; allows starting bot hours early with no penalty
+    # Minimum minutes between consecutive regime_condition trigger fires. Prevents a
+    # miscalibrated valid_until_condition (already-met at write time) or an oscillating
+    # signal from chain-firing a Sonnet call every 60 seconds. Set to 0 to disable.
+    # To add: one entry here and one in config.json under the scheduler section.
+    regime_condition_cooldown_min: int = 20
+    # Suppress thesis breach Sonnet scheduling if the position was reviewed by a full
+    # Sonnet cycle within this many minutes. The Haiku check still runs — only the
+    # downstream Sonnet call is suppressed. Prevents double-reviewing the same position
+    # when a regime_condition cycle and a thesis_breach cycle fire in quick succession.
+    thesis_breach_review_cooldown_min: int = 15
 
 
 @dataclass

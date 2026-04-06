@@ -56,7 +56,9 @@
     "watchlist_build_parse_failure_retry_min": 3,
     "require_watchlist_before_reasoning": false,
     "no_opportunity_streak_warn_threshold": 8,
-    "pre_market_warmup_min": 10
+    "pre_market_warmup_min": 10,
+    "regime_condition_cooldown_min": 20,
+    "thesis_breach_review_cooldown_min": 15
   },
   "claude": {
     "min_call_interval_sec": 3.0,
@@ -64,7 +66,7 @@
     "watchlist_max_entries": 60,
     "watchlist_build_target": 8,
     "max_tokens_per_cycle": 8192,
-    "prompt_version": "v3.10.2",
+    "prompt_version": "v3.10.3",
     "tier1_max_symbols": 18,
     "tier2_max_symbols": 15,
     "news_max_age_hours": 168,

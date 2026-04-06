@@ -272,6 +272,11 @@ class SlowLoopTriggerState:
     # so without this flag the trigger fires on every tick within the window.
     # Cleared when session transitions away from REGULAR_HOURS.
     approaching_close_fired: bool = False
+    # UTC datetime of the last regime_condition trigger fire. Used to enforce a minimum
+    # cooldown between consecutive regime_condition triggers so that a miscalibrated
+    # valid_until_condition (or a noisy signal) cannot chain-fire every 60 seconds.
+    # None = never fired. Controlled by scheduler.regime_condition_cooldown_min.
+    last_regime_condition_utc: Optional[datetime] = None
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +407,11 @@ class Orchestrator:
         # Consumed and cleared by the next _run_claude_cycle invocation so Sonnet
         # knows which condition was detected and can re-examine the affected position.
         self._thesis_breach_context: str | None = None
+        # UTC datetime of the last Sonnet position review per symbol. Used to suppress
+        # thesis breach Sonnet scheduling when the position was reviewed recently —
+        # prevents double-reviewing the same position when a regime_condition cycle
+        # and a thesis_breach fire in quick succession with identical news context.
+        self._last_position_review_utc: dict[str, datetime] = {}
 
         # Phase 17: UTC timestamp of the last completed medium loop cycle.
         # Used by the medium-loop gate in _slow_loop_cycle to prevent Claude from
@@ -2523,19 +2533,41 @@ class Orchestrator:
                         cycle_id=f"medium_{self._trigger_state.last_claude_call_utc}",
                     )
                     if _breach and _breach.needs_sonnet:
-                        log.warning(
-                            "Position thesis breach detected — "
-                            "scheduling Sonnet review [%s]",
-                            _breach.notes,
+                        # Suppress if the breached symbol was reviewed by a full Sonnet
+                        # cycle within thesis_breach_review_cooldown_min — the review
+                        # already assessed the current news context and the thesis held.
+                        # The Haiku check still ran; only the downstream Sonnet call is
+                        # suppressed to avoid double-reviewing the same position.
+                        _breach_symbol = _breach.notes.split(":")[0].strip() if _breach.notes else ""
+                        _cooldown_sec = self._config.scheduler.thesis_breach_review_cooldown_min * 60
+                        _last_review = self._last_position_review_utc.get(_breach_symbol)
+                        _breach_elapsed = (
+                            (datetime.now(timezone.utc) - _last_review).total_seconds()
+                            if _last_review else float("inf")
                         )
-                        # Store breach detail so the next _run_claude_cycle can pass
-                        # it to Sonnet's position review. Without this, Sonnet receives
-                        # no signal about which condition was detected and reruns its
-                        # prior analysis unchanged.
-                        self._thesis_breach_context = _breach.notes
-                        asyncio.ensure_future(
-                            self._run_claude_cycle(trigger_name="thesis_breach")
-                        )
+                        if _breach_elapsed < _cooldown_sec:
+                            log.info(
+                                "Position thesis breach suppressed — %s reviewed %.0fs ago "
+                                "(cooldown=%ds): %s",
+                                _breach_symbol,
+                                _breach_elapsed,
+                                _cooldown_sec,
+                                _breach.notes,
+                            )
+                        else:
+                            log.warning(
+                                "Position thesis breach detected — "
+                                "scheduling Sonnet review [%s]",
+                                _breach.notes,
+                            )
+                            # Store breach detail so the next _run_claude_cycle can pass
+                            # it to Sonnet's position review. Without this, Sonnet receives
+                            # no signal about which condition was detected and reruns its
+                            # prior analysis unchanged.
+                            self._thesis_breach_context = _breach.notes
+                            asyncio.ensure_future(
+                                self._run_claude_cycle(trigger_name="thesis_breach")
+                            )
             except Exception as _exc:
                 log.debug("Phase 21: thesis breach check error — %s", _exc)
 
@@ -3675,9 +3707,23 @@ class Orchestrator:
         # Phase 19: regime condition trigger — check valid_until_conditions from last
         # Sonnet regime_assessment. When a condition is met, fire a fresh reasoning cycle.
         # _run_claude_cycle uses skip_cache=True so no explicit cache expiry needed.
+        # Cooldown prevents chain-firing when a condition is miscalibrated (already met) or
+        # the signal oscillates. Mirrors the approaching_close_fired guard pattern.
+        _regime_cooldown_sec = self._config.scheduler.regime_condition_cooldown_min * 60
+        _regime_elapsed = (
+            (now - ts.last_regime_condition_utc).total_seconds()
+            if ts.last_regime_condition_utc else float("inf")
+        )
         if self._check_regime_conditions():
-            triggers.append("regime_condition")
-            log.debug("Trigger: regime_condition FIRED")
+            if _regime_elapsed >= _regime_cooldown_sec:
+                triggers.append("regime_condition")
+                ts.last_regime_condition_utc = now
+                log.debug("Trigger: regime_condition FIRED  elapsed=%.0fs", _regime_elapsed)
+            else:
+                log.debug(
+                    "Trigger: regime_condition suppressed — cooldown %.0fs remaining",
+                    _regime_cooldown_sec - _regime_elapsed,
+                )
 
         return triggers
 
@@ -4973,7 +5019,8 @@ class Orchestrator:
         the disk between the slow loop's initial load and this function's save.
         """
         portfolio = await self._state_manager.load_portfolio()
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_utc = datetime.now(timezone.utc)
+        now_iso = now_utc.isoformat()
         changed = False
         for review in reviews:
             symbol = review.get("symbol", "")
@@ -4983,6 +5030,10 @@ class Orchestrator:
                 "Position review: %s — action=%s — %s",
                 symbol, action, note or "(no rationale provided)",
             )
+            # Stamp review time so thesis breach scheduling can suppress redundant
+            # Sonnet calls for positions reviewed within thesis_breach_review_cooldown_min.
+            if symbol:
+                self._last_position_review_utc[symbol] = now_utc
             for pos in portfolio.positions:
                 if pos.symbol != symbol:
                     continue

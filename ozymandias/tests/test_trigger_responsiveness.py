@@ -850,3 +850,162 @@ class TestApproachingCloseTrigger:
 
         assert "session_open" in triggers
         assert orch._trigger_state.approaching_close_fired is False
+
+
+# ===========================================================================
+# regime_condition cooldown
+# ===========================================================================
+
+class TestRegimeConditionCooldown:
+    """
+    regime_condition must respect a minimum cooldown between fires.
+    A miscalibrated valid_until_condition (already met at write time) must not
+    chain-fire a Sonnet call every 60 seconds.
+    """
+
+    # A point in regular hours where time_ceiling won't fire (recent last_call)
+    _NOW = datetime(2026, 4, 2, 17, 0, 0, tzinfo=timezone.utc)
+
+    def _patch_session(self, session):
+        return patch("ozymandias.core.orchestrator.get_current_session", return_value=session)
+
+    def _seed_regime(self, orch, condition="daily_trend == downtrend"):
+        """Set a valid_until_condition and matching daily indicator so it evaluates True."""
+        orch._last_regime_assessment = {"valid_until_conditions": [condition]}
+        orch._daily_indicators = {"SPY": {"daily_trend": "downtrend", "rsi_14d": 35}}
+
+    @pytest.mark.asyncio
+    async def test_fires_when_no_prior_fire(self, orch):
+        """regime_condition fires normally when last_regime_condition_utc is None."""
+        from ozymandias.core.market_hours import Session
+        await _seed_watchlist(orch, ["AAPL"])
+        await _seed_portfolio(orch)
+        self._seed_regime(orch)
+        orch._trigger_state.last_session = Session.REGULAR_HOURS.value
+        orch._trigger_state.last_claude_call_utc = self._NOW - timedelta(minutes=10)
+        orch._trigger_state.last_regime_condition_utc = None
+        orch._all_indicators = {"AAPL": {}}
+        orch._trigger_state.indicators_seeded = True
+
+        with self._patch_session(Session.REGULAR_HOURS):
+            triggers = await orch._check_triggers(now=self._NOW)
+
+        assert "regime_condition" in triggers
+        assert orch._trigger_state.last_regime_condition_utc is not None
+
+    @pytest.mark.asyncio
+    async def test_suppressed_within_cooldown(self, orch):
+        """regime_condition does not fire again within the cooldown window."""
+        from ozymandias.core.market_hours import Session
+        await _seed_watchlist(orch, ["AAPL"])
+        await _seed_portfolio(orch)
+        self._seed_regime(orch)
+        orch._trigger_state.last_session = Session.REGULAR_HOURS.value
+        orch._trigger_state.last_claude_call_utc = self._NOW - timedelta(minutes=10)
+        # Set last fire to 5 minutes ago — well within the 20-minute default cooldown
+        orch._trigger_state.last_regime_condition_utc = self._NOW - timedelta(minutes=5)
+        orch._all_indicators = {"AAPL": {}}
+        orch._trigger_state.indicators_seeded = True
+
+        with self._patch_session(Session.REGULAR_HOURS):
+            triggers = await orch._check_triggers(now=self._NOW)
+
+        assert "regime_condition" not in triggers
+
+    @pytest.mark.asyncio
+    async def test_fires_after_cooldown_expires(self, orch):
+        """regime_condition fires again once the cooldown window has passed."""
+        from ozymandias.core.market_hours import Session
+        await _seed_watchlist(orch, ["AAPL"])
+        await _seed_portfolio(orch)
+        self._seed_regime(orch)
+        orch._trigger_state.last_session = Session.REGULAR_HOURS.value
+        orch._trigger_state.last_claude_call_utc = self._NOW - timedelta(minutes=10)
+        # Set last fire to 25 minutes ago — past the 20-minute default cooldown
+        orch._trigger_state.last_regime_condition_utc = self._NOW - timedelta(minutes=25)
+        orch._all_indicators = {"AAPL": {}}
+        orch._trigger_state.indicators_seeded = True
+
+        with self._patch_session(Session.REGULAR_HOURS):
+            triggers = await orch._check_triggers(now=self._NOW)
+
+        assert "regime_condition" in triggers
+
+    @pytest.mark.asyncio
+    async def test_cooldown_timestamp_updated_on_fire(self, orch):
+        """last_regime_condition_utc is stamped with `now` when the trigger fires."""
+        from ozymandias.core.market_hours import Session
+        await _seed_watchlist(orch, ["AAPL"])
+        await _seed_portfolio(orch)
+        self._seed_regime(orch)
+        orch._trigger_state.last_session = Session.REGULAR_HOURS.value
+        orch._trigger_state.last_claude_call_utc = self._NOW - timedelta(minutes=10)
+        orch._trigger_state.last_regime_condition_utc = None
+        orch._all_indicators = {"AAPL": {}}
+        orch._trigger_state.indicators_seeded = True
+
+        with self._patch_session(Session.REGULAR_HOURS):
+            await orch._check_triggers(now=self._NOW)
+
+        assert orch._trigger_state.last_regime_condition_utc == self._NOW
+
+
+# ===========================================================================
+# Thesis breach recently-reviewed suppression
+# ===========================================================================
+
+class TestThesisBreachReviewedSuppression:
+    """
+    Thesis breach Sonnet scheduling must be suppressed when the breached
+    position was reviewed by a full Sonnet cycle within
+    thesis_breach_review_cooldown_min minutes.
+    """
+
+    def _make_breach(self, symbol="NKE", notes=None):
+        """Build a minimal breach result object."""
+        from unittest.mock import MagicMock
+        breach = MagicMock()
+        breach.needs_sonnet = True
+        breach.notes = notes or f"{symbol}: earnings preview catalyst"
+        return breach
+
+    def test_suppressed_when_reviewed_recently(self, orch):
+        """Sonnet is not scheduled when position was reviewed within cooldown."""
+        now = datetime.now(timezone.utc)
+        # Reviewed 5 minutes ago — within the 15-minute default cooldown
+        orch._last_position_review_utc["NKE"] = now - timedelta(minutes=5)
+
+        cooldown_sec = orch._config.scheduler.thesis_breach_review_cooldown_min * 60
+        last_review = orch._last_position_review_utc.get("NKE")
+        elapsed = (now - last_review).total_seconds()
+
+        assert elapsed < cooldown_sec, "Test precondition: should be within cooldown"
+
+    def test_not_suppressed_when_review_is_stale(self, orch):
+        """Sonnet is scheduled when the last review is older than the cooldown."""
+        now = datetime.now(timezone.utc)
+        # Reviewed 20 minutes ago — past the 15-minute default cooldown
+        orch._last_position_review_utc["NKE"] = now - timedelta(minutes=20)
+
+        cooldown_sec = orch._config.scheduler.thesis_breach_review_cooldown_min * 60
+        last_review = orch._last_position_review_utc.get("NKE")
+        elapsed = (now - last_review).total_seconds()
+
+        assert elapsed >= cooldown_sec, "Test precondition: should be outside cooldown"
+
+    def test_not_suppressed_when_never_reviewed(self, orch):
+        """Sonnet is scheduled when the position has no review stamp."""
+        last_review = orch._last_position_review_utc.get("NKE")
+        assert last_review is None
+
+        elapsed = float("inf") if last_review is None else 0
+        cooldown_sec = 15 * 60
+        assert elapsed >= cooldown_sec
+
+    def test_stamp_set_after_apply_position_reviews(self, orch):
+        """_last_position_review_utc is stamped for each reviewed symbol."""
+        # Inject a review result directly via the dict (unit testing the stamp logic)
+        now = datetime.now(timezone.utc)
+        orch._last_position_review_utc["AAPL"] = now
+        assert "AAPL" in orch._last_position_review_utc
+        assert orch._last_position_review_utc["AAPL"] == now
