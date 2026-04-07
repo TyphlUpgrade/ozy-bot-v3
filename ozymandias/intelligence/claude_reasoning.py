@@ -1048,9 +1048,13 @@ class ClaudeReasoningEngine:
 
                             self._last_input_tokens = response.usage.input_tokens
                             self._last_output_tokens = response.usage.output_tokens
+                            cache_read = getattr(response.usage, 'cache_read_input_tokens', 0) or 0
+                            cache_create = getattr(response.usage, 'cache_creation_input_tokens', 0) or 0
                             log.info(
-                                "Token usage: %d input, %d output",
+                                "Token usage: %d input, %d output, "
+                                "%d cache_read, %d cache_create",
                                 self._last_input_tokens, self._last_output_tokens,
+                                cache_read, cache_create,
                             )
                             # Successful — reset circuit breaker
                             if self._overload_fallback_count > 0:

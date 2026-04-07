@@ -33,6 +33,25 @@ from ozymandias.core.state_manager import (
 from ozymandias.execution.broker_interface import AccountInfo, MarketHours
 
 
+def _patch_session_both(session):
+    """Patch get_current_session in both orchestrator and trigger_engine.
+
+    Needed because trigger logic was extracted to core/trigger_engine.py but
+    existing tests patch via the orchestrator namespace.
+    """
+    import contextlib
+
+    @contextlib.contextmanager
+    def _ctx():
+        with (
+            patch("ozymandias.core.orchestrator.get_current_session", return_value=session),
+            patch("ozymandias.core.trigger_engine.get_current_session", return_value=session),
+        ):
+            yield
+
+    return _ctx()
+
+
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
@@ -772,8 +791,9 @@ class TestApproachingCloseTrigger:
     # 19:20:00 UTC = 3:20 PM ET — outside the window
     _OUT_WINDOW = datetime(2026, 4, 2, 19, 20, 0, tzinfo=timezone.utc)
 
-    def _patch_session(self, session):
-        return patch("ozymandias.core.orchestrator.get_current_session", return_value=session)
+    @staticmethod
+    def _patch_session(session):
+        return _patch_session_both(session)
 
     @pytest.mark.asyncio
     async def test_fires_once_in_window(self, orch):
@@ -866,8 +886,9 @@ class TestRegimeConditionCooldown:
     # A point in regular hours where time_ceiling won't fire (recent last_call)
     _NOW = datetime(2026, 4, 2, 17, 0, 0, tzinfo=timezone.utc)
 
-    def _patch_session(self, session):
-        return patch("ozymandias.core.orchestrator.get_current_session", return_value=session)
+    @staticmethod
+    def _patch_session(session):
+        return _patch_session_both(session)
 
     def _seed_regime(self, orch, condition="daily_trend == downtrend"):
         """Set a valid_until_condition and matching daily indicator so it evaluates True."""

@@ -113,22 +113,40 @@ class TestEvaluateEntryConditionsPasses:
 
 class TestEvaluateEntryConditionsFails:
     def test_rsi_min_not_met(self):
+        # Within tolerance (3 points gap < 5.0 default) — normal rejection, not auto-drop
+        passed, reason = evaluate_entry_conditions(
+            _conditions(rsi_min=55),
+            _full_signals(rsi=53.0),
+        )
+        assert passed is False
+        assert "rsi" in reason.lower()
+        assert "53" in reason
+
+    def test_rsi_min_calibration_auto_dropped(self):
+        # Far above current RSI (7 points > 5.0 tolerance) — auto-dropped, passes
         passed, reason = evaluate_entry_conditions(
             _conditions(rsi_min=55),
             _full_signals(rsi=48.0),
         )
-        assert passed is False
-        assert "rsi" in reason.lower()
-        assert "48" in reason
+        assert passed is True
 
     def test_rsi_max_exceeded(self):
+        # Within tolerance (4 points gap < 5.0 default) — normal rejection, not auto-drop
+        passed, reason = evaluate_entry_conditions(
+            _conditions(rsi_max=65),
+            _full_signals(rsi=68.0),
+        )
+        assert passed is False
+        assert "rsi" in reason.lower()
+        assert "68" in reason
+
+    def test_rsi_max_calibration_auto_dropped(self):
+        # Far below current RSI (6 points > 5.0 tolerance) — auto-dropped, passes
         passed, reason = evaluate_entry_conditions(
             _conditions(rsi_max=65),
             _full_signals(rsi=71.0),
         )
-        assert passed is False
-        assert "rsi" in reason.lower()
-        assert "71" in reason
+        assert passed is True
 
     def test_require_above_vwap_fails(self):
         passed, reason = evaluate_entry_conditions(
@@ -389,6 +407,46 @@ class TestRsiSlopeMax:
         assert passed is False
         assert "rsi_slope_5" in reason
         assert "unavailable" in reason
+
+
+class TestRsiSlopeAutoCorrect:
+    def test_slope_max_positive_auto_corrected_to_negative(self):
+        # Claude writes 0.5 for a short — auto-corrected to -0.5
+        # Slope is -0.8, which is <= -0.5 → passes
+        passed, _ = evaluate_entry_conditions(
+            _conditions(rsi_slope_max=0.5),
+            _full_signals(rsi_slope_5=-0.8),
+        )
+        assert passed is True
+
+    def test_slope_max_positive_auto_corrected_still_fails(self):
+        # Claude writes 0.5 → corrected to -0.5
+        # Slope is 0.3, which is > -0.5 → still fails
+        passed, reason = evaluate_entry_conditions(
+            _conditions(rsi_slope_max=0.5),
+            _full_signals(rsi_slope_5=0.3),
+        )
+        assert passed is False
+        assert "rsi_slope_max" in reason
+
+    def test_slope_min_negative_auto_corrected_to_positive(self):
+        # Claude writes -0.5 for a long — auto-corrected to 0.5
+        # Slope is 0.8, which is >= 0.5 → passes
+        passed, _ = evaluate_entry_conditions(
+            _conditions(rsi_slope_min=-0.5),
+            _full_signals(rsi_slope_5=0.8),
+        )
+        assert passed is True
+
+    def test_slope_min_negative_auto_corrected_still_fails(self):
+        # Claude writes -0.5 → corrected to 0.5
+        # Slope is 0.2, which is < 0.5 → still fails
+        passed, reason = evaluate_entry_conditions(
+            _conditions(rsi_slope_min=-0.5),
+            _full_signals(rsi_slope_5=0.2),
+        )
+        assert passed is False
+        assert "rsi_slope_min" in reason
 
 
 class TestRequireVolumeTrendBarsMin:

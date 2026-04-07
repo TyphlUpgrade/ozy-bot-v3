@@ -57,6 +57,34 @@ This asks for internal consistency rather than rule compliance, which is a more 
 
 ---
 
+### CONCERN-4: reasoning.txt context-unaware — sends full content regardless of session state
+**Status:** `open`  
+**Severity:** Medium (wasted tokens, unfocused context)
+
+reasoning.txt is always sent in full (~30KB, ~187 lines). Several sections are irrelevant depending on session state: position review instructions when there are no open positions (~15 lines), the swing daily signals block when there are no swing positions (~7 lines), the full entry_conditions reference (available keys, slope/accel calibration, rsi_max rules, ~27 lines, ~580 tokens) when watchlist_tier1 is empty. On a pure position-review cycle these sections are noise that Claude must parse and weight.
+
+**Fix:** Conditional prompt assembly in `_build_reasoning_prompt()`. Already partially done via `{position_review_notice}` — extend it to conditionally include/exclude section blocks based on `open_positions > 0`, `swing_positions > 0`, `len(watchlist_tier1) > 0`. Prompt file gets section delimiters; builder assembles from them. Code change is ~30–40 lines in claude_reasoning.py.
+
+**Do not:** Extract sections into separate files and inject via template placeholders — same token count, just adds indirection with no benefit.
+
+**First observed:** 2026-04-06 reasoning.txt audit
+
+---
+
+### CONCERN-5: Prompt versioning scheme copies entire directory on each bump
+**Status:** `open`  
+**Severity:** Low (maintenance overhead, no runtime cost)
+
+Every prompt version bump copies all 8 files in `config/prompts/`. Between v3.10.1 and v3.10.3, reasoning.txt changed 3 times; the other 7 files are identical across all three versions. The versioned directory scheme made sense when multiple files changed per version — now it creates 7 decorative duplicates per bump and obscures which file actually changed.
+
+**Fix:** Only version reasoning.txt. Move the 7 stable prompts to `config/prompts/` root (unversioned). Config stores `reasoning_prompt_version` only; all other prompts are loaded directly from the root path. Version bumps then touch only the file that changed.
+
+**Precondition:** Do not do this mid-session when other changes are in flight. Clean start, single-purpose session.
+
+**First observed:** 2026-04-06 reasoning.txt audit (Umbra: "29kb, rest are decorative")
+
+---
+
 ## Resolved Concerns
 
 Resolved items are deleted after one session. See `DRIFT_LOG.md` for the permanent record of what was implemented and why.
@@ -64,6 +92,114 @@ Resolved items are deleted after one session. See `DRIFT_LOG.md` for the permane
 ---
 
 ## Engineering Analyses
+
+### 2026-04-06 — Orchestrator Extraction Plan for Parallel Agent Development
+
+**Goal:** Reduce orchestrator.py (5393 lines, 47 methods) to enable safe parallel development by multiple coding agents (OmX/clawhip/OmO workflow).
+
+**Phase 1 — Do now (zero shared-state coupling, proven safe):**
+
+| Extract to | Methods | Lines | Shared state |
+|------------|---------|-------|-------------|
+| `core/trigger_engine.py` | `_check_triggers` + `SlowLoopTriggerState` + `_check_regime_conditions` + `_update_trigger_prices` | ~520 | None |
+| `core/market_context.py` | `_build_market_context` | ~154 | None (pass `_recommendation_outcomes` as param) |
+| `core/fill_handler.py` | `_journal_closed_trade` + `_register_opening_fill` + `_dispatch_confirmed_fill` | ~240 | None |
+
+**Result:** orchestrator drops to ~4480 lines. Three new independently testable/workable modules.
+
+**Phase 2 — After Phase 1 proves the pattern:**
+
+| Extract to | Methods | Lines | Notes |
+|------------|---------|-------|-------|
+| `core/watchlist_manager.py` | `_apply_watchlist_changes` + `_prune_expired_catalysts` + `_regime_reset_build` + `_clear_directional_suppression` + `_run_watchlist_build_task` | ~445 | `_filter_suppressed` coupling in `_clear_directional_suppression` — pass as param |
+| `core/position_manager.py` | `_apply_position_reviews` + `_medium_evaluate_positions` | ~325 | Clean, but wiring from medium/slow loop needs care |
+| `core/quant_overrides.py` | `_fast_step_quant_overrides` + `_place_override_exit` | ~170 | Fast-loop internals, rarely change |
+| `core/position_sync.py` | `_fast_step_position_sync` | ~204 | Fast-loop internals |
+| `core/reconciliation.py` | `startup_reconciliation` | ~302 | `_filter_suppressed`(3) + `_recommendation_outcomes`(1) — pass as params |
+
+**Result:** orchestrator drops to ~3030 lines.
+
+**Do not extract:**
+- `_medium_try_entry` (529 lines) — 8 writes to `_recommendation_outcomes`, 4 to `_entry_defer_counts`, 1 to `_filter_suppressed`. Core entry pipeline, too coupled.
+- `_run_claude_cycle` (512 lines) — 5 writes to `_recommendation_outcomes`, 3 to `_entry_defer_counts`, 2 to `_filter_suppressed`. Core reasoning pipeline, too coupled.
+- Loop bodies (`_fast_loop_cycle`, `_medium_loop_cycle`, `_slow_loop_cycle`) — coordinator methods that call extracted modules. This is the orchestrator's job.
+
+**Parallel work zones after full extraction:**
+
+| Zone | Files | Safe for parallel agents? |
+|------|-------|-----------------------------|
+| TA indicators | `technical_analysis.py` | Yes |
+| Strategies | `strategies/*.py` | Yes |
+| Trigger logic | `core/trigger_engine.py` | Yes |
+| Context building | `core/market_context.py` | Yes |
+| Watchlist mgmt | `core/watchlist_manager.py` | Yes |
+| Fill handling | `core/fill_handler.py` | Yes |
+| Position reviews | `core/position_manager.py` | Yes |
+| Risk manager | `execution/risk_manager.py` | Yes |
+| Broker | `execution/alpaca_broker.py` | Yes |
+| Claude prompts | `config/prompts/` | **Serialize** |
+| Orchestrator core | `core/orchestrator.py` | **Serialize** |
+
+---
+
+### 2026-04-06 — Trade Journal Performance Audit (68 trades, 2026-03-19 to 2026-04-06)
+
+**Overall:** 68 completed trades, 42.6% win rate, +$576.76 / +9.80% total P&L. System is net profitable because average wins (+2.12%) are 1.52x average losses (-1.39%). Best trade: SLB +9.33% (swing/long). Worst: MKC -9.55% (swing/long, stop hit).
+
+**Finding 1: Shorts are a significant drag.**
+9 short trades, 11.1% win rate, -7.75% total P&L. Only one winner (UHS +0.69%). Swing/short is 1/7 (14%), momentum/short is 0/2. The system has no demonstrated edge on the short side. Claude is already citing "0% short win rate" to reject shorts in real-time, but continues proposing them each session.
+
+**Finding 2: The edge is entirely in multi-day swing longs.**
+Trades held 1-3 days: 67% win rate, +14.51%. Trades held 3+ days: 78% win rate, +23.09%. Everything under 24 hours is net negative. Momentum has 5 trades at 20% win rate (-0.80%). The system makes all its money when it holds swing longs for days and loses it on short-duration entries.
+
+**Finding 3: Profit targets are nearly irrelevant.**
+Only 2 of 68 trades (2.9%) hit their profit target. 73.5% of exits are Claude "strategy" exits (+18.22% total from those). Targets may be too ambitious. The 2 target hits produced +12.64% — huge when they land, but 66 other trades never reached them.
+
+**Finding 4: Stop losses are the biggest P&L destroyer.**
+10 stop exits totaled -20.57%. MKC lost 9.55% (stop at $51 was 4.8% below entry for a low-vol consumer staples stock — too wide). LNG lost 3.69% in 45 minutes. XOM lost 3.16% in 130 minutes. Some stops are calibrated for swing hold duration but applied to positions that should have been cut faster.
+
+**Finding 5: 13:00 ET hour is toxic.**
+7 trades entered at 13:00 ET: 14% win rate, -17.14% total P&L. This single hour accounts for nearly all gross losses. Early morning (09:00-10:00) also underperforms. Late afternoon (14:00-15:00) is the strongest window at 60%+ win rate and +20.53% combined.
+
+**Finding 6: Ultra-short holds indicate entry quality problems.**
+15 trades held under 10 minutes, 27% win rate. These are positions entered and immediately reversed — false entries where Claude or quant override killed the position before the thesis had time to play out.
+
+**Finding 7: Prompt v3.10.1 is underperforming — but the v3.6.0 baseline is inflated.**
+42 trades at 38% win rate and -8.26% total P&L. v3.6.0 was 8 trades at 88% win rate and +25.88% — but 96% of v3.6.0's dollar profit came from 4 energy swing longs (HAL, SLB, XLE, CVX) riding a single sector rally over 5-6 days. That's one good macro call, not a structurally superior prompt. Strip the energy cluster and system total P&L drops from +9.80% to roughly +$450 across 60 trades. v3.10.1's underperformance is real (net negative over 42 trades) but the comparison benchmark needs this asterisk.
+
+---
+
+### 2026-04-06 — Session Log Analysis (6 sessions, full trading day)
+
+**Day result:** equity $30,056.46 → $30,020.12 (-$36.34, -0.12%). 3 completed trades (0 wins). 1 position held overnight (WBD long 121 shares @ $27.38, merger arb thesis).
+
+**Completed trades — all losses, all thesis breach exits:**
+
+| Symbol | Dir | Entry | PnL | Duration | Exit Reason |
+|--------|-----|-------|-----|----------|-------------|
+| NKE | short | $43.64 | -0.71% | 59 min | Zacks earnings upside surprise |
+| ALB | short | $172.24 | -0.10% | 3 min | US supply chain initiative headline |
+| TKO | long | $199.66 | -0.48% | 1 min | Daily downtrend deterioration |
+
+**Claude API usage:** 15 Tier-1 reasoning calls (~240K input tokens, ~66K output), 10 position reviews (~13K input, ~1.9K output). All 15 Tier-1 calls exceeded the 60s warning threshold (range 64.8s–111.1s). Cache token logging shows 0 cache_read / 0 cache_create — the prompt restructuring from this session has not yet been deployed to a running bot instance.
+
+**Dead zone behavior:** WBD blocked by dead zone ~20 times across sessions 3-5. Dead zone bypassed once at 12:55 ET when SPY RVOL hit 1.97 (≥ 1.50 threshold). After bypass, WBD entered and filled immediately. The bypass is working as designed. Note: swing entries were still being blocked because `SwingStrategy.dead_zone_exempt` was incorrectly returning `False` (fixed this session — restored to `True`).
+
+**Claude calibration errors observed:**
+- ALB: `rsi_slope_max=0.5` for a short (positive value, must be negative) — blocked 7+ times
+- CTVA: `rsi_max=35` vs RSI 47-48 — entry impossible without massive RSI crash
+- IVZ: `rsi_max=30` vs RSI 44-49 — same calibration error
+- These are the same class of error documented in CONCERN-3
+
+**Post-market order churn:** WING placed/cancelled 7 times (300s timeout each), L placed/cancelled 5 times. Extended hours with thin liquidity — bot kept trying stale limit prices that never filled. No mechanism to detect "this price isn't going to fill in extended hours" and stop trying.
+
+**yfinance mass failure at 20:25Z:** 50+ symbols returned NoneType. TA cycle spiked to 52.3s (normally 2-3s). Auto-recovered in ~2 minutes. Expected behavior after market close.
+
+**RVOL filter drift through the day:** min_rvol started at 1.2 (Claude raised it citing 0% short win rate), drifted to 0.7-0.8 by afternoon as most symbols fell below threshold. Claude is adjusting this filter reactively each call but the adjustments are not persistent — each new reasoning call re-evaluates from scratch, causing oscillation.
+
+**Regime assessment:** Spent entire day in "sector rotation" (confidence 0.58-0.72) with one brief "risk-off panic" from cache at 17:46Z, then settled to "normal" by close.
+
+---
 
 ### 2026-04-02 — Orchestrator God Object: Analysis and Disentanglement Path
 

@@ -490,11 +490,11 @@ class TestWatchlistBuildDecoupling:
 
     @pytest.mark.asyncio
     async def test_watchlist_only_trigger_fires_build_not_reasoning(self, orch):
-        """watchlist_stale alone: ensure_future called, _run_claude_cycle never called."""
+        """watchlist_stale alone: _spawn_background_task called, _run_claude_cycle never called."""
         with patch.object(orch, "_check_triggers", AsyncMock(return_value=["watchlist_stale"])):
             with patch.object(orch, "_run_claude_cycle", AsyncMock()) as mock_reasoning:
                 with patch.object(orch, "_run_watchlist_build_task", AsyncMock()) as mock_build:
-                    with patch("ozymandias.core.orchestrator.asyncio.ensure_future") as mock_ef:
+                    with patch.object(orch, "_spawn_background_task") as mock_ef:
                         await orch._slow_loop_cycle()
 
         mock_reasoning.assert_not_called()
@@ -503,11 +503,11 @@ class TestWatchlistBuildDecoupling:
 
     @pytest.mark.asyncio
     async def test_combined_triggers_fires_both(self, orch):
-        """watchlist_stale + price_move: ensure_future called AND reasoning runs."""
+        """watchlist_stale + price_move: _spawn_background_task called AND reasoning runs."""
         with patch.object(orch, "_check_triggers",
                           AsyncMock(return_value=["watchlist_stale", "price_move"])):
             with patch.object(orch, "_run_claude_cycle", AsyncMock()) as mock_reasoning:
-                with patch("ozymandias.core.orchestrator.asyncio.ensure_future") as mock_ef:
+                with patch.object(orch, "_spawn_background_task") as mock_ef:
                     await orch._slow_loop_cycle()
 
         mock_ef.assert_called_once()
@@ -524,7 +524,7 @@ class TestWatchlistBuildDecoupling:
         with patch.object(orch, "_check_triggers",
                           AsyncMock(return_value=["watchlist_stale", "price_move"])):
             with patch.object(orch, "_run_claude_cycle", AsyncMock()) as mock_reasoning:
-                with patch("ozymandias.core.orchestrator.asyncio.ensure_future") as mock_ef:
+                with patch.object(orch, "_spawn_background_task") as mock_ef:
                     await orch._slow_loop_cycle()
 
         mock_ef.assert_not_called()
@@ -680,10 +680,9 @@ class TestClaudeDegradation:
         orch._claude.run_reasoning_cycle = AsyncMock(return_value=result)
         orch._broker.get_account = AsyncMock(return_value=_stub_account())
 
-        # _run_claude_cycle may fire ensure_future(_run_watchlist_build_task()) on
-        # the success path. Mock it so the background task doesn't outlive the test
-        # and leave unawaited coroutines when the event loop closes.
-        with patch.object(orch, "_run_watchlist_build_task", AsyncMock()):
+        # _run_claude_cycle may fire _spawn_background_task on the success path.
+        # Mock it so no background task outlives the test.
+        with patch.object(orch, "_spawn_background_task"):
             await orch._run_claude_cycle("time_ceiling")
 
         assert orch._degradation.claude_available is True
@@ -3115,7 +3114,7 @@ class TestPhase23WatchlistSeparation:
         with patch.object(orch, "_check_triggers",
                           AsyncMock(return_value=["candidates_exhausted"])):
             with patch.object(orch, "_run_claude_cycle", AsyncMock()) as mock_reasoning:
-                with patch("ozymandias.core.orchestrator.asyncio.ensure_future") as mock_ef:
+                with patch.object(orch, "_spawn_background_task") as mock_ef:
                     await orch._slow_loop_cycle()
 
         mock_reasoning.assert_not_called()
@@ -3129,7 +3128,7 @@ class TestPhase23WatchlistSeparation:
         with patch.object(orch, "_check_triggers",
                           AsyncMock(return_value=["candidates_exhausted"])):
             with patch.object(orch, "_run_claude_cycle", AsyncMock()):
-                with patch("ozymandias.core.orchestrator.asyncio.ensure_future") as mock_ef:
+                with patch.object(orch, "_spawn_background_task") as mock_ef:
                     await orch._slow_loop_cycle()
 
         mock_ef.assert_not_called()
@@ -3146,7 +3145,7 @@ class TestPhase23WatchlistSeparation:
         with patch.object(orch, "_check_triggers",
                           AsyncMock(return_value=["watchlist_stale", "price_move"])):
             with patch.object(orch, "_run_claude_cycle", AsyncMock()) as mock_reasoning:
-                with patch("ozymandias.core.orchestrator.asyncio.ensure_future") as mock_ef:
+                with patch.object(orch, "_spawn_background_task") as mock_ef:
                     await orch._slow_loop_cycle()
 
         mock_ef.assert_called_once()      # build fires
@@ -3160,7 +3159,7 @@ class TestPhase23WatchlistSeparation:
         with patch.object(orch, "_check_triggers",
                           AsyncMock(return_value=["watchlist_stale", "price_move"])):
             with patch.object(orch, "_run_claude_cycle", AsyncMock()) as mock_reasoning:
-                with patch("ozymandias.core.orchestrator.asyncio.ensure_future") as mock_ef:
+                with patch.object(orch, "_spawn_background_task") as mock_ef:
                     await orch._slow_loop_cycle()
 
         mock_ef.assert_called_once()
@@ -3298,7 +3297,7 @@ class TestPhase23WatchlistSeparation:
         orch._post_build_reasoning = mock_post_build
 
         await orch._run_watchlist_build_task()
-        # Give the event loop a tick so ensure_future-scheduled coroutine runs
+        # Give the event loop a tick so _spawn_background_task-scheduled coroutine runs
         await _asyncio.sleep(0)
 
         # Flag must be cleared

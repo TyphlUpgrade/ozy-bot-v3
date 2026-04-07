@@ -146,8 +146,8 @@ def evaluate_entry_conditions(
 
     # rsi_min --------------------------------------------------------------
     # Calibration check: rsi_min set materially above current RSI for a long
-    # can never be satisfied from the current level — flag as miscalibration so
-    # Claude receives a diagnostic rather than a silent stream of defers.
+    # can never be satisfied from the current level — auto-drop the unreachable
+    # condition rather than stalling for 15 defers.
     if "rsi_min" in conditions:
         val = signals.get("rsi")
         if val is None:
@@ -155,18 +155,20 @@ def evaluate_entry_conditions(
         current_rsi = float(val)
         rsi_min_val = float(conditions["rsi_min"])
         if rsi_level_tolerance > 0 and rsi_min_val > current_rsi + rsi_level_tolerance:
-            return False, (
-                f"rsi_min_calibration_error: rsi_min={rsi_min_val} is "
-                f"{rsi_min_val - current_rsi:.1f} points above current RSI {current_rsi:.1f} — "
-                f"use rsi_slope_min to gate on upward momentum instead of waiting for a level"
+            logger.warning(
+                "Auto-dropped rsi_min=%s (%.1f points above current RSI %.1f) — "
+                "condition is unreachable, letting other gates decide",
+                rsi_min_val, rsi_min_val - current_rsi, current_rsi,
             )
-        if current_rsi < rsi_min_val:
+            # Don't return False — skip this condition and let remaining gates decide.
+        elif current_rsi < rsi_min_val:
             return False, f"rsi_min not met: RSI {current_rsi:.1f} < {rsi_min_val:.1f}"
 
     # rsi_max --------------------------------------------------------------
     # Calibration check: rsi_max set materially below current RSI for a short
     # creates a "wait for RSI to fall to X" gate that stalls for many cycles.
-    # Flag as miscalibration so Claude can self-correct on the next cycle.
+    # Auto-drop the condition when it's hopelessly miscalibrated — Claude intended
+    # "RSI should be falling" but expressed it as an unreachable level gate.
     if "rsi_max" in conditions:
         val = signals.get("rsi")
         if val is None:
@@ -174,12 +176,14 @@ def evaluate_entry_conditions(
         current_rsi = float(val)
         rsi_max_val = float(conditions["rsi_max"])
         if rsi_level_tolerance > 0 and current_rsi > rsi_max_val + rsi_level_tolerance:
-            return False, (
-                f"rsi_max_calibration_error: rsi_max={rsi_max_val} is "
-                f"{current_rsi - rsi_max_val:.1f} points below current RSI {current_rsi:.1f} — "
-                f"use rsi_slope_max to gate on downward momentum instead of waiting for a level"
+            logger.warning(
+                "Auto-dropped rsi_max=%s (%.1f points below current RSI %.1f) — "
+                "condition is unreachable, letting other gates decide",
+                rsi_max_val, current_rsi - rsi_max_val, current_rsi,
             )
-        if current_rsi > rsi_max_val:
+            # Don't return False — skip this condition and let remaining gates decide.
+            # This is better than blocking entry 15 times then suppressing the symbol.
+        elif current_rsi > rsi_max_val:
             return False, f"rsi_max exceeded: RSI {current_rsi:.1f} > {rsi_max_val:.1f}"
 
     # rsi_slope_min — longs: RSI must be rising at least this fast ----------
@@ -190,11 +194,13 @@ def evaluate_entry_conditions(
             return False, "signal 'rsi_slope_5' unavailable"
         threshold = float(conditions["rsi_slope_min"])
         if threshold < 0:
+            # Auto-correct: Claude means +X when it writes -X for a long.
+            corrected = abs(threshold)
             logger.warning(
-                "entry_conditions rsi_slope_min=%s is negative (must be positive for longs) — blocking entry",
-                threshold,
+                "Auto-corrected rsi_slope_min %s → %s (must be positive for longs)",
+                threshold, corrected,
             )
-            return False, f"entry_condition rsi_slope_min={threshold} is invalid (must be >= 0)"
+            threshold = corrected
         if float(val) < threshold:
             return False, f"rsi_slope_min not met: rsi_slope_5 {float(val):.2f} < {threshold:.2f}"
 
@@ -206,11 +212,14 @@ def evaluate_entry_conditions(
             return False, "signal 'rsi_slope_5' unavailable"
         threshold = float(conditions["rsi_slope_max"])
         if threshold > 0:
+            # Auto-correct: Claude means -X when it writes X for a short.
+            # The intent is unambiguous — fix it rather than blocking 7+ times.
+            corrected = -abs(threshold)
             logger.warning(
-                "entry_conditions rsi_slope_max=%s is positive (must be negative for shorts) — blocking entry",
-                threshold,
+                "Auto-corrected rsi_slope_max %s → %s (must be negative for shorts)",
+                threshold, corrected,
             )
-            return False, f"entry_condition rsi_slope_max={threshold} is invalid (must be <= 0)"
+            threshold = corrected
         if float(val) > threshold:
             return False, f"rsi_slope_max exceeded: rsi_slope_5 {float(val):.2f} > {threshold:.2f}"
 

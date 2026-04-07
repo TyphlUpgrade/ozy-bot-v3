@@ -839,29 +839,40 @@ class TestCatalystTypeConvictionCap:
 # ---------------------------------------------------------------------------
 
 class TestEntryConditionSlopeSignValidation:
-    """evaluate_entry_conditions rejects invalid slope signs rather than passing."""
+    """evaluate_entry_conditions auto-corrects invalid slope signs."""
 
-    def test_rsi_slope_min_negative_blocks_entry(self):
-        """rsi_slope_min must be >= 0 for longs; a negative value is invalid — block."""
+    def test_rsi_slope_min_negative_auto_corrected(self):
+        """rsi_slope_min=-0.5 auto-corrected to 0.5; slope 1.0 >= 0.5 → passes."""
         from ozymandias.intelligence.opportunity_ranker import evaluate_entry_conditions
-        import logging
         conditions = {"rsi_slope_min": -0.5}
-        signals = {"rsi_slope_5": 1.0}  # would pass the comparison if sign not checked
-        with patch("ozymandias.intelligence.opportunity_ranker.logger") as mock_log:
-            passed, reason = evaluate_entry_conditions(conditions, signals)
+        signals = {"rsi_slope_5": 1.0}
+        passed, reason = evaluate_entry_conditions(conditions, signals)
+        assert passed is True
+
+    def test_rsi_slope_min_negative_auto_corrected_still_fails(self):
+        """rsi_slope_min=-0.5 auto-corrected to 0.5; slope 0.2 < 0.5 → fails."""
+        from ozymandias.intelligence.opportunity_ranker import evaluate_entry_conditions
+        conditions = {"rsi_slope_min": -0.5}
+        signals = {"rsi_slope_5": 0.2}
+        passed, reason = evaluate_entry_conditions(conditions, signals)
         assert passed is False
-        assert "invalid" in reason
         assert "rsi_slope_min" in reason
 
-    def test_rsi_slope_max_positive_blocks_entry(self):
-        """rsi_slope_max must be <= 0 for shorts; a positive value is invalid — block."""
+    def test_rsi_slope_max_positive_auto_corrected(self):
+        """rsi_slope_max=0.3 auto-corrected to -0.3; slope -0.5 <= -0.3 → passes."""
         from ozymandias.intelligence.opportunity_ranker import evaluate_entry_conditions
         conditions = {"rsi_slope_max": 0.3}
-        signals = {"rsi_slope_5": -0.1}  # would pass the comparison if sign not checked
-        with patch("ozymandias.intelligence.opportunity_ranker.logger") as mock_log:
-            passed, reason = evaluate_entry_conditions(conditions, signals)
+        signals = {"rsi_slope_5": -0.5}
+        passed, reason = evaluate_entry_conditions(conditions, signals)
+        assert passed is True
+
+    def test_rsi_slope_max_positive_auto_corrected_still_fails(self):
+        """rsi_slope_max=0.3 auto-corrected to -0.3; slope -0.1 > -0.3 → fails."""
+        from ozymandias.intelligence.opportunity_ranker import evaluate_entry_conditions
+        conditions = {"rsi_slope_max": 0.3}
+        signals = {"rsi_slope_5": -0.1}
+        passed, reason = evaluate_entry_conditions(conditions, signals)
         assert passed is False
-        assert "invalid" in reason
         assert "rsi_slope_max" in reason
 
     def test_rsi_slope_min_zero_passes(self):
@@ -1028,12 +1039,10 @@ class TestRsiLevelCalibrationError:
 
     # --- rsi_max (short) calibration error -----------------------------------
 
-    def test_rsi_max_well_below_current_rsi_is_calibration_error(self):
-        """rsi_max=40 with current RSI=46 (6 pts below, > tolerance 5) → calibration_error."""
+    def test_rsi_max_well_below_current_rsi_is_auto_dropped(self):
+        """rsi_max=40 with current RSI=46 (6 pts below, > tolerance 5) → auto-dropped, passes."""
         passed, reason = self._eval({"rsi_max": 40}, {"rsi": 46})
-        assert passed is False
-        assert "rsi_max_calibration_error" in reason
-        assert "rsi_slope_max" in reason  # diagnostic must suggest the fix
+        assert passed is True
 
     def test_rsi_max_exactly_at_tolerance_boundary_is_standard_check(self):
         """rsi_max=41 with current RSI=46 (5 pts below, == tolerance) → standard exceeded msg."""
@@ -1054,21 +1063,18 @@ class TestRsiLevelCalibrationError:
         passed, _ = self._eval({"rsi_max": 50}, {"rsi": 46})
         assert passed is True
 
-    def test_rsi_max_calibration_error_disabled_when_tolerance_zero(self):
-        """tolerance=0.0 disables the calibration check; standard rsi_max exceeded applies."""
+    def test_rsi_max_calibration_disabled_when_tolerance_zero_still_rejects(self):
+        """tolerance=0.0 disables auto-drop; standard rsi_max exceeded applies."""
         passed, reason = self._eval({"rsi_max": 30}, {"rsi": 60}, tolerance=0.0)
         assert passed is False
-        assert "rsi_max_calibration_error" not in reason
         assert "rsi_max exceeded" in reason
 
     # --- rsi_min (long) calibration error ------------------------------------
 
-    def test_rsi_min_well_above_current_rsi_is_calibration_error(self):
-        """rsi_min=60 with current RSI=52 (8 pts above, > tolerance 5) → calibration_error."""
+    def test_rsi_min_well_above_current_rsi_is_auto_dropped(self):
+        """rsi_min=60 with current RSI=52 (8 pts above, > tolerance 5) → auto-dropped, passes."""
         passed, reason = self._eval({"rsi_min": 60}, {"rsi": 52})
-        assert passed is False
-        assert "rsi_min_calibration_error" in reason
-        assert "rsi_slope_min" in reason  # diagnostic must suggest the fix
+        assert passed is True
 
     def test_rsi_min_exactly_at_tolerance_boundary_is_standard_check(self):
         """rsi_min=57 with current RSI=52 (5 pts above, == tolerance) → standard not-met msg."""
@@ -1089,8 +1095,8 @@ class TestRsiLevelCalibrationError:
         passed, _ = self._eval({"rsi_min": 48}, {"rsi": 52})
         assert passed is True
 
-    def test_rsi_min_calibration_error_disabled_when_tolerance_zero(self):
-        """tolerance=0.0 disables the calibration check; standard rsi_min not-met applies."""
+    def test_rsi_min_calibration_disabled_when_tolerance_zero_still_rejects(self):
+        """tolerance=0.0 disables auto-drop; standard rsi_min not-met applies."""
         passed, reason = self._eval({"rsi_min": 80}, {"rsi": 30}, tolerance=0.0)
         assert passed is False
         assert "rsi_min_calibration_error" not in reason

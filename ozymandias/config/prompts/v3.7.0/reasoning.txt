@@ -16,9 +16,6 @@ CONSTRAINTS IN EFFECT:
   - Stop-loss breach for SHORT positions: current_price has risen above exit_targets.stop_loss → exit.
   - If the stop has not been breached, hold regardless of intraday noise.
 
-CONTEXT:
-{context_json}
-
 INSTRUCTIONS:
 1. Review each open position: is the thesis still intact? Should targets be adjusted? Should we exit? For each position, check intention.direction ("long" or "short") and assess the thesis accordingly — bullish signals for longs, bearish signals for shorts. State the strongest current argument against holding inside updated_reasoning, even if you recommend hold. This must be specific (e.g. "overhead resistance at $312 from March gap-fill") not generic ("market risk").
    When a position has meaningful unrealised gains (visible in current_price vs avg_cost), explicitly assess whether the current stop_loss still reflects the thesis risk — or whether it should be raised to protect a portion of those gains. Raising the stop is appropriate when the primary catalyst has triggered, a key resistance or thesis milestone has been reached, or the gain is large enough that returning to the original entry level would represent a significant missed opportunity. Do not adjust mechanically on every profit — when the thesis has substantial remaining upside and no milestone has been reached, hold with original stops is correct. The decision should be driven by thesis progress, not by price movement alone.
@@ -119,3 +116,6 @@ RESPONSE FORMAT:
 }
 
 Every symbol from watchlist_tier1 that does not appear in new_opportunities must appear here.
+
+CURRENT MARKET CONTEXT:
+{context_json}

@@ -25,6 +25,9 @@ from zoneinfo import ZoneInfo
 
 from ozymandias.core.config import Config, load_config
 from ozymandias.core.direction import EXIT_SIDE, direction_from_action, is_short
+from ozymandias.core.fill_handler import FillHandler
+from ozymandias.core.market_context import MarketContextBuilder
+from ozymandias.core.trigger_engine import SlowLoopTriggerState, TriggerEngine
 from ozymandias.core.logger import setup_logging
 from ozymandias.core.market_hours import Session, get_current_session, get_next_market_open, is_last_five_minutes, is_market_open
 from ozymandias.core.reasoning_cache import ReasoningCache
@@ -208,76 +211,6 @@ class DegradationState:
     BROKER_SAFE_MODE_SECONDS: int = 300  # 5 minutes unreachable → safe mode
 
 
-# ---------------------------------------------------------------------------
-# Slow loop trigger state
-# ---------------------------------------------------------------------------
-
-@dataclass
-class SlowLoopTriggerState:
-    """Tracks state needed to evaluate whether a slow-loop trigger has fired."""
-    last_claude_call_utc: Optional[datetime] = None
-    last_prices: dict[str, float] = field(default_factory=dict)
-    last_override_exit_count: int = 0
-    # Whether a Claude call is currently in-flight (prevents concurrent calls)
-    claude_call_in_flight: bool = False
-    # Track session transitions so we only fire once per transition
-    last_session: Optional[str] = None
-    # Fired once after the first medium loop cycle populates indicators
-    indicators_seeded: bool = False
-    # Unrealised gain pct (as a fraction) at the time of the last profit trigger per symbol.
-    # Trigger fires when gain_pct >= last value + position_profit_trigger_pct.
-    # Updated after each successful Claude call; cleared when a position closes.
-    last_profit_trigger_gain: dict[str, float] = field(default_factory=dict)
-    # monotonic timestamp of the last near_target Claude call per symbol.
-    # Suppresses repeated firing while price stays within the target zone — only
-    # re-fires after near_target_cooldown_sec elapses since last handled review.
-    # Cleared when a position closes.
-    last_near_target_time: dict[str, float] = field(default_factory=dict)
-    # monotonic timestamp of the last near_stop Claude call per symbol.
-    # Mirrors near_target_time — same cooldown (near_target_cooldown_sec) prevents
-    # repeated firing while price oscillates within 1% of the stop level.
-    # Without this, near_stop fires every slow-loop tick (~60s) indefinitely.
-    # Cleared when a position closes.
-    last_near_stop_time: dict[str, float] = field(default_factory=dict)
-    # Phase 17: price baseline anchored to the last successful Claude call (not reset each cycle).
-    # Used by macro_move and sector_move triggers so that sustained index/sector moves always fire
-    # even when last_prices is updated each tick. Separate from last_prices which resets per eval.
-    last_claude_call_prices: dict[str, float] = field(default_factory=dict)
-    # Phase 17: RSI extreme trigger re-arm tracking.
-    # Once fired, the trigger cannot re-fire until RSI recovers by macro_rsi_rearm_band points.
-    rsi_extreme_fired_low: bool = False    # True after panic trigger fires; cleared when RSI recovers above threshold + band
-    rsi_extreme_fired_high: bool = False   # True after euphoria trigger fires; cleared when RSI falls below threshold - band
-    # watchlist_stale trigger: UTC timestamp of the last completed watchlist build.
-    # None at startup → elapsed = ∞ → watchlist_stale fires on the first slow loop tick.
-    # Reset after every successful build (both watchlist_small and watchlist_stale paths).
-    last_watchlist_build_utc: Optional[datetime] = None
-    # Set by the medium loop when every symbol from the current reasoning cache is either
-    # hard-filter suppressed OR already held as an open position. Cleared by _check_triggers
-    # after firing once per cache generation (guarded by last_exhaustion_trigger_utc <
-    # last_claude_call_utc). To add another exhaustion-style trigger: follow this pattern.
-    candidates_exhausted: bool = False
-    last_exhaustion_trigger_utc: Optional[datetime] = None
-    # Set by _handle_claude_failure so that _check_triggers fires a dedicated retry trigger
-    # once the backoff window expires. Without this, a failure when last_claude_call_utc is
-    # set from a restored cache can leave the bot waiting up to slow_loop_max_interval_sec
-    # (60 min) before any trigger fires — because no_previous_call won't fire (the cached
-    # timestamp is not None) and time_ceiling won't fire until 60 min after the cached call.
-    claude_retry_pending: bool = False
-    # ISO date string (YYYY-MM-DD) of the market open for which a pre_market_warmup trigger
-    # has already fired this cycle. Prevents re-firing every slow-loop tick once inside the
-    # warmup window. Cleared implicitly when date advances to the next trading day.
-    last_warmup_session_date: Optional[str] = None
-    # Prevents approaching_close from firing more than once per regular session.
-    # The trigger window is 4 minutes (15:28–15:32 ET) but slow_loop_check_sec is 60s,
-    # so without this flag the trigger fires on every tick within the window.
-    # Cleared when session transitions away from REGULAR_HOURS.
-    approaching_close_fired: bool = False
-    # UTC datetime of the last regime_condition trigger fire. Used to enforce a minimum
-    # cooldown between consecutive regime_condition triggers so that a miscalibrated
-    # valid_until_condition (or a noisy signal) cannot chain-fire every 60 seconds.
-    # None = never fired. Controlled by scheduler.regime_condition_cooldown_min.
-    last_regime_condition_utc: Optional[datetime] = None
-
 
 # ---------------------------------------------------------------------------
 # Orchestrator
@@ -341,7 +274,17 @@ class Orchestrator:
 
         # -- Runtime state ---------------------------------------------------
         self._degradation = DegradationState()
-        self._trigger_state = SlowLoopTriggerState()
+        self._trigger_engine = TriggerEngine(
+            config=self._config,
+            trade_journal=self._trade_journal,
+            sector_map=_SECTOR_MAP,
+        )
+        self._trigger_state = self._trigger_engine.state  # alias for backward compat
+        self._market_context_builder = MarketContextBuilder(
+            config=self._config,
+            context_symbols=_CONTEXT_SYMBOLS,
+            sector_map=_SECTOR_MAP,
+        )
 
         # Intraday highs per symbol — maintained by the fast loop for the
         # ATR trailing stop check.
@@ -510,6 +453,10 @@ class Orchestrator:
         # Shutdown flag — set by _shutdown(), checked by loops
         self._stopping = False
 
+        # Background tasks spawned via _spawn_background_task(). Stored so they
+        # are not garbage-collected mid-flight and can be cancelled on shutdown.
+        self._background_tasks: set[asyncio.Task] = set()
+
         # Dry-run mode — if True, orders are logged but never submitted
         self._dry_run: bool = dry_run
 
@@ -554,6 +501,22 @@ class Orchestrator:
         # needs more time to reset before re-entry is appropriate.
         # Values are time.monotonic() timestamps of the override exit.
         self._override_closed: dict[str, float] = {}
+
+        self._fill_handler = FillHandler(
+            config=self._config,
+            state_manager=self._state_manager,
+            trade_journal=self._trade_journal,
+            trigger_state=self._trigger_state,
+            entry_contexts=self._entry_contexts,
+            pending_intentions=self._pending_intentions,
+            pending_exit_hints=self._pending_exit_hints,
+            recommendation_outcomes=self._recommendation_outcomes,
+            position_entry_times=self._position_entry_times,
+            recently_closed=self._recently_closed,
+            cycle_consumed_symbols=self._cycle_consumed_symbols,
+            override_closed=self._override_closed,
+            latest_indicators=self._latest_indicators,
+        )
 
         log.debug("Orchestrator created (config loaded, modules not yet connected)")
 
@@ -1085,10 +1048,29 @@ class Orchestrator:
     # Shutdown
     # -----------------------------------------------------------------------
 
+    def _spawn_background_task(self, coro) -> asyncio.Task:
+        """Create a fire-and-forget task and track it for proper lifecycle management.
+
+        The task is stored in _background_tasks so it is not garbage-collected
+        mid-flight and can be cancelled cleanly on shutdown. The task removes
+        itself from the set when it completes.
+        """
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
     async def _shutdown(self) -> None:
         """Gracefully stop all loops and persist state."""
         self._stopping = True
         log.info("Shutdown initiated — saving state")
+
+        # Cancel any in-flight background tasks (watchlist builds, regime resets, etc.)
+        for task in list(self._background_tasks):
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            self._background_tasks.clear()
 
         if self._state_manager:
             try:
@@ -1414,247 +1396,16 @@ class Orchestrator:
                 )
 
     async def _dispatch_confirmed_fill(self, change) -> None:
-        """Route a confirmed fill to the correct handler.
-
-        Uses portfolio state to determine intent:
-        - Symbol already has a local position → this is a closing fill → journal it
-        - No local position → this is an opening fill → register the new position
-
-        This is correct for all four cases: long open (buy), long close (sell),
-        short open (sell), short close (buy). Using change.side alone is wrong
-        because sell can mean either short-open or long-close.
-        """
-        try:
-            portfolio = await self._state_manager.load_portfolio()
-        except Exception as exc:
-            log.error("_dispatch_confirmed_fill: failed to load portfolio for %s: %s", change.symbol, exc, exc_info=True)
-            return
-        has_position = any(p.symbol == change.symbol for p in portfolio.positions)
-        if has_position:
-            hint = self._pending_exit_hints.pop(change.symbol, None)
-            await self._journal_closed_trade(change, exit_reason_hint=hint)
-        else:
-            await self._register_opening_fill(change)
-            # Phase 15: mark recommendation as filled on confirmed opening fill.
-            if change.symbol in self._recommendation_outcomes:
-                self._recommendation_outcomes[change.symbol]["stage"] = "filled"
+        """Delegate to FillHandler. See core/fill_handler.py."""
+        await self._fill_handler.dispatch_confirmed_fill(change)
 
     async def _register_opening_fill(self, change) -> None:
-        """Create a local portfolio position when an opening fill is confirmed.
-
-        Called from _dispatch_confirmed_fill for both long opens (buy fill) and
-        short opens (sell fill). Positions are created at the moment of confirmed
-        fill — with the correct quantity, avg fill price, and intention — rather
-        than speculatively from get_positions() which can race against partial fills.
-
-        Shares are always stored as a positive number; direction="short" conveys
-        the sign. This matches how exit order quantity= fields are used throughout.
-        """
-        from ozymandias.core.state_manager import ExitTargets, Position, TradeIntention
-
-        symbol = change.symbol
-        pending = self._pending_intentions.pop(symbol, {})
-
-        # Move signal context into entry_contexts for use when the position closes.
-        # Also generate a stable trade_id here so all journal records for this
-        # trade (open, snapshot, review, close) can be correlated by trade_id.
-        if pending:
-            self._entry_contexts[symbol] = {
-                "trade_id": str(uuid.uuid4()),
-                "signals": pending.pop("_signals", {}),
-                "claude_conviction": pending.pop("_claude_conviction", 0.0),
-                "composite_score": pending.pop("_composite_score", 0.0),
-                "position_size_pct": pending.pop("_position_size_pct", 0.0),
-            }
-
-        try:
-            portfolio = await self._state_manager.load_portfolio()
-        except Exception as exc:
-            log.error("_register_opening_fill: failed to load portfolio for %s: %s", symbol, exc, exc_info=True)
-            return
-
-        # Guard: if position already exists (e.g. duplicate fill event), skip
-        if any(p.symbol == symbol for p in portfolio.positions):
-            log.debug("_register_opening_fill: position for %s already exists — skipping duplicate", symbol)
-            return
-
-        intention = TradeIntention(
-            strategy=pending.get("strategy", "unknown"),
-            direction=pending.get("direction", "long"),
-            reasoning=pending.get("reasoning", ""),
-            exit_targets=ExitTargets(
-                stop_loss=pending.get("stop", 0.0),
-                profit_target=pending.get("target", 0.0),
-            ),
-            # Persist signal context in portfolio.json so it survives bot restarts.
-            # _entry_contexts (in-memory) is populated from these fields at startup.
-            entry_signals=self._entry_contexts.get(symbol, {}).get("signals", {}),
-            entry_conviction=self._entry_contexts.get(symbol, {}).get("claude_conviction", 0.0),
-            entry_score=self._entry_contexts.get(symbol, {}).get("composite_score", 0.0),
-        )
-        entry_date = datetime.now(timezone.utc).isoformat()
-        portfolio.positions.append(Position(
-            symbol=symbol,
-            shares=change.fill_qty,  # always positive; direction field carries the sign
-            avg_cost=change.fill_price if change.fill_price > 0 else 0.0,
-            entry_date=entry_date,
-            intention=intention,
-        ))
-        await self._state_manager.save_portfolio(portfolio)
-        self._position_entry_times[symbol] = time.monotonic()
-        log.info(
-            "Position registered from opening fill: %s  qty=%.2f  avg_cost=%.4f  "
-            "stop=%.4f  target=%.4f  strategy=%s  direction=%s",
-            symbol, change.fill_qty, change.fill_price,
-            pending.get("stop", 0.0), pending.get("target", 0.0),
-            pending.get("strategy", "unknown"), pending.get("direction", "long"),
-        )
-
-        # Write the "open" journal record. Omitted for broker-adopted positions
-        # (pending is empty) because we lack entry context in that case.
-        trade_id = self._entry_contexts.get(symbol, {}).get("trade_id")
-        if trade_id:
-            ctx = self._entry_contexts[symbol]
-            await self._trade_journal.append({
-                "record_type": "open",
-                "trade_id": trade_id,
-                "symbol": symbol,
-                "strategy": pending.get("strategy", "unknown"),
-                "direction": pending.get("direction", "long"),
-                "entry_time": entry_date,
-                "entry_price": change.fill_price if change.fill_price > 0 else 0.0,
-                "shares": change.fill_qty,
-                "stop_price": pending.get("stop", 0.0),
-                "target_price": pending.get("target", 0.0),
-                "signals_at_entry": ctx.get("signals", {}),
-                "claude_conviction": ctx.get("claude_conviction", 0.0),
-                "composite_score": ctx.get("composite_score", 0.0),
-                "position_size_pct": ctx.get("position_size_pct", 0.0),
-                "source": "live",
-                "prompt_version": self._config.claude.prompt_version,
-                "bot_version": self._config.claude.model,
-            })
+        """Delegate to FillHandler. See core/fill_handler.py."""
+        await self._fill_handler.register_opening_fill(change)
 
     async def _journal_closed_trade(self, change, exit_reason_hint: str | None = None) -> None:
-        """Write a trade journal entry and remove the position from the portfolio.
-
-        Called for any closing fill: sell fill (long close) or buy fill (short close).
-        Captures: entry data from portfolio, exit price from broker fill, signal
-        context from _entry_contexts (populated when the opening fill arrived).
-
-        exit_reason_hint, if provided, overrides price-inferred exit reason logic.
-        Set by override/short-exit/EOD paths via _pending_exit_hints.
-        """
-        symbol = change.symbol
-        try:
-            portfolio = await self._state_manager.load_portfolio()
-            position = next((p for p in portfolio.positions if p.symbol == symbol), None)
-            if position is None:
-                log.debug("_journal_closed_trade: no local position for %s — skipping", symbol)
-                return
-
-            entry_price = position.avg_cost
-            exit_price = change.fill_price
-            pos_is_short = is_short(position.intention.direction)
-            if entry_price > 0 and exit_price > 0:
-                if pos_is_short:
-                    pnl_pct = round((entry_price - exit_price) / entry_price * 100, 4)
-                else:
-                    pnl_pct = round((exit_price - entry_price) / entry_price * 100, 4)
-            else:
-                pnl_pct = 0.0
-
-            # Infer exit reason from fill price vs stop/target levels.
-            # Hint from caller (override/short-protection/EOD paths) takes priority.
-            # For shorts: target is below entry (profit when price falls),
-            # stop is above entry (loss when price rises).
-            stop = position.intention.exit_targets.stop_loss
-            target = position.intention.exit_targets.profit_target
-            if exit_reason_hint:
-                exit_reason = exit_reason_hint
-            elif pos_is_short:
-                if exit_price > 0 and target > 0 and exit_price <= target * 1.001:
-                    exit_reason = "target"
-                elif exit_price > 0 and stop > 0 and exit_price >= stop * 0.999:
-                    exit_reason = "stop"
-                else:
-                    exit_reason = "strategy"
-            else:
-                if exit_price > 0 and target > 0 and exit_price >= target * 0.999:
-                    exit_reason = "target"
-                elif exit_price > 0 and stop > 0 and exit_price <= stop * 1.001:
-                    exit_reason = "stop"
-                else:
-                    exit_reason = "strategy"
-
-            ctx = self._entry_contexts.pop(symbol, {})
-            # Capture live TA indicators at exit time for threshold tuning.
-            # These are the fast-loop cached values — same data the override logic uses.
-            signals_at_exit = dict(getattr(self, "_latest_indicators", {}).get(symbol, {}))
-            # Fall back to TradeIntention fields if in-memory context was lost (e.g. restart).
-            signals_at_entry = (
-                ctx.get("signals")
-                or position.intention.entry_signals
-            )
-            claude_conviction = (
-                ctx.get("claude_conviction")
-                or position.intention.entry_conviction
-            )
-            composite_score = (
-                ctx.get("composite_score")
-                or position.intention.entry_score
-            )
-            exit_time = datetime.now(timezone.utc)
-            try:
-                entry_dt = datetime.fromisoformat(position.entry_date)
-                hold_duration_min = round((exit_time - entry_dt).total_seconds() / 60, 1)
-            except Exception:
-                hold_duration_min = None
-            await self._trade_journal.append({
-                "record_type": "close",
-                "trade_id": ctx.get("trade_id"),
-                "symbol": symbol,
-                "strategy": position.intention.strategy,
-                "direction": position.intention.direction,
-                "entry_time": position.entry_date,
-                "exit_time": exit_time.isoformat(),
-                "hold_duration_min": hold_duration_min,
-                "entry_price": entry_price,
-                "exit_price": exit_price,
-                "shares": change.fill_qty,
-                "pnl_pct": pnl_pct,
-                "stop_price": stop,
-                "target_price": target,
-                "exit_reason": exit_reason,
-                "signals_at_entry": signals_at_entry,
-                "signals_at_exit": signals_at_exit or None,
-                "claude_conviction": claude_conviction,
-                "composite_score": composite_score,
-                "position_size_pct": ctx.get("position_size_pct", 0.0),
-                "peak_unrealized_pct": ctx.get("peak_unrealized_pct", 0.0),
-                "source": "live",
-                "prompt_version": self._config.claude.prompt_version,
-                "bot_version": self._config.claude.model,
-            })
-
-            portfolio.positions = [p for p in portfolio.positions if p.symbol != symbol]
-            # Persist close timestamp before saving so _recently_closed survives restarts.
-            now_utc_iso = datetime.now(timezone.utc).isoformat()
-            portfolio.recently_closed[symbol] = now_utc_iso
-            await self._state_manager.save_portfolio(portfolio)
-            self._recently_closed[symbol] = time.monotonic()
-            self._cycle_consumed_symbols.add(symbol)
-            self._position_entry_times.pop(symbol, None)
-            self._trigger_state.last_profit_trigger_gain.pop(symbol, None)
-            self._trigger_state.last_near_target_time.pop(symbol, None)
-            self._trigger_state.last_near_stop_time.pop(symbol, None)
-            self._override_closed.pop(symbol, None)
-            log.info(
-                "Trade closed and journaled: %s  pnl=%.2f%%  exit_reason=%s",
-                symbol, pnl_pct, exit_reason,
-            )
-        except Exception as exc:
-            log.error("_journal_closed_trade failed for %s: %s", symbol, exc, exc_info=True)
+        """Delegate to FillHandler. See core/fill_handler.py."""
+        await self._fill_handler.journal_closed_trade(change, exit_reason_hint=exit_reason_hint)
 
     async def _place_override_exit(self, position, exit_hint: str) -> None:
         """Place a market exit order for a position flagged by a quant override or hard stop.
@@ -2565,7 +2316,7 @@ class Orchestrator:
                             # no signal about which condition was detected and reruns its
                             # prior analysis unchanged.
                             self._thesis_breach_context = _breach.notes
-                            asyncio.ensure_future(
+                            self._spawn_background_task(
                                 self._run_claude_cycle(trigger_name="thesis_breach")
                             )
             except Exception as _exc:
@@ -2978,6 +2729,37 @@ class Orchestrator:
                 else entry_price + 3 * atr_or_pct
             )
 
+        # Stop distance clamp: enforce strategy-specific min/max percentage bounds.
+        # Prevents Claude from setting stops that are absurdly wide (NKE 6.6%) or
+        # ATR from producing stops that are absurdly tight (WBD 0.14% on a squeeze).
+        _strategy_name = top.strategy if hasattr(top, "strategy") else ""
+        _sp = self._config.strategy.strategy_params.get(_strategy_name, {})
+        _stop_min_pct = _sp.get("stop_distance_min_pct", 0.0)
+        _stop_max_pct = _sp.get("stop_distance_max_pct", 0.0)
+        if _stop_min_pct > 0 or _stop_max_pct > 0:
+            _stop_dist_pct = abs(use_stop - entry_price) / entry_price
+            _original_stop = use_stop
+            if _stop_min_pct > 0 and _stop_dist_pct < _stop_min_pct:
+                if is_short(entry_direction):
+                    use_stop = entry_price * (1 + _stop_min_pct)
+                else:
+                    use_stop = entry_price * (1 - _stop_min_pct)
+                log.info(
+                    "Stop clamp (floor): %s stop %.4f → %.4f (%.2f%% < %.1f%% min)",
+                    symbol, _original_stop, use_stop,
+                    _stop_dist_pct * 100, _stop_min_pct * 100,
+                )
+            elif _stop_max_pct > 0 and _stop_dist_pct > _stop_max_pct:
+                if is_short(entry_direction):
+                    use_stop = entry_price * (1 + _stop_max_pct)
+                else:
+                    use_stop = entry_price * (1 - _stop_max_pct)
+                log.info(
+                    "Stop clamp (ceiling): %s stop %.4f → %.4f (%.2f%% > %.1f%% max)",
+                    symbol, _original_stop, use_stop,
+                    _stop_dist_pct * 100, _stop_max_pct * 100,
+                )
+
         # High-conviction market-order strategies use market orders for immediate fills.
         # Below the threshold, or for strategies that require limit entries, use a limit.
         mkt_threshold = self._config.scheduler.market_order_conviction_threshold
@@ -3293,7 +3075,7 @@ class Orchestrator:
         if is_watchlist_build:
             if not self._watchlist_build_in_flight:
                 self._watchlist_build_in_flight = True
-                asyncio.ensure_future(self._run_watchlist_build_task())
+                self._spawn_background_task(self._run_watchlist_build_task())
             else:
                 log.debug("Slow loop: watchlist build already in-flight — build trigger skipped")
 
@@ -3320,626 +3102,41 @@ class Orchestrator:
             self._trigger_state.claude_call_in_flight = False
 
     async def _check_triggers(self, now: datetime | None = None) -> list[str]:
-        """
-        Evaluate all slow-loop trigger conditions.
-        Returns a list of trigger name strings (empty = no trigger).
-
-        ``now`` is injectable for testing; defaults to current UTC time.
-        """
-        triggers: list[str] = []
-        now = now or datetime.now(timezone.utc)
-        ts = self._trigger_state
-
-        # 0a. Retry after failure: _handle_claude_failure sets this flag so the next
-        # slow-loop tick after backoff expiry fires immediately, regardless of whether
-        # last_claude_call_utc (which may be a restored cache timestamp) would otherwise
-        # keep time_ceiling dormant for up to slow_loop_max_interval_sec minutes.
-        if ts.claude_retry_pending:
-            ts.claude_retry_pending = False
-            triggers.append("claude_retry")
-            log.debug("Trigger: claude_retry FIRED (backoff expired after API failure)")
-
-        # 0b. Pre-market warmup: fires once per upcoming market session when the bot
-        # enters the pre_market_warmup_min window before open. Warms the reasoning
-        # cache so fresh Claude candidates are available the moment market opens —
-        # identical effect to a manual 9:25 start regardless of actual bot start time.
-        if self._is_pre_market_warmup():
-            _next_open_date = get_next_market_open().date().isoformat()
-            if ts.last_warmup_session_date != _next_open_date:
-                ts.last_warmup_session_date = _next_open_date
-                triggers.append("pre_market_warmup")
-                _delta = (get_next_market_open().astimezone(timezone.utc) - now).total_seconds() / 60
-                log.info("Trigger: pre_market_warmup FIRED (%.1f min before open)", _delta)
-
-        # 1. Time ceiling: 60+ minutes since last Claude call
-        if ts.last_claude_call_utc is None:
-            triggers.append("no_previous_call")
-            log.debug("Trigger: no_previous_call FIRED (first call)")
-        else:
-            elapsed_min = (now - ts.last_claude_call_utc).total_seconds() / 60
-            if elapsed_min >= self._config.claude.max_reasoning_interval_min:
-                triggers.append("time_ceiling")
-                log.debug(
-                    "Trigger: time_ceiling FIRED  elapsed=%.1fmin threshold=%.1fmin",
-                    elapsed_min, self._config.claude.max_reasoning_interval_min,
-                )
-            else:
-                log.debug(
-                    "Trigger: time_ceiling skip  elapsed=%.1fmin threshold=%.1fmin",
-                    elapsed_min, self._config.claude.max_reasoning_interval_min,
-                )
-
-        # 2. Price move: any Tier 1 symbol, open position, or macro index moved
-        #    beyond threshold since last eval. Threshold read from config
-        #    (slow_loop_price_move_threshold_pct). SPY/QQQ/IWM included for
-        #    macro awareness even though they are not entry candidates.
-        #    Phase 17: uses self._all_indicators (set by medium loop) for a
-        #    single merged lookup across watchlist + context symbols.
-        price_move_threshold = self._config.scheduler.slow_loop_price_move_threshold_pct / 100
-        watchlist = await self._state_manager.load_watchlist()
-        portfolio = await self._state_manager.load_portfolio()
-        tracked = {e.symbol for e in watchlist.entries if e.priority_tier == 1}
-        tracked |= {p.symbol for p in portfolio.positions}
-        tracked |= {"SPY", "QQQ", "IWM"}
-        # Use the medium-loop-cached merged dict; fall back to on-demand merge for
-        # tests or early startup cycles where the medium loop hasn't run yet.
-        all_ind = self._all_indicators or {
-            **self._latest_indicators,
-            **self._market_context_indicators,
-        }
-        for symbol in tracked:
-            current_price = all_ind.get(symbol, {}).get("price")
-            if current_price is None:
-                # Fallback: try nested signals dict (context symbol format differs)
-                sig = all_ind.get(symbol, {}).get("signals", {})
-                current_price = sig.get("price")
-            if current_price is None:
-                continue
-            last_price = ts.last_prices.get(symbol)
-            if last_price and abs(current_price - last_price) / last_price > price_move_threshold:
-                pct_chg = (current_price - last_price) / last_price * 100
-                triggers.append(f"price_move:{symbol}")
-                log.debug(
-                    "Trigger: price_move:%s FIRED  price=%.4f last=%.4f chg=%.2f%% threshold=%.2f%%",
-                    symbol, current_price, last_price, pct_chg, price_move_threshold * 100,
-                )
-
-        # 3. Position approaching target (within 1% of profit target or stop loss)
-        # near_target has a cooldown: once Claude reviews and holds, the trigger is
-        # suppressed for near_target_cooldown_sec to prevent repeated firing while
-        # price oscillates near the target level.
-        position_indicators = self._latest_indicators
-        near_target_cooldown = self._config.scheduler.near_target_cooldown_sec
-        for pos in portfolio.positions:
-            targets = pos.intention.exit_targets
-            current = position_indicators.get(pos.symbol, {}).get("price")
-            if current is None:
-                continue
-            if targets.profit_target > 0:
-                pct_to_target = abs(current - targets.profit_target) / targets.profit_target
-                if pct_to_target <= 0.01:
-                    last_fired = ts.last_near_target_time.get(pos.symbol, 0.0)
-                    if time.monotonic() - last_fired >= near_target_cooldown:
-                        triggers.append(f"near_target:{pos.symbol}")
-                        ts.last_near_target_time[pos.symbol] = time.monotonic()
-                        log.debug(
-                            "Trigger: near_target:%s FIRED  price=%.4f target=%.4f pct_away=%.2f%%",
-                            pos.symbol, current, targets.profit_target, pct_to_target * 100,
-                        )
-                    else:
-                        log.debug(
-                            "Trigger: near_target:%s suppressed (cooldown %.0fs remaining)",
-                            pos.symbol,
-                            near_target_cooldown - (time.monotonic() - last_fired),
-                        )
-            if targets.stop_loss > 0:
-                pct_to_stop = abs(current - targets.stop_loss) / targets.stop_loss
-                if pct_to_stop <= 0.01:
-                    last_fired = ts.last_near_stop_time.get(pos.symbol, 0.0)
-                    if time.monotonic() - last_fired >= near_target_cooldown:
-                        triggers.append(f"near_stop:{pos.symbol}")
-                        ts.last_near_stop_time[pos.symbol] = time.monotonic()
-                        log.debug(
-                            "Trigger: near_stop:%s FIRED  price=%.4f stop=%.4f pct_away=%.2f%%",
-                            pos.symbol, current, targets.stop_loss, pct_to_stop * 100,
-                        )
-                    else:
-                        log.debug(
-                            "Trigger: near_stop:%s suppressed (cooldown %.0fs remaining)",
-                            pos.symbol,
-                            near_target_cooldown - (time.monotonic() - last_fired),
-                        )
-
-        # 4. Override exit occurred since last Claude call
-        if self._override_exit_count > ts.last_override_exit_count:
-            triggers.append("override_exit")
-            log.debug(
-                "Trigger: override_exit FIRED  count=%d last_seen=%d",
-                self._override_exit_count, ts.last_override_exit_count,
-            )
-
-        # 4b. Open position has reached a meaningful unrealised gain.
-        # Fires when gain_pct crosses the configured threshold, then re-arms each time
-        # gain grows by another full interval — gives Claude a chance to tighten the
-        # stop progressively as the position moves in our favour.
-        # Direction-aware: shorts profit when price falls below avg_cost.
-        profit_threshold = self._config.scheduler.position_profit_trigger_pct
-        for pos in portfolio.positions:
-            current = position_indicators.get(pos.symbol, {}).get("price")
-            if current is None or pos.avg_cost <= 0:
-                continue
-            if is_short(pos.intention.direction):
-                gain_pct = (pos.avg_cost - current) / pos.avg_cost
-            else:
-                gain_pct = (current - pos.avg_cost) / pos.avg_cost
-            # Always update peak unrealized — even when below the trigger threshold.
-            ctx = self._entry_contexts.setdefault(pos.symbol, {})
-            prev_peak = ctx.get("peak_unrealized_pct", 0.0)
-            if gain_pct * 100 > prev_peak:
-                ctx["peak_unrealized_pct"] = round(gain_pct * 100, 4)
-
-            if gain_pct < profit_threshold:
-                continue
-            last_trigger = ts.last_profit_trigger_gain.get(pos.symbol, 0.0)
-            if gain_pct >= last_trigger + profit_threshold:
-                triggers.append(f"position_in_profit:{pos.symbol}")
-                log.debug(
-                    "Trigger: position_in_profit:%s FIRED  gain=%.2f%% last_trigger=%.2f%% interval=%.2f%%",
-                    pos.symbol, gain_pct * 100, last_trigger * 100, profit_threshold * 100,
-                )
-                await self._trade_journal.append({
-                    "record_type": "snapshot",
-                    "trade_id": self._entry_contexts.get(pos.symbol, {}).get("trade_id"),
-                    "symbol": pos.symbol,
-                    "trigger": "position_in_profit",
-                    "unrealized_pnl_pct": round(gain_pct * 100, 4),
-                    "peak_unrealized_pct": ctx.get("peak_unrealized_pct", round(gain_pct * 100, 4)),
-                    "current_price": current,
-                    "stop_price": pos.intention.exit_targets.stop_loss,
-                    "target_price": pos.intention.exit_targets.profit_target,
-                    "strategy": pos.intention.strategy,
-                    "direction": pos.intention.direction,
-                    "source": "live",
-                    "prompt_version": self._config.claude.prompt_version,
-                    "bot_version": self._config.claude.model,
-                })
-
-        # 5. Market session transition (open at 9:30 ET, approaching close at 3:30 ET)
-        current_session = get_current_session()
-        last_session = ts.last_session
-        if last_session != current_session.value:
-            if current_session == Session.REGULAR_HOURS:
-                triggers.append("session_open")
-                ts.approaching_close_fired = False  # re-arm for the new session
-                log.debug("Trigger: session_open FIRED  prev_session=%s", last_session)
-            elif current_session == Session.POST_MARKET and last_session == Session.REGULAR_HOURS:
-                triggers.append("session_close")
-                ts.approaching_close_fired = False  # clear for next day
-                log.debug("Trigger: session_close FIRED")
-            # Always update last_session regardless of whether we fire
-            ts.last_session = current_session.value
-
-        # Also fire once ~30 min before close (3:28–3:32 PM ET) while still in regular hours.
-        # approaching_close_fired ensures this fires exactly once per session regardless of
-        # how many slow-loop ticks fall inside the 4-minute window.
-        if current_session == Session.REGULAR_HOURS and not ts.approaching_close_fired:
-            from datetime import time as _time
-            from zoneinfo import ZoneInfo as _ZI
-            et = now.astimezone(_ZI("America/New_York"))
-            if _time(15, 28) <= et.time() <= _time(15, 32):
-                if "session_open" not in triggers and "time_ceiling" not in triggers:
-                    triggers.append("approaching_close")
-                    ts.approaching_close_fired = True
-                    log.debug("Trigger: approaching_close FIRED")
-
-        # 6. Watchlist critically small
-        if len(watchlist.entries) < 10:
-            triggers.append("watchlist_small")
-            log.debug("Trigger: watchlist_small FIRED  size=%d", len(watchlist.entries))
-
-        # 6b. Watchlist stale — periodic proactive refresh.
-        # Fires when enough time has elapsed since the last watchlist build (both
-        # watchlist_small and watchlist_stale paths update last_watchlist_build_utc).
-        # interval_min = 0 disables this trigger entirely (no overhead).
-        # To add a new time-based watchlist trigger: add an entry here and route it
-        # through the is_watchlist_build check in _slow_loop_cycle.
-        interval_min = self._config.scheduler.watchlist_refresh_interval_min
-        if interval_min > 0:
-            last_build = ts.last_watchlist_build_utc
-            elapsed_min = (
-                (now - last_build).total_seconds() / 60
-                if last_build is not None
-                else float("inf")  # never built → fire immediately on first tick
-            )
-            if elapsed_min >= interval_min:
-                triggers.append("watchlist_stale")
-                log.debug(
-                    "Trigger: watchlist_stale FIRED  elapsed_min=%.1f  interval=%d",
-                    elapsed_min, interval_min,
-                )
-
-        # 7. Indicators seeded for the first time — fire once after the first medium
-        #    loop cycle so Claude always has real TA data on its first call.
-        if not ts.indicators_seeded and self._all_indicators:
-            triggers.append("indicators_ready")
-            ts.indicators_seeded = True
-            # Phase 17: seed last_claude_call_prices from the current snapshot so that
-            # macro_move / sector_move have a valid baseline from the first call forward.
-            for sym, ind in all_ind.items():
-                price = ind.get("price") or ind.get("signals", {}).get("price")
-                if price is not None:
-                    ts.last_claude_call_prices[sym] = price
-
-        # Phase 17 (Fix 2): Macro move trigger --------------------------------
-        # Fires when any SPY/QQQ/IWM index moves beyond macro_move_trigger_pct (1%)
-        # from its price at the time of the last Claude call. Uses a separate
-        # last_claude_call_prices baseline (not last_prices, which resets each tick)
-        # so sustained intraday moves always fire even when last_prices catches up.
-        if ts.last_claude_call_prices:
-            macro_move_threshold = self._config.scheduler.macro_move_trigger_pct / 100
-            for sym in self._config.scheduler.macro_move_symbols:
-                ind = all_ind.get(sym, {})
-                current_price = ind.get("price") or ind.get("signals", {}).get("price")
-                if current_price is None:
-                    continue
-                baseline = ts.last_claude_call_prices.get(sym)
-                if baseline:
-                    pct_chg = (current_price - baseline) / baseline * 100
-                    if abs(pct_chg) / 100 > macro_move_threshold:
-                        triggers.append(f"market_move:{sym}")
-                        log.debug(
-                            "Trigger: market_move:%s FIRED  price=%.4f baseline=%.4f chg=%.2f%% threshold=%.2f%%",
-                            sym, current_price, baseline, pct_chg, macro_move_threshold * 100,
-                        )
-                    else:
-                        log.debug(
-                            "Trigger: market_move:%s skip  chg=%.2f%% threshold=%.2f%%",
-                            sym, pct_chg, macro_move_threshold * 100,
-                        )
-
-        # Phase 17 (Fix 2): Sector move trigger --------------------------------
-        # Fires when a sector ETF moves beyond sector_move_trigger_pct (1.5%) from its
-        # price at the last Claude call. When the portfolio has open exposure to a sector
-        # (i.e. we hold a position in a symbol that maps to that ETF), the threshold is
-        # tightened by sector_exposure_threshold_factor (0.7 → 1.05% instead of 1.5%).
-        if ts.last_claude_call_prices:
-            sector_move_threshold = self._config.scheduler.sector_move_trigger_pct / 100
-            sector_factor = self._config.scheduler.sector_exposure_threshold_factor
-            # Determine which sector ETFs the portfolio has exposure to.
-            # _SECTOR_MAP[symbol] → sector ETF. Symbols absent from the map degrade
-            # gracefully (base threshold used, not tightened threshold).
-            exposed_sectors = {
-                _SECTOR_MAP[pos.symbol]
-                for pos in portfolio.positions
-                if pos.symbol in _SECTOR_MAP
-            }
-            for etf in _CONTEXT_SECTOR_ETFS:
-                # Skip if this ETF is a held position — price_move already covers it.
-                if etf in {pos.symbol for pos in portfolio.positions}:
-                    continue
-                ind = all_ind.get(etf, {})
-                current_price = ind.get("price") or ind.get("signals", {}).get("price")
-                if current_price is None:
-                    continue
-                baseline = ts.last_claude_call_prices.get(etf)
-                if not baseline:
-                    continue
-                threshold = (
-                    sector_move_threshold * sector_factor
-                    if etf in exposed_sectors
-                    else sector_move_threshold
-                )
-                pct_chg = (current_price - baseline) / baseline * 100
-                if abs(pct_chg) / 100 > threshold:
-                    triggers.append(f"sector_move:{etf}")
-                    log.debug(
-                        "Trigger: sector_move:%s FIRED  price=%.4f baseline=%.4f chg=%.2f%% "
-                        "threshold=%.2f%% exposed=%s",
-                        etf, current_price, baseline, pct_chg, threshold * 100,
-                        etf in exposed_sectors,
-                    )
-                else:
-                    log.debug(
-                        "Trigger: sector_move:%s skip  chg=%.2f%% threshold=%.2f%% exposed=%s",
-                        etf, pct_chg, threshold * 100, etf in exposed_sectors,
-                    )
-
-        # Phase 17 (Fix 2): Market RSI extreme trigger -------------------------
-        # Fires when SPY RSI crosses into panic (< macro_rsi_panic_threshold) or
-        # euphoria (> macro_rsi_euphoria_threshold) territory. Re-arm band prevents
-        # rapid re-firing: once triggered, RSI must recover by macro_rsi_rearm_band
-        # points before the trigger can fire again.
-        # Note: the TA module key is "rsi" (not "rsi_14" as spec draft said).
-        spy_sig = all_ind.get("SPY", {})
-        spy_rsi = (spy_sig.get("signals") or spy_sig).get("rsi")
-        if spy_rsi is not None:
-            cfg_s = self._config.scheduler
-            # Panic (low RSI): market selloff
-            if spy_rsi < cfg_s.macro_rsi_panic_threshold and not ts.rsi_extreme_fired_low:
-                triggers.append("market_rsi_extreme")
-                ts.rsi_extreme_fired_low = True
-                log.debug(
-                    "Trigger: market_rsi_extreme FIRED (panic)  spy_rsi=%.1f threshold=%.1f",
-                    spy_rsi, cfg_s.macro_rsi_panic_threshold,
-                )
-            elif spy_rsi > cfg_s.macro_rsi_panic_threshold + cfg_s.macro_rsi_rearm_band:
-                if ts.rsi_extreme_fired_low:
-                    log.debug(
-                        "Trigger: market_rsi_extreme re-armed (panic)  spy_rsi=%.1f", spy_rsi,
-                    )
-                ts.rsi_extreme_fired_low = False  # re-arm when RSI recovers
-            # Euphoria (high RSI): market overheating
-            if spy_rsi > cfg_s.macro_rsi_euphoria_threshold and not ts.rsi_extreme_fired_high:
-                triggers.append("market_rsi_extreme")
-                ts.rsi_extreme_fired_high = True
-                log.debug(
-                    "Trigger: market_rsi_extreme FIRED (euphoria)  spy_rsi=%.1f threshold=%.1f",
-                    spy_rsi, cfg_s.macro_rsi_euphoria_threshold,
-                )
-            elif spy_rsi < cfg_s.macro_rsi_euphoria_threshold - cfg_s.macro_rsi_rearm_band:
-                if ts.rsi_extreme_fired_high:
-                    log.debug(
-                        "Trigger: market_rsi_extreme re-armed (euphoria)  spy_rsi=%.1f", spy_rsi,
-                    )
-                ts.rsi_extreme_fired_high = False  # re-arm when RSI normalises
-        else:
-            log.debug("Trigger: market_rsi_extreme skip — SPY RSI unavailable")
-
-        # 9. Candidates exhausted — all current Claude recommendations suppressed.
-        # Fires at most once per reasoning cache generation: guarded by
-        # last_exhaustion_trigger_utc so a new reasoning cycle must complete before
-        # this can fire again (prevents rapid-fire if the new cycle also produces
-        # immediately-suppressable candidates).
-        if ts.candidates_exhausted:
-            last_exhausted = ts.last_exhaustion_trigger_utc
-            last_call = ts.last_claude_call_utc
-            already_fired_this_generation = (
-                last_exhausted is not None
-                and last_call is not None
-                and last_exhausted >= last_call
-            )
-            if not already_fired_this_generation:
-                triggers.append("candidates_exhausted")
-                ts.candidates_exhausted = False
-                ts.last_exhaustion_trigger_utc = now
-                log.debug("Trigger: candidates_exhausted FIRED")
-
-        # Phase 19: regime condition trigger — check valid_until_conditions from last
-        # Sonnet regime_assessment. When a condition is met, fire a fresh reasoning cycle.
-        # _run_claude_cycle uses skip_cache=True so no explicit cache expiry needed.
-        # Cooldown prevents chain-firing when a condition is miscalibrated (already met) or
-        # the signal oscillates. Mirrors the approaching_close_fired guard pattern.
-        _regime_cooldown_sec = self._config.scheduler.regime_condition_cooldown_min * 60
-        _regime_elapsed = (
-            (now - ts.last_regime_condition_utc).total_seconds()
-            if ts.last_regime_condition_utc else float("inf")
+        """Delegate to TriggerEngine. See core/trigger_engine.py."""
+        return await self._trigger_engine.check_triggers(
+            all_indicators=self._all_indicators,
+            latest_indicators=self._latest_indicators,
+            market_context_indicators=self._market_context_indicators,
+            override_exit_count=self._override_exit_count,
+            last_regime_assessment=self._last_regime_assessment,
+            daily_indicators=self._daily_indicators,
+            entry_contexts=self._entry_contexts,
+            state_manager=self._state_manager,
+            is_pre_market_warmup=self._is_pre_market_warmup(),
+            now=now,
         )
-        if self._check_regime_conditions():
-            if _regime_elapsed >= _regime_cooldown_sec:
-                triggers.append("regime_condition")
-                ts.last_regime_condition_utc = now
-                log.debug("Trigger: regime_condition FIRED  elapsed=%.0fs", _regime_elapsed)
-            else:
-                log.debug(
-                    "Trigger: regime_condition suppressed — cooldown %.0fs remaining",
-                    _regime_cooldown_sec - _regime_elapsed,
-                )
-
-        return triggers
 
     def _check_regime_conditions(self) -> bool:
-        """Phase 19: check regime_assessment.valid_until_conditions against live indicators.
-
-        Returns True if any condition is now met — caller should append
-        "regime_condition" to the trigger list, which causes a fresh reasoning call
-        (_run_claude_cycle already uses skip_cache=True, so no explicit expiry needed).
-
-        Conditions are parsed via simple regex — not LLM evaluation.
-        Unknown condition formats are logged at DEBUG and ignored.
-
-        Supported formats:
-          "SPY daily RSI > N"  / "SPY daily RSI < N"
-          "daily_trend == uptrend"  / "daily_trend == downtrend"
-
-        To add a new condition key: add a branch below and update Phase 19 prompt docs.
-        """
-        if not self._last_regime_assessment:
-            return False
-        conditions = self._last_regime_assessment.get("valid_until_conditions")
-        if not conditions or not isinstance(conditions, list):
-            return False
-
-        spy_daily = self._daily_indicators.get("SPY", {})
-        spy_rsi_daily = spy_daily.get("rsi_14d")
-        spy_trend_daily = spy_daily.get("daily_trend")
-
-        for cond in conditions:
-            if not isinstance(cond, str):
-                continue
-            triggered = False
-            # "SPY daily RSI > N"
-            m = re.match(r"SPY daily RSI\s*>\s*(\d+(?:\.\d+)?)", cond, re.IGNORECASE)
-            if m and spy_rsi_daily is not None:
-                triggered = float(spy_rsi_daily) > float(m.group(1))
-            # "SPY daily RSI < N"
-            m = re.match(r"SPY daily RSI\s*<\s*(\d+(?:\.\d+)?)", cond, re.IGNORECASE)
-            if m and spy_rsi_daily is not None:
-                triggered = float(spy_rsi_daily) < float(m.group(1))
-            # "daily_trend == uptrend" / "daily_trend == downtrend"
-            m = re.match(r"daily_trend\s*==\s*(\w+)", cond, re.IGNORECASE)
-            if m and spy_trend_daily is not None:
-                triggered = spy_trend_daily.lower() == m.group(1).lower()
-
-            if triggered:
-                log.info("Regime condition met — triggering fresh reasoning: %s", cond)
-                return True
-            else:
-                log.debug("Regime condition not yet met: %s", cond)
-        return False
+        """Delegate to TriggerEngine. See core/trigger_engine.py."""
+        return self._trigger_engine.check_regime_conditions(
+            last_regime_assessment=self._last_regime_assessment,
+            daily_indicators=self._daily_indicators,
+        )
 
     async def _update_trigger_prices(self) -> None:
-        """Snapshot current prices into last_prices for next trigger comparison."""
-        # Phase 17: use self._all_indicators (already merged by medium loop).
-        for symbol, ind in self._all_indicators.items():
-            price = ind.get("price")
-            if price is None:
-                price = ind.get("signals", {}).get("price")
-            if price is not None:
-                self._trigger_state.last_prices[symbol] = price
+        """Delegate to TriggerEngine. See core/trigger_engine.py."""
+        self._trigger_engine.update_trigger_prices(self._all_indicators)
 
     async def _build_market_context(self, acct, pdt_remaining: int) -> dict:
-        """
-        Build the market_data context dict for Claude reasoning calls.
-
-        Derives macro trend summary from _market_context_indicators (populated
-        each medium cycle) and fetches tier-1 watchlist news concurrently.
-        """
-        ctx = self._market_context_indicators
-
-        def _classify_trend(sym: str) -> str:
-            """Map a context symbol's TA signals to a simple trend label."""
-            signals = ctx.get(sym, {}).get("signals", {})
-            ts   = signals.get("trend_structure", "")
-            vwap = signals.get("vwap_position", "")
-            if ts == "bullish_aligned" and vwap in ("above", "at"):
-                return "bullish"
-            if ts == "bearish_aligned" and vwap in ("below", "at"):
-                return "bearish"
-            if ts or vwap:
-                return "mixed"
-            return "unknown"
-
-        spy_rsi = ctx.get("SPY", {}).get("signals", {}).get("rsi")
-
-        bullish_count = sum(
-            1 for sym in _CONTEXT_SYMBOLS
-            if ctx.get(sym, {}).get("signals", {}).get("trend_structure") == "bullish_aligned"
+        """Delegate to MarketContextBuilder. See core/market_context.py."""
+        return await self._market_context_builder.build(
+            acct, pdt_remaining,
+            market_context_indicators=self._market_context_indicators,
+            daily_indicators=self._daily_indicators,
+            recommendation_outcomes=self._recommendation_outcomes,
+            state_manager=self._state_manager,
+            data_adapter=self._data_adapter,
         )
-        market_breadth = f"{bullish_count}/{len(_CONTEXT_SYMBOLS)} context instruments bullish-aligned"
-
-        _SECTOR_ETF_NAMES = {
-            "XLK": "Technology",
-            "XLF": "Financials",
-            "XLE": "Energy",
-            "XLV": "Healthcare",
-            "XLI": "Industrials",
-            "XLY": "Consumer Discretionary",
-            "XLC": "Communication Services",
-            "ITA": "Aerospace & Defense",
-            "XBI": "Biotechnology",
-        }
-        sector_performance = []
-        for etf, sector in _SECTOR_ETF_NAMES.items():
-            ind = ctx.get(etf)
-            if not ind:
-                continue
-            # Sort sectors by best directional score — max(long_score, short_score) gives
-            # a regime-neutral strength signal for ranking sectors without direction bias.
-            _sort_score = max(ind.get("long_score", 0.0), ind.get("short_score", 0.0))
-            sector_performance.append({
-                "sector":          sector,
-                "etf":             etf,
-                "trend":           ind.get("signals", {}).get("trend_structure", "unknown"),
-                "long_score":      round(ind.get("long_score",  0.0), 3),
-                "short_score":     round(ind.get("short_score", 0.0), 3),
-                "_sort_score":     _sort_score,
-            })
-        sector_performance.sort(key=lambda x: x.pop("_sort_score"), reverse=True)
-
-        # Fetch news for tier-1 watchlist symbols + macro instruments (SPY, QQQ) concurrently.
-        # Macro news gives Sonnet narrative context for *why* broad market indicators are moving
-        # (tariff shocks, Fed surprises, geopolitical events) — the per-symbol feed won't carry this.
-        watchlist = await self._state_manager.load_watchlist()
-        tier1 = [e.symbol for e in watchlist.entries if e.priority_tier == 1]
-        max_items = self._config.claude.news_max_items_per_symbol
-        max_age = self._config.claude.news_max_age_hours
-        macro_news_items = self._config.claude.macro_news_max_items  # tighter cap for broad-market symbols
-        _MACRO_NEWS_SYMBOLS = ["SPY", "QQQ"]
-        all_fetch_syms = tier1 + _MACRO_NEWS_SYMBOLS
-        all_news_results = await asyncio.gather(
-            *[
-                self._data_adapter.fetch_news(
-                    s,
-                    max_items=(macro_news_items if s in _MACRO_NEWS_SYMBOLS else max_items),
-                    max_age_hours=max_age,
-                )
-                for s in all_fetch_syms
-            ],
-            return_exceptions=True,
-        )
-        watchlist_news: dict[str, list] = {}
-        macro_news: dict[str, list] = {}
-        for sym, result in zip(all_fetch_syms, all_news_results):
-            if isinstance(result, Exception):
-                continue
-            if not result:
-                continue
-            if sym in _MACRO_NEWS_SYMBOLS:
-                macro_news[sym] = result
-            else:
-                watchlist_news[sym] = result
-
-        market_ctx: dict = {
-            "spy_trend":         _classify_trend("SPY"),
-            "spy_rsi":           spy_rsi,
-            "qqq_trend":         _classify_trend("QQQ"),
-            "market_breadth":    market_breadth,
-            "sector_performance": sector_performance,
-            "macro_news":        macro_news,
-            "watchlist_news":    watchlist_news,
-            "trading_session":   get_current_session().value,
-            "pdt_trades_remaining": max(0, pdt_remaining),
-            "account_equity":    acct.equity,
-            "buying_power":      acct.buying_power,
-            # Active strategies from config — Claude must only recommend strategies in this list.
-            "active_strategies": self._config.strategy.active_strategies,
-        }
-
-        # Daily-bar macro regime context — added when _daily_indicators is populated.
-        # These are daily signals for SPY/QQQ; useful for multi-day swing thesis evaluation.
-        # spy_rsi above remains the intraday 5-min signal; spy_daily.rsi_14d is the daily view.
-        _spy_daily = self._daily_indicators.get("SPY")
-        if _spy_daily:
-            market_ctx["spy_daily"] = {
-                "rsi_14d":       _spy_daily.get("rsi_14d"),
-                "daily_trend":   _spy_daily.get("daily_trend"),
-                "roc_5d":        _spy_daily.get("roc_5d"),
-                "ema20_vs_ema50": _spy_daily.get("ema20_vs_ema50"),
-            }
-        _qqq_daily = self._daily_indicators.get("QQQ")
-        if _qqq_daily:
-            market_ctx["qqq_daily"] = {
-                "rsi_14d":     _qqq_daily.get("rsi_14d"),
-                "daily_trend": _qqq_daily.get("daily_trend"),
-            }
-
-        # Phase 19: sector_dispersion — relative performance of watchlist symbols vs sector ETF
-        _sector_dispersion = compute_sector_dispersion(
-            watchlist.entries,
-            _SECTOR_MAP,
-            self._daily_indicators,
-        )
-        if _sector_dispersion:
-            market_ctx["sector_dispersion"] = _sector_dispersion
-
-        # Phase 19: recent_rejections — per-symbol hard-filter failure counts from this session
-        # Shows Claude which candidates the quant system keeps blocking and why.
-        _rejections = [
-            {
-                "symbol": sym,
-                "reason": data["stage_detail"],
-                "cycles_rejected": data["rejection_count"],
-                **({"strategy": data["strategy"]} if data.get("strategy") else {}),
-            }
-            for sym, data in self._recommendation_outcomes.items()
-            if data.get("rejection_count", 0) >= 1 and data.get("stage_detail")
-        ]
-        if _rejections:
-            market_ctx["recent_rejections"] = sorted(
-                _rejections, key=lambda x: x["cycles_rejected"], reverse=True
-            )[:10]
-
-        return market_ctx
 
     async def _run_claude_cycle(self, trigger_name: str) -> None:
         """
@@ -4264,7 +3461,7 @@ class Orchestrator:
             )
             # Evict conflicting entries and rebuild with fresh names.
             # Fire async and do not await (rebuild runs in background after this cycle).
-            asyncio.ensure_future(
+            self._spawn_background_task(
                 self._regime_reset_build(
                     prev_sector_regimes=_prev_sector_regimes,
                     new_sector_regimes=result.sector_regimes,
@@ -4740,7 +3937,7 @@ class Orchestrator:
                     log.info(
                         "Watchlist build: new candidates available — firing post-build reasoning"
                     )
-                    asyncio.ensure_future(self._post_build_reasoning("post_build_candidates"))
+                    self._spawn_background_task(self._post_build_reasoning("post_build_candidates"))
                 else:
                     log.info(
                         "Watchlist build: no new candidates added — skipping post-build reasoning"
