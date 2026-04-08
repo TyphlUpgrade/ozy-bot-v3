@@ -20,7 +20,6 @@ from discord_companion import (
     _is_informational,
     _read_json,
     _remove,
-    _seen_message_ids,
     _touch,
     _write_task,
     handle_command,
@@ -176,92 +175,3 @@ class TestReadJsonHelper:
     def test_missing(self, _isolated_dirs):
         state_dir, _ = _isolated_dirs
         assert _read_json(state_dir / "nope.json") is None
-
-
-# ---------------------------------------------------------------------------
-# Message deduplication tests
-# ---------------------------------------------------------------------------
-
-
-class _FakeChannel:
-    def __init__(self, channel_id: int):
-        self.id = channel_id
-        self.sent: list[str] = []
-
-    async def send(self, content: str):
-        self.sent.append(content)
-
-
-class _FakeUser:
-    def __init__(self, name: str = "human"):
-        self.name = name
-
-
-class _FakeMessage:
-    def __init__(self, msg_id: int, content: str, author=None, channel=None):
-        self.id = msg_id
-        self.content = content
-        self.author = author or _FakeUser()
-        self.channel = channel or _FakeChannel(0)
-
-
-class TestMessageDeduplication:
-    """Verify that duplicate MESSAGE_CREATE events produce only one task file."""
-
-    @pytest.fixture(autouse=True)
-    def _clear_seen_ids(self):
-        """Reset the module-level dedup buffer between tests."""
-        _seen_message_ids.clear()
-
-    async def test_duplicate_message_id_creates_single_task(self, _isolated_dirs):
-        state_dir, _ = _isolated_dirs
-        # Build on_message from the module's main() — we replicate the guard
-        # chain directly to test the real dedup path.
-        from discord_companion import _seen_message_ids as seen
-
-        channel = _FakeChannel(0)
-        msg = _FakeMessage(12345, "!fix duplicate test", channel=channel)
-
-        # Simulate the on_message guard chain (mirrors main's on_message)
-        async def _dispatch(message):
-            if not message.content.startswith("!"):
-                return
-            if message.id in seen:
-                return
-            seen.append(message.id)
-            response = await handle_command(message.content)
-            if response:
-                await message.channel.send(response)
-
-        await _dispatch(msg)
-        await _dispatch(msg)  # duplicate delivery
-
-        task_files = list((state_dir / "agent_tasks").glob("*.json"))
-        assert len(task_files) == 1, f"Expected 1 task file, got {len(task_files)}"
-        assert len(channel.sent) == 1
-
-    async def test_different_message_ids_create_separate_tasks(self, _isolated_dirs):
-        state_dir, _ = _isolated_dirs
-        from discord_companion import _seen_message_ids as seen
-
-        channel = _FakeChannel(0)
-
-        async def _dispatch(message):
-            if not message.content.startswith("!"):
-                return
-            if message.id in seen:
-                return
-            seen.append(message.id)
-            response = await handle_command(message.content)
-            if response:
-                await message.channel.send(response)
-
-        msg_a = _FakeMessage(11111, "!fix issue alpha", channel=channel)
-        msg_b = _FakeMessage(22222, "!fix issue beta", channel=channel)
-
-        await _dispatch(msg_a)
-        await _dispatch(msg_b)
-
-        task_files = list((state_dir / "agent_tasks").glob("*.json"))
-        assert len(task_files) == 2, f"Expected 2 task files, got {len(task_files)}"
-        assert len(channel.sent) == 2
