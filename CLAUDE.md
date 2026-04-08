@@ -13,9 +13,13 @@ External Data (yfinance) → Orchestrator (3 async loops) → Intelligence (Clau
                           Persistent State (JSON files)
 ```
 
-- **Fast loop (5-15s):** Order fills, fill protection, quant overrides, PDT guard, position sync
-- **Medium loop (1-5min):** Technical scans, signal detection, opportunity ranking, position re-eval
-- **Slow loop (event-driven, checked every 5min):** Claude reasoning, watchlist management, news digest, thesis review. Only calls Claude when a trigger fires (price move, time ceiling, session transition, etc.)
+- **Fast loop (5-15s):** Order fills (`FillHandler`), fill protection, quant overrides (`QuantOverrides`), PDT guard, position sync (`PositionSync`)
+- **Medium loop (1-5min):** Technical scans, signal detection, opportunity ranking, position re-eval (`PositionManager`)
+- **Slow loop (event-driven, checked every 5min):** Claude reasoning, watchlist management (`WatchlistManager`), news digest, thesis review. Triggers evaluated by `TriggerEngine`. Context assembled by `MarketContextBuilder`. Only calls Claude when a trigger fires (price move, time ceiling, session transition, etc.)
+
+The orchestrator delegates to 7 extracted modules in `core/` (see Orchestrator Extraction in
+COMPLETED_PHASES.md). Each module receives mutable shared state by reference and broker/indicators
+at call time. The orchestrator remains the only module that knows about all others.
 
 ## Hard Technical Constraints
 - **Python 3.12+**, asyncio throughout (no threading/multiprocessing)
@@ -137,13 +141,31 @@ All 10 spec phases complete. Ongoing post-MVP work documented in `COMPLETED_PHAS
   — intraday timeframe is wrong for swing reviews. The commented code is preserved for future
   re-entry/repositioning logic. Do not delete it or restore it as an active gate.
 
+- **Orchestrator extraction pattern**: 7 modules extracted into `core/` (TriggerEngine,
+  MarketContextBuilder, FillHandler, QuantOverrides, PositionSync, PositionManager,
+  WatchlistManager). Three conventions govern all extracted modules:
+  1. *Mutable shared references*: Python dicts passed by reference at construction time. Safe
+     because all loops run in a single asyncio event loop (no concurrent mutation).
+  2. *Runtime parameters*: `broker`, `latest_indicators`, and other values that tests commonly
+     reassign on the orchestrator are passed at call time, not stored. Storing them breaks when
+     tests do `orch._broker = new_mock` (creates a new object, old reference goes stale).
+  3. *Late initialization*: Extracted modules are instantiated in `_startup()`, not `__init__()`,
+     because `_risk_manager` and `_strategies` are None at construction time.
+  Do not extract `_medium_try_entry` or `_run_claude_cycle` — they write too many orchestrator
+  scalars to decouple cleanly. See `plans/2026-04-06-orchestrator-extraction-phase2.md`.
+
 ### Post-MVP Completed Work
 
 See `COMPLETED_PHASES.md`. When completing a phase or named feature session, document it there — not here. CLAUDE.md is for active conventions that affect future development, not history.
 
 ## Reference Documents
 
-Five documents together form the complete knowledge base. Each has a distinct purpose — read the right one for the job:
+Six documents together form the complete knowledge base. Each has a distinct purpose — read the right one for the job.
+
+**Convention:** All standalone documentation files go in `docs/`. Root-level docs (CLAUDE.md,
+COMPLETED_PHASES.md, DRIFT_LOG.md, NOTES.md) are the exception — they exist at root for
+historical reasons and quick discoverability. New reference documents, architecture guides,
+operational docs, and feature-specific writeups go in `docs/`.
 
 ### `COMPLETED_PHASES.md` — What was built and why
 Phase-level narrative history. Answers: *"What did this phase introduce? What are the key methods, fields, and behaviors it added? What constraints must I respect when touching this area?"* One entry per phase or named feature session. Written for someone who is about to work in that area and needs a mental model of what exists and why.
@@ -172,6 +194,13 @@ Design rationale for non-trivial architectural work. Answers: *"What were the ke
 - **Read before:** extending or reworking a feature that had a plan file — the rationale explains choices that aren't visible in the code.
 - **Update when:** plan mode produces an approved design. Decision rule: small fixes (≤2 files, self-evident) → DRIFT_LOG only; formal phases → `phases/` spec file; everything in between → `plans/` file.
 - **Does not belong here:** post-implementation notes, resolved bugs, or anything already captured by commit messages and DRIFT_LOG.
+
+### `docs/agentic-workflow.md` — Development pipeline architecture and operations
+Reference for the v4 agentic development workflow (phases 22-28). Covers: architecture, 7 agent roles, signal file conventions, Discord commands, conductor judgment calls, task flow, shutdown protocol, and implementation history. This is development infrastructure — it builds and maintains the trading bot but is not part of the bot itself.
+
+- **Read before:** modifying any file in `tools/`, `config/agent_roles/`, or `clawhip.toml`; debugging signal file routing; understanding how agents interact with the trading bot.
+- **Update when:** a new role is added, signal conventions change, or the conductor workflow is modified.
+- **Does not belong here:** trading bot logic, indicator calculations, or anything that runs during market hours.
 
 ### `CLAUDE.md` (this file) — Active conventions for all future development
 The rules that apply right now, every session. Answers: *"What must I know before touching this codebase?"* Covers architecture, hard constraints, design rules, and decisions from past phases that still govern live code.

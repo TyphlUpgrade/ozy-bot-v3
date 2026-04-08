@@ -193,6 +193,8 @@ async def orch(tmp_path):
     broker.place_order     = AsyncMock(return_value=_stub_order_result())
     broker.cancel_order    = AsyncMock()
     o._broker = broker
+    # Rebind extracted modules that stored a broker reference during _startup().
+    o._quant_overrides._broker = broker
 
     # Wire Claude mock into the reasoning engine
     o._claude._load_prompt = MagicMock(return_value="Context: {context_json} Respond in JSON.")

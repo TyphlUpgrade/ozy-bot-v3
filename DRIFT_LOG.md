@@ -12,7 +12,9 @@ Maps key source files to the sections that contain relevant drift entries. Use t
 
 | File | Relevant sections |
 |------|-------------------|
-| *(index to be built next session)* | |
+| `core/signals.py` | Agentic Workflow — Signal Wiring |
+| `core/orchestrator.py` | Agentic Workflow — Signal Wiring |
+| `core/fill_handler.py` | Agentic Workflow — Signal Wiring |
 
 ---
 
@@ -1531,3 +1533,64 @@ Root cause: 2026-04-02T14:00Z session showed 4 watchlist removals in 8 minutes f
 - **Spec:** *(not defined)*
 - **Impl:** The dead zone (11:30–2:30 ET) entry block now lifts when SPY RVOL ≥ `dead_zone_rvol_bypass_threshold` (default 1.5). Pure predicate `_dead_zone_rvol_bypass()` on the orchestrator reads `_all_indicators["SPY"]` with the try-flat-then-nested fallback (SPY is a context symbol stored with nested `"signals"`). `risk_manager.py` is not modified — bypass is expressed via the existing `dead_zone_exempt` parameter to `validate_entry`. All three dead zone call sites updated: ranker rejection suppression loop, entry defer count guard in `_medium_try_entry`, and `validate_entry` call. One-per-cycle log in `_medium_loop_cycle` after `_all_indicators` is populated.
 - **Why:** The dead zone was a static time proxy for "low volume = bad entries." On volatile days (Fed, macro events, sector catalysts) midday is the most active window of the session. Phase 23 decoupled suppression from the dead zone; this change makes the entry block itself data-driven.
+
+---
+
+### Post-Phase-23 — Entry Condition Calibration + Trigger Guards (2026-04-06)
+
+**`evaluate_entry_conditions` RSI calibration error** · *(not in spec)* · `intelligence/opportunity_ranker.py`
+- **Spec:** `evaluate_entry_conditions` returns `(met: bool, reason: str)` with pass/fail per condition key.
+- **Impl:** Two new synthetic failure modes: `rsi_max_calibration_error` (short: `rsi_max` set >5pts below current RSI) and `rsi_min_calibration_error` (long: `rsi_min` set >5pts above current RSI). Returns a diagnostic string suggesting `rsi_slope_max`/`rsi_slope_min` instead. Tolerance controlled by `entry_condition_rsi_level_tolerance` (default 5.0; set 0 to disable).
+- **Why:** Claude was setting `rsi_max=35` when RSI was 48 — an impossible gate that deferred forever. The calibration error surfaces the miscalibration in `last_block_reason` feedback so Claude can self-correct on the next reasoning cycle.
+
+**`filter_adjustments.min_rvol` clamped to strategy floor** · *(not in spec)* · `strategies/momentum_strategy.py`
+- **Spec:** `filter_adjustments.min_rvol` from Claude reasoning output is applied directly as the RVOL filter threshold.
+- **Impl:** Claude's `min_rvol` can only *lower* the strategy's configured RVOL floor, not raise it above the default. `MomentumStrategy.validate_entry` clamps `min(claude_rvol, config_default)`.
+- **Why:** On small-sample execution stats (e.g. 0/3 short streak), Claude was raising `min_rvol` to 1.5+ which filtered out nearly everything — a self-reinforcing cage. The clamp preserves Claude's ability to be more permissive but prevents it from being more restrictive than the operator's configured baseline.
+
+**`approaching_close` fires exactly once per session** · *(not in spec)* · `core/trigger_engine.py`
+- **Spec:** *(not defined — Phase 17 added this trigger without a one-shot guard)*
+- **Impl:** `approaching_close_fired: bool` on `SlowLoopTriggerState`. Set `True` when trigger fires; cleared on `session_open` and `session_close` transitions.
+- **Why:** The trigger window is 4 minutes (15:28–15:32 ET) but `slow_loop_check_sec` is 60s, so without the flag the trigger fired on every tick within the window.
+
+**`regime_condition` 20-min cooldown** · *(not in spec)* · `core/trigger_engine.py`, `core/config.py`
+- **Spec:** *(not defined)*
+- **Impl:** `last_regime_condition_utc` on `SlowLoopTriggerState`; trigger suppressed if within `regime_condition_cooldown_min` (default 20). Config-driven.
+- **Why:** Rapid regime oscillation (normal→sector_rotation→normal within minutes) caused `regime_condition` to chain-fire, producing multiple redundant Claude calls.
+
+**Thesis breach Sonnet suppression** · *(not in spec)* · `core/orchestrator.py`, `core/position_manager.py`
+- **Spec:** *(not defined)*
+- **Impl:** `_last_position_review_utc: dict[str, datetime]` stamped after every Sonnet position review. Thesis breach scheduling gate suppresses Sonnet call if symbol was reviewed within `thesis_breach_review_cooldown_min` (default 15). Haiku check (cheap) runs regardless; Sonnet call (expensive) is the suppression target.
+- **Why:** A thesis breach Haiku check could schedule a Sonnet review for a position that was just reviewed 2 minutes ago by the regular slow-loop cycle, wasting ~15s of API time on a redundant call.
+
+---
+
+### Agentic Workflow — Signal Wiring (Phases 22-28)
+
+*These entries cover changes to trading bot code made by the agentic workflow phases.
+For full workflow architecture see `docs/agentic-workflow.md`.*
+
+**Signal file emitters in orchestrator** · *(not in spec)* · `core/orchestrator.py`, `core/signals.py`
+- **Spec:** *(not defined — agentic workflow addition)*
+- **Impl:** `write_status(data)` called at end of every `_fast_loop_cycle()` with portfolio, orders, and health data. `write_last_review(data)` called after `_apply_position_reviews()`. Three `write_alert()` calls: equity drawdown (>2% session drop, fires once per session), broker error (first failure in `_mark_broker_failure()`), loop stall (tick >60s in `_fast_loop()`). All calls wrapped in `try/except Exception` — fire-and-forget, never crashes the bot.
+- **Why:** Downstream agents (Ops Monitor, clawhip) need machine-readable bot state without importing from `ozymandias/`. Signal files are the universal bus.
+
+**Inbound signal processing** · *(not in spec)* · `core/orchestrator.py`
+- **Spec:** *(not defined — extends existing `EMERGENCY_EXIT` pattern)*
+- **Impl:** `_check_inbound_signals()` called in `_fast_loop()` after emergency signal check. Reads three signals: `PAUSE_ENTRIES` (persistent — sets `_entries_paused` bool, checked at top of `_medium_try_entry()`), `FORCE_REASONING` (one-shot — consumed, sets `_force_reasoning` injected as synthetic trigger in `_slow_loop_cycle()`), `FORCE_BUILD` (one-shot — consumed, sets `_force_build` added to `_BUILD_TRIGGERS` and injected in `_slow_loop_cycle()`).
+- **Why:** Operator and Discord companion need to control bot behavior without restarting it. Same touch-file pattern as `EMERGENCY_EXIT`.
+
+**`write_last_trade` in fill handler** · *(not in spec)* · `core/fill_handler.py`
+- **Spec:** *(not defined)*
+- **Impl:** `write_last_trade(data)` called at end of `dispatch_confirmed_fill()` with symbol, side, qty, price, order_id, timestamp. Wrapped in `try/except Exception`.
+- **Why:** clawhip routes `last_trade.json` changes to Discord `#trades` channel for real-time fill notifications.
+
+**Alert filename microsecond resolution** · *(not in spec)* · `core/signals.py`
+- **Spec:** *(not defined — plan showed second-level resolution)*
+- **Impl:** Alert filenames use `strftime('%Y%m%dT%H%M%S%f')` (microsecond resolution) instead of `strftime('%Y%m%dT%H%M%S')` (second resolution).
+- **Why:** Two alerts within the same second produced identical filenames, causing the second to silently overwrite the first. Microsecond resolution eliminates collisions.
+
+**`_session_start_equity` field** · *(not in spec)* · `core/orchestrator.py`
+- **Spec:** *(not defined)*
+- **Impl:** `_session_start_equity` seeded from `acct.equity` in `_startup()`. Used to calculate session drawdown percentage for the equity drawdown alert (>2% threshold). `_drawdown_alert_fired: bool` prevents repeat alerts within the same session.
+- **Why:** The drawdown alert needs a baseline. Using session start equity (not daily high) matches the operator's mental model of "how much am I down since I started watching."

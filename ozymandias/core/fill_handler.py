@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 
 from ozymandias.core.config import Config
 from ozymandias.core.direction import is_short
+from ozymandias.core.signals import write_last_trade
 from ozymandias.core.trade_journal import TradeJournal
 from ozymandias.core.trigger_engine import SlowLoopTriggerState
 
@@ -88,6 +89,19 @@ class FillHandler:
             # Phase 15: mark recommendation as filled on confirmed opening fill.
             if change.symbol in self._recommendation_outcomes:
                 self._recommendation_outcomes[change.symbol]["stage"] = "filled"
+
+        # Phase 22: write last_trade signal for agentic workflow consumers
+        try:
+            write_last_trade(
+                symbol=change.symbol,
+                action="exit" if has_position else "entry",
+                shares=change.fill_qty,
+                price=change.fill_price,
+                order_id=change.order_id,
+                context={"side": change.side, "change_type": change.change_type},
+            )
+        except Exception as exc:
+            log.debug("Failed to write last_trade signal: %s", exc)
 
     async def register_opening_fill(self, change) -> None:
         """Create a local portfolio position when an opening fill is confirmed.

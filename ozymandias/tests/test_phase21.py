@@ -186,11 +186,19 @@ class TestClearDirectionalSuppression:
 
     def _make_orch_with_suppression(self, suppressed: dict[str, str]) -> object:
         """Minimal stand-in with the suppression dict and the real helper."""
-        from ozymandias.core.orchestrator import Orchestrator, _SECTOR_MAP
-        orch = MagicMock(spec=Orchestrator)
-        orch._filter_suppressed = dict(suppressed)
-        # Bind the real method
-        orch._clear_directional_suppression = Orchestrator._clear_directional_suppression.__get__(orch)
+        from ozymandias.core.orchestrator import _SECTOR_MAP
+        from ozymandias.core.watchlist_manager import WatchlistManager
+        suppressed_dict = dict(suppressed)
+        # Create a real WatchlistManager with the suppression dict so the real
+        # logic runs. The orchestrator wrapper delegates to it.
+        wm = MagicMock(spec=WatchlistManager)
+        wm._filter_suppressed = suppressed_dict
+        wm._sector_map = _SECTOR_MAP
+        wm.clear_directional_suppression = WatchlistManager.clear_directional_suppression.__get__(wm)
+        orch = MagicMock()
+        orch._filter_suppressed = suppressed_dict
+        orch._watchlist_manager = wm
+        orch._clear_directional_suppression = lambda sectors: wm.clear_directional_suppression(sectors)
         return orch
 
     def test_rvol_reason_cleared_for_affected_sector(self):

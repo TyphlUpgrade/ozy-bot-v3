@@ -27,7 +27,20 @@ from ozymandias.core.config import Config, load_config
 from ozymandias.core.direction import EXIT_SIDE, direction_from_action, is_short
 from ozymandias.core.fill_handler import FillHandler
 from ozymandias.core.market_context import MarketContextBuilder
+from ozymandias.core.signals import (
+    check_inbound_signal,
+    consume_inbound_signal,
+    ensure_signal_dirs,
+    write_alert,
+    write_last_review,
+    write_last_trade,
+    write_status,
+)
+from ozymandias.core.position_manager import PositionManager
+from ozymandias.core.position_sync import PositionSync
+from ozymandias.core.quant_overrides import QuantOverrides
 from ozymandias.core.trigger_engine import SlowLoopTriggerState, TriggerEngine
+from ozymandias.core.watchlist_manager import WatchlistManager
 from ozymandias.core.logger import setup_logging
 from ozymandias.core.market_hours import Session, get_current_session, get_next_market_open, is_last_five_minutes, is_market_open
 from ozymandias.core.reasoning_cache import ReasoningCache
@@ -373,6 +386,11 @@ class Orchestrator:
         self._tier_degraded_at: Optional[datetime] = None
         self._tier_failure_count: int = 0
 
+        # Phase 22 — inbound signal state
+        self._entries_paused: bool = False
+        self._force_reasoning: bool = False
+        self._force_build: bool = False
+
         # Pending entry intentions: symbol → {stop, target, strategy, reasoning, ...}.
         # Written by _medium_try_entry when an order is placed; consumed by
         # _fast_step_position_sync when a new broker position is discovered.
@@ -439,16 +457,8 @@ class Orchestrator:
         # Phase 18: Universe scanner + search adapter (instantiated in _startup)
         self._universe_scanner: Optional[UniverseScanner] = None
         self._search_adapter: Optional[SearchAdapter] = None
-        # Session cache for universe scan results — avoids re-scanning on every
-        # watchlist_small trigger within the same session.
-        self._last_universe_scan: list[dict] = []
-        self._last_universe_scan_time: float = 0.0
-        # Guard: True while a background watchlist build task is running.
-        # Separate from claude_call_in_flight — a build in progress never blocks reasoning.
-        self._watchlist_build_in_flight: bool = False
-        # Set when candidates_exhausted or require_watchlist_before_reasoning defers a reasoning
-        # cycle until after the next successful build. Cleared by _run_watchlist_build_task.
-        self._reasoning_needed_after_build: bool = False
+        # WatchlistManager is instantiated in _startup() after _claude is created.
+        self._watchlist_manager: WatchlistManager | None = None
 
         # Shutdown flag — set by _shutdown(), checked by loops
         self._stopping = False
@@ -474,6 +484,9 @@ class Orchestrator:
         # Last-known account equity, updated after every broker account fetch.
         # Used by _fast_step_pdt_check to skip PDT limits when above the $25k threshold.
         self._last_known_equity: float = 0.0
+        # Phase 22: session start equity for drawdown alert detection
+        self._session_start_equity: float = 0.0
+        self._drawdown_alert_fired: bool = False  # only alert once per session
 
         # Recently-closed symbols: symbol → monotonic timestamp of closure.
         # Prevents _fast_step_position_sync from re-adopting a position the bot just
@@ -518,7 +531,53 @@ class Orchestrator:
             latest_indicators=self._latest_indicators,
         )
 
+        # Extracted modules instantiated in _startup() after _risk_manager and
+        # _strategies are created (both are None at __init__ time).
+        self._quant_overrides: QuantOverrides | None = None
+        self._position_sync: PositionSync | None = None
+        self._position_manager: PositionManager | None = None
+
         log.debug("Orchestrator created (config loaded, modules not yet connected)")
+
+    # -- Property proxies for WatchlistManager-owned flags -------------------
+    # These four attributes moved from Orchestrator to WatchlistManager. The
+    # proxies keep existing tests and internal code working without changes.
+
+    @property
+    def _watchlist_build_in_flight(self) -> bool:
+        return self._watchlist_manager.build_in_flight if self._watchlist_manager else False
+
+    @_watchlist_build_in_flight.setter
+    def _watchlist_build_in_flight(self, value: bool) -> None:
+        if self._watchlist_manager:
+            self._watchlist_manager.build_in_flight = value
+
+    @property
+    def _reasoning_needed_after_build(self) -> bool:
+        return self._watchlist_manager.reasoning_needed_after_build if self._watchlist_manager else False
+
+    @_reasoning_needed_after_build.setter
+    def _reasoning_needed_after_build(self, value: bool) -> None:
+        if self._watchlist_manager:
+            self._watchlist_manager.reasoning_needed_after_build = value
+
+    @property
+    def _last_universe_scan(self) -> list:
+        return self._watchlist_manager.last_universe_scan if self._watchlist_manager else []
+
+    @_last_universe_scan.setter
+    def _last_universe_scan(self, value: list) -> None:
+        if self._watchlist_manager:
+            self._watchlist_manager.last_universe_scan = value
+
+    @property
+    def _last_universe_scan_time(self) -> float:
+        return self._watchlist_manager.last_universe_scan_time if self._watchlist_manager else 0.0
+
+    @_last_universe_scan_time.setter
+    def _last_universe_scan_time(self, value: float) -> None:
+        if self._watchlist_manager:
+            self._watchlist_manager.last_universe_scan_time = value
 
     # -----------------------------------------------------------------------
     # Startup
@@ -545,6 +604,10 @@ class Orchestrator:
         # -- State files ------------------------------------------------------
         await self._state_manager.initialize()
         log.info("State files ready at: %s", self._state_manager._dir)
+
+        # -- Signal file bus (Phase 22) ----------------------------------------
+        ensure_signal_dirs()
+        log.info("Signal directories ready")
 
         # -- Reasoning cache --------------------------------------------------
         deleted = self._reasoning_cache.rotate()
@@ -583,6 +646,7 @@ class Orchestrator:
             raise
 
         self._last_known_equity = acct.equity
+        self._session_start_equity = acct.equity
         log.info(
             "Broker connected [%s] — equity=$%.2f  buying_power=$%.2f  "
             "cash=$%.2f  pdt=%s  daytrades_used=%d",
@@ -664,6 +728,60 @@ class Orchestrator:
         log.info(
             "Active strategies: %s",
             [type(s).__name__ for s in self._strategies],
+        )
+
+        # -- Late-init extracted modules (depend on _risk_manager / _strategies) --
+        self._quant_overrides = QuantOverrides(
+            config=self._config,
+            broker=self._broker,
+            state_manager=self._state_manager,
+            fill_protection=self._fill_protection,
+            risk_manager=self._risk_manager,
+            strategies=self._strategies,
+            pending_exit_hints=self._pending_exit_hints,
+            position_entry_times=self._position_entry_times,
+            intraday_highs=self._intraday_highs,
+            intraday_lows=self._intraday_lows,
+            override_closed=self._override_closed,
+        )
+
+        self._position_sync = PositionSync(
+            config=self._config,
+            state_manager=self._state_manager,
+            fill_protection=self._fill_protection,
+            trade_journal=self._trade_journal,
+            entry_contexts=self._entry_contexts,
+            recently_closed=self._recently_closed,
+            pending_intentions=self._pending_intentions,
+            position_entry_times=self._position_entry_times,
+            on_broker_failure=self._mark_broker_failure,
+            on_broker_available=self._mark_broker_available,
+        )
+
+        self._position_manager = PositionManager(
+            config=self._config,
+            state_manager=self._state_manager,
+            fill_protection=self._fill_protection,
+            trade_journal=self._trade_journal,
+            strategies=self._strategies,
+            pending_exit_hints=self._pending_exit_hints,
+            entry_contexts=self._entry_contexts,
+            recently_closed=self._recently_closed,
+            last_position_review_utc=self._last_position_review_utc,
+            on_broker_failure=self._mark_broker_failure,
+            on_broker_available=self._mark_broker_available,
+        )
+
+        self._watchlist_manager = WatchlistManager(
+            config=self._config,
+            state_manager=self._state_manager,
+            claude_engine=self._claude,
+            universe_scanner=self._universe_scanner,
+            search_adapter=self._search_adapter,
+            trigger_state=self._trigger_state,
+            sector_map=_SECTOR_MAP,
+            filter_suppressed=self._filter_suppressed,
+            latest_indicators=self._latest_indicators,
         )
 
         # -- Startup banner ---------------------------------------------------
@@ -1250,11 +1368,55 @@ class Orchestrator:
                 log.error("Emergency signal check error: %s", exc, exc_info=True)
             if self._stopping:
                 break
+
+            # Phase 22 — inbound signal processing
+            try:
+                self._check_inbound_signals()
+            except Exception as exc:
+                log.error("Inbound signal check error: %s", exc, exc_info=True)
+
+            tick_start = time.monotonic()
             try:
                 await self._fast_loop_cycle()
             except Exception as exc:
                 log.error("Fast loop error: %s", exc, exc_info=True)
+            # Phase 22: alert on loop stall (tick > 60s)
+            tick_duration = time.monotonic() - tick_start
+            if tick_duration > 60.0:
+                try:
+                    write_alert(
+                        "loop_stall", "ERROR",
+                        f"Fast loop tick took {tick_duration:.1f}s (threshold: 60s)",
+                    )
+                except Exception:
+                    pass
             await asyncio.sleep(self._config.scheduler.fast_loop_sec)
+
+    def _check_inbound_signals(self) -> None:
+        """Process inbound signal files (Phase 22).
+
+        Called every fast-loop tick, right after emergency signals.
+        PAUSE_ENTRIES is persistent (stays until removed).
+        FORCE_REASONING and FORCE_BUILD are one-shot (consumed on read).
+        """
+        # PAUSE_ENTRIES: persistent toggle
+        pause_present = check_inbound_signal("PAUSE_ENTRIES")
+        if pause_present and not self._entries_paused:
+            self._entries_paused = True
+            log.warning("PAUSE_ENTRIES signal detected — new entries suppressed")
+        elif not pause_present and self._entries_paused:
+            self._entries_paused = False
+            log.info("PAUSE_ENTRIES signal removed — entries resumed")
+
+        # FORCE_REASONING: one-shot
+        if consume_inbound_signal("FORCE_REASONING"):
+            self._force_reasoning = True
+            log.info("FORCE_REASONING signal consumed — will trigger immediate slow loop")
+
+        # FORCE_BUILD: one-shot
+        if consume_inbound_signal("FORCE_BUILD"):
+            self._force_build = True
+            log.info("FORCE_BUILD signal consumed — will trigger immediate watchlist build")
 
     async def _fast_loop_cycle(self) -> None:
         """
@@ -1264,6 +1426,7 @@ class Orchestrator:
         3. Execute quant overrides on open positions.
         4. PDT guard check.
         5. Position sync (broker vs local).
+        6. Write status signal (Phase 22).
         """
         if not self._is_market_open():
             return  # no action outside regular hours — resumes cleanly at 9:30
@@ -1302,6 +1465,31 @@ class Orchestrator:
             await self._fast_step_position_sync()
         except Exception as exc:
             log.error("Fast loop position sync error: %s", exc, exc_info=True)
+
+        # Step 6 (Phase 22): write status signal
+        try:
+            portfolio = await self._state_manager.load_portfolio()
+            orders_state = await self._state_manager.load_orders()
+            write_status(
+                equity=self._last_known_equity,
+                positions=[
+                    {"symbol": p.symbol, "shares": p.shares, "avg_cost": p.avg_cost,
+                     "direction": p.intention.direction if p.intention else "long"}
+                    for p in portfolio.positions
+                ],
+                open_orders=[
+                    {"symbol": o.symbol, "order_id": o.order_id, "status": o.status}
+                    for o in orders_state.orders
+                    if o.status in ("PENDING", "PARTIALLY_FILLED")
+                ],
+                loop_health={
+                    "entries_paused": self._entries_paused,
+                    "broker_available": self._degradation.broker_available,
+                    "safe_mode": self._degradation.safe_mode,
+                },
+            )
+        except Exception as exc:
+            log.debug("Failed to write status signal: %s", exc)
 
     # -- Fast loop steps ----------------------------------------------------
 
@@ -1408,175 +1596,14 @@ class Orchestrator:
         await self._fill_handler.journal_closed_trade(change, exit_reason_hint=exit_reason_hint)
 
     async def _place_override_exit(self, position, exit_hint: str) -> None:
-        """Place a market exit order for a position flagged by a quant override or hard stop.
-
-        Handles fill-protection check, order construction, record keeping,
-        pending exit hint tagging, and override counter increment. Shared by
-        both hard-stop and signal-triggered paths in _fast_step_quant_overrides.
-        """
-        symbol = position.symbol
-
-        if not self._fill_protection.can_place_order(symbol):
-            log.warning(
-                "Override exit for %s blocked — pending order already exists (hint=%s)",
-                symbol, exit_hint,
-            )
-            return
-
-        exit_side = EXIT_SIDE[position.intention.direction]
-        exit_order = Order(
-            symbol=symbol,
-            side=exit_side,
-            quantity=position.shares,
-            order_type="market",
-            time_in_force="day",
-        )
-        try:
-            result = await self._broker.place_order(exit_order)
-            now_iso = datetime.now(timezone.utc).isoformat()
-            order_record = OrderRecord(
-                order_id=result.order_id,
-                symbol=symbol,
-                side=exit_side,
-                quantity=position.shares,
-                order_type="market",
-                limit_price=None,
-                status="PENDING",
-                created_at=now_iso,
-                last_checked_at=now_iso,
-            )
-            await self._fill_protection.record_order(order_record)
-            log.info(
-                "Override exit order placed — %s  order_id=%s  qty=%.2f  hint=%s",
-                symbol, result.order_id, position.shares, exit_hint,
-            )
-            # Tag exit reason for trade journal (consumed in _dispatch_confirmed_fill)
-            self._pending_exit_hints[symbol] = exit_hint
-            # Increment override exit counter (feeds slow loop trigger)
+        """Delegate to QuantOverrides. See core/quant_overrides.py."""
+        placed = await self._quant_overrides.place_override_exit(position, exit_hint)
+        if placed:
             self._override_exit_count += 1
-            # Record override-close timestamp for the extended re-entry cooldown.
-            # override_exit_cooldown_min >> re_entry_cooldown_min because the quant
-            # signal broke down — re-entry should not be allowed until momentum resets.
-            self._override_closed[symbol] = time.monotonic()
-        except Exception as exc:
-            log.error("Failed to place override exit for %s (hint=%s): %s", symbol, exit_hint, exc)
 
     async def _fast_step_quant_overrides(self) -> None:
-        """
-        Step 3: For each open position, evaluate quantitative override signals.
-        If triggered, place a market exit order immediately.
-
-        Both long and short positions are handled in a single unified loop.
-        Signal semantics are direction-aware: the same signal names invert their
-        indicator logic for shorts (e.g. vwap_crossover fires on price-above-VWAP
-        for shorts, price-below-VWAP for longs).
-
-        Exit priority:
-          1. Hard stop (short-only): price >= stop_loss. Fires before min-hold guard
-             and before allow_signals gating — the hard stop is unconditional.
-          2. Signal-triggered exit: evaluated through evaluate_overrides() with
-             per-strategy allow_signals and threshold kwargs.
-
-        ``intraday_extremum`` is the session HIGH for longs and session LOW for
-        shorts, used by the ATR trailing stop signal.
-
-        ``_fast_step_short_exits`` was removed in Phase 18 refactor; all short
-        exit logic now runs through this method.
-        """
-        portfolio = await self._state_manager.load_portfolio()
-        if not portfolio.positions:
-            return
-
-        for position in portfolio.positions:
-            symbol = position.symbol
-            direction = position.intention.direction
-
-            # We need current indicators for all paths.
-            indicators = getattr(self, "_latest_indicators", {}).get(symbol)
-            if indicators is None:
-                log.debug("No indicators cached for %s — skipping override check", symbol)
-                continue
-
-            current_price = indicators.get("price")
-            if current_price is None:
-                continue
-
-            # Hard stop: short-only, fires before min-hold guard and allow_signals gate.
-            if self._risk_manager.check_hard_stop(position, indicators):
-                await self._place_override_exit(position, "hard_stop")
-                continue
-
-            # Resolve strategy for this position.
-            target_name = position.intention.strategy
-            matching = [
-                s for s in self._strategies
-                if type(s).__name__.replace("Strategy", "").lower() == target_name
-            ]
-            strategy_for_position = (matching or self._strategies)[0] if (matching or self._strategies) else None
-            allow_signals = (
-                strategy_for_position.applicable_override_signals()
-                if strategy_for_position is not None else None
-            )
-
-            # If the strategy declares no applicable signals, skip signal evaluation.
-            if allow_signals is not None and not allow_signals:
-                log.debug(
-                    "Override check skipped for %s — %s strategy has no applicable override signals",
-                    symbol, target_name,
-                )
-                continue
-
-            # Enforce minimum hold time before overrides can fire.
-            # This prevents stale indicators (computed before entry) from triggering
-            # an immediate exit on the same fast loop tick that registered the fill.
-            min_hold_sec = self._config.scheduler.min_hold_before_override_min * 60
-            entry_ts = self._position_entry_times.get(symbol)
-            held_sec = (time.monotonic() - entry_ts) if entry_ts is not None else 0.0
-            if held_sec < min_hold_sec:
-                log.debug(
-                    "Override check skipped for %s — %s",
-                    symbol,
-                    f"held {held_sec:.0f}s < min {min_hold_sec:.0f}s"
-                    if entry_ts is not None
-                    else "no entry time recorded (reconciled/adopted position)",
-                )
-                continue
-
-            # Track intraday extremum: session HIGH for longs, session LOW for shorts.
-            if is_short(direction):
-                prev = self._intraday_lows.get(symbol, current_price)
-                self._intraday_lows[symbol] = min(prev, current_price)
-                intraday_extremum = self._intraday_lows[symbol]
-            else:
-                prev_high = self._intraday_highs.get(symbol, 0.0)
-                self._intraday_highs[symbol] = max(prev_high, current_price)
-                intraday_extremum = self._intraday_highs[symbol]
-
-            # Per-strategy override thresholds.
-            atr_multiplier = strategy_for_position.override_atr_multiplier() if strategy_for_position else 2.0
-            vwap_threshold = strategy_for_position.override_vwap_volume_threshold() if strategy_for_position else 1.3
-
-            should_exit, triggered_signals = self._risk_manager.evaluate_overrides(
-                position, indicators, intraday_extremum,
-                allow_signals=allow_signals,
-                direction=direction,
-                atr_multiplier=atr_multiplier,
-                vwap_volume_threshold=vwap_threshold,
-            )
-
-            if not should_exit:
-                continue
-
-            log.warning(
-                "QUANT OVERRIDE EXIT — %s  signals=%s  direction=%s  price=%.4f  "
-                "atr=%.4f  intraday_extremum=%.4f  vwap_pos=%s  vol_ratio=%.2f",
-                symbol, triggered_signals, direction, current_price,
-                float(indicators.get("atr_14") or 0.0),
-                intraday_extremum,
-                indicators.get("vwap_position", "unknown"),
-                float(indicators.get("volume_ratio") or 0.0),
-            )
-            await self._place_override_exit(position, "quant_override")
+        """Delegate to QuantOverrides. See core/quant_overrides.py."""
+        self._override_exit_count += await self._quant_overrides.step(self._latest_indicators)
 
     async def _fast_step_pdt_check(self) -> None:
         """
@@ -1622,204 +1649,8 @@ class Orchestrator:
             log.error("PDT check error: %s", exc, exc_info=True)
 
     async def _fast_step_position_sync(self) -> None:
-        """
-        Step 5: Compare local portfolio state with broker-reported positions.
-        Log any discrepancies.
-        """
-        try:
-            broker_positions = await self._broker.get_positions()
-        except Exception as exc:
-            self._mark_broker_failure(exc)
-            return
-
-        self._mark_broker_available()
-
-        try:
-            portfolio = await self._state_manager.load_portfolio()
-        except Exception as exc:
-            log.error("Failed to load portfolio for sync: %s", exc, exc_info=True)
-            return
-
-        from ozymandias.core.state_manager import ExitTargets, Position, TradeIntention
-
-        broker_symbols = {p.symbol for p in broker_positions}
-        local_symbols = {p.symbol for p in portfolio.positions}
-        local_map = {p.symbol: p for p in portfolio.positions}
-        portfolio_updated = False
-
-        # Positions we have locally but broker no longer holds — these were closed
-        # outside the normal fill-detection path (e.g. manual broker close).
-        # Exception: if there's a pending/partially-filled exit order for the symbol,
-        # the position was closed by our own order but the fill hasn't been processed
-        # yet (common with fast-settling paper market orders). Skip ghost cleanup and
-        # let _dispatch_confirmed_fill handle it on the next cycle.
-        ghost_local = local_symbols - broker_symbols
-        if ghost_local:
-            deferred = {s for s in ghost_local if not self._fill_protection.can_place_order(s)}
-            if deferred:
-                log.debug(
-                    "Position sync: deferring ghost cleanup for %s — active exit order in flight",
-                    deferred,
-                )
-            ghost_local -= deferred
-
-        if ghost_local:
-            log.warning(
-                "Position sync: local positions not found at broker (likely closed externally): %s",
-                ghost_local,
-            )
-            for symbol in ghost_local:
-                pos = local_map.get(symbol)
-                if pos is None:
-                    continue
-                ctx = self._entry_contexts.pop(symbol, {})
-                current_price = getattr(self, "_latest_indicators", {}).get(symbol, {}).get("price", 0.0)
-                # Fall back to avg_cost when no market price is available — records
-                # pnl=0% rather than a misleading 0-price exit.
-                if current_price == 0.0:
-                    current_price = pos.avg_cost
-                await self._trade_journal.append({
-                    "symbol": symbol,
-                    "strategy": pos.intention.strategy,
-                    "direction": pos.intention.direction,
-                    "entry_time": pos.entry_date,
-                    "exit_time": datetime.now(timezone.utc).isoformat(),
-                    "entry_price": pos.avg_cost,
-                    "exit_price": current_price,
-                    "shares": pos.shares,
-                    "pnl_pct": round(
-                        (
-                            (pos.avg_cost - current_price) / pos.avg_cost * 100
-                            if is_short(pos.intention.direction)
-                            else (current_price - pos.avg_cost) / pos.avg_cost * 100
-                        )
-                        if pos.avg_cost > 0 and current_price > 0 else 0.0, 4
-                    ),
-                    "stop_price": pos.intention.exit_targets.stop_loss,
-                    "target_price": pos.intention.exit_targets.profit_target,
-                    "exit_reason": "external_close",
-                    "record_type": "close",
-                    "trade_id": ctx.get("trade_id"),
-                    "signals_at_entry": ctx.get("signals", {}),
-                    "claude_conviction": ctx.get("claude_conviction", 0.0),
-                    "composite_score": ctx.get("composite_score", 0.0),
-                    "position_size_pct": ctx.get("position_size_pct", 0.0),
-                    "peak_unrealized_pct": ctx.get("peak_unrealized_pct", 0.0),
-                    "source": "live",
-                    "prompt_version": self._config.claude.prompt_version,
-                    "bot_version": self._config.claude.model,
-                })
-            portfolio.positions = [p for p in portfolio.positions if p.symbol not in ghost_local]
-            now_utc_iso = datetime.now(timezone.utc).isoformat()
-            for symbol in ghost_local:
-                self._recently_closed[symbol] = time.monotonic()
-                portfolio.recently_closed[symbol] = now_utc_iso
-            portfolio_updated = True
-
-        # Positions broker has that we don't track locally.
-        # Normal bot fills are created by _register_buy_fill in the reconcile loop.
-        # This path is a fallback for positions opened externally (manual trades, etc.).
-        _readopt_ttl = 60.0  # seconds to block re-adoption after a position is closed
-        for bp in broker_positions:
-            if bp.symbol not in local_symbols:
-                # Guard: if we just closed this symbol, don't immediately re-adopt.
-                # This prevents the runaway loop where every close triggers a re-adopt
-                # which triggers another override exit (e.g. 16 AMD sell orders).
-                closed_at = self._recently_closed.get(bp.symbol, 0.0)
-                if time.monotonic() - closed_at < _readopt_ttl:
-                    log.debug(
-                        "Position sync: skipping re-adoption of %s — closed %.0fs ago "
-                        "(fill detection pending or position settling)",
-                        bp.symbol, time.monotonic() - closed_at,
-                    )
-                    continue
-                # Guard: if we have an active (PENDING or PARTIALLY_FILLED) opening
-                # order for this symbol, the fill handler will register it properly
-                # with the full intention when the order completes. Adopting here
-                # would consume _pending_intentions prematurely, which causes the full
-                # fill to be routed as a close (position already exists) and then
-                # re-adopted without intention (strategy="unknown").
-                in_flight = [
-                    o for o in self._fill_protection.get_orders_for_symbol(bp.symbol)
-                    if o.status in ("PENDING", "PARTIALLY_FILLED")
-                ]
-                if in_flight:
-                    log.debug(
-                        "Position sync: skipping adoption of %s — in-flight opening order %s",
-                        bp.symbol, in_flight[0].order_id,
-                    )
-                    continue
-                pending = self._pending_intentions.pop(bp.symbol, {})
-                if pending:
-                    self._entry_contexts[bp.symbol] = {
-                        "trade_id": str(uuid.uuid4()),
-                        "signals": pending.pop("_signals", {}),
-                        "claude_conviction": pending.pop("_claude_conviction", 0.0),
-                        "composite_score": pending.pop("_composite_score", 0.0),
-                        "position_size_pct": pending.pop("_position_size_pct", 0.0),
-                    }
-                intention = TradeIntention(
-                    strategy=pending.get("strategy", "unknown"),
-                    direction=pending.get("direction", bp.side),
-                    reasoning=pending.get("reasoning", ""),
-                    exit_targets=ExitTargets(
-                        stop_loss=pending.get("stop", 0.0),
-                        profit_target=pending.get("target", 0.0),
-                    ),
-                )
-                # Broker reports negative qty for short positions; shares are
-                # always stored as positive — direction field carries the sign.
-                adopted_qty = abs(bp.qty)
-                portfolio.positions.append(Position(
-                    symbol=bp.symbol,
-                    shares=adopted_qty,
-                    avg_cost=bp.avg_entry_price,
-                    entry_date=datetime.now(timezone.utc).isoformat(),
-                    intention=intention,
-                ))
-                # Give adopted positions the hold-time window so override signals
-                # based on stale indicators don't fire immediately after adoption.
-                self._position_entry_times[bp.symbol] = time.monotonic()
-                portfolio_updated = True
-                log.warning(
-                    "Position sync: untracked broker position adopted: %s  qty=%.2f  avg_cost=%.4f  side=%s",
-                    bp.symbol, adopted_qty, bp.avg_entry_price, bp.side,
-                )
-
-        # Quantity mismatches — broker is authoritative; correct local state.
-        # Broker reports negative qty for shorts; compare using abs() since
-        # local shares are always stored as a positive number.
-        #
-        # IMPORTANT: Skip upward corrections when there is an active (PENDING or
-        # PARTIALLY_FILLED) order for the symbol. The broker qty already reflects
-        # shares from that in-flight order, which haven't been dispatched as a fill
-        # event yet. Correcting upward here would cause _dispatch_confirmed_fill to
-        # see "position already exists" and route the fill as a close instead of an
-        # additional open. Downward corrections are always safe (they mean shares
-        # were removed, e.g. an external close).
-        local_map = {p.symbol: p for p in portfolio.positions}
-        for bp in broker_positions:
-            lp = local_map.get(bp.symbol)
-            if lp is None:
-                continue
-            broker_abs_qty = abs(bp.qty)
-            if abs(broker_abs_qty - lp.shares) > 0.001:
-                if broker_abs_qty > lp.shares and not self._fill_protection.can_place_order(bp.symbol):
-                    log.debug(
-                        "Position sync: skipping upward qty correction for %s "
-                        "(local=%.4f broker=%.4f) — active order in flight",
-                        bp.symbol, lp.shares, broker_abs_qty,
-                    )
-                    continue
-                log.warning(
-                    "Position sync: correcting %s qty local=%.4f → broker=%.4f",
-                    bp.symbol, lp.shares, broker_abs_qty,
-                )
-                lp.shares = broker_abs_qty
-                portfolio_updated = True
-
-        if portfolio_updated:
-            await self._state_manager.save_portfolio(portfolio)
+        """Delegate to PositionSync. See core/position_sync.py."""
+        await self._position_sync.step(self._broker, self._latest_indicators)
 
     # -----------------------------------------------------------------------
     # Medium loop
@@ -2072,6 +1903,23 @@ class Orchestrator:
             self._mark_broker_failure(exc)
             return
         self._mark_broker_available()
+
+        # Phase 22: equity drawdown alert (>2% session drop, fires once per session)
+        if (
+            self._session_start_equity > 0
+            and not self._drawdown_alert_fired
+        ):
+            drawdown_pct = (self._session_start_equity - acct.equity) / self._session_start_equity
+            if drawdown_pct > 0.02:
+                self._drawdown_alert_fired = True
+                try:
+                    write_alert(
+                        "equity_drawdown", "WARNING",
+                        f"Equity down {drawdown_pct:.1%} from session start "
+                        f"(${self._session_start_equity:,.2f} -> ${acct.equity:,.2f})",
+                    )
+                except Exception:
+                    pass
 
         # Keep portfolio cash/buying_power in sync with broker so downstream
         # logic (ranker, Claude context) always sees current capital figures.
@@ -2329,6 +2177,11 @@ class Orchestrator:
         (so the caller can try the next ranked candidate).
         """
         symbol = top.symbol
+
+        # Phase 22: PAUSE_ENTRIES signal suppresses all new entries
+        if self._entries_paused:
+            log.info("Medium loop: skipping %s — entries paused via PAUSE_ENTRIES signal", symbol)
+            return False
 
         # Reasoning-cycle guard: block re-entry on a symbol that was already entered
         # and exited within the current Claude reasoning cycle. Prevents the medium
@@ -2852,149 +2705,10 @@ class Orchestrator:
         return True
 
     async def _medium_evaluate_positions(self, portfolio, bars, indicators, acct, orders) -> None:
-        """Run evaluate_position() on each open position; exit if recommended."""
-        for position in portfolio.positions:
-            symbol = position.symbol
-            df = bars.get(symbol)
-            ind_summary = indicators.get(symbol)
-            if df is None or ind_summary is None:
-                log.debug("Medium loop: no data for position %s — skipping eval", symbol)
-                continue
-
-            sigs_flat = ind_summary["signals"]
-
-            # Route to the strategy that opened this position so a swing position is
-            # not evaluated by MomentumStrategy (and vice versa). Fall back to the
-            # first active strategy if the original strategy has since been disabled.
-            target_name = position.intention.strategy
-            matching = [
-                s for s in self._strategies
-                if type(s).__name__.replace("Strategy", "").lower() == target_name
-            ]
-            eval_strategies = matching if matching else self._strategies[:1]
-
-            for strategy in eval_strategies:
-                try:
-                    eval_result = await strategy.evaluate_position(position, df, sigs_flat)
-                except Exception as exc:
-                    log.warning(
-                        "Medium loop: evaluate_position failed %s/%s: %s",
-                        symbol, type(strategy).__name__, exc,
-                    )
-                    continue
-
-                if eval_result.action != "exit":
-                    continue
-
-                log.info(
-                    "Medium loop: strategy exit signal — %s  action=%s  confidence=%.2f  reason=%s",
-                    symbol, eval_result.action, eval_result.confidence, eval_result.reasoning,
-                )
-
-                if not self._fill_protection.can_place_order(symbol):
-                    log.warning(
-                        "Medium loop: exit blocked for %s — pending order exists", symbol
-                    )
-                    break
-
-                # Get suggested exit parameters
-                try:
-                    exit_sug = await strategy.suggest_exit(position, df, sigs_flat)
-                except Exception as exc:
-                    log.warning("Medium loop: suggest_exit failed %s: %s", symbol, exc)
-                    exit_sug = None
-
-                # buy to close short, sell to close long
-                exit_side = EXIT_SIDE[position.intention.direction]
-                if exit_sug and exit_sug.order_type == "limit" and exit_sug.exit_price > 0:
-                    exit_order = Order(
-                        symbol=symbol,
-                        side=exit_side,
-                        quantity=position.shares,
-                        order_type="limit",
-                        limit_price=exit_sug.exit_price,
-                        time_in_force="day",
-                    )
-                else:
-                    exit_order = Order(
-                        symbol=symbol,
-                        side=exit_side,
-                        quantity=position.shares,
-                        order_type="market",
-                        time_in_force="day",
-                    )
-
-                try:
-                    result = await self._broker.place_order(exit_order)
-                except Exception as exc:
-                    self._mark_broker_failure(exc)
-                    break
-                self._mark_broker_available()
-
-                now_iso = datetime.now(timezone.utc).isoformat()
-                record = OrderRecord(
-                    order_id=result.order_id,
-                    symbol=symbol,
-                    side=exit_side,
-                    quantity=position.shares,
-                    order_type=exit_order.order_type,
-                    limit_price=exit_order.limit_price,
-                    status="PENDING",
-                    created_at=now_iso,
-                    last_checked_at=now_iso,
-                )
-                await self._fill_protection.record_order(record)
-                log.info(
-                    "Exit order placed — %s  qty=%d  type=%s  strategy=%s",
-                    symbol, position.shares, exit_order.order_type, type(strategy).__name__,
-                )
-                break  # one exit order per position per cycle
-
-            # EOD forced close for momentum shorts.
-            # Swing shorts may be held overnight intentionally — excluded.
-            # Only fires if no exit order was placed by strategy evaluation above.
-            if (
-                is_short(position.intention.direction)
-                and position.intention.strategy == "momentum"
-                and is_last_five_minutes()
-                and self._fill_protection.can_place_order(symbol)
-            ):
-                log.info(
-                    "Medium loop: EOD forced close — momentum short %s in last 5 minutes",
-                    symbol,
-                )
-                exit_side = EXIT_SIDE[position.intention.direction]
-                eod_order = Order(
-                    symbol=symbol,
-                    side=exit_side,
-                    quantity=position.shares,
-                    order_type="market",
-                    time_in_force="day",
-                )
-                try:
-                    result = await self._broker.place_order(eod_order)
-                except Exception as exc:
-                    self._mark_broker_failure(exc)
-                    continue
-                self._mark_broker_available()
-                now_iso = datetime.now(timezone.utc).isoformat()
-                record = OrderRecord(
-                    order_id=result.order_id,
-                    symbol=symbol,
-                    side=exit_side,
-                    quantity=position.shares,
-                    order_type="market",
-                    limit_price=None,
-                    status="PENDING",
-                    created_at=now_iso,
-                    last_checked_at=now_iso,
-                )
-                await self._fill_protection.record_order(record)
-                # Tag exit reason for trade journal (consumed in _dispatch_confirmed_fill)
-                self._pending_exit_hints[symbol] = "eod_close"
-                log.info(
-                    "EOD short exit order placed — %s  order_id=%s", symbol, result.order_id,
-                )
+        """Delegate to PositionManager. See core/position_manager.py."""
+        await self._position_manager.evaluate_positions(
+            portfolio, bars, indicators, acct, orders, broker=self._broker,
+        )
 
     # -----------------------------------------------------------------------
     # Slow loop
@@ -3057,6 +2771,16 @@ class Orchestrator:
 
         triggers = await self._check_triggers()
 
+        # Phase 22: inject force signals as synthetic triggers
+        if self._force_reasoning:
+            triggers.append("force_reasoning")
+            self._force_reasoning = False
+            log.info("Slow loop: FORCE_REASONING injected as trigger")
+        if self._force_build:
+            triggers.append("force_build")
+            self._force_build = False
+            log.info("Slow loop: FORCE_BUILD injected as trigger")
+
         if not triggers:
             log.debug("Slow loop: no triggers fired — no-op")
             await self._update_trigger_prices()
@@ -3064,17 +2788,17 @@ class Orchestrator:
 
         log.info("Slow loop: triggers fired — %s", triggers)
 
-        _BUILD_TRIGGERS = {"watchlist_small", "watchlist_stale", "candidates_exhausted"}
+        _BUILD_TRIGGERS = {"watchlist_small", "watchlist_stale", "candidates_exhausted", "force_build"}
         is_watchlist_build = any(t in _BUILD_TRIGGERS for t in triggers)
         reasoning_triggers = [t for t in triggers if t not in _BUILD_TRIGGERS]
 
         if "candidates_exhausted" in triggers:
-            self._reasoning_needed_after_build = True
+            self._watchlist_manager.reasoning_needed_after_build = True
             log.info("Slow loop: candidates exhausted — deferring reasoning until build completes")
 
         if is_watchlist_build:
-            if not self._watchlist_build_in_flight:
-                self._watchlist_build_in_flight = True
+            if not self._watchlist_manager.build_in_flight:
+                self._watchlist_manager.build_in_flight = True
                 self._spawn_background_task(self._run_watchlist_build_task())
             else:
                 log.debug("Slow loop: watchlist build already in-flight — build trigger skipped")
@@ -3084,7 +2808,7 @@ class Orchestrator:
             and reasoning_triggers
             and self._config.scheduler.require_watchlist_before_reasoning
         ):
-            self._reasoning_needed_after_build = True
+            self._watchlist_manager.reasoning_needed_after_build = True
             reasoning_triggers = []
             log.info(
                 "Slow loop: require_watchlist_before_reasoning=True — deferring reasoning until build completes"
@@ -3627,6 +3351,17 @@ class Orchestrator:
         # -- Apply position review notes -------------------------------------
         if result.position_reviews:
             await self._apply_position_reviews(result.position_reviews)
+            # Phase 22: write last_review signal for most recent review
+            try:
+                last = result.position_reviews[-1]
+                write_last_review(
+                    symbol=last.get("symbol", "unknown"),
+                    action=last.get("action", "hold"),
+                    reasoning_summary=last.get("reasoning", ""),
+                    context={"review_count": len(result.position_reviews)},
+                )
+            except Exception as exc:
+                log.debug("Failed to write last_review signal: %s", exc)
 
         # Persist recommendation_outcomes and fetch_failure suppression so both survive
         # restarts within the same trading day. Load a fresh portfolio to avoid clobbering
@@ -3676,47 +3411,8 @@ class Orchestrator:
         return cfg.cache_max_age_default_min
 
     def _clear_directional_suppression(self, affected_sectors: set[str] | None) -> None:
-        """Clear direction-dependent session suppressions on regime reset.
-
-        Called when a regime change causes a watchlist rebuild so that symbols
-        suppressed under the old regime's direction can be reconsidered under
-        the new regime's direction.
-
-        Args:
-            affected_sectors: ETF keys whose regime changed. Pass None to clear
-                              all sectors (broad panic flip).
-
-        Direction-dependent reasons (cleared): rvol, directional_score, conviction_floor,
-                                                defer_expired
-        Direction-neutral reasons (preserved): fetch_failure, blacklist, no_entry
-        """
-        # Patterns indicating direction-dependent suppression — these are stale
-        # when the regime or sector bias flips; the symbol may now be valid in the
-        # opposite direction or under relaxed conditions.
-        # Extension point: add new reason patterns here if new suppression reasons
-        # are added that are direction-dependent.
-        _DIRECTION_DEPENDENT_PATTERNS = (
-            "rvol", "directional_score", "conviction_floor", "defer_expired",
-        )
-
-        to_clear: list[str] = []
-        for sym, reason in list(self._filter_suppressed.items()):
-            if not any(pat in reason.lower() for pat in _DIRECTION_DEPENDENT_PATTERNS):
-                continue
-            if affected_sectors is not None:
-                etf = _SECTOR_MAP.get(sym)
-                if etf not in affected_sectors:
-                    continue
-            to_clear.append(sym)
-
-        for sym in to_clear:
-            del self._filter_suppressed[sym]
-
-        if to_clear:
-            log.info(
-                "Regime reset: cleared %d directional suppression(s): %s",
-                len(to_clear), to_clear,
-            )
+        """Delegate to WatchlistManager. See core/watchlist_manager.py."""
+        self._watchlist_manager.clear_directional_suppression(affected_sectors)
 
     async def _regime_reset_build(
         self,
@@ -3726,122 +3422,16 @@ class Orchestrator:
         changed_sectors: set[str],
         broad_regime_changed: bool,
     ) -> None:
-        """Evict direction-conflicting watchlist entries and rebuild for the new regime.
-
-        Called (fire-and-forget) after a regime or sector-regime change is detected.
-        Does not block the reasoning cycle that triggered it — runs as a background task.
-
-        Eviction rules:
-        - Broad "risk-off panic": evict all swing/both longs (no `catalyst_driven` flag
-          concept implemented yet — future: add to WatchlistEntry).
-        - Sector-granular: evict entries in changed sectors whose direction conflicts
-          with the new sector bias:
-            long entry + "correcting" / "downtrend" sector → evict
-            short entry + "breaking_out" / "uptrend" sector → evict
-        After eviction: run a targeted watchlist build with target_count=watchlist_build_target
-        to fill with aligned candidates. Subsequent scheduled builds fill remaining capacity
-        as TA data arrives — avoids add→prune→add churn from overshooting the stable capacity.
-        """
-        try:
-            watchlist = await self._state_manager.load_watchlist()
-            portfolio = await self._state_manager.load_portfolio()
-            open_syms = {p.symbol for p in portfolio.positions}
-
-            broad_panic = new_regime == "risk-off panic"
-
-            # Log watchlist direction breakdown before eviction so we can compare after rebuild.
-            def _direction_summary(entries) -> str:
-                longs  = sum(1 for e in entries if e.expected_direction == "long")
-                shorts = sum(1 for e in entries if e.expected_direction == "short")
-                either = sum(1 for e in entries if e.expected_direction == "either")
-                return f"{len(entries)} total — {longs}L / {shorts}S / {either}either"
-
-            log.info(
-                "Regime reset triggered: %s → %s | changed_sectors=%s | watchlist before: %s",
-                new_regime, "broad_panic" if broad_panic else "sector_granular",
-                sorted(changed_sectors) if changed_sectors else "[]",
-                _direction_summary(watchlist.entries),
-            )
-
-            # Determine which entries to evict
-            to_evict: list[str] = []
-            for e in watchlist.entries:
-                if e.symbol in open_syms:
-                    continue
-                if broad_panic:
-                    # Evict all long candidates (swing and both strategies)
-                    if e.expected_direction == "long":
-                        to_evict.append(e.symbol)
-                elif new_sector_regimes:
-                    etf = _SECTOR_MAP.get(e.symbol)
-                    if etf not in changed_sectors:
-                        continue
-                    sector_info = new_sector_regimes.get(etf, {})
-                    sector_regime = sector_info.get("regime", "neutral")
-                    if e.expected_direction == "long" and sector_regime in ("correcting", "downtrend"):
-                        to_evict.append(e.symbol)
-                    elif e.expected_direction == "short" and sector_regime in ("breaking_out", "uptrend"):
-                        to_evict.append(e.symbol)
-
-            if to_evict:
-                evict_set = set(to_evict)
-                watchlist.entries = [e for e in watchlist.entries if e.symbol not in evict_set]
-                log.info(
-                    "Regime reset: evicted %d conflicting watchlist entries: %s",
-                    len(to_evict), to_evict,
-                )
-                # Persist eviction immediately so entries are not restored on the
-                # next state load (regardless of whether the rebuild below succeeds).
-                await self._state_manager.save_watchlist(watchlist)
-
-            # Clear direction-dependent session suppressions for affected sectors
-            if broad_panic:
-                self._clear_directional_suppression(None)
-            elif changed_sectors:
-                self._clear_directional_suppression(changed_sectors)
-
-            # Rebuild with fresh names aligned to the new regime
-            market_data = self._latest_market_context or {}
-            if self._last_universe_scan:
-                _n = self._config.universe_scanner.max_candidates_to_claude
-                _candidates = self._last_universe_scan[:_n]
-            else:
-                _candidates = None
-
-            try:
-                wl_result = await self._claude.run_watchlist_build(
-                    market_context=market_data,
-                    current_watchlist=watchlist,
-                    target_count=self._config.claude.watchlist_build_target,  # use standard target; avoids add→prune→add churn (new entries have no TA data)
-                    candidates=_candidates,
-                    search_adapter=self._search_adapter,
-                    no_entry_symbols=self._config.ranker.no_entry_symbols,
-                )
-                if wl_result is not None:
-                    symbols_before = {e.symbol for e in watchlist.entries}
-                    await self._apply_watchlist_changes(
-                        watchlist, wl_result.watchlist, wl_result.removes, open_syms
-                    )
-                    added = [e for e in watchlist.entries if e.symbol not in symbols_before]
-                    added_longs  = [e.symbol for e in added if e.expected_direction == "long"]
-                    added_shorts = [e.symbol for e in added if e.expected_direction == "short"]
-                    added_either = [e.symbol for e in added if e.expected_direction == "either"]
-                    log.info(
-                        "Regime reset build complete — %d added (L:%s S:%s either:%s) | watchlist after: %s",
-                        len(added),
-                        added_longs or "[]",
-                        added_shorts or "[]",
-                        added_either or "[]",
-                        _direction_summary(watchlist.entries),
-                    )
-                    # Only stamp timestamp when a build actually completed (not on None
-                    # return or exception — those don't count as successful builds).
-                    self._trigger_state.last_watchlist_build_utc = datetime.now(timezone.utc)
-            except Exception as exc:
-                log.error("Regime reset watchlist build failed: %s", exc, exc_info=True)
-
-        except Exception as exc:
-            log.error("_regime_reset_build failed: %s", exc, exc_info=True)
+        """Delegate to WatchlistManager. See core/watchlist_manager.py."""
+        await self._watchlist_manager.regime_reset_build(
+            prev_sector_regimes=prev_sector_regimes,
+            new_sector_regimes=new_sector_regimes,
+            new_regime=new_regime,
+            changed_sectors=changed_sectors,
+            broad_regime_changed=broad_regime_changed,
+            latest_market_context=self._latest_market_context or {},
+            last_sector_regimes=self._last_sector_regimes,
+        )
 
     async def _post_build_reasoning(self, trigger_name: str) -> None:
         """Fire a reasoning cycle after a successful build — skips if market closed or call in-flight."""
@@ -3861,102 +3451,15 @@ class Orchestrator:
             self._trigger_state.claude_call_in_flight = False
 
     async def _run_watchlist_build_task(self) -> None:
-        """Background watchlist build — fires from _slow_loop_cycle, never blocks reasoning."""
-        try:
-            watchlist = await self._state_manager.load_watchlist()
-            portfolio = await self._state_manager.load_portfolio()
-            open_syms = {p.symbol for p in portfolio.positions}
-            market_data = self._latest_market_context or {}
-
-            # Universe scan (session cache; second call within cache_ttl_min is free)
-            if self._config.universe_scanner.enabled and self._universe_scanner is not None:
-                cache_age_min = (time.monotonic() - self._last_universe_scan_time) / 60
-                if cache_age_min > self._config.universe_scanner.cache_ttl_min or not self._last_universe_scan:
-                    existing_symbols = {e.symbol for e in watchlist.entries}
-                    blacklist_symbols = set(self._config.ranker.no_entry_symbols)
-                    try:
-                        self._last_universe_scan = await self._universe_scanner.get_top_candidates(
-                            n=self._config.universe_scanner.max_candidates,
-                            exclude=existing_symbols,
-                            blacklist=blacklist_symbols,
-                            sector_regimes=self._last_sector_regimes,
-                            regime_assessment=self._last_regime_assessment,
-                            sector_map=_SECTOR_MAP,
-                        )
-                        self._last_universe_scan_time = time.monotonic()
-                        log.info(
-                            "Watchlist build: universe scan %d candidates (top RVOL: %s)",
-                            len(self._last_universe_scan),
-                            [c["symbol"] for c in self._last_universe_scan[:5]],
-                        )
-                    except Exception as exc:
-                        log.warning("Watchlist build: universe scan failed — proceeding without candidates: %s", exc)
-                else:
-                    log.debug("Watchlist build: universe scan cache fresh (%.1f min old)", cache_age_min)
-
-            _n = self._config.universe_scanner.max_candidates_to_claude
-            _candidates = (self._last_universe_scan or [])[:_n] or None
-
-            log.info(
-                "Watchlist build: starting [candidates=%d  search=%s]",
-                len(_candidates) if _candidates else 0,
-                "enabled" if (self._search_adapter and self._search_adapter.enabled) else "disabled",
-            )
-
-            wl_result = await self._claude.run_watchlist_build(
-                market_context=market_data,
-                current_watchlist=watchlist,
-                target_count=self._config.claude.watchlist_build_target,
-                candidates=_candidates,
-                search_adapter=self._search_adapter,
-                no_entry_symbols=self._config.ranker.no_entry_symbols,
-            )
-
-            if wl_result is None:
-                parse_retry_min = self._config.scheduler.watchlist_build_parse_failure_retry_min
-                interval_min = self._config.scheduler.watchlist_refresh_interval_min
-                back_min = max(0, interval_min - parse_retry_min)
-                self._trigger_state.last_watchlist_build_utc = (
-                    datetime.now(timezone.utc) - timedelta(minutes=back_min)
-                )
-                self._reasoning_needed_after_build = False
-                log.warning(
-                    "Watchlist build: response unparseable — will retry in ~%d min", parse_retry_min
-                )
-                return
-
-            added = await self._apply_watchlist_changes(
-                watchlist, wl_result.watchlist, wl_result.removes, open_syms,
-            )
-            self._trigger_state.last_watchlist_build_utc = datetime.now(timezone.utc)
-            log.info("Watchlist build: complete — %d added", added)
-
-            if self._reasoning_needed_after_build:
-                self._reasoning_needed_after_build = False
-                if added > 0:
-                    log.info(
-                        "Watchlist build: new candidates available — firing post-build reasoning"
-                    )
-                    self._spawn_background_task(self._post_build_reasoning("post_build_candidates"))
-                else:
-                    log.info(
-                        "Watchlist build: no new candidates added — skipping post-build reasoning"
-                    )
-
-        except Exception as exc:
-            probe_min = self._config.ai_fallback.circuit_breaker_probe_min
-            interval_min = self._config.scheduler.watchlist_refresh_interval_min
-            back_min = max(0, interval_min - probe_min)
-            self._trigger_state.last_watchlist_build_utc = (
-                datetime.now(timezone.utc) - timedelta(minutes=back_min)
-            )
-            self._reasoning_needed_after_build = False
-            log.error(
-                "Watchlist build: unexpected error — will retry in ~%d min: %s",
-                probe_min, exc, exc_info=True,
-            )
-        finally:
-            self._watchlist_build_in_flight = False
+        """Delegate to WatchlistManager. See core/watchlist_manager.py."""
+        await self._watchlist_manager.run_watchlist_build_task(
+            latest_market_context=self._latest_market_context or {},
+            last_sector_regimes=self._last_sector_regimes,
+            last_regime_assessment=self._last_regime_assessment,
+            on_post_build_reasoning=lambda trigger: self._spawn_background_task(
+                self._post_build_reasoning(trigger)
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Phase 22 — reasoning tier management (opportunity call degradation)
@@ -4030,24 +3533,8 @@ class Orchestrator:
                 log.warning("Tier downgrade → 3 (Haiku emergency) due to 529 overload")
 
     def _prune_expired_catalysts(self, watchlist: "WatchlistState") -> list[str]:
-        """Remove entries whose catalyst_expiry_utc has passed. Returns removed symbols."""
-        now_utc = datetime.now(timezone.utc)
-        expired, kept = [], []
-        for e in watchlist.entries:
-            if e.catalyst_expiry_utc:
-                try:
-                    if datetime.fromisoformat(e.catalyst_expiry_utc) <= now_utc:
-                        expired.append(e.symbol)
-                        log.info("Watchlist: pruned %s — catalyst expired at %s", e.symbol, e.catalyst_expiry_utc)
-                        continue
-                except Exception:
-                    log.warning(
-                        "Watchlist: malformed catalyst_expiry_utc for %s: %r — keeping entry",
-                        e.symbol, e.catalyst_expiry_utc,
-                    )
-            kept.append(e)
-        watchlist.entries = kept
-        return expired
+        """Delegate to WatchlistManager. See core/watchlist_manager.py."""
+        return self._watchlist_manager.prune_expired_catalysts(watchlist)
 
     async def _apply_watchlist_changes(
         self,
@@ -4055,327 +3542,21 @@ class Orchestrator:
         add_list: list[dict],
         remove_list: list[str],
         open_symbols: set[str] | None = None,
-    ) -> int:  # returns count of symbols actually added
-        """Apply Claude-suggested watchlist additions and removals, then enforce the size cap.
-
-        ``open_symbols`` is the set of symbols with active positions — these are
-        never pruned regardless of score or rank.  Pass an empty set when no
-        positions are open.
-        """
-        now_iso = datetime.now(timezone.utc).isoformat()
-        from ozymandias.core.state_manager import WatchlistEntry
-
-        # Non-tradeable index tickers that Alpaca cannot order (config.json entry would be
-        # overkill for a static safety blacklist — these never change).
-        _INDEX_BLACKLIST = {
-            "VIX", "VXN", "SPX", "NDX", "RUT", "DJI", "COMP",
-            "INDU", "NYA", "XAX", "OEX", "MID", "SML",
-        }
-
-        self._prune_expired_catalysts(watchlist)  # caller saves; no separate save needed here
-        existing_symbols = {e.symbol for e in watchlist.entries}
-        added = 0
-
-        for item in add_list:
-            # Claude may return plain strings ("SPY") or dicts ({"symbol": "SPY", ...})
-            if isinstance(item, str):
-                symbol = item.strip().upper()
-                reason = "Added by Claude"
-                tier = 1
-                strategy = "both"
-                expected_direction = "either"
-                catalyst_expiry_utc = None
-            else:
-                symbol = item.get("symbol", "").upper()
-                reason = item.get("reason", "Added by Claude")
-                tier = item.get("priority_tier", 1)
-                strategy = item.get("strategy", "both")
-                # Phase 15: extract expected_direction from Claude's add-item dict.
-                # Default "either" when absent for backward compatibility.
-                _raw_ed = item.get("expected_direction", "either")
-                if _raw_ed not in {"long", "short", "either"}:
-                    log.warning(
-                        "Watchlist add %s: Claude returned invalid expected_direction %r — using 'either'",
-                        symbol, _raw_ed,
-                    )
-                    _raw_ed = "either"
-                expected_direction = _raw_ed
-                catalyst_expiry_utc = item.get("catalyst_expiry_utc")
-            if not symbol or symbol in existing_symbols:
-                continue
-            if symbol in _INDEX_BLACKLIST or symbol.startswith("^"):
-                log.warning("Watchlist: rejected non-tradeable index ticker %s", symbol)
-                continue
-            watchlist.entries.append(WatchlistEntry(
-                symbol=symbol,
-                date_added=now_iso,
-                reason=reason,
-                priority_tier=tier,
-                strategy=strategy,
-                expected_direction=expected_direction,
-                catalyst_expiry_utc=catalyst_expiry_utc,
-            ))
-            existing_symbols.add(symbol)
-            added += 1
-            log.info("Watchlist: added %s (tier=%s direction=%s)", symbol, tier, expected_direction)
-
-        if remove_list:
-            # Never remove a symbol that currently has an open position.
-            _safe_removes = set(remove_list) - (open_symbols or set())
-            _protected = set(remove_list) & (open_symbols or set())
-            if _protected:
-                log.debug("Watchlist: skipped removal of open position symbol(s): %s", sorted(_protected))
-            before = len(watchlist.entries)
-            watchlist.entries = [
-                e for e in watchlist.entries if e.symbol not in _safe_removes
-            ]
-            removed = before - len(watchlist.entries)
-            if removed:
-                log.info("Watchlist: removed %d symbol(s): %s", removed, sorted(_safe_removes))
-
-        # Hard size cap — prune lowest-value entries beyond the limit.
-        # Open positions and newly-added symbols are always protected.
-        # Phase 21: multi-tier eviction order:
-        #   1. Tier-2 entries (exploratory; lower conviction than tier-1)
-        #   2. Tier-1 entries whose expected_direction conflicts with current sector_regimes
-        #   3. Remaining tier-1 entries by lowest directional score (existing behavior)
-        # This prevents the pruner from evicting deliberate swing setups (e.g. oversold
-        # mean-reversion theses) which legitimately have low intraday directional scores.
-        max_entries = self._config.claude.watchlist_max_entries
-        if len(watchlist.entries) > max_entries:
-            # Newly-added symbols are protected for this cycle: they haven't been
-            # through a medium loop scan yet so _latest_indicators has no data for
-            # them, giving a score of 0.0 that would cause immediate eviction.
-            newly_added = {
-                (item if isinstance(item, str) else item.get("symbol", "")).upper()
-                for item in add_list
-            } - {""}
-            protected = (open_symbols or set()) | newly_added
-
-            def _composite(e) -> float:
-                # _latest_indicators has signals merged flat (no "signals" sub-key),
-                # so use pre-computed long_score/short_score directly.
-                ind = self._latest_indicators.get(e.symbol, {})
-                ed = getattr(e, "expected_direction", "either")
-                if ed == "long":  return float(ind.get("long_score",  0.0))
-                if ed == "short": return float(ind.get("short_score", 0.0))
-                return max(float(ind.get("long_score", 0.0)), float(ind.get("short_score", 0.0)))
-
-            def _direction_conflicts(e) -> bool:
-                """True if this entry's direction conflicts with current sector_regimes."""
-                if not self._last_sector_regimes:
-                    return False
-                etf = _SECTOR_MAP.get(e.symbol)
-                if not etf:
-                    return False
-                sector_info = self._last_sector_regimes.get(etf, {})
-                sector_regime = sector_info.get("regime", "neutral")
-                ed = getattr(e, "expected_direction", "either")
-                # Long entry in correcting/downtrend sector conflicts
-                if ed == "long" and sector_regime in ("correcting", "downtrend"):
-                    return True
-                # Short entry in breaking_out/uptrend sector conflicts
-                if ed == "short" and sector_regime in ("breaking_out", "uptrend"):
-                    return True
-                return False
-
-            def _eviction_priority(e) -> tuple:
-                """Lowest priority = evicted first. Tuple comparison: (tier, composite)."""
-                composite = _composite(e)
-                if getattr(e, "priority_tier", 1) == 2:
-                    return (0, composite)   # tier-2: evict first
-                if _direction_conflicts(e):
-                    return (1, composite)   # tier-1 conflicting: evict before non-conflicting
-                return (2, composite)       # tier-1 non-conflicting: keep last
-
-            keep_protected = [e for e in watchlist.entries if e.symbol in protected]
-            prunable = [e for e in watchlist.entries if e.symbol not in protected]
-            slots = max(0, max_entries - len(keep_protected))
-            # Sort descending by eviction priority: highest priority (tier=2, composite=1.0)
-            # at front → kept. Lowest priority (tier=0, composite=0.0) at back → pruned.
-            prunable.sort(key=_eviction_priority, reverse=True)
-            pruned = [e.symbol for e in prunable[slots:]]
-            watchlist.entries = keep_protected + prunable[:slots]
-            if pruned:
-                log.info(
-                    "Watchlist: pruned %d entries over cap=%d: %s",
-                    len(pruned), max_entries, pruned,
-                )
-
-        await self._state_manager.save_watchlist(watchlist)
-        return added
+    ) -> int:
+        """Delegate to WatchlistManager. See core/watchlist_manager.py."""
+        return await self._watchlist_manager.apply_watchlist_changes(
+            watchlist, add_list, remove_list, open_symbols,
+            last_sector_regimes=self._last_sector_regimes,
+        )
 
     async def _apply_position_reviews(
         self,
         reviews: list[dict],
     ) -> None:
-        """Append Claude's review notes and act on exit recommendations.
-
-        Always loads a fresh portfolio snapshot so stop/target adjustments are
-        not silently lost when a concurrent fast-loop or medium-loop save writes
-        the disk between the slow loop's initial load and this function's save.
-        """
-        portfolio = await self._state_manager.load_portfolio()
-        now_utc = datetime.now(timezone.utc)
-        now_iso = now_utc.isoformat()
-        changed = False
-        for review in reviews:
-            symbol = review.get("symbol", "")
-            action = review.get("action", "hold")
-            note = review.get("updated_reasoning") or review.get("notes", "")
-            log.info(
-                "Position review: %s — action=%s — %s",
-                symbol, action, note or "(no rationale provided)",
-            )
-            # Stamp review time so thesis breach scheduling can suppress redundant
-            # Sonnet calls for positions reviewed within thesis_breach_review_cooldown_min.
-            if symbol:
-                self._last_position_review_utc[symbol] = now_utc
-            for pos in portfolio.positions:
-                if pos.symbol != symbol:
-                    continue
-
-                # Journal this review event before any mutations so the record
-                # captures the state Claude reasoned about (current stop/target
-                # before adjustment) plus what Claude recommended.
-                _review_price = getattr(self, "_latest_indicators", {}).get(symbol, {}).get("price")
-                _pos_is_short = is_short(pos.intention.direction)
-                if _review_price and pos.avg_cost > 0:
-                    _gain = (
-                        (pos.avg_cost - _review_price) / pos.avg_cost
-                        if _pos_is_short
-                        else (_review_price - pos.avg_cost) / pos.avg_cost
-                    )
-                    _unrealized_pnl_pct = round(_gain * 100, 4)
-                else:
-                    _unrealized_pnl_pct = None
-                await self._trade_journal.append({
-                    "record_type": "review",
-                    "trade_id": self._entry_contexts.get(symbol, {}).get("trade_id"),
-                    "symbol": symbol,
-                    "strategy": pos.intention.strategy,
-                    "direction": pos.intention.direction,
-                    "action": action,
-                    "note": review.get("updated_reasoning") or review.get("notes", ""),
-                    "current_price": _review_price,
-                    "unrealized_pnl_pct": _unrealized_pnl_pct,
-                    "current_stop": pos.intention.exit_targets.stop_loss,
-                    "current_target": pos.intention.exit_targets.profit_target,
-                    "thesis_intact": review.get("thesis_intact"),
-                    "adjusted_targets": review.get("adjusted_targets"),
-                    "source": "live",
-                    "prompt_version": self._config.claude.prompt_version,
-                    "bot_version": self._config.claude.model,
-                })
-
-                if note:
-                    pos.intention.review_notes.append(f"[{now_iso}] {note}")
-                    changed = True
-                # Apply adjusted targets if provided
-                adj = review.get("adjusted_targets") or {}
-                if adj.get("profit_target"):
-                    old_target = pos.intention.exit_targets.profit_target
-                    new_target = float(adj["profit_target"])
-                    if new_target == old_target:
-                        log.debug("Position review: %s target no-op (%.4f unchanged)", symbol, old_target)
-                    else:
-                        pos.intention.exit_targets.profit_target = new_target
-                        changed = True
-                        log.info(
-                            "Position review: %s target adjusted  %.4f → %.4f",
-                            symbol, old_target, new_target,
-                        )
-                if adj.get("stop_loss"):
-                    new_stop = float(adj["stop_loss"])
-                    # Guard: reject a stop adjustment that would put the stop on the
-                    # wrong side of current price — it would trigger an immediate exit
-                    # on the next fast-loop cycle rather than protecting future gains.
-                    # This happened with XOM when Claude raised the stop to $162 while
-                    # price was $161.25, forcing an instant exit at +1.7%.
-                    _cur = _review_price  # already fetched above; None if unavailable
-                    # _from_dict_position normalises "sell_short" → "short" at load
-                    # time, so _pos_is_short (from is_short()) is reliable here.
-                    _is_short_dir = _pos_is_short
-                    _would_trigger = (
-                        _cur is not None and (
-                            (not _is_short_dir and new_stop >= _cur)
-                            or (_is_short_dir and new_stop <= _cur)
-                        )
-                    )
-                    old_stop = pos.intention.exit_targets.stop_loss
-                    if new_stop == old_stop:
-                        log.debug("Position review: %s stop no-op (%.4f unchanged)", symbol, old_stop)
-                    elif _would_trigger:
-                        log.warning(
-                            "Stop adjustment rejected for %s: new_stop=%.4f would "
-                            "immediately trigger at current_price=%.4f — keeping "
-                            "existing stop=%.4f",
-                            symbol, new_stop, _cur,
-                            old_stop,
-                        )
-                    else:
-                        pos.intention.exit_targets.stop_loss = new_stop
-                        changed = True
-                        log.info(
-                            "Position review: %s stop adjusted  %.4f → %.4f  price=%.4f",
-                            symbol, old_stop, new_stop, _cur or 0.0,
-                        )
-                # Claude recommends exiting — place a market exit order immediately.
-                # thesis_intact=False is a hard signal; action="exit" is sufficient.
-                if action == "exit":
-                    # Guard against the override-vs-Claude race: if this symbol was
-                    # closed by the fast loop (override/stop) while Claude's API call
-                    # was in flight, the position no longer exists — skip the exit.
-                    if symbol in self._recently_closed:
-                        log.info(
-                            "Claude position review: exit for %s skipped — "
-                            "position already closed by fast loop (%.0fs ago)",
-                            symbol,
-                            time.monotonic() - self._recently_closed[symbol],
-                        )
-                        break
-                    if not self._fill_protection.can_place_order(symbol):
-                        log.warning(
-                            "Claude position review: exit for %s blocked — pending order exists",
-                            symbol,
-                        )
-                        break
-                    exit_side = EXIT_SIDE[pos.intention.direction]
-                    exit_order = Order(
-                        symbol=symbol,
-                        side=exit_side,
-                        quantity=pos.shares,
-                        order_type="market",
-                        time_in_force="day",
-                    )
-                    try:
-                        result = await self._broker.place_order(exit_order)
-                        order_record = OrderRecord(
-                            order_id=result.order_id,
-                            symbol=symbol,
-                            side=exit_side,
-                            quantity=pos.shares,
-                            order_type="market",
-                            limit_price=None,
-                            status="PENDING",
-                            created_at=now_iso,
-                            last_checked_at=now_iso,
-                        )
-                        await self._fill_protection.record_order(order_record)
-                        log.info(
-                            "Claude position review exit: %s  order_id=%s  "
-                            "reason=%s",
-                            symbol, result.order_id,
-                            review.get("updated_reasoning", "")[:120],
-                        )
-                    except Exception as exc:
-                        log.error(
-                            "Failed to place Claude review exit for %s: %s",
-                            symbol, exc,
-                        )
-                    break  # done with this position
-        if changed:
-            await self._state_manager.save_portfolio(portfolio)
+        """Delegate to PositionManager. See core/position_manager.py."""
+        await self._position_manager.apply_position_reviews(
+            reviews, broker=self._broker, latest_indicators=self._latest_indicators,
+        )
 
     # -----------------------------------------------------------------------
     # Degradation helpers
@@ -4388,6 +3569,11 @@ class Orchestrator:
             log.error("Broker failure: %s — entering degraded mode", exc)
             self._degradation.broker_available = False
             self._degradation.broker_first_failure_utc = now
+            # Phase 22: alert on first broker failure
+            try:
+                write_alert("broker_error", "WARNING", f"Broker API failure: {exc}")
+            except Exception:
+                pass
         else:
             elapsed = (now - self._degradation.broker_first_failure_utc).total_seconds()
             if (

@@ -85,6 +85,70 @@ Every prompt version bump copies all 8 files in `config/prompts/`. Between v3.10
 
 ---
 
+### CONCERN-6: Agentic Workflow v3 — Orchestrator monolith
+**Status:** `open`  
+**Severity:** High (highest blast radius, hardest to test, most likely to cause cascading failures)
+
+`tools/agent_runner.py` is assigned ~18 distinct responsibilities: task watching, intent classification, API calls to Architect, worktree creation, CLAUDE.md generation, tmux session spawning, checkpoint polling, Architect response routing, Reviewer API calls, merge execution, post-merge testing, revert on failure, cost tracking, budget enforcement, session killing, failure escalation, heartbeat emission, task deduplication, priority scheduling, and state persistence. This is the monolith the plan claims to avoid. A bug in cost tracking can cascade into merge failures. The plan's own modularity philosophy says "if a new feature requires touching more than two modules, the abstraction is wrong."
+
+**Solution analysis (2026-04-07):** Extract 3 infrastructure modules, keep 2 domain clusters. The 18 responsibilities cluster into 5 natural groups. **TaskManager** (task watching, deduplication, priority scheduling, intent classification, state persistence — pure data operations on `state/agent_tasks/`), **WorktreeManager** (worktree creation, CLAUDE.md generation, tmux spawning, session killing, timeout — git/tmux operations), and **CostTracker** (cost tracking, budget enforcement, heartbeat — pure accounting) extract cleanly using the same pattern proven in the trading bot extraction: mutable shared ref to `orchestrator_state` dict at construction, runtime params at call time, single asyncio event loop. Pipeline sequencing (Architect → Executor → Reviewer + checkpoint loops) and merge/revert stay in the orchestrator — they are the orchestrator's reason to exist. Extracting them creates a god-context object, the same problem that kept `_medium_try_entry` in the trading bot. ~60% size reduction. Phase E restructure required.
+
+**First observed:** 2026-04-07 architectural review of agentic-workflow-v3.md
+
+---
+
+### CONCERN-7: Agentic Workflow v3 — Checkpoint polling burns Executor context
+**Status:** `open`  
+**Severity:** High (directly degrades Opus Executor quality)
+
+The Executor writes `checkpoint.json`, then polls for `architect_response.json`. During this wait, the Claude Code session is alive — consuming an API seat and holding its full context window. Each poll-wait-read cycle adds low-value turns to the conversation. Over a 5-checkpoint plan, context degradation could meaningfully erode Executor quality at the most expensive model tier.
+
+**Solution analysis (2026-04-07):** Replace polling with exit-and-respawn. The zone file was already designed for crash recovery (records last completed unit, approach, test status). Checkpoint polling exists because the plan assumes session continuity is valuable — it isn't, because zone file + git branch carry all state. New protocol: Executor completes checkpoint unit → updates zone file → commits → **exits**. Orchestrator detects checkpoint → calls Architect API → pre-seeds `architect_response.json` into worktree → spawns fresh Executor with "continue from unit N." Zero idle burn, fresh context window per segment. Tradeoff: loses in-session mental model (files read, approaches tried), mitigated by zone file + git commits + Architect response. Over a 5-checkpoint plan, fresh context per segment dominates vs 4 rounds of idle-polling degradation at Opus cost. Low effort — Execution_Policy rewrite + one zone file field (`resumed_from_checkpoint`).
+
+**First observed:** 2026-04-07 architectural review of agentic-workflow-v3.md
+
+---
+
+### CONCERN-8: Agentic Workflow v3 — Dual signal bus violates Principle 1
+**Status:** `open`  
+**Severity:** High (class of silent-failure bugs)
+
+The plan declares "signal files are the universal bus" (Principle 1) but the architecture has two distinct signal namespaces: `<worktree>/.executor/` for Executor signals and `state/signals/` in the main repo for everything else. The orchestrator translates between them. Stale or orphaned signals in worktrees after crashes are silently dropped if the orchestrator's worktree-path mapping gets out of sync with reality.
+
+**Solution analysis (2026-04-07):** Rename, don't unify. The dual bus is architecturally correct — `.executor/` is a sandboxed outbox, the orchestrator is a signal gateway. Unifying would break worktree isolation (the core safety property): Executor writing to `state/signals/` enables cross-task signal corruption; symlinks are fragile (dynamic worktree lifecycle); signal writer abstraction silently breaks the trust boundary. Fix: (1) rename in plan — `.executor/` is "executor outbox," orchestrator polling is "signal gateway," Principle 1 becomes true by definition; (2) add explicit startup reconciliation — on orchestrator restart, scan all active worktree `.executor/` dirs for unprocessed signals. Orphaned signals on crash are low severity: orchestrator tracks worktree paths in `orchestrator_state.json`, re-polls on restart, worktrees preserved on failure. Trivial effort — terminology + one sentence addition.
+
+**First observed:** 2026-04-07 architectural review of agentic-workflow-v3.md
+
+---
+
+### CONCERN-9: Agentic Workflow v3 — Additional architectural issues (5 items)
+**Status:** `open`  
+**Severity:** Medium
+
+**a) Claude Code token tracking is aspirational.** The plan says "Executor writes cumulative token usage to zone file" but Claude Code doesn't expose token counts programmatically. The 80%/100% budget enforcement layer for Executor sessions won't work or will be wildly inaccurate.
+
+**Solution (2026-04-07):** Drop token tracking for Executor sessions entirely. Claude Code's `--max-budget-usd` and `--output-format json` only work with `--print` mode, not interactive tmux sessions. The Executor runs on Max plan (zero API cost), so token counts have no dollar consequence. Keep the 60-minute wall-clock timeout (already planned). Keep token tracking for API-based agents only (Architect, Reviewer, Strategy Analyst) where it's trivially available in the response. Zone file `cumulative_tokens` field → replace with `wall_clock_seconds` for Executor zones.
+
+**b) Post-merge revert unsafe with parallel Executors.** `git revert --no-edit HEAD` assumes merge ordering. If two Executors merge close together and the first merge's tests are still running, the revert can target the wrong commit.
+
+**Solution (2026-04-07):** Use merge commit SHA instead of HEAD. The race window is near-zero under current design (orchestrator is single-threaded, manages merges procedurally), but `HEAD` is fragile regardless — an operator hotfix between merge and revert breaks it. The orchestrator already performs the merge; capture the SHA from `git merge` output and pass to `git revert --no-edit <sha>`. One variable, one line. No merge lock or queue serialization needed — the plan already serializes merges.
+
+**c) Haiku context vs day-long pattern accumulation.** Ops Monitor uses persistent Haiku to detect patterns over the trading day, but compaction will discard the oldest pattern history — exactly what the persistence is meant to preserve.
+
+**Solution (2026-04-07):** Structured daily summary file + reduced poll frequency. (1) Ops Monitor maintains `state/ops_daily_summary.json` with rolling anomaly counts, pattern timestamps, and trend flags — updated every cycle, read back after compaction. Decouples pattern memory from conversation memory entirely. Follows existing signal-file convention. (2) Reduce polling from 60s to 2-3 minutes (130-195 polls vs 390, same detection quality for multi-minute anomalies, longer between compactions). (3) PreCompact hook injects one-line reminder: "Read ops_daily_summary.json for pattern history." Two-role split (stateless poller + periodic Sonnet) rejected as over-engineering — adds a second agent and coordination protocol to solve what a single JSON file solves.
+
+**d) No backpressure on task ingestion.** Three sources write tasks (Ops Monitor, Strategy Analyst, humans). Nothing limits ingestion rate. A bad trading day could create a 15-task backlog that takes hours to drain, making bug reports stale by the time they're processed.
+
+**Solution (2026-04-07):** The real problem is staleness, not volume. Three layered defenses: (1) Reproduction gate — before calling Architect, orchestrator re-runs the bug report's reproduction test. If it passes, auto-close as `resolved_before_processing`. Highest value, catches the 9AM-bug-fixed-by-2PM scenario. Skip for `source: human` tasks. (2) TTL per task type — bug reports 2h, strategy findings 8h, human tasks no TTL. Orchestrator checks file age at dequeue. (3) Ops Monitor rate limit — cap at 3 bug reports per rolling hour (prevents cascade from a single root cause generating many reports). Queue depth limit rejected — priority ordering + TTL + reproduction gate cover all failure modes without forcing a drop policy.
+
+**e) Worktree leak on failure path.** Failed/timed-out worktrees are "preserved for debugging" with no automated cleanup, no TTL, no disk monitoring. Worktrees accumulate indefinitely.
+
+**Solution (2026-04-07):** TTL + startup sweep + max count cap. (1) 48-hour TTL on failed worktrees (timestamp recorded in `orchestrator_state.json`, configurable). (2) Startup sweep removes worktrees past TTL. (3) Max-5 cap — if a new failure exceeds the cap, remove the oldest. Tarball archiving rejected: adds compression logic and its own cleanup problem. After 48h, the git branch still exists — `git log`/`git diff`/`git show` recover all committed state. Uncommitted changes are the only loss, and Executors commit before signaling completion.
+
+**First observed:** 2026-04-07 architectural review of agentic-workflow-v3.md
+
+---
+
 ## Resolved Concerns
 
 Resolved items are deleted after one session. See `DRIFT_LOG.md` for the permanent record of what was implemented and why.
@@ -93,38 +157,14 @@ Resolved items are deleted after one session. See `DRIFT_LOG.md` for the permane
 
 ## Engineering Analyses
 
-### 2026-04-06 — Orchestrator Extraction Plan for Parallel Agent Development
+### 2026-04-06 — Orchestrator Extraction (completed)
 
-**Goal:** Reduce orchestrator.py (5393 lines, 47 methods) to enable safe parallel development by multiple coding agents (OmX/clawhip/OmO workflow).
+**Result:** orchestrator.py reduced from 5393 → 3605 lines (-33%) across two phases. 7 modules
+extracted into `core/`. Reconciliation extraction intentionally skipped (too many scalar writes).
+`_medium_try_entry` and `_run_claude_cycle` remain in orchestrator — too coupled to shared mutable
+state. See COMPLETED_PHASES.md for full implementation details and `plans/2026-04-06-orchestrator-extraction-phase*.md` for the approved designs.
 
-**Phase 1 — Do now (zero shared-state coupling, proven safe):**
-
-| Extract to | Methods | Lines | Shared state |
-|------------|---------|-------|-------------|
-| `core/trigger_engine.py` | `_check_triggers` + `SlowLoopTriggerState` + `_check_regime_conditions` + `_update_trigger_prices` | ~520 | None |
-| `core/market_context.py` | `_build_market_context` | ~154 | None (pass `_recommendation_outcomes` as param) |
-| `core/fill_handler.py` | `_journal_closed_trade` + `_register_opening_fill` + `_dispatch_confirmed_fill` | ~240 | None |
-
-**Result:** orchestrator drops to ~4480 lines. Three new independently testable/workable modules.
-
-**Phase 2 — After Phase 1 proves the pattern:**
-
-| Extract to | Methods | Lines | Notes |
-|------------|---------|-------|-------|
-| `core/watchlist_manager.py` | `_apply_watchlist_changes` + `_prune_expired_catalysts` + `_regime_reset_build` + `_clear_directional_suppression` + `_run_watchlist_build_task` | ~445 | `_filter_suppressed` coupling in `_clear_directional_suppression` — pass as param |
-| `core/position_manager.py` | `_apply_position_reviews` + `_medium_evaluate_positions` | ~325 | Clean, but wiring from medium/slow loop needs care |
-| `core/quant_overrides.py` | `_fast_step_quant_overrides` + `_place_override_exit` | ~170 | Fast-loop internals, rarely change |
-| `core/position_sync.py` | `_fast_step_position_sync` | ~204 | Fast-loop internals |
-| `core/reconciliation.py` | `startup_reconciliation` | ~302 | `_filter_suppressed`(3) + `_recommendation_outcomes`(1) — pass as params |
-
-**Result:** orchestrator drops to ~3030 lines.
-
-**Do not extract:**
-- `_medium_try_entry` (529 lines) — 8 writes to `_recommendation_outcomes`, 4 to `_entry_defer_counts`, 1 to `_filter_suppressed`. Core entry pipeline, too coupled.
-- `_run_claude_cycle` (512 lines) — 5 writes to `_recommendation_outcomes`, 3 to `_entry_defer_counts`, 2 to `_filter_suppressed`. Core reasoning pipeline, too coupled.
-- Loop bodies (`_fast_loop_cycle`, `_medium_loop_cycle`, `_slow_loop_cycle`) — coordinator methods that call extracted modules. This is the orchestrator's job.
-
-**Parallel work zones after full extraction:**
+**Parallel work zones now available:**
 
 | Zone | Files | Safe for parallel agents? |
 |------|-------|-----------------------------|
@@ -135,10 +175,153 @@ Resolved items are deleted after one session. See `DRIFT_LOG.md` for the permane
 | Watchlist mgmt | `core/watchlist_manager.py` | Yes |
 | Fill handling | `core/fill_handler.py` | Yes |
 | Position reviews | `core/position_manager.py` | Yes |
+| Quant overrides | `core/quant_overrides.py` | Yes |
+| Position sync | `core/position_sync.py` | Yes |
 | Risk manager | `execution/risk_manager.py` | Yes |
 | Broker | `execution/alpaca_broker.py` | Yes |
 | Claude prompts | `config/prompts/` | **Serialize** |
 | Orchestrator core | `core/orchestrator.py` | **Serialize** |
+
+---
+
+### 2026-04-07 — Agentic Development Workflow Design
+
+**Goal:** Enable parallel AI agent development of Ozymandias + autonomous bot operation, both
+coordinated through Discord. Informed by the claw-code orchestration model (OmX/clawhip/oh-my-openagent
+stack that shipped 48K LOC Rust in an hour using coordinated agents driven from a Discord text box).
+
+**Architecture: three separated concerns**
+
+The claw-code insight is that workflow, monitoring, and coordination are three distinct problems that
+must not share context windows. An agent implementing a feature should never have notification logic
+in its working memory. A monitoring daemon should never reason about code architecture.
+
+| Layer | Claw-code equivalent | Ozymandias implementation | Owns |
+|-------|---------------------|--------------------------|------|
+| **Directive parser** | OmX (`$team`, `$ralph`) | Discord command → structured task decomposition | Turns human text into zone-scoped agent tasks |
+| **Signal daemon** | clawhip | Separate Python process, watches `state/signals/` + git | All monitoring, notification, Discord I/O. Never touches agent context. |
+| **Agent coordinator** | oh-my-openagent | Manages Architect → Executor → Reviewer cycle | Conflict resolution, task handoffs, verification loops |
+
+**Signal files are the universal bus.** The trading bot, the dev agents, and the signal daemon all
+communicate through structured JSON files in `state/signals/`. Discord is one client of this bus,
+not the bus itself. If Discord goes down, signal files still work. SSH `touch state/PAUSE_ENTRIES`
+still works. A cron job still works.
+
+```
+Trading Bot → writes signal files (trade events, reviews, alerts)
+Dev Agents  → write signal files (task claims, completions, test results)
+                    ↓
+            [Signal Daemon — separate process]
+                    ↓
+            Discord webhooks (outbound notifications)
+            Discord listener (inbound commands → signal files)
+            Git watcher (commits, PRs → Discord)
+```
+
+**Signal daemon design (clawhip equivalent):**
+
+Separate process. Stateless. Watches:
+- `state/signals/` — bot trade events, position reviews, alerts, agent task claims/completions
+- Git — new commits, branch creation, PR activity
+- Agent tmux sessions — lifecycle events (started, completed, errored)
+
+Routes to Discord channels:
+- `#trades` — entry/exit fills, stop hits, target hits, Claude exits
+- `#reviews` — position review summaries, thesis breach alerts, regime changes
+- `#alerts` — emergency exit, broker degradation, daily loss limit
+- `#daily` — session open/close summary, P&L, equity
+- `#agent-tasks` — task claims, completions, test results
+- `#agent-prs` — automated PR notifications
+
+Writes inbound signal files from Discord commands:
+- `!pause` → `state/PAUSE_ENTRIES`
+- `!resume` → removes `state/PAUSE_ENTRIES`
+- `!status` → reads `state/signals/status.json`, posts to channel
+- `!exit <symbol>` → `state/EMERGENCY_EXIT` (or per-symbol variant)
+- `$team "implement X"` → writes structured task to `state/agent_tasks/`
+
+**Bot signal file API (extends existing EMERGENCY_* pattern):**
+
+Outbound (bot writes, daemon reads):
+- `state/signals/last_trade.json` — most recent entry/exit with full context
+- `state/signals/last_review.json` — most recent Claude position review
+- `state/signals/status.json` — equity, positions, open orders, loop health (written every fast tick)
+- `state/signals/alert.json` — emergency/degradation events (append-only, daemon consumes)
+
+Inbound (daemon writes, bot reads on fast-loop tick):
+- `state/PAUSE_ENTRIES` / `state/RESUME_ENTRIES` — suppress/allow new entries
+- `state/FORCE_REASONING` — trigger immediate slow loop cycle
+- `state/FORCE_BUILD` — trigger immediate watchlist build
+- `state/APPROVE_<symbol>` — approval gate response (for future supervised mode)
+
+**Agent roles and verification loop:**
+
+Three roles, mapped to Claude Code instances:
+
+- **Architect** — reads directive + CLAUDE.md + COMPLETED_PHASES.md + NOTES.md + DRIFT_LOG.
+  Produces a plan with zone boundaries, file constraints, and verification criteria.
+  Context: full doc set. Does not write code.
+
+- **Executor** — picks up plan, works within assigned zone, writes code + tests.
+  Multiple Executors can run in parallel on different zones.
+  Context: CLAUDE.md + plan + zone files only. Does not see full architecture.
+
+- **Reviewer** — runs tests, reads diff, checks against CLAUDE.md conventions,
+  checks for integration issues across zone boundaries.
+  Context: diff + test output + CLAUDE.md. Does not see Architect's reasoning.
+
+Cycle: Architect → Executor(s) → Reviewer → (back to Architect if re-planning needed) → merge.
+
+Agent coordination through signal files:
+- `state/agent_tasks/<task-id>.json` — task definition (zone, files, plan, criteria)
+- `state/agent_claims/<zone>.lock` — agent claims zone before working (prevents collision)
+- `state/agent_results/<task-id>.json` — completion status, test results, branch name
+
+**Context boundary enforcement:**
+
+Each agent role gets a defined context window scope. This prevents bloat and keeps agents focused:
+- Architect: full doc set, no source code beyond structure
+- Executor: CLAUDE.md conventions + plan + zone source files
+- Reviewer: diff + test output + CLAUDE.md conventions
+
+The signal daemon keeps all monitoring/notification outside every agent's context. An Executor deep
+in a complex implementation never has its limited memory filled with Discord formatting or git
+webhook logic.
+
+**Bot autonomy escalation (runtime, not dev):**
+
+Four levels, config-driven (`autonomy_level` in config.json):
+1. **Supervised** — bot proposes entries via signal file, waits for `APPROVE_<symbol>` before placing
+2. **Guided** — entries auto-execute, exits auto-execute, all events notify Discord
+3. **Autonomous** — notify only on fills, reviews, and alerts
+4. **Silent** — daily summary only
+
+Default starts at Guided. Escalation requires explicit operator command via Discord.
+
+**Prerequisites before implementation:**
+
+1. Commit Phase 2 extraction (done, needs commit) — parallel zones depend on it
+2. Fix CONCERN-5 (prompt versioning copies 8 files per bump) — multi-agent prompt footgun
+3. Discord server setup (channels, webhook URLs, bot token) — operator task, not code
+4. Signal daemon is the first code deliverable — everything else plugs into it
+
+**Implementation order:**
+
+1. Signal file API on the bot (extend `EMERGENCY_*` pattern, add `state/signals/` output)
+2. Signal daemon (standalone process, webhook-only outbound first)
+3. Discord inbound commands (daemon listens, writes signal files)
+4. Agent task format + claim/completion protocol
+5. Architect/Executor/Reviewer role definitions + context scoping
+6. Bot autonomy levels (approval gates, escalation)
+
+**What not to build:**
+
+- No custom agent runtime. Claude Code instances in tmux sessions, coordinated by signal files
+  and the daemon. The orchestration is in the file protocol, not in a framework.
+- No complex message broker. Signal files with polling. The fast loop already polls every 5-15s.
+  The daemon polls or uses `watchdog`. No Redis, no RabbitMQ, no Kafka.
+- No agent-to-agent direct communication. All coordination goes through signal files. If the
+  Reviewer needs to tell the Executor something, it writes a signal file. The daemon routes it.
 
 ---
 
@@ -201,7 +384,7 @@ Only 2 of 68 trades (2.9%) hit their profit target. 73.5% of exits are Claude "s
 
 ---
 
-### 2026-04-02 — Orchestrator God Object: Analysis and Disentanglement Path
+### 2026-04-02 — Orchestrator God Object: Analysis and Disentanglement Path *(superseded by 2026-04-06 extraction)*
 
 `orchestrator.py` is 5,305 lines and 58 methods. It currently owns: startup/shutdown lifecycle, all three loop bodies, fill handling, entry execution, trigger evaluation, Claude cycle orchestration, market context assembly, watchlist lifecycle, regime management, position review application, degradation/broker failure state, and PDT management. CLAUDE.md deliberately encodes "only the orchestrator knows about all other modules" — that rule is doing real work and should be preserved. The question is whether everything currently living inside the class needs to be there to honour it.
 

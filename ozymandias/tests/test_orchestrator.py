@@ -100,6 +100,8 @@ async def orch(tmp_path):
     broker.place_order     = AsyncMock()
     broker.cancel_order    = AsyncMock()
     o._broker = broker
+    # Rebind extracted modules that stored a broker reference during _startup().
+    o._quant_overrides._broker = broker
     return o
 
 
@@ -3229,11 +3231,11 @@ class TestPhase23WatchlistSeparation:
 
         apply_calls = []
 
-        async def capture_apply(watchlist, add_list, remove_list, open_symbols=None):
+        async def capture_apply(watchlist, add_list, remove_list, open_symbols=None, *, last_sector_regimes=None):
             apply_calls.append(remove_list)
             return 0
 
-        orch._apply_watchlist_changes = capture_apply
+        orch._watchlist_manager.apply_watchlist_changes = capture_apply
         await orch._run_watchlist_build_task()
 
         assert apply_calls, "apply_watchlist_changes was never called"
