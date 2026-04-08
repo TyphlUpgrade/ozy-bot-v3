@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,6 +28,10 @@ TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 COMMAND_CHANNEL_IDS = [
     int(ch) for ch in os.environ.get("COMPANION_CHANNELS", "").split(",") if ch.strip()
 ]
+
+# Bounded dedup buffer for Discord MESSAGE_CREATE replays (gateway reconnects).
+# deque provides O(1) append + automatic eviction of oldest entries.
+_seen_message_ids: deque[int] = deque(maxlen=1000)
 
 # Paths relative to project root
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -236,6 +241,10 @@ def main():
             return
         if not message.content.startswith("!"):
             return
+
+        if message.id in _seen_message_ids:
+            return
+        _seen_message_ids.append(message.id)
 
         response = await handle_command(message.content)
         if response:
