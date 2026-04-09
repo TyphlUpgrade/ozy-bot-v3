@@ -14,10 +14,11 @@ Where: How the system works — module structure, data flow, component relations
 - [v5 Harness Design Decisions](v5-harness-design-decisions.md) — O_NONBLOCK, caveman config, concurrency patterns
 
 ### Roadmap
-Where: Where we're going — proposals, integration plans, feature designs
+Where: Where we're going — proposals, integration plans, feature designs, timelines
 
-- [v5 OMC Agent Integration](v5-omc-agent-integration.md) — Fold agent capabilities into existing pipeline roles
-- [v5 Conversational Discord Operator](v5-conversational-discord-operator.md) — 3-piece Discord interaction architecture
+- [v5 Harness Roadmap](v5-harness-roadmap.md) — Phase timeline with feature assignments and dependencies
+- [v5 OMC Agent Integration](proposals/v5-omc-agent-integration.md) — Fold agent capabilities into existing pipeline roles
+- [v5 Conversational Discord Operator](proposals/v5-conversational-discord-operator.md) — 3-piece Discord interaction architecture
 
 ### Quality
 Where: How we verify it works — bug tracking, review findings, audit reports

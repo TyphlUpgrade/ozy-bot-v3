@@ -20,14 +20,31 @@ updated: 2026-04-09
 | Phase completion checklist | [[v5-phase3-readiness]] | Sign-off criteria, due diligence |
 | Per-session discovery or experiment | Session Logs (auto-named) | Dead-end investigation, prototype notes |
 
+## Directory Structure
+
+```text
+.omc/wiki/
+├── index.md                  # Catalog — auto-maintained
+├── wiki-guide.md             # This file
+├── v5-harness-*.md           # Architecture, quality, progress pages
+├── v5-harness-roadmap.md     # Phase timeline with feature assignments
+├── proposals/                # Feature proposals and integration plans
+│   ├── v5-omc-agent-integration.md
+│   └── v5-conversational-discord-operator.md
+└── logs/                     # Operation log and session logs
+    ├── log.md                # Append-only operation chronicle
+    └── session-log-*.md      # Auto-captured per-session discoveries
+```
+
 ## Page Naming Convention
 
 **Harness pages:** `v5-{section}-{topic}.md`
 
 Sections:
-- **harness-** : Architecture, design, bugs, findings (core system)
-- **[feature-name]-** : Roadmap feature (e.g., `v5-omc-agent-integration.md`)
-- **phase[N]-readiness.md** : Progress checkpoints
+- **harness-** : Architecture, design, bugs, findings (core system) → wiki root
+- **[feature-name]-** : Proposals → `proposals/` subfolder
+- **phase[N]-readiness.md** : Progress checkpoints → wiki root
+- **session-log-** : Session logs → `logs/` subfolder
 
 **Trading bot pages** (future): `trading-bot-{topic}.md`
 
