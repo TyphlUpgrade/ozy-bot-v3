@@ -10,7 +10,7 @@ _Full listing: `wiki_list` · Targeted lookup: `wiki_query`_
 - [v5 Harness Design Decisions](v5-harness-design-decisions.md) — O_NONBLOCK, caveman config, concurrency
 
 ## Quality
-- [v5 Harness Known Bugs](v5-harness-known-bugs.md) — 11 open bugs (12 resolved → archive)
+- [v5 Harness Known Bugs](v5-harness-known-bugs.md) — 8 open bugs (15 resolved → archive)
 - [v5 Harness Reviewer Findings](v5-harness-reviewer-findings.md) — 3 review rounds, 27 issues fixed
 
 ## Roadmap

@@ -10,7 +10,7 @@ updated: 2026-04-09
 
 Bugs found during review that are deferred or represent latent risks. Tracked here for future phases.
 
-**11 open bugs tracked** — 12 resolved (see [[v5-harness-known-bugs-archive-2026]])
+**8 open bugs tracked** — 15 resolved (see [[v5-harness-known-bugs-archive-2026]])
 
 ## Open (Deferred)
 
@@ -49,15 +49,6 @@ If a newer harness writes extra fields to `state.json`, an older harness catches
 The stage pipeline (`classify → architect → executor → reviewer → merge → wiki`) is hardcoded. Per architect/critic consensus: the three-stage dev pipeline is the stable code review loop, not an arbitrary choice. Future agents (ops monitor, analyst) are task *sources* feeding into this pipeline, not alternative stages. Genericizing is a Phase 5 nicety, not a structural flaw.
 **Mitigation**: Extract stage transition graph to a module-level constant in Phase 5 if configurable pipelines are needed.
 
-### BUG-009: Hardcoded test runner in do_merge
-**Severity**: Medium | **File**: `orchestrator.py` | **Phase**: 2
-`do_merge()` runs `python3 -m pytest tests/ -x --timeout=120` — hardcoded to pytest, hardcoded directory, hardcoded timeout. Non-Python projects or projects using other test frameworks can't use the merge stage.
-**Mitigation**: Add `test_command` to `[pipeline]` in `project.toml`. Use `shlex.split()` to execute the user-defined command. Keep pytest as the default value in config, not in code.
-
-### BUG-011: No wall-clock stage timeout — orchestrator waits forever
-**Severity**: Medium | **File**: `orchestrator.py` | **Phase**: 2
-The orchestrator polls `check_stage_complete()` every `poll_interval` but has no maximum wait for any stage. The only timeout is clawhip's `stale_minutes` (output-based). A session that produces steady output but never completes will run indefinitely. At scale (many sessions, internal teams), this becomes an unbounded cost risk.
-**Mitigation**: Add `max_stage_minutes` per stage in `project.toml`. Track `stage_started_ts` on PipelineState. If exceeded, kill the session and fail the task.
 
 ### BUG-012: AsyncMock/MagicMock GC warning — unawaited coroutines in tests
 **Severity**: Info | **File**: `tests/test_orchestrator.py` | **Phase**: 2
@@ -68,10 +59,6 @@ Test helpers create `AsyncMock` attributes on `MagicMock` bases; GC emits `Runti
 
 Found by architect + critic + code-reviewer agents after Phase 2 escalation implementation.
 
-### BUG-019: should_renotify window coupled to poll_interval
-**Severity**: Low | **File**: `escalation.py:114-116` | **Phase**: 2
-`int(elapsed) % interval_seconds < 10` assumes poll loop hits the 10-second window at least once. Breaks at `poll_interval > 10s`. Default config is safe but non-obvious footgun.
-**Fix**: Replace with `last_renotify_ts` field on PipelineState. **Track for future phase.**
 
 ## Cross-References
 

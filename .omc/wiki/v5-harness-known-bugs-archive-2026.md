@@ -52,6 +52,30 @@ Archive of resolved bugs from v5-harness-known-bugs.md. All entries below were c
 **Severity**: Medium | **File**: `orchestrator.py`, `pipeline.py` | **Phase**: 2
 **Fix**: `handle_escalation_tier1` checks `escalation_started_ts` against `config.tier1_timeout` (default 1800s). If exceeded, auto-promotes to Tier 2 with `escalation_promoted` event. `tier1_timeout` added as a first-class field on `ProjectConfig` (loaded from `pipeline.tier1_timeout` in TOML). Also logs warning when `started_ts` is None.
 
+### ~~BUG-009: Hardcoded test runner in do_merge~~ RESOLVED
+**Severity**: Medium | **File**: `orchestrator.py`, `pipeline.py` | **Phase**: 2
+**Fix**: Added `test_command` field to `ProjectConfig` (default `"python3 -m pytest tests/ -x"`), loaded from `pipeline.test_command` in TOML. `do_merge()` uses `shlex.split(config.test_command)` instead of hardcoded args. Empty test_command guard skips tests with warning.
+
+### ~~BUG-011: No wall-clock stage timeout~~ RESOLVED
+**Severity**: Medium | **File**: `orchestrator.py`, `pipeline.py` | **Phase**: 2
+**Fix**: Added `stage_started_ts` to `PipelineState` (set on `activate()` and `advance()`, cleared in `clear_active()`). Added `max_stage_minutes` config dict with per-stage defaults (classify=10, architect=60, executor=120, reviewer=60, merge=15, wiki=15). `_check_stage_timeout()` in main loop kills session and clears task on exceed. Escalation stages excluded.
+
+### ~~BUG-019: should_renotify window coupled to poll_interval~~ RESOLVED
+**Severity**: Low | **File**: `escalation.py`, `pipeline.py` | **Phase**: 2
+**Fix**: Replaced `int(elapsed) % interval_seconds < 10` modulo trick with explicit `last_renotify_ts` field on `PipelineState`. `should_renotify()` now takes `last_renotify_ts` parameter — returns True when None (first renotify after one interval) or when elapsed since last renotify >= interval.
+
+## Phase 2 Prereq Batch (2026-04-09)
+
+Fixes applied before Phase 3 entry. Found via Phase 3 readiness assessment.
+
+| Bug | Severity | Fix |
+|-----|----------|-----|
+| BUG-009 | Medium | `test_command` config field, `shlex.split()` in `do_merge()` |
+| BUG-011 | Medium | `stage_started_ts` + `max_stage_minutes` + `_check_stage_timeout()` in main loop |
+| BUG-019 | Low | `last_renotify_ts` replaces modulo-based renotify window |
+
+**Tests added**: 8 tests (5 stage timeout orchestrator + 3 pipeline), 3 renotify tests, 9 P1 edge case tests (signals, escalation, discord).
+
 ## Phase 2 Stall Triad Batch (2026-04-09)
 
 Three interconnected bugs (BUG-015/016/017) that compound into permanent pipeline hangs when escalation state is lost or architect is unresponsive.
