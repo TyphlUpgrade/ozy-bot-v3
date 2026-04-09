@@ -70,6 +70,11 @@ def config(tmp_dir):
             orchestrator={"classify": "ultra", "summarize": "ultra", "wiki": "off"},
         ),
         timeouts={"classify": 5, "summarize": 5, "reformulate": 5, "wiki": 10},
+        max_stage_minutes={
+            "classify": 1, "architect": 2, "executor": 3,
+            "reviewer": 2, "merge": 1, "wiki": 1,
+        },
+        test_command="python3 -m pytest tests/ -x",
     )
 
 

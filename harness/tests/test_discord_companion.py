@@ -69,6 +69,9 @@ class TestParseCaveman:
         # not a valid level, so treated as a bare command token
         assert parse_caveman("fakecommand") == ("fakecommand", "")
 
+    def test_multiple_spaces_between_agent_and_level(self):
+        assert parse_caveman("executor   ultra") == ("executor", "ultra")
+
 
 # ---------- TestParseTell ----------
 

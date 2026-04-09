@@ -148,6 +148,28 @@ class TestPipelineState:
         state = PipelineState.load(path)
         assert state.active_task is None
 
+    def test_stage_started_ts_set_on_activate(self, pipeline_state):
+        task = TaskSignal(task_id="t1", description="Test")
+        pipeline_state.activate(task)
+        assert pipeline_state.stage_started_ts is not None
+
+    def test_stage_started_ts_updated_on_advance(self, pipeline_state):
+        task = TaskSignal(task_id="t1", description="Test")
+        pipeline_state.activate(task)
+        ts_after_activate = pipeline_state.stage_started_ts
+        pipeline_state.advance("architect", "architect")
+        assert pipeline_state.stage_started_ts is not None
+        # advance() sets a fresh timestamp (may equal activate's if same instant, but field is set)
+        assert pipeline_state.stage_started_ts >= ts_after_activate
+
+    def test_stage_started_ts_roundtrip(self, tmp_path):
+        path = tmp_path / "state.json"
+        state = PipelineState(active_task="t1", stage="executor")
+        state.stage_started_ts = "2026-04-09T12:00:00+00:00"
+        state.save(path)
+        loaded = PipelineState.load(path)
+        assert loaded.stage_started_ts == "2026-04-09T12:00:00+00:00"
+
 
 class TestAgentDef:
     def test_deny_flags_str_empty(self):

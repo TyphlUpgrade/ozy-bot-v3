@@ -101,19 +101,26 @@ def _elapsed_seconds(started_ts: str) -> float:
     return (datetime.now(UTC) - started).total_seconds()
 
 
-def should_renotify(started_ts: str | None, interval_seconds: int) -> bool:
+def should_renotify(
+    started_ts: str | None,
+    interval_seconds: int,
+    last_renotify_ts: str | None = None,
+) -> bool:
     """Return True if a blocking escalation should re-notify the operator.
 
     Re-notifies every `interval_seconds` (default 4 hours = 14400s).
     Must have been waiting at least one full interval before first re-notify.
+    Uses `last_renotify_ts` to track the last notification time, avoiding the
+    poll-window assumption of the previous modulo approach.
     """
     if started_ts is None:
         return False
     elapsed = _elapsed_seconds(started_ts)
     if elapsed < interval_seconds:
         return False
-    # Re-notify at each interval boundary (10s window to catch it in poll cycle)
-    return int(elapsed) % interval_seconds < 10
+    if last_renotify_ts is None:
+        return True
+    return _elapsed_seconds(last_renotify_ts) >= interval_seconds
 
 
 def should_auto_proceed(esc: EscalationRequest, started_ts: str | None,

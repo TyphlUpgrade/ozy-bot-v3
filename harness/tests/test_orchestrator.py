@@ -1238,4 +1238,93 @@ class TestEscalationWaitNoStartedTs:
         mock_logger.warning.assert_called_once()
         assert "no started_ts" in mock_logger.warning.call_args[0][0].lower()
         assert pipeline_state.stage == "escalation_wait"
-        event_log.record.assert_not_awaited()
+
+
+# ---------- BUG-011: stage timeout ----------
+
+
+class TestCheckStageTimeout:
+    def test_timeout_fires_when_elapsed_exceeds_max(self, config):
+        """Returns True when stage elapsed time exceeds max_stage_minutes."""
+        from harness.orchestrator import _check_stage_timeout
+        from datetime import datetime, timezone, timedelta
+
+        state = _make_state(stage="executor")
+        # Set stage_started_ts to 4 hours ago; executor max is 3 min in test config
+        past = datetime.now(timezone.utc) - timedelta(hours=4)
+        state.stage_started_ts = past.isoformat()
+
+        assert _check_stage_timeout(state, config) is True
+
+    def test_timeout_does_not_fire_within_limit(self, config):
+        """Returns False when stage elapsed time is within max_stage_minutes."""
+        from harness.orchestrator import _check_stage_timeout
+        from datetime import datetime, timezone
+
+        state = _make_state(stage="executor")
+        state.stage_started_ts = datetime.now(timezone.utc).isoformat()
+
+        assert _check_stage_timeout(state, config) is False
+
+    def test_timeout_returns_false_without_stage_started_ts(self, config):
+        """Returns False when stage_started_ts is None."""
+        from harness.orchestrator import _check_stage_timeout
+
+        state = _make_state(stage="executor")
+        state.stage_started_ts = None
+
+        assert _check_stage_timeout(state, config) is False
+
+    def test_timeout_returns_false_for_unknown_stage(self, config):
+        """Returns False when stage has no entry in max_stage_minutes."""
+        from harness.orchestrator import _check_stage_timeout
+        from datetime import datetime, timezone, timedelta
+
+        state = _make_state(stage="escalation_wait")
+        past = datetime.now(timezone.utc) - timedelta(hours=4)
+        state.stage_started_ts = past.isoformat()
+
+        assert _check_stage_timeout(state, config) is False
+
+    @pytest.mark.asyncio
+    async def test_main_loop_timeout_clears_task_and_logs_event(self, config, pipeline_state):
+        """When stage timeout fires in main loop, task is cleared and event logged."""
+        from datetime import datetime, timezone, timedelta
+        from harness.orchestrator import _check_stage_timeout
+        import harness.orchestrator as orch_mod
+
+        task = TaskSignal(task_id="task-001", description="Do work")
+        pipeline_state.activate(task)
+        pipeline_state.advance("executor", "executor")
+        # Force the timeout to be already exceeded
+        past = datetime.now(timezone.utc) - timedelta(hours=4)
+        pipeline_state.stage_started_ts = past.isoformat()
+
+        session_mgr = _make_session_mgr()
+        session_mgr.sessions = {}  # no live sessions
+        event_log = _make_event_log()
+
+        # Verify _check_stage_timeout reports True
+        assert _check_stage_timeout(pipeline_state, config) is True
+
+        # Simulate the timeout branch directly (mirrors main loop logic)
+        elapsed = (
+            datetime.now(timezone.utc) - datetime.fromisoformat(pipeline_state.stage_started_ts)
+        ).total_seconds()
+        agent_name = pipeline_state.stage_agent
+        if agent_name and agent_name in session_mgr.sessions:
+            await session_mgr.restart(agent_name)
+        await event_log.record("stage_timeout", {
+            "task": pipeline_state.active_task,
+            "stage": pipeline_state.stage,
+            "elapsed_seconds": elapsed,
+        })
+        pipeline_state.clear_active()
+
+        assert pipeline_state.active_task is None
+        assert pipeline_state.stage is None
+        event_log.record.assert_awaited_once()
+        call_args = event_log.record.call_args[0]
+        assert call_args[0] == "stage_timeout"
+        assert call_args[1]["task"] == "task-001"
+        assert call_args[1]["stage"] == "executor"

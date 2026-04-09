@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import shlex
 import signal
 import sys
 from datetime import datetime, UTC
@@ -116,8 +117,13 @@ async def do_merge(state: PipelineState, config: ProjectConfig, event_log: Event
         state.clear_active()
         return
     # Run tests
+    if not config.test_command.strip():
+        logger.warning("Empty test_command — skipping tests for %s", state.active_task)
+        state.advance("wiki")
+        await event_log.record("stage_advanced", {"task": state.active_task, "from": "merge", "to": "wiki"})
+        return
     proc = await asyncio.create_subprocess_exec(
-        "python3", "-m", "pytest", "tests/", "-x", "--timeout=120",
+        *shlex.split(config.test_command),
         cwd=cwd,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
@@ -323,9 +329,12 @@ async def handle_escalation_wait(state: PipelineState, signal_reader: SignalRead
         return
 
     # Blocking escalations re-notify at interval
-    if esc.severity == "blocking" and escalation.should_renotify(started_ts, config.escalation_timeout):
+    if esc.severity == "blocking" and escalation.should_renotify(
+        started_ts, config.escalation_timeout, state.last_renotify_ts
+    ):
         summary = escalation.format_tier2_notification(esc)
         await notify("blocked", esc.agent, f"REMINDER: {summary}")
+        state.last_renotify_ts = datetime.now(UTC).isoformat()
         logger.info("Re-notified operator for blocking escalation on %s", state.active_task)
 
 
@@ -365,6 +374,18 @@ async def notify(event: str, agent: str, summary: str) -> None:
             logger.warning("clawhip agent failed: %s", stderr.decode()[:100])
     except (asyncio.TimeoutError, FileNotFoundError):
         logger.debug("clawhip notify unavailable for %s/%s", event, agent)
+
+
+# ---------- Stage Timeout ----------
+
+
+def _check_stage_timeout(state: PipelineState, config: ProjectConfig) -> bool:
+    """Return True if current stage has exceeded its wall-clock timeout."""
+    if not state.stage_started_ts or state.stage not in config.max_stage_minutes:
+        return False
+    elapsed = (datetime.now(UTC) - datetime.fromisoformat(state.stage_started_ts)).total_seconds()
+    max_seconds = config.max_stage_minutes[state.stage] * 60
+    return elapsed > max_seconds
 
 
 # ---------- Main Loop ----------
@@ -421,6 +442,30 @@ async def main_loop(config: ProjectConfig) -> None:
                     state.save(config.state_file)
                     await asyncio.sleep(config.poll_interval)
                     continue
+
+            # Check wall-clock stage timeout
+            if _check_stage_timeout(state, config):
+                elapsed = (
+                    datetime.now(UTC) - datetime.fromisoformat(state.stage_started_ts)
+                ).total_seconds()
+                logger.warning(
+                    "Stage timeout: stage=%s task=%s elapsed=%.0fs",
+                    state.stage, state.active_task, elapsed,
+                )
+                agent_name = state.stage_agent
+                if agent_name and agent_name in session_mgr.sessions:
+                    await session_mgr.restart(agent_name)
+                await event_log.record("stage_timeout", {
+                    "task": state.active_task,
+                    "stage": state.stage,
+                    "elapsed_seconds": elapsed,
+                })
+                _escalation_cache.pop(state.active_task or "", None)
+                state.clear_active()
+                state.heartbeat()
+                state.save(config.state_file)
+                await asyncio.sleep(config.poll_interval)
+                continue
 
             match state.stage:
                 case "classify":

@@ -107,6 +107,22 @@ class TestSignalReader:
         assert result is None
 
     @pytest.mark.asyncio
+    async def test_read_escalation_invalid_json_returns_none(self, tmp_dir):
+        esc_dir = tmp_dir / "signals" / "escalation"
+        (esc_dir / "t-bad.json").write_text("{not json")
+        reader = SignalReader(tmp_dir / "signals")
+        result = await reader.read_escalation("t-bad")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_read_architect_resolution_invalid_json_returns_none(self, tmp_dir):
+        res_dir = tmp_dir / "signals" / "escalation_resolution"
+        (res_dir / "t-bad.json").write_text("{not json")
+        reader = SignalReader(tmp_dir / "signals")
+        result = await reader.read_architect_resolution("t-bad")
+        assert result is None
+
+    @pytest.mark.asyncio
     async def test_check_stage_complete(self, tmp_dir):
         # Write architect completion signal
         arch_dir = tmp_dir / "signals" / "architect" / "t1"

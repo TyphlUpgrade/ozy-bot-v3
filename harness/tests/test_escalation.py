@@ -186,6 +186,33 @@ class TestShouldRenotify:
         ts = (datetime.now(UTC) - timedelta(seconds=14400)).isoformat()
         assert should_renotify(ts, 14400)
 
+    def test_just_before_boundary_does_not_renotify(self):
+        # 11 seconds short of the 4-hour interval — elapsed < interval_seconds, so no renotify
+        ts = (datetime.now(UTC) - timedelta(seconds=14400 - 11)).isoformat()
+        assert not should_renotify(ts, 14400)
+
+    def test_multiple_intervals_elapsed_renotifies(self):
+        # 8 hours elapsed = exactly 2 intervals
+        ts = (datetime.now(UTC) - timedelta(seconds=14400 * 2)).isoformat()
+        assert should_renotify(ts, 14400)
+
+    def test_last_renotify_ts_suppresses_early_renotify(self):
+        # Started 5 hours ago, last notified 1 hour ago — not yet a full interval since last notify
+        started_ts = (datetime.now(UTC) - timedelta(seconds=14400 + 3600)).isoformat()
+        last_renotify_ts = (datetime.now(UTC) - timedelta(seconds=3600)).isoformat()
+        assert not should_renotify(started_ts, 14400, last_renotify_ts)
+
+    def test_last_renotify_ts_allows_renotify_after_full_interval(self):
+        # Started 10 hours ago, last notified 5 hours ago — full interval has passed
+        started_ts = (datetime.now(UTC) - timedelta(seconds=14400 * 2 + 7200)).isoformat()
+        last_renotify_ts = (datetime.now(UTC) - timedelta(seconds=14400 + 3600)).isoformat()
+        assert should_renotify(started_ts, 14400, last_renotify_ts)
+
+    def test_none_last_renotify_ts_triggers_after_first_interval(self):
+        # No previous renotify, elapsed > interval — should fire
+        started_ts = (datetime.now(UTC) - timedelta(seconds=14400 + 60)).isoformat()
+        assert should_renotify(started_ts, 14400, last_renotify_ts=None)
+
 
 class TestShouldAutoProceed:
     def test_blocking_never_auto_proceeds(self):
@@ -210,4 +237,21 @@ class TestShouldAutoProceed:
     def test_informational_does_not_auto_proceed(self):
         esc = _make_esc(severity="informational")
         ts = (datetime.now(UTC) - timedelta(hours=5)).isoformat()
+        assert not should_auto_proceed(esc, ts, 14400)
+
+    def test_blocking_at_timeout_does_not_auto_proceed(self):
+        # Blocking severity must never auto-proceed even when timeout is exceeded
+        esc = _make_esc(severity="blocking")
+        ts = (datetime.now(UTC) - timedelta(seconds=14400)).isoformat()
+        assert not should_auto_proceed(esc, ts, 14400)
+
+    def test_advisory_exactly_at_timeout_proceeds(self):
+        # Elapsed == timeout_seconds is >= threshold, so should proceed
+        esc = _make_esc(severity="advisory")
+        ts = (datetime.now(UTC) - timedelta(seconds=14400)).isoformat()
+        assert should_auto_proceed(esc, ts, 14400)
+
+    def test_advisory_one_second_before_timeout_does_not_proceed(self):
+        esc = _make_esc(severity="advisory")
+        ts = (datetime.now(UTC) - timedelta(seconds=14399)).isoformat()
         assert not should_auto_proceed(esc, ts, 14400)

@@ -184,8 +184,10 @@ class ProjectConfig:
     agents: dict[str, AgentDef]
     caveman: CavemanConfig
     timeouts: dict[str, int] = field(default_factory=dict)
+    max_stage_minutes: dict[str, int] = field(default_factory=dict)
     claude_binary: str = "claude"       # configurable LLM CLI binary
     commands_module: str | None = None
+    test_command: str = "python3 -m pytest tests/ -x"  # command run after merge; override for non-Python projects
 
     @classmethod
     def load(cls, config_path: Path) -> ProjectConfig:
@@ -209,11 +211,23 @@ class ProjectConfig:
             agents=_default_agents(agents_dir),
             caveman=CavemanConfig.from_toml(data),
             claude_binary=pipeline.get("claude_binary", "claude"),
+            test_command=pipeline.get("test_command", "python3 -m pytest tests/ -x"),
             timeouts={
                 "classify": pipeline.get("classify_timeout", 120),
                 "summarize": pipeline.get("summarize_timeout", 120),
                 "reformulate": pipeline.get("reformulate_timeout", 120),
                 "wiki": pipeline.get("wiki_timeout", 300),
+            },
+            max_stage_minutes={
+                stage: pipeline.get(f"{stage}_max_minutes", default)
+                for stage, default in [
+                    ("classify", 10),
+                    ("architect", 60),
+                    ("executor", 120),
+                    ("reviewer", 60),
+                    ("merge", 15),
+                    ("wiki", 15),
+                ]
             },
             commands_module=data.get("commands", {}).get("module"),
         )
@@ -242,6 +256,8 @@ class PipelineState:
     escalation_started_ts: str | None = None  # when current escalation began (for tier promotion timing)
     pre_escalation_stage: str | None = None  # stage before escalation, for resume routing
     pre_escalation_agent: str | None = None  # agent before escalation, for reply injection
+    last_renotify_ts: str | None = None  # when blocking escalation last re-notified operator
+    stage_started_ts: str | None = None  # wall-clock time current stage began (for max timeout)
 
     def activate(self, task: "TaskSignal") -> None:
         from .signals import TaskSignal  # avoid circular at module level
@@ -254,12 +270,15 @@ class PipelineState:
         self.escalation_started_ts = None
         self.pre_escalation_stage = None
         self.pre_escalation_agent = None
+        self.last_renotify_ts = None
+        self.stage_started_ts = datetime.now(UTC).isoformat()
 
     def advance(self, next_stage: str, agent: str | None = None) -> None:
         if next_stage not in VALID_STAGES:
             raise ValueError(f"Invalid stage: {next_stage!r}. Valid: {', '.join(sorted(VALID_STAGES))}")
         self.stage = next_stage
         self.stage_agent = agent
+        self.stage_started_ts = datetime.now(UTC).isoformat()
         # Track escalation timing for tier promotion
         if next_stage.startswith("escalation_"):
             if self.escalation_started_ts is None:
@@ -285,6 +304,8 @@ class PipelineState:
         self.escalation_started_ts = None
         self.pre_escalation_stage = None
         self.pre_escalation_agent = None
+        self.last_renotify_ts = None
+        self.stage_started_ts = None
 
     def heartbeat(self) -> None:
         self.heartbeat_ts = datetime.now(UTC).isoformat()
