@@ -16,3 +16,14 @@ dist/
 build/
 *.egg-info/
 harness_events.jsonl
+
+# Transient/generated
+.worktrees/
+claw-code-main/
+debug/
+tests/debug_after_16.py
+tests/iv_probe.py
+tests/sentiment_indicator_analysis.py
+tests/trade_journal_backtest.jsonl
+tests/vix_backtest.py
+*.kate-swp

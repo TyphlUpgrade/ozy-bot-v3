@@ -1,0 +1,463 @@
+#!/bin/bash
+# ozy — unified launcher for the Ozymandias agentic workflow
+#
+# Usage:
+#   ozy up        Start all services (conductor, clawhip, discord companion)
+#   ozy down      Graceful shutdown of all services
+#   ozy restart   Restart the conductor (keeps clawhip + companion running)
+#   ozy status    Show what's running
+#   ozy logs      Tail the conductor log
+#   ozy task DESC Submit a task to the agent pipeline
+#   ozy caveman   Toggle caveman mode (prose compression for agents)
+#
+# Starts everything in a tmux session (default: ozy-dev).
+# Idempotent — safe to run 'up' when already running.
+
+set -euo pipefail
+
+# Ensure ~/.cargo/bin is in PATH (clawhip lives there)
+export PATH="$HOME/.cargo/bin:$PATH"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+TMUX_SESSION="${TMUX_SESSION:-ozy-dev}"
+STATE_DIR="$PROJECT_ROOT/ozymandias/state"
+SIGNALS_DIR="$STATE_DIR/signals"
+CONDUCTOR_LOG="$STATE_DIR/logs/conductor.log"
+CAVEMAN_FILE="$STATE_DIR/CAVEMAN_MODE"
+
+# Pane names (by index within the single tmux window)
+#   0 = shell (operator)
+#   1 = conductor
+#   2 = clawhip
+#   3 = discord companion
+PANE_CONDUCTOR=1
+PANE_CLAWHIP=2
+PANE_COMPANION=3
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+red()    { printf '\033[31m%s\033[0m\n' "$*"; }
+green()  { printf '\033[32m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
+dim()    { printf '\033[2m%s\033[0m\n' "$*"; }
+
+die() { red "error: $*" >&2; exit 1; }
+
+# Check if the tmux session exists
+session_exists() {
+  tmux has-session -t "$TMUX_SESSION" 2>/dev/null
+}
+
+# Check if a specific pane is running a process (not just a shell prompt).
+# Checks both the pane command name AND whether the shell has child processes
+# (handles cases like start_conductor.sh where pane_current_command is still "bash").
+pane_busy() {
+  local pane="$1"
+  local cmd pid
+  cmd=$(tmux display-message -t "$TMUX_SESSION:0.$pane" -p '#{pane_current_command}' 2>/dev/null) || return 1
+  # Non-shell command is definitely busy
+  [[ "$cmd" != "bash" && "$cmd" != "zsh" && "$cmd" != "fish" ]] && return 0
+  # Shell command — check if it has child processes
+  pid=$(tmux display-message -t "$TMUX_SESSION:0.$pane" -p '#{pane_pid}' 2>/dev/null) || return 1
+  pgrep -P "$pid" &>/dev/null
+}
+
+# Send a command to a tmux pane
+pane_send() {
+  local pane="$1"; shift
+  tmux send-keys -t "$TMUX_SESSION:0.$pane" "$*" Enter
+}
+
+# Check prereqs and print warnings (non-fatal)
+check_prereqs() {
+  local ok=true
+
+  if [ ! -f "$PROJECT_ROOT/.env" ]; then
+    yellow "warn: no .env file — Discord integration may not work"
+    ok=false
+  fi
+
+  if ! command -v clawhip &>/dev/null; then
+    yellow "warn: clawhip not found — Discord event routing disabled"
+    ok=false
+  fi
+
+  if ! command -v claude &>/dev/null; then
+    die "claude CLI not found — conductor requires it"
+  fi
+
+  if ! command -v tmux &>/dev/null; then
+    die "tmux not found — install with your package manager"
+  fi
+
+  if ! command -v jq &>/dev/null; then
+    die "jq not found — conductor requires it"
+  fi
+
+  if ! python -c "import discord" 2>/dev/null; then
+    yellow "warn: discord.py not installed — companion will fail"
+    ok=false
+  fi
+
+  $ok
+}
+
+# ---------------------------------------------------------------------------
+# Ensure directories
+# ---------------------------------------------------------------------------
+
+ensure_dirs() {
+  mkdir -p "$STATE_DIR/logs/agents" \
+           "$STATE_DIR/logs/signals" \
+           "$STATE_DIR/logs/judgments" \
+           "$STATE_DIR/logs/summaries" \
+           "$STATE_DIR/agent_tasks" \
+           "$SIGNALS_DIR/orchestrator" \
+           "$SIGNALS_DIR/conductor" \
+           "$SIGNALS_DIR/alerts" \
+           "$SIGNALS_DIR/architect" \
+           "$SIGNALS_DIR/executor" \
+           "$SIGNALS_DIR/reviewer" \
+           "$SIGNALS_DIR/analyst" \
+           "$SIGNALS_DIR/dialogue"
+}
+
+# ---------------------------------------------------------------------------
+# Create or attach to tmux session with 4 panes
+# ---------------------------------------------------------------------------
+
+ensure_session() {
+  if session_exists; then
+    # Count panes — if fewer than 4, add more
+    local count
+    count=$(tmux list-panes -t "$TMUX_SESSION:0" 2>/dev/null | wc -l)
+    while [ "$count" -lt 4 ]; do
+      tmux split-window -t "$TMUX_SESSION:0" -h
+      count=$((count + 1))
+    done
+    tmux select-layout -t "$TMUX_SESSION:0" tiled >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  # Create session with 4 panes in a tiled layout
+  tmux new-session -d -s "$TMUX_SESSION" -c "$PROJECT_ROOT"
+  tmux split-window -t "$TMUX_SESSION:0" -h -c "$PROJECT_ROOT"
+  tmux split-window -t "$TMUX_SESSION:0" -v -c "$PROJECT_ROOT"
+  tmux split-window -t "$TMUX_SESSION:0.0" -v -c "$PROJECT_ROOT"
+  tmux select-layout -t "$TMUX_SESSION:0" tiled
+
+  # Label panes (visible in status line if configured)
+  tmux select-pane -t "$TMUX_SESSION:0.0" -T "operator"
+  tmux select-pane -t "$TMUX_SESSION:0.$PANE_CONDUCTOR" -T "conductor"
+  tmux select-pane -t "$TMUX_SESSION:0.$PANE_CLAWHIP" -T "clawhip"
+  tmux select-pane -t "$TMUX_SESSION:0.$PANE_COMPANION" -T "companion"
+
+  green "created tmux session: $TMUX_SESSION"
+}
+
+# ---------------------------------------------------------------------------
+# Service launchers
+# ---------------------------------------------------------------------------
+
+start_conductor() {
+  if pane_busy "$PANE_CONDUCTOR"; then
+    dim "conductor already running"
+    return 0
+  fi
+  pane_send "$PANE_CONDUCTOR" "cd $PROJECT_ROOT && set -a && source .env 2>/dev/null; set +a && bash tools/start_conductor.sh"
+  green "conductor started"
+}
+
+start_clawhip() {
+  if ! command -v clawhip &>/dev/null; then
+    dim "clawhip not installed — skipping"
+    return 0
+  fi
+  # Check if clawhip is already running as a daemon (any process, not just our pane)
+  if clawhip status &>/dev/null; then
+    dim "clawhip already running (daemon on port 25294)"
+    return 0
+  fi
+  if pane_busy "$PANE_CLAWHIP"; then
+    dim "clawhip already running (pane)"
+    return 0
+  fi
+  # Source .env for Discord tokens, then start clawhip
+  pane_send "$PANE_CLAWHIP" "cd $PROJECT_ROOT && set -a && source .env 2>/dev/null; set +a && clawhip start --config clawhip.toml"
+  green "clawhip started"
+}
+
+start_companion() {
+  if pane_busy "$PANE_COMPANION"; then
+    dim "discord companion already running"
+    return 0
+  fi
+  pane_send "$PANE_COMPANION" "cd $PROJECT_ROOT && set -a && source .env 2>/dev/null; set +a && python tools/discord_companion.py"
+  green "discord companion started"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_up() {
+  echo "starting ozymandias agentic workflow..."
+  echo ""
+  check_prereqs || true
+  ensure_dirs
+  ensure_session
+
+  # Clean stale control signals from previous shutdown
+  rm -f "$SIGNALS_DIR/conductor/shutdown.json" "$SIGNALS_DIR/conductor/restart.json"
+
+  start_clawhip
+  start_companion
+  start_conductor
+
+  echo ""
+  green "all services launched in tmux session '$TMUX_SESSION'"
+  dim "attach with: tmux attach -t $TMUX_SESSION"
+  dim "submit tasks: ozy task \"fix the bug in ...\""
+  dim "shut down:    ozy down"
+
+  # Show caveman mode status
+  if [ -f "$CAVEMAN_FILE" ]; then
+    local level
+    level=$(cat "$CAVEMAN_FILE" 2>/dev/null | tr -d '[:space:]')
+    [ -z "$level" ] && level="full"
+    yellow "caveman mode: $level"
+  fi
+}
+
+cmd_down() {
+  if ! session_exists; then
+    dim "no active session"
+    return 0
+  fi
+
+  echo "shutting down..."
+
+  # Signal conductor for graceful shutdown
+  mkdir -p "$SIGNALS_DIR/conductor"
+  echo '{"action":"shutdown","source":"ozy-cli","ts":"'"$(date -Iseconds)"'"}' \
+    > "$SIGNALS_DIR/conductor/shutdown.json"
+  green "shutdown signal sent to conductor"
+
+  # Give conductor 10s to exit gracefully, then kill remaining panes
+  echo "waiting for conductor to exit (up to 10s)..."
+  for i in $(seq 1 10); do
+    if ! pane_busy "$PANE_CONDUCTOR" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+
+  # Send Ctrl-C to clawhip and companion
+  tmux send-keys -t "$TMUX_SESSION:0.$PANE_CLAWHIP" C-c 2>/dev/null || true
+  tmux send-keys -t "$TMUX_SESSION:0.$PANE_COMPANION" C-c 2>/dev/null || true
+  sleep 1
+
+  green "all services stopped"
+  dim "tmux session '$TMUX_SESSION' still open — kill with: tmux kill-session -t $TMUX_SESSION"
+}
+
+cmd_restart() {
+  if ! session_exists; then
+    yellow "no active session — running 'up' instead"
+    cmd_up
+    return
+  fi
+
+  # Signal conductor restart (outer loop in start_conductor.sh handles it)
+  mkdir -p "$SIGNALS_DIR/conductor"
+  echo '{"action":"restart","source":"ozy-cli","ts":"'"$(date -Iseconds)"'"}' \
+    > "$SIGNALS_DIR/conductor/restart.json"
+  green "restart signal sent to conductor"
+}
+
+cmd_status() {
+  echo "ozy status"
+  echo "----------"
+
+  if ! session_exists; then
+    dim "no tmux session '$TMUX_SESSION'"
+    return 0
+  fi
+
+  local services=("conductor:$PANE_CONDUCTOR" "clawhip:$PANE_CLAWHIP" "companion:$PANE_COMPANION")
+  for svc in "${services[@]}"; do
+    local name="${svc%%:*}"
+    local pane="${svc##*:}"
+    if pane_busy "$pane" 2>/dev/null; then
+      green "  $name: running (pane)"
+    elif [ "$name" = "clawhip" ] && command -v clawhip &>/dev/null && clawhip status &>/dev/null; then
+      green "  $name: running (daemon)"
+    else
+      red "  $name: stopped"
+    fi
+  done
+
+  # Show caveman mode
+  if [ -f "$CAVEMAN_FILE" ]; then
+    local level
+    level=$(cat "$CAVEMAN_FILE" 2>/dev/null | tr -d '[:space:]')
+    [ -z "$level" ] && level="full"
+    yellow "  caveman: $level"
+  else
+    dim "  caveman: off"
+  fi
+
+  # Show active task if any
+  local orch_state="$SIGNALS_DIR/orchestrator/orchestrator_state.json"
+  if [ -f "$orch_state" ]; then
+    local task stage
+    task=$(jq -r '.active_task // "none"' "$orch_state" 2>/dev/null)
+    stage=$(jq -r '.stage // "idle"' "$orch_state" 2>/dev/null)
+    if [ "$task" != "none" ] && [ "$task" != "null" ]; then
+      echo ""
+      echo "  active task: $task ($stage)"
+    else
+      echo ""
+      dim "  no active task"
+    fi
+  fi
+
+  # Show pending tasks
+  local pending
+  pending=$(find "$STATE_DIR/agent_tasks" -name '*.json' 2>/dev/null | wc -l)
+  if [ "$pending" -gt 0 ]; then
+    echo "  pending tasks: $pending"
+  fi
+}
+
+cmd_logs() {
+  if [ ! -f "$CONDUCTOR_LOG" ]; then
+    dim "no conductor log yet"
+    return 0
+  fi
+  tail -f "$CONDUCTOR_LOG" | while read -r line; do
+    # Pretty-print JSON log lines
+    echo "$line" | jq -c '.' 2>/dev/null || echo "$line"
+  done
+}
+
+cmd_task() {
+  local desc="$*"
+  if [ -z "$desc" ]; then
+    die "usage: ozy task \"description of what to do\""
+  fi
+
+  ensure_dirs
+
+  local ts
+  ts=$(date -u +%Y%m%dT%H%M%S)
+  local task_id="task-${ts}"
+  local task_file="$STATE_DIR/agent_tasks/${task_id}.json"
+
+  # Use jq to safely encode the description (handles quotes, newlines, etc.)
+  jq -n --arg desc "$desc" --arg ts "$(date -Iseconds)" \
+    '{type:"task",source:"ozy-cli",ts:$ts,description:$desc}' \
+    > "$task_file"
+
+  green "task submitted: $task_id"
+  dim "conductor will pick it up within ~10s"
+}
+
+cmd_caveman() {
+  local arg="${1:-}"
+
+  case "$arg" in
+    on|full)
+      mkdir -p "$STATE_DIR"
+      echo "full" > "$CAVEMAN_FILE"
+      green "caveman mode: full"
+      dim "agents will compress prose output. JSON structure + code unchanged."
+      ;;
+    lite)
+      mkdir -p "$STATE_DIR"
+      echo "lite" > "$CAVEMAN_FILE"
+      green "caveman mode: lite"
+      dim "agents remove filler/hedging, keep articles + full sentences."
+      ;;
+    ultra)
+      mkdir -p "$STATE_DIR"
+      echo "ultra" > "$CAVEMAN_FILE"
+      green "caveman mode: ultra"
+      dim "agents abbreviate aggressively. arrows for causality. one word when one word enough."
+      ;;
+    off)
+      if [ -f "$CAVEMAN_FILE" ]; then
+        rm -f "$CAVEMAN_FILE"
+        green "caveman mode: off"
+      else
+        dim "caveman mode was already off"
+      fi
+      ;;
+    status|"")
+      if [ -f "$CAVEMAN_FILE" ]; then
+        local level
+        level=$(cat "$CAVEMAN_FILE" 2>/dev/null | tr -d '[:space:]')
+        [ -z "$level" ] && level="full"
+        green "caveman mode: $level"
+      else
+        dim "caveman mode: off"
+      fi
+      ;;
+    *)
+      die "usage: ozy caveman [on|off|lite|full|ultra|status]"
+      ;;
+  esac
+}
+
+cmd_help() {
+  cat <<'EOF'
+ozy — Ozymandias agentic workflow launcher
+
+USAGE
+  ozy <command> [args]
+
+COMMANDS
+  up          Start all services (conductor, clawhip, discord companion)
+  down        Graceful shutdown of all services
+  restart     Restart the conductor only
+  status      Show what's running and active tasks
+  logs        Tail the conductor log (Ctrl-C to stop)
+  task DESC   Submit a task to the agent pipeline
+  caveman     Toggle prose compression for agents (lite|full|ultra|off)
+  help        Show this help
+
+ENVIRONMENT
+  TMUX_SESSION   tmux session name (default: ozy-dev)
+
+EXAMPLES
+  ozy up                                    # start everything
+  ozy task "fix the bug in fill handler"    # submit a task
+  ozy caveman on                            # enable prose compression
+  ozy caveman ultra                         # maximum compression
+  ozy caveman off                           # back to normal
+  ozy status                                # check what's running
+  ozy down                                  # shut it all down
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Main dispatch
+# ---------------------------------------------------------------------------
+
+cmd="${1:-help}"
+shift 2>/dev/null || true
+
+case "$cmd" in
+  up)       cmd_up ;;
+  down)     cmd_down ;;
+  restart)  cmd_restart ;;
+  status)   cmd_status ;;
+  logs)     cmd_logs ;;
+  task)     cmd_task "$@" ;;
+  caveman)  cmd_caveman "$@" ;;
+  help|-h|--help) cmd_help ;;
+  *)        die "unknown command: $cmd (try 'ozy help')" ;;
+esac
