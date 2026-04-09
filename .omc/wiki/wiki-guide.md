@@ -22,51 +22,113 @@ updated: 2026-04-09
 
 ## Directory Structure
 
+All wiki pages live directly in the wiki root. No subdirectories. This is required because `listPages()` uses a flat `readdirSync` and does not recurse into subdirectories — pages in subfolders are invisible to `wiki_query`, `wiki_lint`, and auto-indexing.
+
 ```text
 .omc/wiki/
-├── index.md                  # Catalog — auto-maintained
-├── wiki-guide.md             # This file
-├── v5-harness-*.md           # Architecture, quality, progress pages
-├── v5-harness-roadmap.md     # Phase timeline with feature assignments
-├── proposals/                # Feature proposals and integration plans
-│   ├── v5-omc-agent-integration.md
-│   └── v5-conversational-discord-operator.md
-└── logs/                     # Operation log and session logs
-    ├── log.md                # Append-only operation chronicle
-    └── session-log-*.md      # Auto-captured per-session discoveries
+├── index.md                               # Catalog — auto-maintained
+├── wiki-guide.md                          # This file
+├── wiki-log.md                            # Append-only operation chronicle
+├── v5-harness-*.md                        # Architecture, quality, progress pages
+├── v5-omc-agent-integration.md            # Feature proposals (flat, not in proposals/)
+├── v5-conversational-discord-operator.md  # Feature proposals (flat, not in proposals/)
+├── session-log-*.md                       # Per-session logs (flat, not in logs/)
+└── *-archive-YYYY.md                      # Archived pages (flat, not in archive/)
 ```
 
-## Page Naming Convention
+**Naming conventions:**
+- Harness core pages: `v5-harness-{topic}.md`
+- Feature proposals: `v5-{feature-name}.md`
+- Phase readiness: `v5-phase{N}-readiness.md`
+- Session logs: `session-log-{YYYY-MM-DD}-{slug}.md`
+- Archive pages: `{original-page-name}-archive-YYYY.md`
+- Operation log: `wiki-log.md` (not `log.md` — that name is reserved by the wiki plugin)
 
-**Harness pages:** `v5-{section}-{topic}.md`
+Do NOT create subdirectories. Any page placed in a subfolder will be invisible to all wiki tooling.
 
-Sections:
-- **harness-** : Architecture, design, bugs, findings (core system) → wiki root
-- **[feature-name]-** : Proposals → `proposals/` subfolder
-- **phase[N]-readiness.md** : Progress checkpoints → wiki root
-- **session-log-** : Session logs → `logs/` subfolder
+## Page Size Policy
 
-**Trading bot pages** (future): `trading-bot-{topic}.md`
+Page size is measured in bytes by `wiki_lint` (via `config.maxPageSize`, default 10,240 bytes).
+
+| Page type | Ceiling | Enforcement |
+|-----------|---------|-------------|
+| Tracking/quality pages (bugs, findings) | 8KB hard ceiling | Split or archive when reached |
+| Architecture/design pages | 12KB soft ceiling | wiki_lint warns at 10KB default; guide warns at 12KB |
+| Session logs | 6KB per log | Auto-pruned after 30 days |
+| index.md | 30 lines maximum | Matches SessionStart injection window |
+
+When a page exceeds its ceiling, either archive resolved/completed items or split the page by topic. See **Archive Rotation** and **When to Split a Page** below.
+
+## Archive Rotation
+
+When a tracking page exceeds its byte ceiling or resolved items exceed 50% of content, move resolved items to an archive page.
+
+**Archive page naming:** `{original-page-name}-archive-YYYY.md` in the wiki root.
+
+Example: `v5-harness-known-bugs-archive-2026.md`
+
+**Archive page frontmatter:**
+```yaml
+---
+title: [Original Title] — Archive 2026
+tags: [original-tags, archive]
+category: reference
+created: YYYY-MM-DD
+updated: YYYY-MM-DD
+---
+```
+
+- Use `category: reference` (the `archive` tag differentiates it from other reference pages)
+- Include original page's tags plus the `archive` tag
+- Archive pages are **excluded from index.md** but **searchable via `wiki_query`** (because they live in wiki root)
+- Add a "See also" link in the active page pointing to the archive page
+
+**Rotation triggers:**
+1. Page exceeds its byte-size ceiling, OR
+2. Resolved/completed items exceed 50% of page content — detected by counting `~~strikethrough~~ RESOLVED` headers or measuring `## Resolved` section size
+
+**Future enhancement:** `wiki_lint` will add an `archive-candidate` signal when a `debugging` category page has >50% resolved items. This is tracked as a separate lint code enhancement.
 
 ## Frontmatter Template
 
 ```yaml
 ---
 title: Page Title (human-readable)
-tags: [category, topic, subtopic]
-category: [architecture|design|roadmap|quality|progress|pattern]
+tags: [tag1, tag2, tag3]
+category: [architecture|decision|pattern|debugging|environment|session-log|reference|convention]
 created: YYYY-MM-DD
 updated: YYYY-MM-DD
 ---
 ```
 
-Categories:
-- `architecture` : System structure, module design, data flow
-- `design` : Trade-offs, decisions, rationale
-- `roadmap` : Proposals, integration plans, features
-- `quality` : Bugs, findings, audit results
-- `progress` : Phase completions, readiness assessments
-- `pattern` : Meta docs (like this guide)
+## Categories
+
+Categories are enum-constrained by the `WikiCategory` type. You must use exactly one of these values:
+
+| Category | Use for |
+|----------|---------|
+| `architecture` | System structure, module design, data flow |
+| `decision` | Trade-offs, decisions, rationale |
+| `pattern` | Meta docs (guides, conventions) |
+| `debugging` | Bugs, incident tracking |
+| `environment` | Environment setup, tooling config |
+| `session-log` | Per-session discoveries |
+| `reference` | Reference material, archived content |
+| `convention` | Coding standards, process rules |
+
+Do not use phantom categories (`design`, `roadmap`, `quality`, `progress`) — these are not valid `WikiCategory` enum values and will fail validation.
+
+## Tag Conventions
+
+Tags are free-form strings (not enum-constrained like categories). They drive `wiki_query` relevance scoring (tags weight 3 vs content weight 1), so consistent tags significantly improve search precision.
+
+**Core canonical tags:**
+`harness`, `bugs`, `architecture`, `design`, `roadmap`, `quality`, `progress`, `escalation`, `discord`, `agent`, `pipeline`, `archive`
+
+**Rules:**
+- Every page should have 2-5 tags
+- Prefer canonical tags for search consistency
+- New canonical tags can be added to this list when a recurring topic warrants it
 
 ## Cross-References: When to Use Links
 
@@ -85,6 +147,19 @@ to the FIFO intake. See [[v5-phase3-readiness]] for sign-off criteria.
 - File paths (use `file:line` format instead)
 - Commit hashes (use `git log` instead)
 - Code snippet references (inline code or `file:line`)
+
+## When to Split a Page
+
+Split a page when either trigger fires:
+
+1. **Byte size trigger** — page exceeds its ceiling. Archive resolved items first; if still over, split by topic.
+2. **Topic drift** — 3+ H2 sections cover unrelated topics. Split by topic.
+
+**Split naming:** `{parent-page}-{subtopic}.md`
+
+Example: `v5-harness-known-bugs.md` → `v5-harness-known-bugs-agent-roles.md`
+
+**After splitting:** add a "See also" section to the parent page linking to the split pages. `wiki_lint` orphan detection will catch any split pages that lose their cross-reference.
 
 ## What Does NOT Belong in the Wiki
 
@@ -116,28 +191,13 @@ status before processing.
 | `plans/` | Approved designs (before building) | For non-trivial architectural work, before coding |
 | `.omc/wiki/` | Living knowledge base (now+future) | For ongoing architecture, roadmap, quality tracking, progress |
 
-## Wiki Sections at a Glance
-
-### Harness (Development Pipeline)
-Current state of the v5 agent orchestration system. Read before modifying signal routing, conductor logic, or agent roles.
-
-### Roadmap
-Upcoming features and integration proposals. Read before planning new capabilities.
-
-### Quality
-Bug tracker and review findings. Consult before touching a module with known issues.
-
-### Progress
-Phase readiness and sign-off. Answers "what's done and what's next?"
-
-### Session Logs
-Per-session ephemeral notes. Auto-generated; kept for 30 days.
-
 ## Quick Rules
 
 1. **One concern per page** — Keep pages focused. Link liberally.
-2. **Frontmatter required** — Use the template above. Category is mandatory.
+2. **Frontmatter required** — Use the template above. Category must be a valid `WikiCategory` enum value.
 3. **Link as you write** — When you mention another wiki topic, add `[[page-name]]`.
 4. **Reference files, not snippets** — Use `file:line`, not copy-pasted code.
 5. **Update the timestamp** — Change `updated:` field when you edit.
-6. **Index is auto-built** — Don't manually edit `index.md`. Structure it via frontmatter.
+6. **Index is auto-built** — Don't manually edit `index.md` for content. Structure it via frontmatter.
+7. **Flat root only** — Never create subdirectories. All pages go directly in `.omc/wiki/`.
+8. **Lint alignment** — `wiki_lint` already enforces a byte-based page size ceiling (default 10KB via `config.maxPageSize`). Per-category byte overrides (8KB for `debugging`, 12KB for `architecture`) and `archive-candidate` detection are tracked as future `wiki_lint` code enhancements.

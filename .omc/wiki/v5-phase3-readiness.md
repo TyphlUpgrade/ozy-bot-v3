@@ -4,6 +4,7 @@ tags: [harness, phase3, audit, readiness]
 category: architecture
 created: 2026-04-09
 updated: 2026-04-09
+status: all-blockers-resolved
 ---
 
 # v5 Phase 3 Readiness Assessment
@@ -212,8 +213,8 @@ These are secondary integration and boundary cases. Lower risk than P0 but impor
 
 ## Recommended Phase 3 Ordering
 
-1. **Fix stall triad** (BUG-015, BUG-016, BUG-017) — ~50 lines total, unblocks Phase 3
-2. **Add P0 Discord tests** (`DiscordCompanion.handle_message`, `_handle_caveman` dispatch) — ~80 lines
+1. ~~**Fix stall triad** (BUG-015, BUG-016, BUG-017)~~ — DONE (stall triad batch, 2026-04-09)
+2. ~~**Add P0 Discord tests** (`DiscordCompanion.handle_message`, `_handle_caveman` dispatch)~~ — DONE (40 tests, 2026-04-09)
 3. **Implement Phase 3 features**:
    - `claude.reformulate()` for dispute resolution
    - `claude.summarize()` for context transfer
@@ -239,14 +240,14 @@ These are secondary integration and boundary cases. Lower risk than P0 but impor
 
 | Item | Status | Owner |
 |------|--------|-------|
-| Stall triad (BUG-015, 016, 017) fixed | ❌ REQUIRED | Executor |
-| P0 Discord tests added | ❌ REQUIRED | Code-Reviewer |
+| Stall triad (BUG-015, 016, 017) fixed | ✅ DONE | Executor |
+| P0 Discord tests added | ✅ DONE (40 tests) | Test-Engineer |
 | All existing tests passing | ✅ YES | — |
 | Code review findings documented | ✅ YES | Reviewer |
 | Architecture gaps identified | ✅ YES | Architect |
 | Phase 3 feature scope clear | ✅ YES | Architect |
 
-**Phase 3 Entry**: READY pending stall-triad fixes.
+**Phase 3 Entry**: ✅ ALL BLOCKERS RESOLVED. Ready to proceed.
 
 ---
 

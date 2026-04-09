@@ -31,7 +31,7 @@ title: Wiki Log
 - **UPDATE** `index.md` — added v5-omc-agent-integration.md under Architecture subsection
 - **ADD** `v5-phase3-readiness.md` — Pre-Phase 3 due diligence: Phase 3 scope, stall-triad blockers (BUG-015/016/017), code review findings, P0/P1 test gaps, architecture gaps, Phase 3 ordering, loose ends, sign-off checklist
 - **UPDATE** `index.md` — added Phase 3 Readiness Assessment under new "Phase Planning" section
-- **UPDATE** `log.md` — recorded Phase 3 readiness assessment creation
+- **UPDATE** `wiki-log.md` — recorded Phase 3 readiness assessment creation
 
 ## [2026-04-09T02:57:00.244Z] ingest
 - **Pages:** session-log-2026-04-09-fcca83d5.md
