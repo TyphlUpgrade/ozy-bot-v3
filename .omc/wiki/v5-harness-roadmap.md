@@ -16,34 +16,16 @@ Central timeline mapping v5 harness features to phases with dependencies and sta
 |-------|------|--------|-----------------|---|
 | 1 | Foundation | COMPLETE | Async orchestrator, FIFO sessions, stage pipeline | 86 tests |
 | 2 | Escalation | COMPLETE | Tiered escalation (Tier 1 architect, Tier 2 operator), confidence gating, timeouts | 150 tests |
-| 2.5 | Stall Triad | NOT STARTED | BUG-015/016/017 fixes, DiscordCompanion tests | Prerequisite for Phase 3 |
+| 2.5 | Stall Triad | COMPLETE | BUG-015/016/017 fixes, DiscordCompanion tests | Prerequisite for Phase 3 |
 | 3 | Intelligence + Disputes | NOT STARTED | `claude.reformulate()`, `claude.summarize()`, session rotation, frozen-pipeline mitigation | Phase 2.5 prerequisite |
 | 4 | Wiki + Documentation | NOT STARTED | Wiki stage integration, document-task improvements | Phase 3 prerequisite |
 | 5 | Bot Pipeline + Extensibility | NOT STARTED | Configurable pipelines, trading bot integration, sessions.toml | Phase 4 prerequisite |
 
 ---
 
-## Phase 2.5: Stall Triad (Prerequisite for Phase 3)
+## Phase 2.5: Stall Triad — COMPLETE
 
-Three bugs that compound into permanent pipeline hangs. Must fix before Phase 3 entry.
-
-| Bug | File | Severity | Fix | Effort |
-|-----|------|----------|-----|--------|
-| BUG-015 | `orchestrator.py:258-260` | High | Deleted escalation signal → silent stall. When `read_escalation()` returns `None`, check `escalation_started_ts` age. If exceeds `2 * escalation_timeout`, force-resume with warning. | ~10 lines |
-| BUG-016 | `lifecycle.py:64-86` | Medium | Crash during `escalation_tier1` → no recovery. Add `escalation_tier1` case to `reconcile()`, re-send escalation question or promote to Tier 2. | ~15 lines |
-| BUG-017 | `orchestrator.py:208-247` | Medium | No timeout on Tier 1 wait. `handle_escalation_tier1` polls indefinitely. Add `tier1_timeout` check against `escalation_started_ts`, auto-promote to Tier 2 if exceeded. | ~20 lines |
-
-**Test Gaps (P0 Blocking):**
-
-| Gap | Tests Needed | Coverage |
-|-----|--------------|----------|
-| DiscordCompanion.handle_message() | Valid/malformed commands, permission checks, dispatch | Zero → 40 lines |
-| _handle_caveman() dispatcher | Caveman parsing + command routing | Zero → 40 lines |
-
-**Recommended Ordering:**
-1. Fix stall triad bugs (~45 lines total)
-2. Add P0 Discord tests (~80 lines total)
-3. Validate Phase 2 fix batch still works (3 tests: handle_escalation_wait, _apply_reply)
+All stall triad bugs fixed + P0 Discord tests added. See [[v5-harness-roadmap-archive-2026]] for full details.
 
 ---
 
@@ -167,10 +149,9 @@ Phase 5 (Configurable pipelines, bot integration, extensibility)
 
 ## Open Questions
 
-1. **Phase 2.5 ownership?** P0 Discord tests (DiscordCompanion, _handle_caveman) need a reviewer sign-off.
-2. **BUG-019 fix timing?** `should_renotify` window coupling to poll_interval is low severity — defer to Phase 3 or Phase 4?
-3. **Analyst trigger criteria?** "Complex + vague tasks" is heuristic. Define concrete thresholds in Phase 3 design review.
-4. **Verifier mandatory or opt-in?** Phase 3 spec needed to decide if pre-merge gate is standard or per-task.
+1. **BUG-019 fix timing?** `should_renotify` window coupling to poll_interval is low severity — defer to Phase 3 or Phase 4?
+2. **Analyst trigger criteria?** "Complex + vague tasks" is heuristic. Define concrete thresholds in Phase 3 design review.
+3. **Verifier mandatory or opt-in?** Phase 3 spec needed to decide if pre-merge gate is standard or per-task.
 
 ---
 
@@ -178,6 +159,7 @@ Phase 5 (Configurable pipelines, bot integration, extensibility)
 
 - [[v5-harness-architecture]] — Architecture design, module structure, orchestrator logic
 - [[v5-phase3-readiness]] — Readiness assessment, full blocker analysis, test coverage gaps
-- [[v5-harness-known-bugs]] — Bug tracking (21 total, 9 open, 12 resolved)
+- [[v5-harness-known-bugs]] — Bug tracking (24 total, 9 open, 15 resolved)
+- [[v5-harness-roadmap-archive-2026]] — Archived Phase 2.5 (Stall Triad) details
 - [[v5-omc-agent-integration]] — Tier 1-3 agent folding and ad-hoc delegation
 - [[v5-conversational-discord-operator]] — Three-piece Discord operator design

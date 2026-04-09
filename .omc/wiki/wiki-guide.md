@@ -48,46 +48,41 @@ Do NOT create subdirectories. Any page placed in a subfolder will be invisible t
 
 ## Page Size Policy
 
-Page size is measured in bytes by `wiki_lint` (via `config.maxPageSize`, default 10,240 bytes).
+File size is the only observable proxy for context ingestion cost. Per-category ceilings enforced via `wiki_lint` (or manual `wc -c` until per-category lint ships).
 
-| Page type | Ceiling | Enforcement |
-|-----------|---------|-------------|
-| Tracking/quality pages (bugs, findings) | 8KB hard ceiling | Split or archive when reached |
-| Architecture/design pages | 12KB soft ceiling | wiki_lint warns at 10KB default; guide warns at 12KB |
-| Session logs | 6KB per log | Auto-pruned after 30 days |
-| index.md | 30 lines maximum | Matches SessionStart injection window |
+| WikiCategory | Ceiling | Rationale |
+|---|---|---|
+| `debugging` | 8KB | High churn — archive resolved items aggressively |
+| `decision` | 8KB | Tracking pages — archive when resolved |
+| `architecture` | 10KB | Reference material, lower churn |
+| `pattern` | 10KB | Meta/guide pages |
+| `reference` | 12KB | Archive material, rarely read in full |
+| `session-log` | 6KB | Auto-pruned after 30 days |
+| `environment` | 10KB | Infrequent |
+| `convention` | 10KB | Infrequent |
 
-When a page exceeds its ceiling, either archive resolved/completed items or split the page by topic. See **Archive Rotation** and **When to Split a Page** below.
+**Special entries:** `index.md`: 30 lines maximum (matches SessionStart injection window).
+
+When a page exceeds its ceiling, archive resolved/completed items first (cheapest intervention). If still over, split by topic coherence. See [[wiki-operations]] for archive rotation and split procedures.
+
+**Phase 3+:** Add `section` parameter to `wiki_read` with auto-generated section indexes at write time — structurally bounds ingestion cost regardless of file size.
+
+## Freshness Policy
+
+Stale pages waste agent context on outdated information — worse than large pages with correct information.
+
+- **`updated:` field is mandatory.** Every edit must bump the `updated:` date in frontmatter.
+- **30-day staleness flag:** Pages with `updated:` >30 days old are flagged for review. The author (or any contributor) either confirms the content is still current (bump `updated:`) or revises it.
+- **Enforcement:** `wiki_lint` staleness check (existing `stale` lint code). Manual audit until per-page staleness is automated.
+- **Exemptions:** Archive pages (`reference` category with `archive` tag) and session logs are exempt — they are historical records.
 
 ## Archive Rotation
 
-When a tracking page exceeds its byte ceiling or resolved items exceed 50% of content, move resolved items to an archive page.
+See [[wiki-operations]] for full archive rotation mechanics (naming, frontmatter template, triggers, examples). Key points:
 
-**Archive page naming:** `{original-page-name}-archive-YYYY.md` in the wiki root.
-
-Example: `v5-harness-known-bugs-archive-2026.md`
-
-**Archive page frontmatter:**
-```yaml
----
-title: [Original Title] — Archive 2026
-tags: [original-tags, archive]
-category: reference
-created: YYYY-MM-DD
-updated: YYYY-MM-DD
----
-```
-
-- Use `category: reference` (the `archive` tag differentiates it from other reference pages)
-- Include original page's tags plus the `archive` tag
-- Archive pages are **excluded from index.md** but **searchable via `wiki_query`** (because they live in wiki root)
-- Add a "See also" link in the active page pointing to the archive page
-
-**Rotation triggers:**
-1. Page exceeds its byte-size ceiling, OR
-2. Resolved/completed items exceed 50% of page content — detected by counting `~~strikethrough~~ RESOLVED` headers or measuring `## Resolved` section size
-
-**Future enhancement:** `wiki_lint` will add an `archive-candidate` signal when a `debugging` category page has >50% resolved items. This is tracked as a separate lint code enhancement.
+- **Naming:** `{original-page-name}-archive-YYYY.md`
+- **Triggers:** page exceeds byte ceiling, OR resolved items exceed 50% of content
+- **Archive pages are excluded from index.md** but searchable via `wiki_query`
 
 ## Frontmatter Template
 
@@ -129,6 +124,9 @@ Tags are free-form strings (not enum-constrained like categories). They drive `w
 - Every page should have 2-5 tags
 - Prefer canonical tags for search consistency
 - New canonical tags can be added to this list when a recurring topic warrants it
+- **Minimum enforced:** Pages with <2 tags should be flagged during review. Manual audit until `wiki_lint` tag-count check ships (Phase 3+).
+- **No single-use tags.** If a tag appears on only one page, it adds no search value. Either add it to more pages or remove it.
+- **Tag audit:** During archive rotation or page splits, verify tags on both the active and archive pages.
 
 ## Cross-References: When to Use Links
 
@@ -150,16 +148,11 @@ to the FIFO intake. See [[v5-phase3-readiness]] for sign-off criteria.
 
 ## When to Split a Page
 
-Split a page when either trigger fires:
+See [[wiki-operations]] for full split procedures and naming conventions. Key points:
 
-1. **Byte size trigger** — page exceeds its ceiling. Archive resolved items first; if still over, split by topic.
-2. **Topic drift** — 3+ H2 sections cover unrelated topics. Split by topic.
-
-**Split naming:** `{parent-page}-{subtopic}.md`
-
-Example: `v5-harness-known-bugs.md` → `v5-harness-known-bugs-agent-roles.md`
-
-**After splitting:** add a "See also" section to the parent page linking to the split pages. `wiki_lint` orphan detection will catch any split pages that lose their cross-reference.
+- **Archive first** — resolved/completed items are cheapest to remove
+- **Split by topic** only if still over ceiling after archiving
+- **Split naming:** `{parent-page}-{subtopic}.md`
 
 ## What Does NOT Belong in the Wiki
 
@@ -200,4 +193,6 @@ status before processing.
 5. **Update the timestamp** — Change `updated:` field when you edit.
 6. **Index is auto-built** — Don't manually edit `index.md` for content. Structure it via frontmatter.
 7. **Flat root only** — Never create subdirectories. All pages go directly in `.omc/wiki/`.
-8. **Lint alignment** — `wiki_lint` already enforces a byte-based page size ceiling (default 10KB via `config.maxPageSize`). Per-category byte overrides (8KB for `debugging`, 12KB for `architecture`) and `archive-candidate` detection are tracked as future `wiki_lint` code enhancements.
+8. **Lint alignment** — `wiki_lint` enforces a byte-based page size ceiling (default 10KB via `config.maxPageSize`). Per-category byte overrides (8KB for `debugging`/`decision`, 10KB for `architecture`/`pattern`/`environment`/`convention`, 12KB for `reference`) and `archive-candidate` detection are tracked as future `wiki_lint` enhancements.
+9. **Link, don't duplicate.** When the same information exists in multiple pages, designate one as the canonical source and have the others link to it via `[[page-name]]`. If you find duplicated content, remove the copy and add a cross-reference. The canonical source is the page whose primary topic matches the information.
+10. **Agents: prefer `wiki_query`** for targeted lookup. Use `wiki_read` only when you need full page context of one topic.

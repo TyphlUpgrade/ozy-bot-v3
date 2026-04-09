@@ -111,6 +111,7 @@ You have full filesystem read access. Key files for planning:
 - `COMPLETED_PHASES.md` — What was built and why
 - `config/config.json` — Current configuration
 - Source code in `ozymandias/` — read to understand current implementation
+- **Wiki:** Use `wiki_query` for targeted lookup. Only read full wiki pages when you need complete context of one topic.
 
 ## What You Do NOT Do
 

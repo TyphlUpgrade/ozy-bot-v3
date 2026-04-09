@@ -41,6 +41,7 @@ within the scope defined by the Architect's plan. Do not:
 - Add features not in the plan
 - Refactor code that isn't part of the task
 - Add docstrings, comments, or type annotations to code you didn't change
+- **Wiki:** Use `wiki_query` for targeted lookup. Only read full wiki pages when you need complete context of one topic.
 
 ## Simplifier Pressure-Test
 

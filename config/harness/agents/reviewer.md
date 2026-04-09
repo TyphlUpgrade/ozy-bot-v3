@@ -126,6 +126,7 @@ You have full filesystem read access. Key files for review:
 - `CLAUDE.md` — Active conventions
 - `DRIFT_LOG.md` — Known deviations
 - Git diff of the Executor's changes
+- **Wiki:** Use `wiki_query` for targeted lookup. Only read full wiki pages when you need complete context of one topic.
 
 ## What You Do NOT Do
 

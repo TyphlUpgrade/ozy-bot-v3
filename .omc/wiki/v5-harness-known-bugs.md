@@ -10,7 +10,7 @@ updated: 2026-04-09
 
 Bugs found during review that are deferred or represent latent risks. Tracked here for future phases.
 
-**8 open bugs tracked** — 15 resolved (see [[v5-harness-known-bugs-archive-2026]])
+**9 open bugs tracked** — 15 resolved (see [[v5-harness-known-bugs-archive-2026]])
 
 ## Open (Deferred)
 
@@ -59,6 +59,10 @@ Test helpers create `AsyncMock` attributes on `MagicMock` bases; GC emits `Runti
 
 Found by architect + critic + code-reviewer agents after Phase 2 escalation implementation.
 
+### BUG-022: restart() re-launches session on stage timeout — wasteful
+**Severity**: Medium | **File**: `orchestrator.py`, `sessions.py` | **Phase**: 3
+`_check_stage_timeout` calls `session_mgr.restart()` to kill a stuck session, but `restart()` also re-launches a fresh session immediately. The next line calls `clear_active()` — no task remains. The new session sits idle, wasting a tmux pane and potentially a Claude API session. For per-task agents (`executor`), especially wasteful since they're only launched on new tasks.
+**Mitigation**: Extract a `kill()` method on `SessionManager` that does teardown without relaunch. Use `kill()` in the timeout path, `restart()` only for crash recovery.
 
 ## Cross-References
 
