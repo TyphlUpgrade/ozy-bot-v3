@@ -170,7 +170,7 @@ class DiscordCompanion:
 
 async def _apply_reply(state: "PipelineState", session_mgr: "SessionManager",
                        task_id: str, response: str,
-                       signal_reader: "SignalReader | None" = None) -> None:
+                       signal_reader: "SignalReader") -> None:
     """Apply an escalation reply — inject into the original agent and resume."""
     if state.active_task != task_id:
         logger.warning("Reply for %s but active task is %s", task_id, state.active_task)
@@ -184,7 +184,6 @@ async def _apply_reply(state: "PipelineState", session_mgr: "SessionManager",
     elif original_agent:
         logger.warning("Session %s dead during escalation — reply not delivered", original_agent)
     state.resume_from_escalation()
-    if signal_reader is not None:
-        signal_reader.clear_escalation(task_id)
+    signal_reader.clear_escalation(task_id)
     logger.info("Operator reply applied for %s → resuming %s at %s",
                 task_id, original_agent, state.stage)

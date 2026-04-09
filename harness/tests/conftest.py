@@ -48,6 +48,7 @@ def config(tmp_dir):
         poll_interval=0.1,
         max_retries=3,
         escalation_timeout=14400,
+        tier1_timeout=1800,
         agents={
             "architect": AgentDef(
                 name="architect", model="opus", mode="read-only",

@@ -260,6 +260,75 @@ class TestReconcile:
 
         session_mgr.restart.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_reconcile_escalation_tier1_with_signal(self, config):
+        """reconcile re-sends escalation to architect when signal exists at escalation_tier1."""
+        state = PipelineState(
+            active_task="task-001",
+            stage="escalation_tier1",
+            stage_agent="executor",
+            pre_escalation_stage="executor",
+            pre_escalation_agent="executor",
+        )
+        esc = EscalationRequest(
+            task_id="task-001", agent="executor", stage="executor",
+            severity="blocking", category="design_choice",
+            question="Which approach?", options=["a", "b"], context="ctx",
+        )
+        session_mgr = _make_session_mgr(sessions={}, config=config)
+        signal_reader = _make_signal_reader(escalation=esc)
+        notify_fn = AsyncMock()
+
+        await reconcile(state, session_mgr, signal_reader, notify_fn)
+
+        notify_fn.assert_awaited_once_with(esc)
+        # Stage stays at escalation_tier1 — architect will handle it when session restarts
+        assert state.stage == "escalation_tier1"
+
+    @pytest.mark.asyncio
+    async def test_reconcile_escalation_tier1_no_signal(self, config):
+        """reconcile promotes to escalation_wait (Tier 2) when no signal found at escalation_tier1."""
+        state = PipelineState(
+            active_task="task-001",
+            stage="escalation_tier1",
+            stage_agent="executor",
+            pre_escalation_stage="executor",
+            pre_escalation_agent="executor",
+        )
+        session_mgr = _make_session_mgr(sessions={}, config=config)
+        signal_reader = _make_signal_reader(escalation=None)
+        notify_fn = AsyncMock()
+
+        await reconcile(state, session_mgr, signal_reader, notify_fn)
+
+        notify_fn.assert_not_awaited()
+        assert state.stage == "escalation_wait"
+
+    @pytest.mark.asyncio
+    async def test_reconcile_escalation_tier1_preserves_pre_escalation(self, config):
+        """reconcile preserves pre_escalation_stage/agent after escalation_tier1 recovery."""
+        state = PipelineState(
+            active_task="task-001",
+            stage="escalation_tier1",
+            stage_agent="executor",
+            pre_escalation_stage="executor",
+            pre_escalation_agent="executor",
+        )
+        esc = EscalationRequest(
+            task_id="task-001", agent="executor", stage="executor",
+            severity="blocking", category="design_choice",
+            question="Which approach?", options=["a", "b"], context="ctx",
+        )
+        session_mgr = _make_session_mgr(sessions={}, config=config)
+        signal_reader = _make_signal_reader(escalation=esc)
+        notify_fn = AsyncMock()
+
+        await reconcile(state, session_mgr, signal_reader, notify_fn)
+
+        # pre_escalation fields must be intact so resume_from_escalation works later
+        assert state.pre_escalation_stage == "executor"
+        assert state.pre_escalation_agent == "executor"
+
 
 # ---------- check_sessions ----------
 

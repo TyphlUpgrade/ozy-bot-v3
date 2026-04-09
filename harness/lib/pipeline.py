@@ -180,6 +180,7 @@ class ProjectConfig:
     poll_interval: float
     max_retries: int
     escalation_timeout: int
+    tier1_timeout: int
     agents: dict[str, AgentDef]
     caveman: CavemanConfig
     timeouts: dict[str, int] = field(default_factory=dict)
@@ -204,6 +205,7 @@ class ProjectConfig:
             poll_interval=pipeline.get("poll_interval", 5.0),
             max_retries=pipeline.get("max_retries", 3),
             escalation_timeout=pipeline.get("escalation_timeout", 14400),
+            tier1_timeout=pipeline.get("tier1_timeout", 1800),
             agents=_default_agents(agents_dir),
             caveman=CavemanConfig.from_toml(data),
             claude_binary=pipeline.get("claude_binary", "claude"),

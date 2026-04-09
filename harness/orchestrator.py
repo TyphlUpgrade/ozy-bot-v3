@@ -72,6 +72,7 @@ async def check_reviewer(state: PipelineState, signal_reader: SignalReader,
     else:
         if state.retry_count >= config.max_retries:
             logger.error("Task %s failed after %d retries", state.active_task, state.retry_count)
+            _escalation_cache.pop(state.active_task or "", None)
             state.clear_active()
             return
         # Reformulate and retry
@@ -111,6 +112,7 @@ async def do_merge(state: PipelineState, config: ProjectConfig, event_log: Event
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         await abort.communicate()
+        _escalation_cache.pop(state.active_task or "", None)
         state.clear_active()
         return
     # Run tests
@@ -130,6 +132,7 @@ async def do_merge(state: PipelineState, config: ProjectConfig, event_log: Event
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         await revert.communicate()
+        _escalation_cache.pop(state.active_task or "", None)
         state.clear_active()
         return
     if proc.returncode != 0:
@@ -139,6 +142,7 @@ async def do_merge(state: PipelineState, config: ProjectConfig, event_log: Event
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         await revert.communicate()
+        _escalation_cache.pop(state.active_task or "", None)
         state.clear_active()
         return
     state.advance("wiki")
@@ -161,6 +165,7 @@ async def do_wiki(state: PipelineState, config: ProjectConfig, event_log: EventL
     if not success:
         logger.warning("Wiki documentation failed for %s — continuing", task_id)
     await event_log.record("task_completed", {"task": task_id})
+    _escalation_cache.pop(task_id, None)
     state.clear_active()
     logger.info("Task %s complete", task_id)
 
@@ -224,6 +229,27 @@ async def handle_escalation_tier1(state: PipelineState, signal_reader: SignalRea
     """Poll for architect resolution of a Tier 1 escalation."""
     resolution = await signal_reader.read_architect_resolution(state.active_task or "")
     if resolution is None:
+        started_ts = state.escalation_started_ts
+        tier1_timeout = config.tier1_timeout
+        if started_ts:
+            elapsed = (datetime.now(UTC) - datetime.fromisoformat(started_ts)).total_seconds()
+            if elapsed > tier1_timeout:
+                logger.warning("Tier 1 timeout for %s after %.0fs — promoting to Tier 2",
+                               state.active_task, elapsed)
+                task_id = state.active_task or ""
+                esc = _escalation_cache.pop(task_id, None) or await signal_reader.read_escalation(task_id)
+                summary = f"TIMEOUT: Architect did not resolve within {tier1_timeout}s"
+                if esc:
+                    summary = escalation.format_tier2_notification(esc, summary)
+                await notify("blocked", state.pre_escalation_agent or "unknown", summary)
+                state.advance("escalation_wait")
+                await event_log.record("escalation_promoted", {
+                    "task": state.active_task, "from_tier": 1, "to_tier": 2,
+                    "reason": "tier1_timeout", "elapsed_seconds": elapsed,
+                })
+        else:
+            logger.warning("Tier 1 escalation for %s has no started_ts — cannot check timeout",
+                           state.active_task)
         return
 
     if escalation.should_promote(resolution):
@@ -269,6 +295,19 @@ async def handle_escalation_wait(state: PipelineState, signal_reader: SignalRead
     """
     esc = await signal_reader.read_escalation(state.active_task or "")
     if esc is None:
+        started_ts = state.escalation_started_ts
+        if started_ts:
+            elapsed = (datetime.now(UTC) - datetime.fromisoformat(started_ts)).total_seconds()
+            if elapsed > 2 * config.escalation_timeout:
+                logger.warning("Escalation signal missing for %s after %.0fs — force-resuming",
+                               state.active_task, elapsed)
+                state.resume_from_escalation()
+                await event_log.record("escalation_force_resumed", {
+                    "task": state.active_task, "reason": "signal_missing", "elapsed_seconds": elapsed,
+                })
+        else:
+            logger.warning("Escalation wait for %s has no started_ts — cannot check timeout",
+                           state.active_task)
         return
 
     started_ts = state.escalation_started_ts

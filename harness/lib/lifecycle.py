@@ -73,6 +73,22 @@ async def reconcile(
                     "escalation_wait for task %s but no escalation signal found",
                     state.active_task,
                 )
+        elif state.stage == "escalation_tier1":
+            # BUG-016: crash during tier1 — re-send escalation to architect
+            esc = await signal_reader.read_escalation(state.active_task)
+            if esc is not None:
+                logger.info(
+                    "Re-sending escalation to architect for task %s after crash",
+                    state.active_task,
+                )
+                await notify_fn(esc)
+            else:
+                # No signal found — promote to Tier 2 so operator can handle
+                logger.warning(
+                    "escalation_tier1 for task %s but no escalation signal — promoting to Tier 2",
+                    state.active_task,
+                )
+                state.advance("escalation_wait")
         elif state.worktree is not None and not state.worktree.exists():
             logger.warning(
                 "Worktree %s missing for task %s — clearing active state",

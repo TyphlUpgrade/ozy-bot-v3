@@ -869,8 +869,10 @@ class TestApplyReply:
         pipeline_state.advance("escalation_wait")
         session_mgr = _make_session_mgr()
         session_mgr.sessions = {"executor": MagicMock()}
+        signal_reader = _make_signal_reader()
+        signal_reader.clear_escalation = MagicMock()
 
-        await _apply_reply(pipeline_state, session_mgr, "task-001", "use option B")
+        await _apply_reply(pipeline_state, session_mgr, "task-001", "use option B", signal_reader)
 
         assert pipeline_state.stage == "executor"
         assert pipeline_state.pre_escalation_stage is None
@@ -886,8 +888,10 @@ class TestApplyReply:
         pipeline_state.activate(task)
         pipeline_state.advance("escalation_wait")
         session_mgr = _make_session_mgr()
+        signal_reader = _make_signal_reader()
+        signal_reader.clear_escalation = MagicMock()
 
-        await _apply_reply(pipeline_state, session_mgr, "task-999", "reply")
+        await _apply_reply(pipeline_state, session_mgr, "task-999", "reply", signal_reader)
 
         assert pipeline_state.stage == "escalation_wait"  # unchanged
 
@@ -900,8 +904,10 @@ class TestApplyReply:
         pipeline_state.activate(task)
         pipeline_state.advance("executor", "executor")
         session_mgr = _make_session_mgr()
+        signal_reader = _make_signal_reader()
+        signal_reader.clear_escalation = MagicMock()
 
-        await _apply_reply(pipeline_state, session_mgr, "task-001", "reply")
+        await _apply_reply(pipeline_state, session_mgr, "task-001", "reply", signal_reader)
 
         assert pipeline_state.stage == "executor"  # unchanged
 
@@ -917,8 +923,10 @@ class TestApplyReply:
         pipeline_state.advance("escalation_wait")
         session_mgr = _make_session_mgr()
         session_mgr.sessions = {}  # no sessions alive
+        signal_reader = _make_signal_reader()
+        signal_reader.clear_escalation = MagicMock()
 
-        await _apply_reply(pipeline_state, session_mgr, "task-001", "reply")
+        await _apply_reply(pipeline_state, session_mgr, "task-001", "reply", signal_reader)
 
         assert pipeline_state.stage == "executor"  # state advanced despite dead session
         session_mgr.send.assert_not_awaited()  # but message not delivered
@@ -943,3 +951,291 @@ class TestApplyReply:
 
         assert pipeline_state.stage == "executor"
         signal_reader.clear_escalation.assert_called_once_with("task-001")
+
+
+# ---------- _escalation_cache cleanup ----------
+
+
+class TestEscalationCacheCleanup:
+    @pytest.mark.asyncio
+    async def test_cache_empty_after_tier1_resolution(self, config, pipeline_state):
+        """After architect resolves escalation, _escalation_cache should be empty."""
+        from harness.orchestrator import handle_escalation_tier1, _escalation_cache
+        from harness.lib.signals import EscalationRequest
+
+        # Setup state in escalation_tier1
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_tier1", "architect")
+
+        # Pre-populate cache (simulating check_for_escalation having stashed it)
+        esc = EscalationRequest(
+            task_id="task-001", agent="executor", stage="executor",
+            severity="blocking", category="design_choice",
+            question="Which approach?", options=["a", "b"], context="ctx",
+        )
+        _escalation_cache["task-001"] = esc
+
+        # Mock architect resolution (resolved, not promoted)
+        resolution = MagicMock()
+        resolution.resolution = "resolved"
+        resolution.confidence = "high"
+        resolution.reasoning = "Use approach A"
+
+        signal_reader = _make_signal_reader()
+        signal_reader.read_architect_resolution = AsyncMock(return_value=resolution)
+        signal_reader.clear_escalation = MagicMock()
+
+        session_mgr = _make_session_mgr()
+        session_mgr.sessions = {"executor": MagicMock()}
+
+        event_log = _make_event_log()
+
+        try:
+            with patch("harness.orchestrator.escalation.should_promote", return_value=False):
+                await handle_escalation_tier1(pipeline_state, signal_reader, session_mgr, config, event_log)
+            # Assert BEFORE finally cleanup — verifies the function itself popped the entry
+            assert "task-001" not in _escalation_cache
+            assert pipeline_state.stage == "executor"
+        finally:
+            _escalation_cache.pop("task-001", None)
+
+    @pytest.mark.asyncio
+    async def test_cache_cleaned_on_tier1_promote(self, config, pipeline_state):
+        """When promoting to Tier 2, _escalation_cache should be cleaned."""
+        from harness.orchestrator import handle_escalation_tier1, _escalation_cache
+        from harness.lib.signals import EscalationRequest
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_tier1", "architect")
+
+        esc = EscalationRequest(
+            task_id="task-001", agent="executor", stage="executor",
+            severity="blocking", category="design_choice",
+            question="Which approach?", options=["a", "b"], context="ctx",
+        )
+        _escalation_cache["task-001"] = esc
+
+        resolution = MagicMock()
+        resolution.resolution = "uncertain"
+        resolution.confidence = "low"
+        resolution.reasoning = "Not sure"
+
+        signal_reader = _make_signal_reader()
+        signal_reader.read_architect_resolution = AsyncMock(return_value=resolution)
+        signal_reader.read_escalation = AsyncMock(return_value=esc)
+        signal_reader.clear_escalation = MagicMock()
+
+        session_mgr = _make_session_mgr()
+
+        event_log = _make_event_log()
+
+        try:
+            with patch("harness.orchestrator.escalation.should_promote", return_value=True), \
+                 patch("harness.orchestrator.notify", new=AsyncMock()):
+                await handle_escalation_tier1(pipeline_state, signal_reader, session_mgr, config, event_log)
+            # Assert BEFORE finally cleanup — verifies the function itself popped the entry
+            assert "task-001" not in _escalation_cache
+            assert pipeline_state.stage == "escalation_wait"
+        finally:
+            _escalation_cache.pop("task-001", None)
+
+
+# ---------- BUG-015: handle_escalation_wait force-resume ----------
+
+
+class TestEscalationWaitMissingSignal:
+    @pytest.mark.asyncio
+    async def test_force_resumes_on_missing_signal(self, config, pipeline_state):
+        """esc=None + started_ts 3h ago > 2*escalation_timeout(3600) → force-resume."""
+        from harness.orchestrator import handle_escalation_wait
+        import datetime as dt_mod
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_wait")
+        config.escalation_timeout = 3600
+        # 3 hours ago; 10800s > 2*3600=7200
+        pipeline_state.escalation_started_ts = "2026-04-09T00:00:00+00:00"
+
+        signal_reader = _make_signal_reader()
+        signal_reader.read_escalation = AsyncMock(return_value=None)
+        event_log = _make_event_log()
+
+        fixed_now = dt_mod.datetime(2026, 4, 9, 3, 0, 0, tzinfo=dt_mod.timezone.utc)
+        with patch("harness.orchestrator.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_now
+            mock_dt.fromisoformat.side_effect = dt_mod.datetime.fromisoformat
+            await handle_escalation_wait(pipeline_state, signal_reader, config, event_log)
+
+        assert pipeline_state.stage == "executor"
+        assert pipeline_state.pre_escalation_stage is None
+        event_log.record.assert_awaited_once()
+        assert event_log.record.call_args[0][0] == "escalation_force_resumed"
+
+    @pytest.mark.asyncio
+    async def test_no_force_resume_when_fresh(self, config, pipeline_state):
+        """esc=None + started_ts 10min ago < 2*escalation_timeout → no change."""
+        from harness.orchestrator import handle_escalation_wait
+        import datetime as dt_mod
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_wait")
+        config.escalation_timeout = 3600
+        # 10 minutes ago; 600s << 7200
+        pipeline_state.escalation_started_ts = "2026-04-09T02:50:00+00:00"
+
+        signal_reader = _make_signal_reader()
+        signal_reader.read_escalation = AsyncMock(return_value=None)
+        event_log = _make_event_log()
+
+        fixed_now = dt_mod.datetime(2026, 4, 9, 3, 0, 0, tzinfo=dt_mod.timezone.utc)
+        with patch("harness.orchestrator.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_now
+            mock_dt.fromisoformat.side_effect = dt_mod.datetime.fromisoformat
+            await handle_escalation_wait(pipeline_state, signal_reader, config, event_log)
+
+        assert pipeline_state.stage == "escalation_wait"
+        event_log.record.assert_not_awaited()
+
+
+# ---------- BUG-017: handle_escalation_tier1 timeout → Tier 2 ----------
+
+
+class TestEscalationTier1Timeout:
+    @pytest.mark.asyncio
+    async def test_timeout_promotes_to_tier2(self, config, pipeline_state):
+        """resolution=None + started_ts 2h ago > tier1_timeout(1800) → promote to Tier 2."""
+        from harness.orchestrator import handle_escalation_tier1
+        from harness.lib.signals import EscalationRequest
+        import datetime as dt_mod
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_tier1", "architect")
+        # 2 hours ago; 7200s > tier1_timeout=1800
+        pipeline_state.escalation_started_ts = "2026-04-09T01:00:00+00:00"
+
+        esc = EscalationRequest(
+            task_id="task-001", agent="executor", stage="executor",
+            severity="blocking", category="ambiguous_requirement",
+            question="What to do?", options=["a", "b"], context="ctx",
+        )
+        signal_reader = _make_signal_reader()
+        signal_reader.read_architect_resolution = AsyncMock(return_value=None)
+        signal_reader.read_escalation = AsyncMock(return_value=esc)
+        session_mgr = _make_session_mgr()
+        event_log = _make_event_log()
+
+        fixed_now = dt_mod.datetime(2026, 4, 9, 3, 0, 0, tzinfo=dt_mod.timezone.utc)
+        with patch("harness.orchestrator.datetime") as mock_dt, \
+             patch("harness.orchestrator.notify", new=AsyncMock()):
+            mock_dt.now.return_value = fixed_now
+            mock_dt.fromisoformat.side_effect = dt_mod.datetime.fromisoformat
+            await handle_escalation_tier1(
+                pipeline_state, signal_reader, session_mgr, config, event_log
+            )
+
+        assert pipeline_state.stage == "escalation_wait"
+        event_log.record.assert_awaited_once()
+        assert event_log.record.call_args[0][0] == "escalation_promoted"
+        assert event_log.record.call_args[0][1]["reason"] == "tier1_timeout"
+
+    @pytest.mark.asyncio
+    async def test_no_timeout_when_fresh(self, config, pipeline_state):
+        """resolution=None + started_ts 5min ago < tier1_timeout(1800) → no change."""
+        from harness.orchestrator import handle_escalation_tier1
+        import datetime as dt_mod
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_tier1", "architect")
+        # 5 minutes ago; 300s < tier1_timeout=1800
+        pipeline_state.escalation_started_ts = "2026-04-09T02:55:00+00:00"
+
+        signal_reader = _make_signal_reader()
+        signal_reader.read_architect_resolution = AsyncMock(return_value=None)
+        session_mgr = _make_session_mgr()
+        event_log = _make_event_log()
+
+        fixed_now = dt_mod.datetime(2026, 4, 9, 3, 0, 0, tzinfo=dt_mod.timezone.utc)
+        with patch("harness.orchestrator.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_now
+            mock_dt.fromisoformat.side_effect = dt_mod.datetime.fromisoformat
+            await handle_escalation_tier1(
+                pipeline_state, signal_reader, session_mgr, config, event_log
+            )
+
+        assert pipeline_state.stage == "escalation_tier1"
+        event_log.record.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_started_ts_logs_warning(self, config, pipeline_state):
+        """resolution=None + started_ts=None → warning logged, no crash."""
+        from harness.orchestrator import handle_escalation_tier1
+        import logging
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_tier1", "architect")
+        pipeline_state.escalation_started_ts = None
+
+        signal_reader = _make_signal_reader()
+        signal_reader.read_architect_resolution = AsyncMock(return_value=None)
+        session_mgr = _make_session_mgr()
+        event_log = _make_event_log()
+
+        with patch("harness.orchestrator.logger") as mock_logger:
+            await handle_escalation_tier1(
+                pipeline_state, signal_reader, session_mgr, config, event_log
+            )
+
+        mock_logger.warning.assert_called_once()
+        assert "no started_ts" in mock_logger.warning.call_args[0][0].lower()
+        assert pipeline_state.stage == "escalation_tier1"
+        event_log.record.assert_not_awaited()
+
+
+# ---------- BUG-015: handle_escalation_wait started_ts=None ----------
+
+
+class TestEscalationWaitNoStartedTs:
+    @pytest.mark.asyncio
+    async def test_no_started_ts_logs_warning(self, config, pipeline_state):
+        """esc=None + started_ts=None → warning logged, no crash."""
+        from harness.orchestrator import handle_escalation_wait
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_wait")
+        pipeline_state.escalation_started_ts = None
+
+        signal_reader = _make_signal_reader()
+        signal_reader.read_escalation = AsyncMock(return_value=None)
+        event_log = _make_event_log()
+
+        with patch("harness.orchestrator.logger") as mock_logger:
+            await handle_escalation_wait(pipeline_state, signal_reader, config, event_log)
+
+        mock_logger.warning.assert_called_once()
+        assert "no started_ts" in mock_logger.warning.call_args[0][0].lower()
+        assert pipeline_state.stage == "escalation_wait"
+        event_log.record.assert_not_awaited()
