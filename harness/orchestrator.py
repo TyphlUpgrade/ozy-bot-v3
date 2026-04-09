@@ -47,15 +47,35 @@ async def classify_task(state: PipelineState, session_mgr: SessionManager,
 
 
 async def check_stage(state: PipelineState, signal_reader: SignalReader,
+                      session_mgr: SessionManager, config: ProjectConfig,
                       stage: str, event_log: EventLog) -> None:
     """Poll for stage completion signal."""
     result = await signal_reader.check_stage_complete(stage, state.active_task or "")
     if result is not None:
+        # Collect architect plan for wiki documentation
+        if stage == "architect" and isinstance(result, dict):
+            state.plan_summary = result.get("output", "") or result.get("plan", "")
         next_stages = {"architect": "executor", "executor": "reviewer", "reviewer": "merge"}
         next_stage = next_stages.get(stage, "merge")
         state.advance(next_stage, next_stage if next_stage != "merge" else None)
         await event_log.record("stage_advanced", {"task": state.active_task, "from": stage, "to": next_stage})
         logger.info("Stage %s complete for %s → %s", stage, state.active_task, next_stage)
+        # Send summarized context to next agent on architect→executor and executor→reviewer transitions
+        if stage in ("architect", "executor") and next_stage in ("executor", "reviewer"):
+            output = result.get("output", "") if isinstance(result, dict) else ""
+            if output:
+                summary = await claude.summarize(output, config)
+                if summary:
+                    next_agent = next_stage
+                    await session_mgr.send(
+                        next_agent,
+                        f"[CONTEXT] Previous stage ({stage}) summary:\n{summary}\n\n"
+                        f"[TASK] Continue work on: {state.active_task}",
+                    )
+                else:
+                    logger.debug("summarize returned None for stage %s — proceeding without context", stage)
+            else:
+                logger.debug("No output in stage %s signal — proceeding without context", stage)
 
 
 async def check_reviewer(state: PipelineState, signal_reader: SignalReader,
@@ -67,6 +87,7 @@ async def check_reviewer(state: PipelineState, signal_reader: SignalReader,
         return
     verdict = result.get("verdict", "").lower()
     if verdict == "approve" or verdict == "approved":
+        state.review_verdict = result.get("feedback", "") or "approved"
         state.advance("merge")
         await event_log.record("stage_advanced", {"task": state.active_task, "from": "reviewer", "to": "merge", "verdict": "approved"})
         logger.info("Reviewer approved %s", state.active_task)
@@ -151,28 +172,58 @@ async def do_merge(state: PipelineState, config: ProjectConfig, event_log: Event
         _escalation_cache.pop(state.active_task or "", None)
         state.clear_active()
         return
+    # Capture diff stat for wiki documentation
+    diff_proc = await asyncio.create_subprocess_exec(
+        "git", "diff", "--stat", "HEAD~1",
+        cwd=cwd,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    diff_out, _ = await diff_proc.communicate()
+    state.diff_stat = diff_out.decode().strip() if diff_proc.returncode == 0 else None
     state.advance("wiki")
     await event_log.record("stage_advanced", {"task": state.active_task, "from": "merge", "to": "wiki"})
     logger.info("Merge + tests passed for %s", state.active_task)
 
 
-async def do_wiki(state: PipelineState, config: ProjectConfig, event_log: EventLog) -> None:
+async def do_wiki(state: PipelineState, config: ProjectConfig, event_log: EventLog,
+                  session_mgr: SessionManager | None = None) -> None:
     """Document task via claude -p + /wiki."""
     task_id = state.active_task or ""
     description = state.task_description or task_id
     success = await claude.document_task(
         task_id=task_id,
         description=description,
-        plan_summary="(auto-generated)",
-        diff_stat="(see git log)",
-        review_verdict="approved",
+        plan_summary=state.plan_summary or "(no architect plan)",
+        diff_stat=state.diff_stat or "(no file changes)",
+        review_verdict=state.review_verdict or "(no review)",
         config=config,
     )
     if not success:
         logger.warning("Wiki documentation failed for %s — continuing", task_id)
+        await event_log.record("wiki_failed", {"task": task_id})
     await event_log.record("task_completed", {"task": task_id})
     _escalation_cache.pop(task_id, None)
     state.clear_active()
+    # Unshelve next task if any are waiting
+    unshelved = state.unshelve()
+    if unshelved:
+        logger.info("Unshelved task %s (was in %s)", unshelved["task_id"], unshelved.get("stage"))
+        await event_log.record("task_unshelved", {"task_id": unshelved["task_id"], "stage": unshelved.get("stage")})
+        # Inject stored operator reply if escalation was resolved while shelved.
+        # NOTE: The executor session at this point may belong to the just-completed
+        # task, not the unshelved one. If the session is dead or wrong, the reply is
+        # silently skipped — the main loop will need to relaunch an executor for the
+        # unshelved task. The operator reply content is still on the unshelved dict
+        # for future re-injection if needed.
+        pending_reply = unshelved.get("pending_operator_reply")
+        if pending_reply and session_mgr and state.stage_agent:
+            if state.stage_agent in session_mgr.sessions:
+                await session_mgr.send(state.stage_agent, pending_reply)
+                logger.info("Injected pending operator reply for unshelved task %s", state.active_task)
+            else:
+                logger.warning("Executor session not available for unshelved task %s — "
+                               "pending reply will need re-injection after session launch",
+                               state.active_task)
     logger.info("Task %s complete", task_id)
 
 
@@ -206,6 +257,9 @@ async def check_for_escalation(state: PipelineState, signal_reader: SignalReader
     # Store pre-escalation context for resume routing
     state.pre_escalation_stage = state.stage
     state.pre_escalation_agent = state.stage_agent
+    # Clear any pending stage completion signal to prevent spurious advancement on resume
+    if state.stage:
+        signal_reader.clear_stage_signal(state.stage, state.active_task or "")
 
     if tier == "tier1":
         _escalation_cache[esc.task_id] = esc  # cache for handle_escalation_tier1
@@ -471,19 +525,40 @@ async def main_loop(config: ProjectConfig) -> None:
                 case "classify":
                     await classify_task(state, session_mgr, config, event_log)
                 case "architect":
-                    await check_stage(state, signal_reader, "architect", event_log)
+                    await check_stage(state, signal_reader, session_mgr, config, "architect", event_log)
                 case "executor":
-                    await check_stage(state, signal_reader, "executor", event_log)
+                    await check_stage(state, signal_reader, session_mgr, config, "executor", event_log)
                 case "reviewer":
                     await check_reviewer(state, signal_reader, session_mgr, config, event_log)
                 case "merge":
                     await do_merge(state, config, event_log)
                 case "wiki":
-                    await do_wiki(state, config, event_log)
+                    await do_wiki(state, config, event_log, session_mgr)
                 case "escalation_tier1":
                     await handle_escalation_tier1(state, signal_reader, session_mgr, config, event_log)
                 case "escalation_wait":
                     await handle_escalation_wait(state, signal_reader, config, event_log)
+
+            # F3: Check for new tasks while current is blocked in escalation_wait
+            if state.stage == "escalation_wait":
+                new_task = await signal_reader.next_task(config.task_dir)
+                if new_task:
+                    worktree = await create_worktree(new_task.task_id, config)
+                    if worktree:
+                        shelved_id = state.active_task
+                        logger.info("Shelving escalation-blocked task %s, activating %s",
+                                    shelved_id, new_task.task_id)
+                        state.shelve()
+                        state.activate(new_task)
+                        state.worktree = worktree
+                        executor_def = config.agents["executor"].with_cwd(worktree)
+                        await session_mgr.launch("executor", executor_def)
+                        await event_log.record("task_shelved_and_new_activated", {
+                            "shelved": shelved_id, "new_task": new_task.task_id,
+                        })
+                    else:
+                        logger.error("Worktree failed for %s — keeping current task in escalation",
+                                     new_task.task_id)
         else:
             # Check for new tasks
             new_task = await signal_reader.next_task(config.task_dir)
@@ -501,6 +576,25 @@ async def main_loop(config: ProjectConfig) -> None:
 
         # 2. Health checks (persistent sessions only)
         await lifecycle.check_sessions(session_mgr, state)
+
+        # 2.5 Session rotation check
+        if state.stage_agent and state.stage_agent in session_mgr.sessions:
+            if session_mgr.needs_rotation(state.stage_agent, config.token_rotation_threshold):
+                logger.info("Rotating session %s (token threshold exceeded)", state.stage_agent)
+                session = session_mgr.sessions[state.stage_agent]
+                summary = None
+                if session.log.exists():
+                    try:
+                        content = session.log.read_text()[-4000:]
+                        summary = await claude.summarize(content, config)
+                    except Exception as exc:
+                        logger.warning("Failed to read session log for %s: %s", state.stage_agent, exc)
+                await session_mgr.restart(state.stage_agent)
+                if summary:
+                    await session_mgr.send(
+                        state.stage_agent,
+                        f"[SYSTEM] Session rotated due to token limit. Context summary:\n\n{summary}",
+                    )
 
         # 3. Heartbeat
         state.heartbeat()

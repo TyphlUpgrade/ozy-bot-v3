@@ -134,6 +134,23 @@ class SignalReader:
             logger.warning("Bad stage signal %s: %s", path, e)
             return None
 
+    def clear_stage_signal(self, stage: str, task_id: str) -> None:
+        """Remove a stage completion signal for a task.
+
+        Prevents stale signals from causing spurious advancement after
+        escalation→shelve→unshelve→resume cycles.
+        """
+        _safe_task_id(task_id)
+        patterns = {
+            "architect": self.signal_dir / "architect" / task_id / "plan.json",
+            "executor": self.signal_dir / "executor" / f"completion-{task_id}.json",
+            "reviewer": self.signal_dir / "reviewer" / task_id / "verdict.json",
+        }
+        path = patterns.get(stage)
+        if path is not None and path.exists():
+            path.unlink()
+            logger.info("Cleared stale %s signal for %s", stage, task_id)
+
     def clear_escalation(self, task_id: str) -> None:
         """Remove processed escalation and resolution signals for a task."""
         _safe_task_id(task_id)

@@ -129,9 +129,10 @@ async def document_task(
         f"Review verdict:\n{review_verdict}"
     )
     timeout = config.timeouts.get("wiki", 300)
-    result = await _run_claude(
-        system, user, timeout, "wiki", config, tools=["oh-my-claudecode:wiki"]
-    )
+    # /wiki in user prompt triggers the skill via magic keyword — no --allowedTools needed.
+    # Passing a skill name as --allowedTools blocks all real tools (Write, Read, etc.),
+    # leaving the model unable to write wiki files. BUG: Umbra catch, 2026-04-09.
+    result = await _run_claude(system, user, timeout, "wiki", config)
     if result is None:
         logger.warning("document_task failed for task_id=%s", task_id)
         return False

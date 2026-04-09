@@ -101,6 +101,31 @@ async def reconcile(
                 "Resuming %s at stage %s", state.active_task, state.stage
             )
 
+    # Reconcile shelved tasks — re-notify any stuck in escalation stages.
+    # Both escalation_wait (Tier 2 / operator) and escalation_tier1 (architect)
+    # are checked. For tier1, we re-send to architect; if signal is missing,
+    # promote to escalation_wait so operator can handle it on next unshelve.
+    for shelved in state.shelved_tasks:
+        stask_id = shelved.get("task_id", "")
+        sstage = shelved.get("stage", "")
+        if sstage in ("escalation_wait", "escalation_tier1"):
+            esc = await signal_reader.read_escalation(stask_id)
+            if esc is not None:
+                logger.info("Re-notifying escalation for shelved task %s (stage=%s)", stask_id, sstage)
+                await notify_fn(esc)
+            else:
+                if sstage == "escalation_tier1":
+                    logger.warning(
+                        "Shelved task %s in escalation_tier1 but no signal — promoting to escalation_wait",
+                        stask_id,
+                    )
+                    shelved["stage"] = "escalation_wait"
+                else:
+                    logger.warning(
+                        "Shelved task %s in escalation_wait but no escalation signal found",
+                        stask_id,
+                    )
+
     # Verify all persistent sessions alive; restart dead ones.
     for name, session in list(session_mgr.sessions.items()):
         agent_def = session_mgr.config.agents.get(name)

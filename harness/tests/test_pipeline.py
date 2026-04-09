@@ -241,6 +241,130 @@ class TestCavemanConfig:
         assert cfg.skills_compress is False
 
 
+class TestShelveUnshelve:
+    def test_shelve_saves_active_task(self, pipeline_state):
+        task = TaskSignal(task_id="t1", description="Test task")
+        pipeline_state.activate(task)
+        pipeline_state.advance("executor", "executor")
+        pipeline_state.shelve()
+        assert pipeline_state.active_task is None
+        assert len(pipeline_state.shelved_tasks) == 1
+        assert pipeline_state.shelved_tasks[0]["task_id"] == "t1"
+        assert pipeline_state.shelved_tasks[0]["stage"] == "executor"
+
+    def test_shelve_noop_when_no_active_task(self, pipeline_state):
+        pipeline_state.shelve()
+        assert pipeline_state.shelved_tasks == []
+
+    def test_unshelve_restores_task(self, pipeline_state, tmp_path):
+        task = TaskSignal(task_id="t1", description="Test task")
+        pipeline_state.activate(task)
+        pipeline_state.advance("escalation_wait")
+        pipeline_state.worktree = tmp_path / "wt"
+        pipeline_state.retry_count = 2
+        pipeline_state.shelve()
+        assert pipeline_state.active_task is None
+        restored = pipeline_state.unshelve()
+        assert restored is not None
+        assert pipeline_state.active_task == "t1"
+        assert pipeline_state.stage == "escalation_wait"
+        assert pipeline_state.worktree == tmp_path / "wt"
+        assert pipeline_state.retry_count == 2
+
+    def test_unshelve_returns_none_when_empty(self, pipeline_state):
+        assert pipeline_state.unshelve() is None
+
+    def test_shelved_tasks_persist_through_save_load(self, tmp_path):
+        path = tmp_path / "state.json"
+        state = PipelineState()
+        task = TaskSignal(task_id="t1", description="Shelved task")
+        state.activate(task)
+        state.advance("escalation_wait")
+        state.shelve()
+        state.save(path)
+        loaded = PipelineState.load(path)
+        assert len(loaded.shelved_tasks) == 1
+        assert loaded.shelved_tasks[0]["task_id"] == "t1"
+
+    def test_multiple_shelve_unshelve_lifo(self, pipeline_state):
+        for tid in ("t1", "t2"):
+            task = TaskSignal(task_id=tid, description=f"Task {tid}")
+            pipeline_state.activate(task)
+            pipeline_state.advance("escalation_wait")
+            pipeline_state.shelve()
+        assert len(pipeline_state.shelved_tasks) == 2
+        restored = pipeline_state.unshelve()
+        assert restored["task_id"] == "t2"
+        restored = pipeline_state.unshelve()
+        assert restored["task_id"] == "t1"
+
+    def test_load_ignores_unknown_fields(self, tmp_path):
+        path = tmp_path / "state.json"
+        import json
+        data = {"active_task": "t1", "stage": "executor", "future_field": "value",
+                "retry_count": 0, "shelved_tasks": []}
+        path.write_text(json.dumps(data))
+        loaded = PipelineState.load(path)
+        assert loaded.active_task == "t1"
+        assert loaded.stage == "executor"
+
+    def test_shelve_unshelve_preserves_wiki_fields(self, pipeline_state):
+        task = TaskSignal(task_id="t1", description="Test")
+        pipeline_state.activate(task)
+        pipeline_state.advance("escalation_wait")
+        pipeline_state.plan_summary = "Build the feature"
+        pipeline_state.diff_stat = " file.py | 3 +++\n 1 file changed"
+        pipeline_state.review_verdict = "approved with notes"
+        pipeline_state.shelve()
+        assert pipeline_state.plan_summary is None  # cleared by clear_active
+        restored = pipeline_state.unshelve()
+        assert restored is not None
+        assert pipeline_state.plan_summary == "Build the feature"
+        assert pipeline_state.diff_stat == " file.py | 3 +++\n 1 file changed"
+        assert pipeline_state.review_verdict == "approved with notes"
+
+
+class TestWikiFields:
+    def test_new_fields_default_none(self):
+        state = PipelineState()
+        assert state.plan_summary is None
+        assert state.diff_stat is None
+        assert state.review_verdict is None
+
+    def test_new_fields_persist_save_load(self, tmp_path):
+        path = tmp_path / "state.json"
+        state = PipelineState()
+        state.plan_summary = "Architect plan text"
+        state.diff_stat = " 2 files changed, 10 insertions(+)"
+        state.review_verdict = "approved"
+        state.save(path)
+        loaded = PipelineState.load(path)
+        assert loaded.plan_summary == "Architect plan text"
+        assert loaded.diff_stat == " 2 files changed, 10 insertions(+)"
+        assert loaded.review_verdict == "approved"
+
+    def test_clear_active_resets_new_fields(self, pipeline_state):
+        task = TaskSignal(task_id="t1", description="Test")
+        pipeline_state.activate(task)
+        pipeline_state.plan_summary = "Some plan"
+        pipeline_state.diff_stat = "some diff"
+        pipeline_state.review_verdict = "approved"
+        pipeline_state.clear_active()
+        assert pipeline_state.plan_summary is None
+        assert pipeline_state.diff_stat is None
+        assert pipeline_state.review_verdict is None
+
+    def test_activate_resets_wiki_fields(self, pipeline_state):
+        pipeline_state.plan_summary = "Old plan"
+        pipeline_state.diff_stat = "old diff"
+        pipeline_state.review_verdict = "old verdict"
+        task = TaskSignal(task_id="t2", description="New task")
+        pipeline_state.activate(task)
+        assert pipeline_state.plan_summary is None
+        assert pipeline_state.diff_stat is None
+        assert pipeline_state.review_verdict is None
+
+
 class TestProjectConfig:
     def test_load_from_toml(self, tmp_path):
         agents_dir = tmp_path / "agents"

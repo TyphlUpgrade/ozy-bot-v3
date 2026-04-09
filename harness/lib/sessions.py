@@ -36,6 +36,8 @@ class Session:
     fifo: Path
     log: Path
     pid: int | None = None              # tmux pane PID (for health checks)
+    tokens_in: int = 0                  # cumulative input tokens (for rotation)
+    tokens_out: int = 0                 # cumulative output tokens (for rotation)
 
 
 def _load_caveman_directives(skill_path: Path) -> dict[str, str]:
@@ -131,6 +133,15 @@ class SessionManager:
 
     async def launch(self, name: str, agent_def: AgentDef) -> None:
         """Launch a persistent session via clawhip tmux new."""
+        # Auto-close existing session with same name (prevents FD leak on overwrite)
+        if name in self.sessions:
+            old = self.sessions.pop(name)
+            try:
+                os.close(old.fd)
+            except OSError:
+                pass
+            old.fifo.unlink(missing_ok=True)
+
         fifo_path = self.session_dir / f"{name}.fifo"
         log_path = self.session_dir / f"{name}.log"
 
@@ -251,6 +262,43 @@ class SessionManager:
             await self.send(name, f"[SYSTEM] Update compression level to {level}.\n\n{directive}")
         else:
             logger.warning("Unknown caveman level '%s' for inject_caveman_update", level)
+
+    def parse_token_usage(self, name: str) -> tuple[int, int]:
+        """Parse cumulative token usage from a session's stream-json log.
+
+        Returns (tokens_in, tokens_out). Updates the Session object's counters.
+
+        BUG: Re-reads entire log every call — O(n) growth per poll cycle.
+        Fix: track file offset on Session, seek to last position, parse only new lines.
+        See NOTES.md PERF-1.
+        """
+        session = self.sessions.get(name)
+        if not session or not session.log.exists():
+            return (0, 0)
+        tokens_in = 0
+        tokens_out = 0
+        try:
+            for line in session.log.read_text().splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    msg = json.loads(line)
+                    usage = msg.get("usage")
+                    if usage:
+                        tokens_in += usage.get("input_tokens", 0)
+                        tokens_out += usage.get("output_tokens", 0)
+                except (json.JSONDecodeError, AttributeError, TypeError):
+                    continue
+        except OSError:
+            pass
+        session.tokens_in = tokens_in
+        session.tokens_out = tokens_out
+        return (tokens_in, tokens_out)
+
+    def needs_rotation(self, name: str, threshold: int) -> bool:
+        """Check if a session's cumulative tokens exceed the rotation threshold."""
+        tokens_in, tokens_out = self.parse_token_usage(name)
+        return (tokens_in + tokens_out) >= threshold
 
     async def shutdown(self) -> None:
         """Graceful shutdown — close all FIFOs (sends EOF to sessions)."""

@@ -305,6 +305,101 @@ class TestReconcile:
         assert state.stage == "escalation_wait"
 
     @pytest.mark.asyncio
+    async def test_reconcile_shelved_tasks_renotifies_escalation_wait(self, config):
+        """reconcile re-notifies for shelved tasks stuck in escalation_wait."""
+        state = PipelineState()
+        state.shelved_tasks = [
+            {"task_id": "task-shelved", "stage": "escalation_wait",
+             "stage_agent": None, "worktree": None, "retry_count": 0},
+        ]
+        esc = EscalationRequest(
+            task_id="task-shelved", agent="executor", stage="executor",
+            severity="blocking", category="design_choice",
+            question="Which approach?", options=["a", "b"], context="ctx",
+        )
+        session_mgr = _make_session_mgr(sessions={}, config=config)
+        signal_reader = _make_signal_reader(escalation=esc)
+        notify_fn = AsyncMock()
+
+        await reconcile(state, session_mgr, signal_reader, notify_fn)
+
+        signal_reader.read_escalation.assert_awaited_with("task-shelved")
+        notify_fn.assert_awaited_once_with(esc)
+
+    @pytest.mark.asyncio
+    async def test_reconcile_shelved_tasks_no_signal_logs_warning(self, config):
+        """reconcile handles shelved escalation_wait with missing signal gracefully."""
+        state = PipelineState()
+        state.shelved_tasks = [
+            {"task_id": "task-shelved", "stage": "escalation_wait",
+             "stage_agent": None, "worktree": None, "retry_count": 0},
+        ]
+        session_mgr = _make_session_mgr(sessions={}, config=config)
+        signal_reader = _make_signal_reader(escalation=None)
+        notify_fn = AsyncMock()
+
+        await reconcile(state, session_mgr, signal_reader, notify_fn)
+
+        notify_fn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reconcile_shelved_tier1_renotifies_when_signal_exists(self, config):
+        """reconcile re-notifies for shelved tasks stuck in escalation_tier1."""
+        state = PipelineState()
+        state.shelved_tasks = [
+            {"task_id": "task-tier1", "stage": "escalation_tier1",
+             "stage_agent": None, "worktree": None, "retry_count": 0},
+        ]
+        esc = EscalationRequest(
+            task_id="task-tier1", agent="executor", stage="executor",
+            severity="blocking", category="design_choice",
+            question="Which approach?", options=["a", "b"], context="ctx",
+        )
+        session_mgr = _make_session_mgr(sessions={}, config=config)
+        signal_reader = _make_signal_reader(escalation=esc)
+        notify_fn = AsyncMock()
+
+        await reconcile(state, session_mgr, signal_reader, notify_fn)
+
+        signal_reader.read_escalation.assert_awaited_with("task-tier1")
+        notify_fn.assert_awaited_once_with(esc)
+        assert state.shelved_tasks[0]["stage"] == "escalation_tier1"  # unchanged when signal exists
+
+    @pytest.mark.asyncio
+    async def test_reconcile_shelved_tier1_promotes_when_no_signal(self, config):
+        """reconcile promotes shelved escalation_tier1 to escalation_wait when signal missing."""
+        state = PipelineState()
+        state.shelved_tasks = [
+            {"task_id": "task-tier1", "stage": "escalation_tier1",
+             "stage_agent": None, "worktree": None, "retry_count": 0},
+        ]
+        session_mgr = _make_session_mgr(sessions={}, config=config)
+        signal_reader = _make_signal_reader(escalation=None)
+        notify_fn = AsyncMock()
+
+        await reconcile(state, session_mgr, signal_reader, notify_fn)
+
+        notify_fn.assert_not_awaited()
+        assert state.shelved_tasks[0]["stage"] == "escalation_wait"
+
+    @pytest.mark.asyncio
+    async def test_reconcile_shelved_tasks_non_escalation_ignored(self, config):
+        """reconcile does not re-notify shelved tasks not in escalation_wait."""
+        state = PipelineState()
+        state.shelved_tasks = [
+            {"task_id": "task-shelved", "stage": "executor",
+             "stage_agent": "executor", "worktree": None, "retry_count": 0},
+        ]
+        session_mgr = _make_session_mgr(sessions={}, config=config)
+        signal_reader = _make_signal_reader()
+        notify_fn = AsyncMock()
+
+        await reconcile(state, session_mgr, signal_reader, notify_fn)
+
+        notify_fn.assert_not_awaited()
+        signal_reader.read_escalation.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_reconcile_escalation_tier1_preserves_pre_escalation(self, config):
         """reconcile preserves pre_escalation_stage/agent after escalation_tier1 recovery."""
         state = PipelineState(

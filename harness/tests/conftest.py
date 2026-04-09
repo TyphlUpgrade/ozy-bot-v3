@@ -75,6 +75,7 @@ def config(tmp_dir):
             "reviewer": 2, "merge": 1, "wiki": 1,
         },
         test_command="python3 -m pytest tests/ -x",
+        token_rotation_threshold=100_000,
     )
 
 

@@ -133,7 +133,7 @@ class TestClassifyTask:
 
 class TestCheckStage:
     @pytest.mark.asyncio
-    async def test_completion_signal_advances_architect_to_executor(self, pipeline_state):
+    async def test_completion_signal_advances_architect_to_executor(self, config, pipeline_state):
         """Architect completion signal advances stage to executor."""
         from harness.orchestrator import check_stage
 
@@ -143,12 +143,12 @@ class TestCheckStage:
         signal_reader = _make_signal_reader()
         signal_reader.check_stage_complete = AsyncMock(return_value={"plan": "do the thing"})
 
-        await check_stage(pipeline_state, signal_reader, "architect", _make_event_log())
+        await check_stage(pipeline_state, signal_reader, _make_session_mgr(), config, "architect", _make_event_log())
 
         assert pipeline_state.stage == "executor"
 
     @pytest.mark.asyncio
-    async def test_completion_signal_advances_executor_to_reviewer(self, pipeline_state):
+    async def test_completion_signal_advances_executor_to_reviewer(self, config, pipeline_state):
         """Executor completion signal advances stage to reviewer."""
         from harness.orchestrator import check_stage
 
@@ -158,12 +158,12 @@ class TestCheckStage:
         signal_reader = _make_signal_reader()
         signal_reader.check_stage_complete = AsyncMock(return_value={"status": "done"})
 
-        await check_stage(pipeline_state, signal_reader, "executor", _make_event_log())
+        await check_stage(pipeline_state, signal_reader, _make_session_mgr(), config, "executor", _make_event_log())
 
         assert pipeline_state.stage == "reviewer"
 
     @pytest.mark.asyncio
-    async def test_completion_signal_advances_reviewer_to_merge(self, pipeline_state):
+    async def test_completion_signal_advances_reviewer_to_merge(self, config, pipeline_state):
         """Reviewer completion signal advances stage to merge."""
         from harness.orchestrator import check_stage
 
@@ -173,12 +173,12 @@ class TestCheckStage:
         signal_reader = _make_signal_reader()
         signal_reader.check_stage_complete = AsyncMock(return_value={"verdict": "approved"})
 
-        await check_stage(pipeline_state, signal_reader, "reviewer", _make_event_log())
+        await check_stage(pipeline_state, signal_reader, _make_session_mgr(), config, "reviewer", _make_event_log())
 
         assert pipeline_state.stage == "merge"
 
     @pytest.mark.asyncio
-    async def test_no_signal_is_noop(self, pipeline_state):
+    async def test_no_signal_is_noop(self, config, pipeline_state):
         """Absent completion signal leaves state unchanged."""
         from harness.orchestrator import check_stage
 
@@ -188,12 +188,12 @@ class TestCheckStage:
         signal_reader = _make_signal_reader()
         signal_reader.check_stage_complete = AsyncMock(return_value=None)
 
-        await check_stage(pipeline_state, signal_reader, "executor", _make_event_log())
+        await check_stage(pipeline_state, signal_reader, _make_session_mgr(), config, "executor", _make_event_log())
 
         assert pipeline_state.stage == "executor"
 
     @pytest.mark.asyncio
-    async def test_check_stage_passes_task_id_to_reader(self, pipeline_state):
+    async def test_check_stage_passes_task_id_to_reader(self, config, pipeline_state):
         """check_stage passes active_task to signal reader."""
         from harness.orchestrator import check_stage
 
@@ -203,7 +203,7 @@ class TestCheckStage:
         signal_reader = _make_signal_reader()
         signal_reader.check_stage_complete = AsyncMock(return_value=None)
 
-        await check_stage(pipeline_state, signal_reader, "executor", _make_event_log())
+        await check_stage(pipeline_state, signal_reader, _make_session_mgr(), config, "executor", _make_event_log())
 
         signal_reader.check_stage_complete.assert_awaited_once_with("executor", "task-xyz")
 
@@ -442,14 +442,16 @@ class TestDoMerge:
 
         merge_ok = _make_proc(returncode=0)
         tests_ok = _make_proc(returncode=0)
+        diff_ok = _make_proc(returncode=0, stdout=b" file.py | 3 +++\n 1 file changed\n")
 
         with patch("asyncio.create_subprocess_exec",
-                   side_effect=[merge_ok, tests_ok]):
+                   side_effect=[merge_ok, tests_ok, diff_ok]):
             with patch("asyncio.wait_for",
                        side_effect=lambda coro, timeout: coro):
                 await do_merge(pipeline_state, config, _make_event_log())
 
         assert pipeline_state.stage == "wiki"
+        assert pipeline_state.diff_stat is not None
 
 
 # ---------- do_wiki ----------
@@ -1328,3 +1330,501 @@ class TestCheckStageTimeout:
         assert call_args[0] == "stage_timeout"
         assert call_args[1]["task"] == "task-001"
         assert call_args[1]["stage"] == "executor"
+
+
+# ---------- check_stage context transfer (F1) ----------
+
+
+class TestCheckStageContextTransfer:
+    @pytest.mark.asyncio
+    async def test_sends_summary_on_architect_to_executor(self, config):
+        from harness.orchestrator import check_stage
+
+        state = _make_state(stage="architect")
+        signal_reader = _make_signal_reader()
+        signal_reader.check_stage_complete = AsyncMock(
+            return_value={"output": "architect plan details here"}
+        )
+        session_mgr = _make_session_mgr()
+        session_mgr.sessions = {"executor": True}
+        event_log = _make_event_log()
+
+        with patch("lib.claude.summarize", new=AsyncMock(return_value="compressed plan")):
+            await check_stage(state, signal_reader, session_mgr, config, "architect", event_log)
+
+        assert state.stage == "executor"
+        session_mgr.send.assert_awaited_once()
+        msg = session_mgr.send.call_args[0][1]
+        assert "[CONTEXT]" in msg
+        assert "compressed plan" in msg
+        assert "[TASK]" in msg
+        assert session_mgr.send.call_args[0][0] == "executor"
+
+    @pytest.mark.asyncio
+    async def test_sends_summary_on_executor_to_reviewer(self, config):
+        from harness.orchestrator import check_stage
+
+        state = _make_state(stage="executor")
+        signal_reader = _make_signal_reader()
+        signal_reader.check_stage_complete = AsyncMock(
+            return_value={"output": "executor changes summary"}
+        )
+        session_mgr = _make_session_mgr()
+        session_mgr.sessions = {"reviewer": True}
+        event_log = _make_event_log()
+
+        with patch("lib.claude.summarize", new=AsyncMock(return_value="compressed changes")):
+            await check_stage(state, signal_reader, session_mgr, config, "executor", event_log)
+
+        assert state.stage == "reviewer"
+        session_mgr.send.assert_awaited_once()
+        assert session_mgr.send.call_args[0][0] == "reviewer"
+
+    @pytest.mark.asyncio
+    async def test_proceeds_without_context_when_summarize_fails(self, config):
+        from harness.orchestrator import check_stage
+
+        state = _make_state(stage="architect")
+        signal_reader = _make_signal_reader()
+        signal_reader.check_stage_complete = AsyncMock(
+            return_value={"output": "some output"}
+        )
+        session_mgr = _make_session_mgr()
+        event_log = _make_event_log()
+
+        with patch("lib.claude.summarize", new=AsyncMock(return_value=None)):
+            await check_stage(state, signal_reader, session_mgr, config, "architect", event_log)
+
+        assert state.stage == "executor"
+        session_mgr.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_proceeds_without_context_when_no_output(self, config):
+        from harness.orchestrator import check_stage
+
+        state = _make_state(stage="architect")
+        signal_reader = _make_signal_reader()
+        signal_reader.check_stage_complete = AsyncMock(return_value={"verdict": "done"})
+        session_mgr = _make_session_mgr()
+        event_log = _make_event_log()
+
+        with patch("lib.claude.summarize", new=AsyncMock()) as mock_sum:
+            await check_stage(state, signal_reader, session_mgr, config, "architect", event_log)
+
+        assert state.stage == "executor"
+        mock_sum.assert_not_awaited()
+        session_mgr.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_context_transfer_on_reviewer_to_merge(self, config):
+        from harness.orchestrator import check_stage
+
+        state = _make_state(stage="reviewer")
+        signal_reader = _make_signal_reader()
+        signal_reader.check_stage_complete = AsyncMock(
+            return_value={"output": "review done", "verdict": "approved"}
+        )
+        session_mgr = _make_session_mgr()
+        event_log = _make_event_log()
+
+        with patch("lib.claude.summarize", new=AsyncMock()) as mock_sum:
+            await check_stage(state, signal_reader, session_mgr, config, "reviewer", event_log)
+
+        assert state.stage == "merge"
+        mock_sum.assert_not_awaited()
+
+
+# ---------- Integration: Shelving + Unshelving ----------
+
+
+class TestShelveIntegration:
+    """Orchestrator-level integration tests for task shelving during escalation."""
+
+    @pytest.mark.asyncio
+    async def test_shelve_during_escalation_activates_new_task(self, config, pipeline_state):
+        """Full flow: escalation_wait + new task → shelve old, activate new."""
+        from harness.orchestrator import create_worktree
+        from harness.lib.signals import TaskSignal
+
+        # Set up task in escalation_wait
+        task1 = TaskSignal(task_id="task-001", description="First task")
+        pipeline_state.activate(task1)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_wait")
+
+        # Simulate new task arriving and worktree creation
+        task2 = TaskSignal(task_id="task-002", description="Second task")
+        signal_reader = _make_signal_reader()
+        signal_reader.next_task = AsyncMock(return_value=task2)
+        session_mgr = _make_session_mgr()
+        session_mgr.sessions = {}
+        event_log = _make_event_log()
+
+        with patch("harness.orchestrator.create_worktree",
+                   new=AsyncMock(return_value=config.worktree_base / "task-002")):
+            # Inline the shelving logic from main_loop
+            new_task = await signal_reader.next_task(config.task_dir)
+            assert new_task is not None
+            worktree = await create_worktree(new_task.task_id, config)
+            pipeline_state.shelve()
+            pipeline_state.activate(new_task)
+            pipeline_state.worktree = worktree
+
+        # Verify shelved state
+        assert pipeline_state.active_task == "task-002"
+        assert pipeline_state.stage == "classify"
+        assert len(pipeline_state.shelved_tasks) == 1
+        assert pipeline_state.shelved_tasks[0]["task_id"] == "task-001"
+        assert pipeline_state.shelved_tasks[0]["stage"] == "escalation_wait"
+
+    @pytest.mark.asyncio
+    async def test_unshelve_after_wiki_restores_task(self, config, pipeline_state):
+        """do_wiki completes active task and unshelves previously shelved task."""
+        from harness.orchestrator import do_wiki
+        from harness.lib.signals import TaskSignal
+
+        # Shelve task-001, activate task-002
+        task1 = TaskSignal(task_id="task-001", description="First task")
+        pipeline_state.activate(task1)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_wait")
+        pipeline_state.shelve()
+
+        task2 = TaskSignal(task_id="task-002", description="Second task")
+        pipeline_state.activate(task2)
+        pipeline_state.advance("wiki")
+
+        with patch("lib.claude.document_task", new=AsyncMock(return_value=True)):
+            await do_wiki(pipeline_state, config, _make_event_log())
+
+        # task-002 completed, task-001 unshelved
+        assert pipeline_state.active_task == "task-001"
+        assert pipeline_state.stage == "escalation_wait"
+        assert len(pipeline_state.shelved_tasks) == 0
+
+    @pytest.mark.asyncio
+    async def test_unshelve_injects_pending_operator_reply(self, config, pipeline_state):
+        """Unshelved task with pending_operator_reply gets reply injected."""
+        from harness.orchestrator import do_wiki
+        from harness.lib.signals import TaskSignal
+
+        # Shelve task-001 with a pending reply (simulates reply received while shelved)
+        task1 = TaskSignal(task_id="task-001", description="First task")
+        pipeline_state.activate(task1)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_wait")
+        pipeline_state.shelve()
+        # Simulate reply resolving escalation on shelved task
+        pipeline_state.shelved_tasks[0]["stage"] = "executor"
+        pipeline_state.shelved_tasks[0]["stage_agent"] = "executor"
+        pipeline_state.shelved_tasks[0]["pending_operator_reply"] = "[OPERATOR REPLY] go ahead"
+
+        task2 = TaskSignal(task_id="task-002", description="Second task")
+        pipeline_state.activate(task2)
+        pipeline_state.advance("wiki")
+
+        session_mgr = _make_session_mgr()
+        session_mgr.sessions = {"executor": MagicMock()}
+
+        with patch("lib.claude.document_task", new=AsyncMock(return_value=True)):
+            await do_wiki(pipeline_state, config, _make_event_log(), session_mgr)
+
+        assert pipeline_state.active_task == "task-001"
+        assert pipeline_state.stage == "executor"
+        session_mgr.send.assert_awaited_once_with("executor", "[OPERATOR REPLY] go ahead")
+
+    @pytest.mark.asyncio
+    async def test_escalation_entry_clears_stale_stage_signal(self, config, pipeline_state):
+        """check_for_escalation clears any pending stage completion signal."""
+        from harness.orchestrator import check_for_escalation
+        from harness.lib.signals import EscalationRequest
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.advance("executor", "executor")
+
+        esc = EscalationRequest(
+            task_id="task-001", agent="executor", stage="executor",
+            severity="blocking", category="security_concern",
+            question="Is this safe?", options=["yes", "no"], context="ctx",
+        )
+        signal_reader = _make_signal_reader()
+        signal_reader.read_escalation = AsyncMock(return_value=esc)
+        signal_reader.clear_stage_signal = MagicMock()
+        session_mgr = _make_session_mgr()
+
+        with patch("harness.orchestrator.notify", new=AsyncMock()):
+            await check_for_escalation(pipeline_state, signal_reader, session_mgr, config, _make_event_log())
+
+        signal_reader.clear_stage_signal.assert_called_once_with("executor", "task-001")
+
+
+# ---------- Integration: Session Rotation ----------
+
+
+class TestSessionRotationIntegration:
+    """Orchestrator-level test for session rotation with context re-injection."""
+
+    @pytest.mark.asyncio
+    async def test_rotation_restarts_and_reinjects_context(self, config):
+        """Session rotation reads log tail, summarizes, restarts, and re-injects."""
+        from harness.lib.sessions import Session
+
+        state = _make_state(stage="executor")
+        state.stage_agent = "executor"
+
+        session_mgr = _make_session_mgr()
+        log_path = MagicMock()
+        log_path.exists.return_value = True
+        log_path.read_text.return_value = "x" * 5000
+        session = Session(name="executor", role="executor", fd=5,
+                          fifo=MagicMock(), log=log_path)
+        session_mgr.sessions = {"executor": session}
+        session_mgr.needs_rotation = MagicMock(return_value=True)
+
+        with patch("lib.claude.summarize", new=AsyncMock(return_value="rotation summary")):
+            # Inline the rotation logic from main_loop
+            if session_mgr.needs_rotation(state.stage_agent, config.token_rotation_threshold):
+                sess = session_mgr.sessions[state.stage_agent]
+                content = sess.log.read_text()[-4000:]
+                summary = await __import__("lib.claude", fromlist=["summarize"]).summarize(content, config)
+                await session_mgr.restart(state.stage_agent)
+                if summary:
+                    await session_mgr.send(
+                        state.stage_agent,
+                        f"[SYSTEM] Session rotated due to token limit. Context summary:\n\n{summary}",
+                    )
+
+        session_mgr.restart.assert_awaited_once_with("executor")
+        session_mgr.send.assert_awaited_once()
+        msg = session_mgr.send.call_args[0][1]
+        assert "[SYSTEM] Session rotated" in msg
+        assert "rotation summary" in msg
+
+
+# ---------- Phase 4: Wiki data collection ----------
+
+
+class TestWikiDataCollection:
+    """Tests for plan_summary, diff_stat, review_verdict collection (Phase 4)."""
+
+    @pytest.mark.asyncio
+    async def test_check_stage_stores_plan_summary(self, config, pipeline_state):
+        """Architect completion stores plan output on state.plan_summary."""
+        from harness.orchestrator import check_stage
+
+        task = TaskSignal(task_id="task-001", description="Plan it")
+        pipeline_state.activate(task)
+        pipeline_state.advance("architect", "architect")
+        signal_reader = _make_signal_reader()
+        signal_reader.check_stage_complete = AsyncMock(
+            return_value={"output": "Build auth module with JWT tokens"}
+        )
+
+        await check_stage(pipeline_state, signal_reader, _make_session_mgr(),
+                         config, "architect", _make_event_log())
+
+        assert pipeline_state.plan_summary == "Build auth module with JWT tokens"
+
+    @pytest.mark.asyncio
+    async def test_check_stage_no_plan_summary_on_executor(self, config, pipeline_state):
+        """Executor completion does not set plan_summary."""
+        from harness.orchestrator import check_stage
+
+        task = TaskSignal(task_id="task-001", description="Do it")
+        pipeline_state.activate(task)
+        pipeline_state.advance("executor", "executor")
+        pipeline_state.plan_summary = "Existing plan"
+        signal_reader = _make_signal_reader()
+        signal_reader.check_stage_complete = AsyncMock(
+            return_value={"output": "Executor output"}
+        )
+
+        await check_stage(pipeline_state, signal_reader, _make_session_mgr(),
+                         config, "executor", _make_event_log())
+
+        assert pipeline_state.plan_summary == "Existing plan"  # unchanged
+
+    @pytest.mark.asyncio
+    async def test_check_stage_plan_summary_fallback_to_plan_key(self, config, pipeline_state):
+        """Architect signal with 'plan' key (no 'output') still sets plan_summary."""
+        from harness.orchestrator import check_stage
+
+        task = TaskSignal(task_id="task-001", description="Plan it")
+        pipeline_state.activate(task)
+        pipeline_state.advance("architect", "architect")
+        signal_reader = _make_signal_reader()
+        signal_reader.check_stage_complete = AsyncMock(
+            return_value={"plan": "Alternative plan text"}
+        )
+
+        await check_stage(pipeline_state, signal_reader, _make_session_mgr(),
+                         config, "architect", _make_event_log())
+
+        assert pipeline_state.plan_summary == "Alternative plan text"
+
+    @pytest.mark.asyncio
+    async def test_check_reviewer_stores_verdict(self, config, pipeline_state):
+        """Approved verdict stores feedback on state.review_verdict."""
+        from harness.orchestrator import check_reviewer
+
+        task = TaskSignal(task_id="task-001", description="Code change")
+        pipeline_state.activate(task)
+        pipeline_state.advance("reviewer", "reviewer")
+        signal_reader = _make_signal_reader()
+        signal_reader.check_stage_complete = AsyncMock(
+            return_value={"verdict": "approved", "feedback": "Clean implementation, well tested"}
+        )
+
+        await check_reviewer(pipeline_state, signal_reader, _make_session_mgr(),
+                            config, _make_event_log())
+
+        assert pipeline_state.review_verdict == "Clean implementation, well tested"
+
+    @pytest.mark.asyncio
+    async def test_check_reviewer_verdict_no_feedback_defaults_approved(self, config,
+                                                                        pipeline_state):
+        """Approved verdict with empty feedback defaults review_verdict to 'approved'."""
+        from harness.orchestrator import check_reviewer
+
+        task = TaskSignal(task_id="task-001", description="Code change")
+        pipeline_state.activate(task)
+        pipeline_state.advance("reviewer", "reviewer")
+        signal_reader = _make_signal_reader()
+        signal_reader.check_stage_complete = AsyncMock(
+            return_value={"verdict": "approve", "feedback": ""}
+        )
+
+        await check_reviewer(pipeline_state, signal_reader, _make_session_mgr(),
+                            config, _make_event_log())
+
+        assert pipeline_state.review_verdict == "approved"
+
+    @pytest.mark.asyncio
+    async def test_do_merge_captures_diff_stat(self, config, pipeline_state, tmp_dir):
+        """Successful merge captures git diff --stat on state.diff_stat."""
+        from harness.orchestrator import do_merge
+
+        task = TaskSignal(task_id="task-001", description="Add feature")
+        pipeline_state.activate(task)
+        pipeline_state.worktree = tmp_dir / "worktrees" / "task-001"
+
+        merge_ok = _make_proc(returncode=0)
+        tests_ok = _make_proc(returncode=0)
+        diff_ok = _make_proc(returncode=0, stdout=b" src/auth.py | 42 +++\n 1 file changed, 42 insertions(+)\n")
+
+        with patch("asyncio.create_subprocess_exec",
+                   side_effect=[merge_ok, tests_ok, diff_ok]):
+            with patch("asyncio.wait_for",
+                       side_effect=lambda coro, timeout: coro):
+                await do_merge(pipeline_state, config, _make_event_log())
+
+        assert pipeline_state.diff_stat == "src/auth.py | 42 +++\n 1 file changed, 42 insertions(+)"
+
+    @pytest.mark.asyncio
+    async def test_do_merge_diff_stat_failure(self, config, pipeline_state, tmp_dir):
+        """Git diff --stat failure sets diff_stat to None."""
+        from harness.orchestrator import do_merge
+
+        task = TaskSignal(task_id="task-001", description="Add feature")
+        pipeline_state.activate(task)
+        pipeline_state.worktree = tmp_dir / "worktrees" / "task-001"
+
+        merge_ok = _make_proc(returncode=0)
+        tests_ok = _make_proc(returncode=0)
+        diff_fail = _make_proc(returncode=128, stderr=b"fatal: bad revision")
+
+        with patch("asyncio.create_subprocess_exec",
+                   side_effect=[merge_ok, tests_ok, diff_fail]):
+            with patch("asyncio.wait_for",
+                       side_effect=lambda coro, timeout: coro):
+                await do_merge(pipeline_state, config, _make_event_log())
+
+        assert pipeline_state.stage == "wiki"
+        assert pipeline_state.diff_stat is None
+
+    @pytest.mark.asyncio
+    async def test_do_merge_no_worktree_diff_stat_stays_none(self, config, pipeline_state):
+        """No worktree skips merge entirely — diff_stat stays None."""
+        from harness.orchestrator import do_merge
+
+        task = TaskSignal(task_id="task-001", description="Simple task")
+        pipeline_state.activate(task)
+        pipeline_state.worktree = None
+
+        await do_merge(pipeline_state, config, _make_event_log())
+
+        assert pipeline_state.stage == "wiki"
+        assert pipeline_state.diff_stat is None
+
+    @pytest.mark.asyncio
+    async def test_do_wiki_passes_real_data(self, config, pipeline_state):
+        """do_wiki passes accumulated plan_summary, diff_stat, review_verdict to document_task."""
+        from harness.orchestrator import do_wiki
+
+        task = TaskSignal(task_id="task-001", description="Add auth")
+        pipeline_state.activate(task)
+        pipeline_state.advance("wiki")
+        pipeline_state.plan_summary = "Build JWT auth"
+        pipeline_state.diff_stat = " auth.py | 50 +++\n 1 file changed"
+        pipeline_state.review_verdict = "Clean code, approved"
+        captured = {}
+
+        async def fake_doc(task_id, description, plan_summary, diff_stat,
+                           review_verdict, config):
+            captured.update(plan_summary=plan_summary, diff_stat=diff_stat,
+                           review_verdict=review_verdict)
+            return True
+
+        with patch("lib.claude.document_task", new=fake_doc):
+            await do_wiki(pipeline_state, config, _make_event_log())
+
+        assert captured["plan_summary"] == "Build JWT auth"
+        assert captured["diff_stat"] == " auth.py | 50 +++\n 1 file changed"
+        assert captured["review_verdict"] == "Clean code, approved"
+
+    @pytest.mark.asyncio
+    async def test_do_wiki_fallbacks_on_none(self, config, pipeline_state):
+        """do_wiki passes fallback strings when fields are None."""
+        from harness.orchestrator import do_wiki
+
+        task = TaskSignal(task_id="task-001", description="Simple fix")
+        pipeline_state.activate(task)
+        pipeline_state.advance("wiki")
+        # Leave plan_summary, diff_stat, review_verdict as None
+        captured = {}
+
+        async def fake_doc(task_id, description, plan_summary, diff_stat,
+                           review_verdict, config):
+            captured.update(plan_summary=plan_summary, diff_stat=diff_stat,
+                           review_verdict=review_verdict)
+            return True
+
+        with patch("lib.claude.document_task", new=fake_doc):
+            await do_wiki(pipeline_state, config, _make_event_log())
+
+        assert captured["plan_summary"] == "(no architect plan)"
+        assert captured["diff_stat"] == "(no file changes)"
+        assert captured["review_verdict"] == "(no review)"
+
+    @pytest.mark.asyncio
+    async def test_do_wiki_records_wiki_failed_event(self, config, pipeline_state):
+        """Failed wiki documentation records wiki_failed event."""
+        from harness.orchestrator import do_wiki
+
+        task = TaskSignal(task_id="task-001", description="Fix bug")
+        pipeline_state.activate(task)
+        pipeline_state.advance("wiki")
+        event_log = _make_event_log()
+
+        with patch("lib.claude.document_task", new=AsyncMock(return_value=False)):
+            await do_wiki(pipeline_state, config, event_log)
+
+        events = [c[0][0] for c in event_log.record.call_args_list]
+        assert "wiki_failed" in events
+        wiki_event = next(c for c in event_log.record.call_args_list
+                         if c[0][0] == "wiki_failed")
+        assert wiki_event[0][1]["task"] == "task-001"

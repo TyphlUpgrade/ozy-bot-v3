@@ -153,6 +153,43 @@ class TestSignalReader:
         reader = SignalReader(tmp_dir / "signals")
         reader.clear_escalation("nonexistent")  # should not raise
 
+    def test_clear_stage_signal_architect(self, tmp_dir):
+        """clear_stage_signal removes architect plan.json for a task."""
+        plan_dir = tmp_dir / "signals" / "architect" / "t1"
+        plan_dir.mkdir(parents=True)
+        (plan_dir / "plan.json").write_text('{"plan": "do stuff"}')
+        reader = SignalReader(tmp_dir / "signals")
+        reader.clear_stage_signal("architect", "t1")
+        assert not (plan_dir / "plan.json").exists()
+
+    def test_clear_stage_signal_executor(self, tmp_dir):
+        """clear_stage_signal removes executor completion signal."""
+        exec_dir = tmp_dir / "signals" / "executor"
+        exec_dir.mkdir(parents=True, exist_ok=True)
+        (exec_dir / "completion-t2.json").write_text('{"status": "done"}')
+        reader = SignalReader(tmp_dir / "signals")
+        reader.clear_stage_signal("executor", "t2")
+        assert not (exec_dir / "completion-t2.json").exists()
+
+    def test_clear_stage_signal_reviewer(self, tmp_dir):
+        """clear_stage_signal removes reviewer verdict.json for a task."""
+        rev_dir = tmp_dir / "signals" / "reviewer" / "t3"
+        rev_dir.mkdir(parents=True)
+        (rev_dir / "verdict.json").write_text('{"verdict": "approve"}')
+        reader = SignalReader(tmp_dir / "signals")
+        reader.clear_stage_signal("reviewer", "t3")
+        assert not (rev_dir / "verdict.json").exists()
+
+    def test_clear_stage_signal_missing_is_noop(self, tmp_dir):
+        """clear_stage_signal does nothing when signal file doesn't exist."""
+        reader = SignalReader(tmp_dir / "signals")
+        reader.clear_stage_signal("architect", "nonexistent")  # should not raise
+
+    def test_clear_stage_signal_unknown_stage_is_noop(self, tmp_dir):
+        """clear_stage_signal does nothing for an unrecognized stage name."""
+        reader = SignalReader(tmp_dir / "signals")
+        reader.clear_stage_signal("unknown_stage", "t1")  # should not raise
+
     def test_archive(self, tmp_dir):
         esc_dir = tmp_dir / "signals" / "escalation"
         (esc_dir / "t1.json").write_text('{"task_id": "t1"}')

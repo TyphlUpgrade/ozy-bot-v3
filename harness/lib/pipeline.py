@@ -188,6 +188,7 @@ class ProjectConfig:
     claude_binary: str = "claude"       # configurable LLM CLI binary
     commands_module: str | None = None
     test_command: str = "python3 -m pytest tests/ -x"  # command run after merge; override for non-Python projects
+    token_rotation_threshold: int = 100_000  # cumulative tokens before session rotation
 
     @classmethod
     def load(cls, config_path: Path) -> ProjectConfig:
@@ -212,6 +213,7 @@ class ProjectConfig:
             caveman=CavemanConfig.from_toml(data),
             claude_binary=pipeline.get("claude_binary", "claude"),
             test_command=pipeline.get("test_command", "python3 -m pytest tests/ -x"),
+            token_rotation_threshold=pipeline.get("token_rotation_threshold", 100_000),
             timeouts={
                 "classify": pipeline.get("classify_timeout", 120),
                 "summarize": pipeline.get("summarize_timeout", 120),
@@ -258,6 +260,10 @@ class PipelineState:
     pre_escalation_agent: str | None = None  # agent before escalation, for reply injection
     last_renotify_ts: str | None = None  # when blocking escalation last re-notified operator
     stage_started_ts: str | None = None  # wall-clock time current stage began (for max timeout)
+    shelved_tasks: list[dict] = field(default_factory=list)  # tasks shelved during escalation
+    plan_summary: str | None = None        # architect plan output, collected in check_stage
+    diff_stat: str | None = None           # git diff --stat, collected in do_merge
+    review_verdict: str | None = None      # reviewer verdict, collected in check_reviewer
 
     def activate(self, task: "TaskSignal") -> None:
         from .signals import TaskSignal  # avoid circular at module level
@@ -272,6 +278,9 @@ class PipelineState:
         self.pre_escalation_agent = None
         self.last_renotify_ts = None
         self.stage_started_ts = datetime.now(UTC).isoformat()
+        self.plan_summary = None
+        self.diff_stat = None
+        self.review_verdict = None
 
     def advance(self, next_stage: str, agent: str | None = None) -> None:
         if next_stage not in VALID_STAGES:
@@ -306,6 +315,56 @@ class PipelineState:
         self.pre_escalation_agent = None
         self.last_renotify_ts = None
         self.stage_started_ts = None
+        self.plan_summary = None
+        self.diff_stat = None
+        self.review_verdict = None
+
+    def shelve(self) -> None:
+        """Save current active task to shelf and clear pipeline for next task."""
+        if not self.active_task:
+            return
+        self.shelved_tasks.append({
+            "task_id": self.active_task,
+            "description": self.task_description,
+            "stage": self.stage,
+            "stage_agent": self.stage_agent,
+            "worktree": str(self.worktree) if self.worktree else None,
+            "retry_count": self.retry_count,
+            "shelved_at": datetime.now(UTC).isoformat(),
+            "escalation_started_ts": self.escalation_started_ts,
+            "pre_escalation_stage": self.pre_escalation_stage,
+            "pre_escalation_agent": self.pre_escalation_agent,
+            "last_renotify_ts": self.last_renotify_ts,
+            "plan_summary": self.plan_summary,
+            "diff_stat": self.diff_stat,
+            "review_verdict": self.review_verdict,
+        })
+        self.clear_active()
+
+    def unshelve(self) -> dict | None:
+        """Pop newest shelved task and restore it as active. Returns task dict or None."""
+        if not self.shelved_tasks:
+            return None
+        task = self.shelved_tasks.pop()
+        self.active_task = task["task_id"]
+        self.task_description = task.get("description")
+        self.stage = task.get("stage")
+        self.stage_agent = task.get("stage_agent")
+        wt = task.get("worktree")
+        self.worktree = Path(wt) if wt else None
+        self.retry_count = task.get("retry_count", 0)
+        self.escalation_started_ts = task.get("escalation_started_ts")
+        self.pre_escalation_stage = task.get("pre_escalation_stage")
+        self.pre_escalation_agent = task.get("pre_escalation_agent")
+        self.last_renotify_ts = task.get("last_renotify_ts")
+        self.plan_summary = task.get("plan_summary")
+        self.diff_stat = task.get("diff_stat")
+        self.review_verdict = task.get("review_verdict")
+        self.stage_started_ts = datetime.now(UTC).isoformat()
+        # Reset escalation clock so shelved duration doesn't count toward timeout
+        if self.stage and self.stage.startswith("escalation_"):
+            self.escalation_started_ts = datetime.now(UTC).isoformat()
+        return task
 
     def heartbeat(self) -> None:
         self.heartbeat_ts = datetime.now(UTC).isoformat()
@@ -328,6 +387,12 @@ class PipelineState:
         try:
             data = json.loads(path.read_text())
             wt = data.pop("worktree", None)
+            # Pop unknown keys to avoid TypeError on version mismatch (BUG-002 mitigation)
+            known = {f.name for f in cls.__dataclass_fields__.values()}
+            for key in list(data):
+                if key not in known:
+                    logger.debug("Dropping unknown state key: %s", key)
+                    data.pop(key)
             state = cls(**data)
             if wt:
                 state.worktree = Path(wt)

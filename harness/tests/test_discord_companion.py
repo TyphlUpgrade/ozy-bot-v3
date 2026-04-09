@@ -334,6 +334,49 @@ class TestMutationExecution:
         assert state.stage == "executor"  # unchanged
 
     @pytest.mark.asyncio
+    async def test_apply_reply_shelved_task_stores_reply(self, config):
+        """_apply_reply resolves escalation on shelved task and stores pending reply."""
+        task1 = TaskSignal(task_id="task-shelved", description="Shelved task")
+        task2 = TaskSignal(task_id="task-active", description="Active task")
+        state = PipelineState()
+        state.activate(task1)
+        state.pre_escalation_stage = "executor"
+        state.pre_escalation_agent = "executor"
+        state.advance("escalation_wait")
+        state.shelve()
+        state.activate(task2)
+
+        mutations = []
+        dc = _make_companion(config, mutations)
+        await dc.handle_message("!reply", "task-shelved go ahead")
+        sm = _make_session_mgr()
+        await mutations[0](state, sm)
+
+        # Shelved task escalation resolved in-place
+        assert state.shelved_tasks[0]["stage"] == "executor"
+        assert state.shelved_tasks[0]["pending_operator_reply"] == "[OPERATOR REPLY] go ahead"
+        assert state.shelved_tasks[0]["pre_escalation_stage"] is None
+        dc.signal_reader.clear_escalation.assert_called_once_with("task-shelved")
+        sm.send.assert_not_awaited()  # not injected yet — task still shelved
+
+    @pytest.mark.asyncio
+    async def test_apply_reply_unknown_task_logs_warning(self, config):
+        """_apply_reply logs warning when task_id not found in active or shelved."""
+        task = TaskSignal(task_id="task-active", description="Active task")
+        state = PipelineState()
+        state.activate(task)
+        state.advance("executor")
+
+        mutations = []
+        dc = _make_companion(config, mutations)
+        await dc.handle_message("!reply", "task-unknown go ahead")
+        sm = _make_session_mgr()
+        await mutations[0](state, sm)
+
+        sm.send.assert_not_awaited()
+        dc.signal_reader.clear_escalation.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_apply_reply_dead_session_still_resumes(self, config):
         """_apply_reply resumes pipeline even when the original agent session is dead."""
         task = TaskSignal(task_id="task-xyz", description="Work")

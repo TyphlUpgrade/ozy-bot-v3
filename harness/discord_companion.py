@@ -171,19 +171,45 @@ class DiscordCompanion:
 async def _apply_reply(state: "PipelineState", session_mgr: "SessionManager",
                        task_id: str, response: str,
                        signal_reader: "SignalReader") -> None:
-    """Apply an escalation reply — inject into the original agent and resume."""
-    if state.active_task != task_id:
-        logger.warning("Reply for %s but active task is %s", task_id, state.active_task)
+    """Apply an escalation reply — inject into the original agent and resume.
+
+    If the task is shelved (not active), resolve its escalation in-place and
+    store the reply for injection when unshelved.
+    """
+    if state.active_task == task_id:
+        # Active task — apply immediately
+        if state.stage not in ("escalation_wait", "escalation_tier1"):
+            logger.warning("Reply for %s but stage is %s (not escalation)", task_id, state.stage)
+            return
+        original_agent = state.pre_escalation_agent
+        if original_agent and original_agent in session_mgr.sessions:
+            await session_mgr.send(original_agent, f"[OPERATOR REPLY] {response}")
+        elif original_agent:
+            logger.warning("Session %s dead during escalation — reply not delivered", original_agent)
+        state.resume_from_escalation()
+        signal_reader.clear_escalation(task_id)
+        logger.info("Operator reply applied for %s → resuming %s at %s",
+                    task_id, original_agent, state.stage)
         return
-    if state.stage not in ("escalation_wait", "escalation_tier1"):
-        logger.warning("Reply for %s but stage is %s (not escalation)", task_id, state.stage)
-        return
-    original_agent = state.pre_escalation_agent
-    if original_agent and original_agent in session_mgr.sessions:
-        await session_mgr.send(original_agent, f"[OPERATOR REPLY] {response}")
-    elif original_agent:
-        logger.warning("Session %s dead during escalation — reply not delivered", original_agent)
-    state.resume_from_escalation()
-    signal_reader.clear_escalation(task_id)
-    logger.info("Operator reply applied for %s → resuming %s at %s",
-                task_id, original_agent, state.stage)
+
+    # Check shelved tasks
+    for shelved in state.shelved_tasks:
+        if shelved.get("task_id") == task_id:
+            stage = shelved.get("stage", "")
+            if stage not in ("escalation_wait", "escalation_tier1"):
+                logger.warning("Reply for shelved %s but stage is %s (not escalation)", task_id, stage)
+                return
+            # Resolve escalation in-place on the shelved entry
+            pre_stage = shelved.get("pre_escalation_stage", "executor")
+            shelved["stage"] = pre_stage
+            shelved["stage_agent"] = shelved.get("pre_escalation_agent")
+            shelved["pre_escalation_stage"] = None
+            shelved["pre_escalation_agent"] = None
+            shelved["pending_operator_reply"] = f"[OPERATOR REPLY] {response}"
+            signal_reader.clear_escalation(task_id)
+            logger.info("Operator reply stored for shelved task %s — escalation resolved to %s",
+                        task_id, pre_stage)
+            return
+
+    logger.warning("Reply for %s but task not found (active=%s, shelved=%d)",
+                   task_id, state.active_task, len(state.shelved_tasks))
