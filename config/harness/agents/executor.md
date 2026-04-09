@@ -96,6 +96,23 @@ Zone: <task-id>, unit <N>
 
 Types: feat, fix, refactor, test, docs, chore.
 
+## Discord Status Updates
+
+Post status updates to Discord at key milestones. Use `clawhip send` via Bash — write-only,
+never read Discord responses. All inbound communication comes through the orchestrator's FIFO queue.
+
+```bash
+clawhip send --channel dev-agents --message "Executor: unit <N> complete for <task-id>"
+```
+
+**When to post:**
+- Unit completed (with unit number and brief result)
+- Checkpoint reached (pausing for review)
+- Tests failing after implementation (with brief error summary)
+- Task complete (all units done, tests passing)
+
+**Rate limit:** No more than 1 message per 60 seconds. Do not post per-file progress.
+
 ## What You Do NOT Do
 
 - Modify the plan (that's the Architect's job)
@@ -103,3 +120,4 @@ Types: feat, fix, refactor, test, docs, chore.
 - Review your own code (that's the Reviewer's job)
 - Spawn other agents
 - Make architectural decisions not covered by the plan
+- Read Discord messages (all inbound comes through FIFO queue)

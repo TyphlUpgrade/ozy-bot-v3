@@ -13,6 +13,7 @@ from harness.discord_companion import (
     parse_reply,
     parse_tell,
 )
+from harness.lib.claude import classify_target
 from harness.lib.pipeline import PipelineState
 from harness.lib.signals import TaskSignal
 
@@ -20,13 +21,14 @@ from harness.lib.signals import TaskSignal
 # ---------- Helpers ----------
 
 
-def _make_companion(config, mutations=None):
+def _make_companion(config, mutations=None, active_agents_fn=None):
     sr = MagicMock()
     sr.clear_escalation = MagicMock()
     return DiscordCompanion(
         config=config,
         pending_mutations=mutations if mutations is not None else [],
         signal_reader=sr,
+        active_agents_fn=active_agents_fn,
     )
 
 
@@ -418,3 +420,201 @@ class TestLoadProjectCommands:
         mock_import.assert_called_once_with("config.commands_module")
         assert dc._project_commands == {"!deploy": "Deploy the app"}
         assert dc._project_handler is fake_handler
+
+
+# ---------- TestHandleRawMessage ----------
+
+
+class TestHandleRawMessage:
+    @pytest.mark.asyncio
+    async def test_prefix_command_delegates_to_handle_message(self, config):
+        mutations = []
+        dc = _make_companion(config, mutations)
+        resp = await dc.handle_raw_message("!tell executor do the thing")
+        assert resp == "Feedback queued for executor."
+        assert len(mutations) == 1
+
+    @pytest.mark.asyncio
+    async def test_prefix_command_with_no_args(self, config):
+        dc = _make_companion(config)
+        resp = await dc.handle_raw_message("!status")
+        assert resp is not None
+        assert "!caveman" in resp
+
+    @pytest.mark.asyncio
+    async def test_nl_message_routes_to_single_agent(self, config):
+        mutations = []
+        dc = _make_companion(config, mutations, active_agents_fn=lambda: ["executor"])
+        with patch("lib.claude.classify_target") as mock_ct:
+            resp = await dc.handle_raw_message("focus on error handling")
+        assert resp == "Message routed to executor."
+        assert len(mutations) == 1
+        mock_ct.assert_not_called()  # single agent, no classify needed
+
+    @pytest.mark.asyncio
+    async def test_nl_message_strips_whitespace(self, config):
+        mutations = []
+        dc = _make_companion(config, mutations, active_agents_fn=lambda: ["executor"])
+        resp = await dc.handle_raw_message("  focus on tests  ")
+        assert resp == "Message routed to executor."
+
+    @pytest.mark.asyncio
+    async def test_empty_message_routes_as_nl(self, config):
+        dc = _make_companion(config, active_agents_fn=lambda: [])
+        resp = await dc.handle_raw_message("  ")
+        assert resp == "No active agents. Submit a task first."
+
+
+# ---------- TestRouteNaturalLanguage ----------
+
+
+class TestRouteNaturalLanguage:
+    @pytest.mark.asyncio
+    async def test_no_active_agents(self, config):
+        dc = _make_companion(config, active_agents_fn=lambda: [])
+        resp = await dc._route_natural_language("do something")
+        assert "No active agents" in resp
+
+    @pytest.mark.asyncio
+    async def test_single_agent_routes_directly(self, config):
+        mutations = []
+        dc = _make_companion(config, mutations, active_agents_fn=lambda: ["architect"])
+        resp = await dc._route_natural_language("review the design")
+        assert resp == "Message routed to architect."
+        assert len(mutations) == 1
+
+    @pytest.mark.asyncio
+    async def test_single_agent_mutation_sends_operator_prefix(self, config, pipeline_state):
+        mutations = []
+        dc = _make_companion(config, mutations, active_agents_fn=lambda: ["executor"])
+        await dc._route_natural_language("fix the bug")
+        sm = _make_session_mgr()
+        await mutations[0](pipeline_state, sm)
+        sm.send.assert_awaited_once_with("executor", "[OPERATOR] fix the bug")
+
+    @pytest.mark.asyncio
+    async def test_multiple_agents_uses_classify(self, config):
+        mutations = []
+        dc = _make_companion(config, mutations, active_agents_fn=lambda: ["architect", "executor"])
+        with patch("lib.claude.classify_target", new_callable=AsyncMock, return_value="executor"):
+            resp = await dc._route_natural_language("focus on error handling")
+        assert resp == "Message routed to executor."
+        assert len(mutations) == 1
+
+    @pytest.mark.asyncio
+    async def test_multiple_agents_ambiguous_returns_prompt(self, config):
+        dc = _make_companion(config, active_agents_fn=lambda: ["architect", "executor"])
+        with patch("lib.claude.classify_target", new_callable=AsyncMock, return_value=None):
+            resp = await dc._route_natural_language("do something")
+        assert "Who do you mean?" in resp
+        assert "architect" in resp
+        assert "executor" in resp
+
+    @pytest.mark.asyncio
+    async def test_mutation_late_binding_safe(self, config, pipeline_state):
+        """Two NL messages produce independent mutations."""
+        mutations = []
+        dc = _make_companion(config, mutations, active_agents_fn=lambda: ["executor"])
+        await dc._route_natural_language("first message")
+        await dc._route_natural_language("second message")
+        sm = _make_session_mgr()
+        await mutations[0](pipeline_state, sm)
+        await mutations[1](pipeline_state, sm)
+        calls = [c.args for c in sm.send.await_args_list]
+        assert ("executor", "[OPERATOR] first message") in calls
+        assert ("executor", "[OPERATOR] second message") in calls
+
+
+# ---------- TestActiveAgentsFn ----------
+
+
+class TestActiveAgentsFn:
+    def test_default_uses_config_agents(self, config):
+        dc = _make_companion(config)
+        agents = dc._active_agents_fn()
+        assert set(agents) == set(config.agents.keys())
+
+    def test_custom_fn_overrides_default(self, config):
+        dc = _make_companion(config, active_agents_fn=lambda: ["custom-agent"])
+        agents = dc._active_agents_fn()
+        assert agents == ["custom-agent"]
+
+
+# ---------- TestClassifyTarget ----------
+
+
+class TestClassifyTarget:
+    @pytest.mark.asyncio
+    async def test_returns_matching_agent(self, config):
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value="executor"):
+            result = await classify_target("fix the bug", ["architect", "executor"], config)
+        assert result == "executor"
+
+    @pytest.mark.asyncio
+    async def test_case_insensitive_match(self, config):
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value="EXECUTOR"):
+            result = await classify_target("fix it", ["architect", "executor"], config)
+        assert result == "executor"
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_returns_none(self, config):
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value="ambiguous"):
+            result = await classify_target("do something", ["architect", "executor"], config)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_unknown_agent_returns_none(self, config):
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value="debugger"):
+            result = await classify_target("debug this", ["architect", "executor"], config)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_timeout_returns_none(self, config):
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value=None):
+            result = await classify_target("do the thing", ["executor"], config)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_uses_haiku_model(self, config):
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value="executor") as mock:
+            await classify_target("fix it", ["executor"], config)
+        assert mock.call_args.kwargs.get("model") == "haiku"
+
+    @pytest.mark.asyncio
+    async def test_uses_classify_target_timeout(self, config):
+        config.timeouts["classify_target"] = 42
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value="executor") as mock:
+            await classify_target("fix it", ["executor"], config)
+        # timeout is the 3rd positional arg
+        assert mock.call_args.args[2] == 42
+
+
+# ---------- TestRunClaudeModelParam ----------
+
+
+class TestRunClaudeModelParam:
+    @pytest.mark.asyncio
+    async def test_model_param_added_to_command(self, config):
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = AsyncMock()
+            mock_proc.returncode = 0
+            mock_proc.communicate = AsyncMock(return_value=(b"output", b""))
+            mock_exec.return_value = mock_proc
+            from harness.lib.claude import _run_claude
+            await _run_claude("sys", "user", 10, "test", config, model="haiku")
+        cmd_args = mock_exec.call_args.args
+        assert "--model" in cmd_args
+        idx = cmd_args.index("--model")
+        assert cmd_args[idx + 1] == "haiku"
+
+    @pytest.mark.asyncio
+    async def test_no_model_param_when_none(self, config):
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = AsyncMock()
+            mock_proc.returncode = 0
+            mock_proc.communicate = AsyncMock(return_value=(b"output", b""))
+            mock_exec.return_value = mock_proc
+            from harness.lib.claude import _run_claude
+            await _run_claude("sys", "user", 10, "test", config)
+        cmd_args = mock_exec.call_args.args
+        assert "--model" not in cmd_args

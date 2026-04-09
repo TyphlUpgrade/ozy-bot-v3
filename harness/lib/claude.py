@@ -18,6 +18,7 @@ async def _run_claude(
     call_type: str,
     config: "ProjectConfig",
     tools: list[str] | None = None,
+    model: str | None = None,
 ) -> str | None:
     """Core subprocess wrapper for ephemeral claude -p calls.
 
@@ -29,6 +30,8 @@ async def _run_claude(
         system_prompt = directives[level] + "\n\n" + system_prompt
 
     cmd: list[str] = [config.claude_binary, "-p", "--permission-mode", "dontAsk"]
+    if model:
+        cmd += ["--model", model]
     if tools:
         cmd += ["--allowedTools", ",".join(tools)]
     cmd += ["--system-prompt", system_prompt, user_prompt]
@@ -138,3 +141,30 @@ async def document_task(
         return False
     logger.info("document_task succeeded for task_id=%s", task_id)
     return True
+
+
+async def classify_target(
+    message: str,
+    agents: list[str],
+    config: "ProjectConfig",
+) -> str | None:
+    """Route an operator's NL message to the correct agent. Returns agent name or None."""
+    system = (
+        "You are a message router. Given the operator's message and the list of "
+        "active agents, reply with exactly one agent name. "
+        "If the intent is ambiguous, reply 'ambiguous'."
+    )
+    user = f"Active agents: {', '.join(agents)}\n\nOperator message: {message}"
+    timeout = config.timeouts.get("classify_target", 10)
+    result = await _run_claude(system, user, timeout, "classify_target", config, model="haiku")
+    if result is None:
+        return None
+    normalized = result.strip().lower()
+    if normalized == "ambiguous":
+        return None
+    # Validate the response is a known agent name
+    for agent in agents:
+        if normalized == agent.lower():
+            return agent
+    logger.warning("classify_target returned unknown agent %r — treating as ambiguous", result)
+    return None

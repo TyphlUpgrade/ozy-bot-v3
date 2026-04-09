@@ -66,10 +66,12 @@ class DiscordCompanion:
 
     def __init__(self, config: "ProjectConfig",
                  pending_mutations: list[Mutation],
-                 signal_reader: "SignalReader"):
+                 signal_reader: "SignalReader",
+                 active_agents_fn: Callable[[], list[str]] | None = None):
         self.config = config
         self.pending_mutations = pending_mutations
         self.signal_reader = signal_reader
+        self._active_agents_fn = active_agents_fn or (lambda: list(config.agents.keys()))
         self._project_commands: dict[str, str] = {}
         self._project_handler: Any = None
         self._load_project_commands()
@@ -85,6 +87,35 @@ class DiscordCompanion:
             logger.info("Loaded %d project commands", len(self._project_commands))
         except (ImportError, AttributeError) as e:
             logger.warning("Project commands not loaded: %s", e)
+
+    async def handle_raw_message(self, text: str) -> str | None:
+        """Entry point for all Discord messages. Splits prefix commands vs NL."""
+        text = text.strip()
+        if text.startswith("!"):
+            parts = text.split(maxsplit=1)
+            cmd = parts[0]
+            args = parts[1] if len(parts) > 1 else ""
+            return await self.handle_message(cmd, args)
+        return await self._route_natural_language(text)
+
+    async def _route_natural_language(self, text: str) -> str | None:
+        """Route a non-prefixed operator message to the correct agent."""
+        from lib.claude import classify_target
+
+        agents = self._active_agents_fn()
+        if not agents:
+            return "No active agents. Submit a task first."
+        if len(agents) == 1:
+            target = agents[0]
+        else:
+            target = await classify_target(text, agents, self.config)
+            if target is None:
+                return f"Who do you mean? Active agents: {', '.join(agents)}"
+        # NOTE: default-argument binding to avoid late-binding closure bug
+        self.pending_mutations.append(
+            lambda s, sm, a=target, m=text: sm.send(a, f"[OPERATOR] {m}")
+        )
+        return f"Message routed to {target}."
 
     async def handle_message(self, cmd: str, args: str) -> str | None:
         """Dispatch a command. Returns response text or None.

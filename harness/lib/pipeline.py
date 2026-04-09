@@ -219,6 +219,7 @@ class ProjectConfig:
                 "summarize": pipeline.get("summarize_timeout", 120),
                 "reformulate": pipeline.get("reformulate_timeout", 120),
                 "wiki": pipeline.get("wiki_timeout", 300),
+                "classify_target": pipeline.get("classify_target_timeout", 10),
             },
             max_stage_minutes={
                 stage: pipeline.get(f"{stage}_max_minutes", default)
