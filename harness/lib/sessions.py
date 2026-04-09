@@ -219,8 +219,8 @@ class SessionManager:
             except OSError as e2:
                 logger.error("FIFO write failed after restart for %s: %s", name, e2)
 
-    async def restart(self, name: str) -> None:
-        """Restart a dead session. Cleans up old FIFO, launches fresh."""
+    async def kill(self, name: str) -> None:
+        """Tear down a session without relaunching. Use for stage timeout cleanup."""
         session = self.sessions.pop(name, None)
         if session:
             try:
@@ -232,6 +232,10 @@ class SessionManager:
             )
             await asyncio.sleep(1)
             session.fifo.unlink(missing_ok=True)
+
+    async def restart(self, name: str) -> None:
+        """Restart a dead session. Cleans up old FIFO, launches fresh."""
+        await self.kill(name)
         await self.launch(name, self.config.agents[name])
 
     async def inject_caveman_update(self, name: str, level: str) -> None:

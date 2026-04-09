@@ -151,19 +151,19 @@ Sessions use `O_NONBLOCK` FIFO pipes. 0.5s sleep after tmux launch before FIFO o
 
 ## Open Bug Summary
 
-9 open bugs tracked in [[v5-harness-known-bugs]]. Key patterns by area:
+8 open bugs tracked in [[v5-harness-known-bugs]]. Key patterns by area:
 
 | Area | Bugs | Pattern |
 |------|------|---------|
 | Signals | BUG-001, BUG-005 | Unbounded state (`_processed` set), missing path validation |
-| Sessions | BUG-006, BUG-007, BUG-022 | FIFO race window, clawhip bypass, wasteful restart-on-timeout |
+| Sessions | BUG-006, BUG-007 | FIFO race window, clawhip bypass |
 | Pipeline | BUG-002, BUG-008 | State deserialization fragility, hardcoded stage graph |
 | Templates | BUG-003 | Fragile frontmatter stripping regex |
 | Tests | BUG-012 | AsyncMock GC warning (cosmetic) |
 
-**Phase 3 priority:** BUG-022 (Medium) — extract `kill()` from `restart()` to prevent idle sessions after stage timeout. All others Low/Info.
+All open bugs are Low/Info severity. No blocking issues remain.
 
-15 resolved bugs archived in [[v5-harness-known-bugs-archive-2026]].
+16 resolved bugs archived in [[v5-harness-known-bugs-archive-2026]].
 
 ---
 

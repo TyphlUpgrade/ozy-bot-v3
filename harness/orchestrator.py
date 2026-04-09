@@ -454,7 +454,7 @@ async def main_loop(config: ProjectConfig) -> None:
                 )
                 agent_name = state.stage_agent
                 if agent_name and agent_name in session_mgr.sessions:
-                    await session_mgr.restart(agent_name)
+                    await session_mgr.kill(agent_name)
                 await event_log.record("stage_timeout", {
                     "task": state.active_task,
                     "stage": state.stage,
