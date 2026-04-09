@@ -1,0 +1,74 @@
+# v5 Harness — Project Configuration for Ozymandias
+# All project-specific paths and settings. The harness reads this file
+# at startup. No hardcoded project paths in harness/ code.
+
+[project]
+name = "ozymandias-v3"
+root = "."                              # Resolved to absolute path at startup
+signal_dir = "ozymandias/state/signals"
+task_dir = "ozymandias/state/signals/agent_tasks"
+state_file = "ozymandias/state/signals/conductor/pipeline_state.json"
+session_dir = "/tmp/harness-sessions"   # FIFO files and session logs
+worktree_base = "/tmp/harness-worktrees"
+
+[discord]
+bot_token_env = "DISCORD_BOT_TOKEN"     # Environment variable name, not the token
+dev_channel = "dev-agents"
+ops_channel = "ops-monitor"
+escalation_channel = "escalations"
+
+[pipeline]
+poll_interval = 5.0                     # seconds between main loop iterations
+max_retries = 3                         # reviewer rejection retries before task failure
+escalation_timeout = 14400              # 4 hours — re-notify for blocking escalations
+classify_timeout = 120                  # claude -p timeout for classify() calls
+summarize_timeout = 120                 # claude -p timeout for summarize() calls
+reformulate_timeout = 120               # claude -p timeout for reformulate() calls
+wiki_timeout = 300                      # claude -p timeout for wiki documentation
+
+[caveman]
+# Global default — applies to any agent without an explicit override
+default_level = "full"
+
+# Per-agent overrides
+[caveman.agents]
+architect = "off"                       # Needs full reasoning quality for design decisions
+executor = "full"                       # Prose compressed, code untouched
+reviewer = "lite"                       # Professional but tight — verdicts must be clear
+ops_monitor = "ultra"                   # Terse status reports, save tokens on long-running session
+dialogue = "off"                        # User-facing responses need natural language
+analyst = "lite"                        # Analysis needs clarity, but no filler
+
+# Orchestrator claude -p calls (ephemeral, never user-facing)
+[caveman.orchestrator]
+classify = "ultra"                      # One-word answer wrapped in JSON
+summarize = "ultra"                     # Internal context transfer
+reformulate = "full"                    # Executor needs to understand the reformulation
+wiki = "off"                            # Documentation must be readable by humans
+
+# Wenyan mode (classical Chinese token compression)
+# Experimental — keep off until benchmarked
+[caveman.wenyan]
+enabled = false
+default_level = "lite"
+# Per-agent wenyan overrides (only used if wenyan.enabled = true)
+# agents.architect = "off"
+# agents.executor = "wenyan-full"
+
+# Caveman skill integration
+[caveman.skills]
+commit = true                           # Executor uses caveman-commit for git commits
+review = true                           # Reviewer uses caveman-review for verdicts
+compress = true                         # Pre-compress CLAUDE.md and role files (LLM-based)
+skill_path = "~/.claude/plugins/marketplaces/caveman/caveman/SKILL.md"
+compress_script = "~/.claude/plugins/marketplaces/caveman/caveman-compress"
+compress_targets = [
+    "CLAUDE.md",
+    "config/harness/agents/architect.md",
+    "config/harness/agents/executor.md",
+    "config/harness/agents/reviewer.md",
+]
+
+# Project-specific commands plugin
+[commands]
+module = "config.harness.commands"      # importlib path to project commands

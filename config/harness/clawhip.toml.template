@@ -1,0 +1,46 @@
+# v5 Harness — Clawhip Configuration Template
+# Generated from this template by start.sh with $PROJECT_ROOT substitution.
+# Do NOT edit clawhip.toml directly — edit this template instead.
+
+[general]
+log_level = "info"
+
+[discord]
+bot_token_env = "DISCORD_BOT_TOKEN"
+
+[[routes]]
+name = "dev-pipeline"
+watch = "$PROJECT_ROOT/ozymandias/state/signals/conductor"
+patterns = ["*.json"]
+channel = "dev-agents"
+
+[[routes]]
+name = "escalations"
+watch = "$PROJECT_ROOT/ozymandias/state/signals/escalation"
+patterns = ["*.json"]
+channel = "escalations"
+
+[[routes]]
+name = "agent-tasks"
+watch = "$PROJECT_ROOT/ozymandias/state/signals/agent_tasks"
+patterns = ["*.json"]
+channel = "dev-agents"
+
+# Session monitoring — clawhip watches tmux sessions for stale/keyword alerts
+[[sessions]]
+name = "agent-architect"
+stale_minutes = 15
+keywords = ["ERROR", "CRITICAL", "BLOCKED"]
+channel = "dev-agents"
+
+[[sessions]]
+name = "agent-executor"
+stale_minutes = 30
+keywords = ["ERROR", "CRITICAL", "BLOCKED"]
+channel = "dev-agents"
+
+[[sessions]]
+name = "agent-reviewer"
+stale_minutes = 15
+keywords = ["ERROR", "CRITICAL", "BLOCKED"]
+channel = "dev-agents"
