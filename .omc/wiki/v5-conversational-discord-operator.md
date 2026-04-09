@@ -49,7 +49,8 @@ Operator sends messages without `!` prefix; companion interprets and routes to c
 | **Output** | Routes as `[OPERATOR] message` via FIFO; appears in EventLog audit trail |
 
 **Algorithm**:
-```
+
+```python
 if no command prefix AND message not recognized:
   if len(active_agents) == 1:
     target = active_agents[0]
@@ -94,7 +95,7 @@ Structured multi-turn conversation during Tier 2 escalation instead of single `!
 
 ## Implementation Order
 
-```
+```text
 1. Piece 1 (agent outbound)     ← no code changes, do anytime
    ↓
 2. Piece 2 (NL inbound routing) ← ~50 lines in discord_companion
@@ -107,7 +108,7 @@ Pieces 1 and 2 are independently useful; Piece 3 depends on both.
 ## Design Constraints (Load-Bearing)
 
 | Constraint | Rationale |
-|-----------|-----------|
+|-----------|-----------:|
 | **Star topology** | Preserves central audit trail, escalation routing, pipeline state consistency, FIFO concurrency model |
 | **Agent outbound is write-only** | Agents post status but never read Discord responses |
 | **Harness remains project-agnostic** | No Claw Code-specific code in `harness/`; uses signal types + clawhip |

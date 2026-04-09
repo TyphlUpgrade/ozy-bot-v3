@@ -90,7 +90,8 @@ These spawn on demand by conductor, operator, or other agents. No new pipeline s
 **The real pipeline gap.** When reviewer rejects, feedback currently reaches executor as unstructured text. After max_retries, task abandons silently.
 
 ### Current Flow (Broken)
-```
+
+```text
 reviewer rejects → retry_count++ → text feedback → executor retries
                                        ↓
                               repeats same mistake

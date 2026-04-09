@@ -3,7 +3,7 @@ title: v5 Harness Known Bugs
 tags: [harness, bugs, tracking]
 category: debugging
 created: 2026-04-09
-updated: 2026-04-08
+updated: 2026-04-09
 ---
 
 # v5 Harness Known Bugs

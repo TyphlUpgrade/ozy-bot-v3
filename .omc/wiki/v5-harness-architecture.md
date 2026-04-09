@@ -12,7 +12,7 @@ The v5 harness is a Python asyncio orchestrator that manages Claude Code agent s
 
 ## Three-Layer Stack
 
-```
+```text
 clawhip (infrastructure) — tmux session management, Discord relay, health monitoring
     |
 Python asyncio orchestrator (intelligence) — task routing, stage dispatch, state machine
@@ -35,7 +35,7 @@ Claude Code sessions (work) — persistent FIFO-fed agent sessions doing actual 
 
 ## Stage Pipeline
 
-```
+```text
 classify -> architect -> executor -> reviewer -> merge -> wiki
                 |            |            |
             (escalation) (escalation) (escalation)
