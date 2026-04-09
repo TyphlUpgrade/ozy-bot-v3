@@ -13,6 +13,10 @@ title: Wiki Log
 - **UPDATE** `v5-harness-reviewer-findings` — added Round 2 granular review results (13 fixes, 4 deferred)
 - **ADD** `v5-harness-known-bugs` — 7 deferred bugs tracked for Phase 2+
 - **UPDATE** `index.md` — added Bugs section under Harness
+- **UPDATE** `v5-harness-known-bugs` — added BUG-008 (hardcoded pipeline stages) and BUG-009 (hardcoded test runner) from genericity audit
+- **UPDATE** `v5-harness-design-decisions` — added "Generic harness, project-specific config" decision with BUG cross-refs
+- **UPDATE** `index.md` — updated bug count (7 → 9)
+
 ## [2026-04-09T02:57:00.244Z] ingest
 - **Pages:** session-log-2026-04-09-fcca83d5.md
 - **Summary:** Auto-captured session log for f5ef5960-d825-4a46-bf6c-2ec6fcca83d5

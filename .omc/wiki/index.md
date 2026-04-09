@@ -1,6 +1,6 @@
 ---
 title: Wiki Index
-updated: 2026-04-09
+updated: 2026-04-08
 ---
 
 # Wiki Index
@@ -15,7 +15,7 @@ updated: 2026-04-09
 - [v5 Harness Reviewer Findings](v5-harness-reviewer-findings.md) — 23 issues found across 2 review rounds, all fixed
 
 ### Bugs
-- [v5 Harness Known Bugs](v5-harness-known-bugs.md) — 7 deferred bugs tracked for Phase 2+
+- [v5 Harness Known Bugs](v5-harness-known-bugs.md) — 9 deferred bugs tracked for Phase 2+ (includes genericity audit)
 
 ---
 

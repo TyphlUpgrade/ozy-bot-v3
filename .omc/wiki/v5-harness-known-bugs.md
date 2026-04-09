@@ -10,6 +10,8 @@ updated: 2026-04-09
 
 Bugs found during review that are deferred or represent latent risks. Tracked here for future phases.
 
+**9 bugs tracked** — 7 from code review, 2 from genericity audit.
+
 ## Open (Deferred)
 
 ### BUG-001: _processed set grows without bound
@@ -46,6 +48,16 @@ No validation on `next_stage` parameter. A typo like `state.advance("reviwer")` 
 **Severity**: Info | **File**: `sessions.py` | **Phase**: 2
 `restart()` calls raw `tmux kill-session` but `launch()` uses `clawhip tmux new`. If clawhip tracks session state internally, bypassing it for teardown may leave stale metadata.
 **Mitigation**: Use `clawhip tmux kill` if available.
+
+### BUG-008: Hardcoded pipeline stages break genericity
+**Severity**: High | **File**: `orchestrator.py`, `pipeline.py` | **Phase**: 2
+The stage pipeline (`classify → architect → executor → reviewer → merge → wiki`) is hardcoded in three places: the `match/case` dispatch in `main_loop`, the `next_stages` dict in `check_stage()`, and `_default_agents()`. A project with a different role structure (e.g., `planner → coder → tester → integrator`) cannot use the harness without editing orchestrator code. This violates the design intent of a generic, config-driven pipeline.
+**Mitigation**: Define stages as an ordered list in `project.toml` with per-stage transition rules. Replace the match/case with dynamic dispatch from config. Make `_default_agents()` return empty (force explicit config).
+
+### BUG-009: Hardcoded test runner in do_merge
+**Severity**: Medium | **File**: `orchestrator.py` | **Phase**: 2
+`do_merge()` runs `python3 -m pytest tests/ -x --timeout=120` — hardcoded to pytest, hardcoded directory, hardcoded timeout. Non-Python projects or projects using other test frameworks can't use the merge stage.
+**Mitigation**: Add `test_command` to `[pipeline]` in `project.toml`. Use `shlex.split()` to execute the user-defined command. Keep pytest as the default value in config, not in code.
 
 ## Resolved
 

@@ -60,6 +60,14 @@ Key design choices made during v5 harness Phase 1 implementation, with rationale
 
 **Why**: The dataclass schemas cost nothing to define early and establishing them now means Phase 2 doesn't need to modify `signals.py`. Similarly, `claude.py` functions are self-contained — implementing them early exercises the subprocess wrapper pattern without adding risk.
 
+## Generic harness, project-specific config
+
+**Decision**: The harness lives in the Ozymandias repo but is designed to be project-agnostic. All project-specific content belongs in `config/harness/` (agent roles, project.toml), never in `harness/` Python code.
+
+**Why**: The harness will eventually drive other projects and support Ozymandias-specific tools (Phase 5). Keeping project knowledge in config files means a new project only needs to supply its own `project.toml` and agent role `.md` files. The Phase 1 code violates this in two places — hardcoded stage pipeline and hardcoded test runner (tracked as BUG-008, BUG-009) — scheduled for Phase 2 fix.
+
+**Implication**: When adding harness features, ask: "Would a non-Python, non-trading project need to change harness code to use this?" If yes, parameterize it in `project.toml`.
+
 ## Cross-References
 
 - [[v5-harness-architecture]] — module overview and pipeline flow
