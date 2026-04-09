@@ -3,14 +3,14 @@ title: v5 Harness Known Bugs
 tags: [harness, bugs, tracking]
 category: debugging
 created: 2026-04-09
-updated: 2026-04-09
+updated: 2026-04-08
 ---
 
 # v5 Harness Known Bugs
 
 Bugs found during review that are deferred or represent latent risks. Tracked here for future phases.
 
-**9 bugs tracked** — 7 from code review, 2 from genericity audit.
+**11 bugs tracked** — 7 from code review, 2 from genericity audit, 2 from nested execution review. BUG-008 downgraded after architect/critic consensus.
 
 ## Open (Deferred)
 
@@ -49,15 +49,25 @@ No validation on `next_stage` parameter. A typo like `state.advance("reviwer")` 
 `restart()` calls raw `tmux kill-session` but `launch()` uses `clawhip tmux new`. If clawhip tracks session state internally, bypassing it for teardown may leave stale metadata.
 **Mitigation**: Use `clawhip tmux kill` if available.
 
-### BUG-008: Hardcoded pipeline stages break genericity
-**Severity**: High | **File**: `orchestrator.py`, `pipeline.py` | **Phase**: 2
-The stage pipeline (`classify → architect → executor → reviewer → merge → wiki`) is hardcoded in three places: the `match/case` dispatch in `main_loop`, the `next_stages` dict in `check_stage()`, and `_default_agents()`. A project with a different role structure (e.g., `planner → coder → tester → integrator`) cannot use the harness without editing orchestrator code. This violates the design intent of a generic, config-driven pipeline.
-**Mitigation**: Define stages as an ordered list in `project.toml` with per-stage transition rules. Replace the match/case with dynamic dispatch from config. Make `_default_agents()` return empty (force explicit config).
+### BUG-008: Hardcoded pipeline stages (downgraded)
+**Severity**: Low | **File**: `orchestrator.py`, `pipeline.py` | **Phase**: 5
+The stage pipeline (`classify → architect → executor → reviewer → merge → wiki`) is hardcoded. Per architect/critic consensus: the three-stage dev pipeline is the stable code review loop, not an arbitrary choice. Future agents (ops monitor, analyst) are task *sources* feeding into this pipeline, not alternative stages. Genericizing is a Phase 5 nicety, not a structural flaw.
+**Mitigation**: Extract stage transition graph to a module-level constant in Phase 5 if configurable pipelines are needed.
 
 ### BUG-009: Hardcoded test runner in do_merge
 **Severity**: Medium | **File**: `orchestrator.py` | **Phase**: 2
 `do_merge()` runs `python3 -m pytest tests/ -x --timeout=120` — hardcoded to pytest, hardcoded directory, hardcoded timeout. Non-Python projects or projects using other test frameworks can't use the merge stage.
 **Mitigation**: Add `test_command` to `[pipeline]` in `project.toml`. Use `shlex.split()` to execute the user-defined command. Keep pytest as the default value in config, not in code.
+
+### BUG-010: Worktree cwd never propagated to session
+**Severity**: High | **File**: `sessions.py` | **Phase**: 2
+`AgentDef.with_cwd()` creates a new AgentDef but `SessionManager.launch()` never passes a `--cwd` flag or `cd` prefix to the `claude -p` command. The session inherits the orchestrator's cwd (project root), not the worktree. Any session intended to work in a specific directory (executor in worktree, future sessions in other paths) operates in the wrong location. Sub-agents spawned internally also inherit the wrong cwd.
+**Mitigation**: Prepend `cd '{worktree}' &&` to the launch command, or use `claude -p --cwd` if available. Verify the flag exists first.
+
+### BUG-011: No wall-clock stage timeout — orchestrator waits forever
+**Severity**: Medium | **File**: `orchestrator.py` | **Phase**: 2
+The orchestrator polls `check_stage_complete()` every `poll_interval` but has no maximum wait for any stage. The only timeout is clawhip's `stale_minutes` (output-based). A session that produces steady output but never completes will run indefinitely. At scale (many sessions, internal teams), this becomes an unbounded cost risk.
+**Mitigation**: Add `max_stage_minutes` per stage in `project.toml`. Track `stage_started_ts` on PipelineState. If exceeded, kill the session and fail the task.
 
 ## Resolved
 

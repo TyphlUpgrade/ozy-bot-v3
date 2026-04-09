@@ -64,11 +64,57 @@ Key design choices made during v5 harness Phase 1 implementation, with rationale
 
 **Decision**: The harness lives in the Ozymandias repo but is designed to be project-agnostic. All project-specific content belongs in `config/harness/` (agent roles, project.toml), never in `harness/` Python code.
 
-**Why**: The harness will eventually drive other projects and support Ozymandias-specific tools (Phase 5). Keeping project knowledge in config files means a new project only needs to supply its own `project.toml` and agent role `.md` files. The Phase 1 code violates this in two places — hardcoded stage pipeline and hardcoded test runner (tracked as BUG-008, BUG-009) — scheduled for Phase 2 fix.
+**Why**: The harness will eventually drive other projects and support Ozymandias-specific tools (Phase 5). Keeping project knowledge in config files means a new project only needs to supply its own `project.toml` and agent role `.md` files. The Phase 1 code violates this in one place — hardcoded test runner (tracked as BUG-009) — scheduled for Phase 2 fix.
 
 **Implication**: When adding harness features, ask: "Would a non-Python, non-trading project need to change harness code to use this?" If yes, parameterize it in `project.toml`.
+
+## Three-stage dev pipeline is stable (not a genericization target)
+
+**Decision**: The architect → executor → reviewer pipeline is the software code review loop. It stays hardcoded. Future agents (ops monitor, analyst, dialogue) are task *sources* feeding into this pipeline, not alternative stages within it.
+
+**Why**: Every workflow considered (ops monitor detects bug, analyst produces insight, human says "do X") enters the pipeline at `classify` — none replace architect/executor/reviewer. Genericizing the stage dispatch adds speculative complexity for a scenario (non-software pipeline) that isn't on the roadmap. BUG-008 downgraded from High to Low/Deferred (Phase 5 nicety).
+
+**Implication**: When adding new agent types, they should create tasks that enter the existing pipeline, not require new pipeline stages.
+
+## Future-proofing: what to build when (architect + critic consensus)
+
+Reviewed by architect and critic agents. The critic reclassified the architect's priorities — the revised plan below reflects both perspectives.
+
+### Before Phase 2 (genuine Phase 2 prerequisites)
+
+1. **EventLog (JSONL append-only)** — ~30-line class. Escalation audit trail is a real Phase 2 requirement (who escalated, when, what tier, what resolution). Without it, history gets bolted onto PipelineState, conflating state with history.
+2. **Configurable CLI binary** — add `claude_binary` config field to `ProjectConfig`, extract command builder in `_run_claude`. Even mock-binary testing requires code edits today. Trivial.
+3. **`escalation_started_ts` on PipelineState** — the escalation timeout config exists (14400s) but there's no timestamp to track when escalation started. Without it, tier promotion timing doesn't work. *(Critic-identified gap — the architect missed this.)*
+
+### Recommended with Phase 2 (cheap, no urgency)
+
+4. **Notifier protocol** — extract `notify()` into a `Notifier` ABC with `ClawhipNotifier` implementation. Adds testability but the bare function works for Phase 2. Small.
+5. **`role` field on Session** — separate session name (unique ID) from role (archetype). Phase 1 sets `name == role`. Prevents dict key collision when launching multiple executors in Phase 5. Trivial.
+6. **Document message prefix conventions** — `[TASK]`, `[RETRY]`, `[OPERATOR]`, `[SYSTEM]`, `[REINIT]` are ad-hoc across 4 files. One docstring prevents collision as agent types grow. Trivial.
+7. **Comment on TaskSignal.priority sort gap** — priority field is parsed but unused in sorting. Prevents false assumption when implementing preemption. Trivial.
+
+### Before Phase 3 (don't build yet — requirements not concrete)
+
+8. **Extract TaskState from PipelineState** — the architect wanted this before Phase 2, but the critic correctly noted that Phase 2 escalation doesn't need multi-task support (the `escalation_wait` stage is already stubbed). This is a Phase 3 (shelving) and Phase 5 (parallel executors) concern. Doing it now means 25+ scalar reference rewrites, 86 tests to audit, and serialization migration — all for zero Phase 2 benefit. Design alongside Phase 3 shelving when requirements are concrete.
+9. **Stage transition graph as constant** — replace the local `next_stages` dict and match/case with a declarative lookup. Marginal value now (the current code is ~20 lines), real value in Phase 5 configurable pipelines. Do not build a graph class — just a module-level dict.
+10. **`tokens_in`/`tokens_out` on Session** — Phase 3 session rotation needs a canonical place for token accumulation. Two `int = 0` fields, zero behavioral change.
+
+### Known latent issues (from critic)
+
+- `_apply_reply` in `discord_companion.py` re-advances to the current stage via `state.advance(state.stage, state.stage_agent)` — may be intentional for escalation unblocking or a latent bug. Verify during Phase 2 implementation.
+- Signal file cleanup: `SignalReader.archive()` exists but is never called from the orchestrator. Files accumulate. Not Phase 2 blocking but should be wired in.
+- PipelineState serialization has no `schema_version` — if TaskState extraction happens in Phase 3, a migration strategy is needed.
+
+## Sessions never talk to each other
+
+**Decision**: All inter-session communication goes through the orchestrator. Sessions communicate inward (signal files → orchestrator) and receive outward (orchestrator → FIFO). No session-to-session channel exists or should be created.
+
+**Why**: With N sessions, direct communication creates N-squared routing complexity — every session needs to know about every other session's FIFO, handle failures, and manage ordering. The orchestrator as single hub keeps the coordination problem linear. Each session is independently testable (mock the FIFO in, check the signal out) and independently replaceable.
+
+**Implication**: If a future feature seems to require agent-to-agent communication, route it through the orchestrator via signal files. The orchestrator reads the signal, decides the routing, and writes to the target FIFO. This adds one poll cycle of latency (~5s) but preserves the star topology. At 20 sessions this is the difference between a manageable system and a distributed systems nightmare.
 
 ## Cross-References
 
 - [[v5-harness-architecture]] — module overview and pipeline flow
 - [[v5-harness-reviewer-findings]] — security and quality review results
+- [[v5-harness-known-bugs]] — 9 deferred bugs for Phase 2+
