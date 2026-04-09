@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -18,9 +19,19 @@ logger = logging.getLogger("harness.sessions")
 from .pipeline import VALID_CAVEMAN_LEVELS as VALID_LEVELS  # single source of truth
 
 
+# Message prefix conventions (used across orchestrator, lifecycle, discord_companion):
+#   [TASK]     — new task assignment (orchestrator → executor/architect)
+#   [RETRY]    — reformulated retry after reviewer rejection (orchestrator → executor)
+#   [OPERATOR] — operator feedback from Discord (discord_companion → agent)
+#   [OPERATOR REPLY] — operator reply to escalation (discord_companion → agent)
+#   [SYSTEM]   — caveman level change or system directive (session_mgr → agent)
+#   [REINIT]   — session reinitialization after crash recovery (lifecycle → agent)
+
+
 @dataclass
 class Session:
     name: str
+    role: str                           # agent archetype (e.g. "executor"); name is unique ID
     fd: int                             # write-end file descriptor for FIFO
     fifo: Path
     log: Path
@@ -130,13 +141,15 @@ class SessionManager:
         # Launch via clawhip tmux new. The tmux shell's `< fifo` redirection
         # blocks in the tmux pane's process, NOT in our event loop. This avoids
         # the FIFO open deadlock (POSIX: read-end open blocks until writer exists).
+        binary = shlex.quote(self.config.claude_binary)
+        cwd_prefix = f"cd {shlex.quote(str(agent_def.cwd))} && " if agent_def.cwd else ""
         cmd = (
-            f"claude -p --verbose"
+            f"{cwd_prefix}{binary} -p --verbose"
             f" --input-format stream-json --output-format stream-json"
             f" --permission-mode dontAsk {agent_def.deny_flags_str}"
-            f" --model {agent_def.model}"
+            f" --model {shlex.quote(agent_def.model)}"
             f" --include-hook-events"
-            f" < '{fifo_path}' > '{log_path}' 2>&1"
+            f" < {shlex.quote(str(fifo_path))} > {shlex.quote(str(log_path))} 2>&1"
         )
         await asyncio.create_subprocess_exec(
             "clawhip", "tmux", "new",
@@ -170,7 +183,7 @@ class SessionManager:
             logger.debug("Could not capture PID for session %s", name)
 
         self.sessions[name] = Session(
-            name=name, fd=fd, fifo=fifo_path, log=log_path, pid=pid,
+            name=name, role=agent_def.name, fd=fd, fifo=fifo_path, log=log_path, pid=pid,
         )
 
         # Build init message with caveman directive if configured

@@ -14,3 +14,4 @@ logs/
 dist/
 build/
 *.egg-info/
+harness_events.jsonl

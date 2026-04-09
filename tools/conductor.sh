@@ -28,6 +28,8 @@ HEARTBEAT_INTERVAL=60
 AGENT_TIMEOUT=600  # 10 min max per agent stage
 PERMISSION_TIMEOUT=120  # seconds to wait for Discord approval before auto-deny
 TMUX_SESSION="${TMUX_SESSION:-ozy-dev}"
+CAVEMAN_FILE="$STATE_DIR/CAVEMAN_MODE"
+CAVEMAN_DIRECTIVE="$PROJECT_ROOT/config/agent_roles/_caveman_directive.md"
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -49,6 +51,39 @@ write_exit_intent() {
     > "$INTENT_FILE"
 }
 
+# Send a stage transition notification to Discord via clawhip.
+# Usage: notify_discord <emoji> <message>
+notify_discord() {
+  local emoji="$1" msg="$2"
+  local channel="${AGENT_CHANNEL:-}"
+  [ -z "$channel" ] && return 0
+  "${HOME}/.cargo/bin/clawhip" send --channel "$channel" \
+    --message "$emoji $msg" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Caveman mode — prose compression for agent prompts
+# ---------------------------------------------------------------------------
+
+# Returns the caveman directive block with level substituted, or empty string
+# if caveman mode is off. Appended to agent prompt files to compress prose output.
+get_caveman_block() {
+  [ -f "$CAVEMAN_FILE" ] || return 0
+  [ -f "$CAVEMAN_DIRECTIVE" ] || return 0
+  local level
+  level=$(cat "$CAVEMAN_FILE" 2>/dev/null | tr -d '[:space:]')
+  [ -z "$level" ] && level="full"
+  # Validate level
+  case "$level" in
+    lite|full|ultra) ;;
+    *) level="full" ;;
+  esac
+  echo ""
+  echo "## Communication Mode: Caveman ($level)"
+  echo ""
+  sed "s/CAVEMAN_LEVEL/$level/g" "$CAVEMAN_DIRECTIVE"
+}
+
 # ---------------------------------------------------------------------------
 # Pipeline helpers
 # ---------------------------------------------------------------------------
@@ -57,37 +92,95 @@ strip_frontmatter() {
   awk 'BEGIN{fm=0} /^---$/{fm++; next} fm>=2{print}' "$1"
 }
 
-# Run a claude -p judgment call. Handles frontmatter stripping and fence parsing.
-# Usage: run_judgment <role_file> <input_json> → sets JUDGMENT_RESULT
-run_judgment() {
+# Run a claude -p judgment call without tool access. Pure text-in/text-out.
+# Used for classify_task where no file access is needed.
+# Usage: run_judgment_no_tools <role_file> <input_json> → sets JUDGMENT_RESULT
+run_judgment_no_tools() {
   local role_file="$1" input="$2"
   local role_prompt
   role_prompt=$(strip_frontmatter "$role_file")
+  local caveman_block
+  caveman_block=$(get_caveman_block)
+  if [ -n "$caveman_block" ]; then
+    role_prompt="$role_prompt
+$caveman_block"
+  fi
   local raw
-  if raw=$(echo "$input" | claude -p --permission-mode dontAsk --allowedTools "Read,Glob,Grep" "$role_prompt" 2>/dev/null); then
-    JUDGMENT_RESULT=$(echo "$raw" | sed '/^```/d' | jq '.' 2>/dev/null) \
-      || JUDGMENT_RESULT='{"error":"response not valid JSON"}'
+  if raw=$(echo "$input" | claude -p --permission-mode dontAsk "$role_prompt" 2>/dev/null); then
+    local cleaned
+    cleaned=$(echo "$raw" | sed '/^```/d')
+    if JUDGMENT_RESULT=$(echo "$cleaned" | jq '.' 2>/dev/null); then
+      :
+    elif JUDGMENT_RESULT=$(echo "$cleaned" | grep -oP '\{[^{}]*(\{[^{}]*\}[^{}]*)*\}' | head -1 | jq '.' 2>/dev/null); then
+      :
+    else
+      JUDGMENT_RESULT='{"error":"response not valid JSON"}'
+    fi
   else
     JUDGMENT_RESULT='{"error":"claude invocation failed"}'
     return 1
   fi
 }
 
-# Spawn a claude -p agent in a tmux pane. Returns pane ID.
-# Permission model: --allowedTools pre-approves known tools (no prompt). Tools not
-# in the list trigger an interactive permission prompt, which the conductor detects
-# via check_permission_prompt() and proxies to Discord for operator approval.
-# Per-role tool lists:
-#   Architect: Read,Bash,Glob,Grep           (read-only + signal writes via Bash)
-#   Executor:  Read,Write,Edit,Bash,Glob,Grep (full access in worktree)
-#   Reviewer:  Read,Bash,Glob,Grep           (read-only + signal writes via Bash)
-# Usage: pane_id=$(spawn_agent <prompt_file> <workdir> <log_file> [allowed_tools])
+# Run a claude -p judgment call. Handles frontmatter stripping and fence parsing.
+# Usage: run_judgment <role_file> <input_json> → sets JUDGMENT_RESULT
+run_judgment() {
+  local role_file="$1" input="$2"
+  local role_prompt
+  role_prompt=$(strip_frontmatter "$role_file")
+  # Inject caveman directive into judgment prompt if active
+  local caveman_block
+  caveman_block=$(get_caveman_block)
+  if [ -n "$caveman_block" ]; then
+    role_prompt="$role_prompt
+$caveman_block"
+  fi
+  local raw
+  if raw=$(echo "$input" | claude -p --permission-mode dontAsk --allowedTools "Read,Glob,Grep" "$role_prompt" 2>/dev/null); then
+    # 4-step defensive JSON extraction (matches trading bot pattern):
+    # 1. Strip code fences
+    local cleaned
+    cleaned=$(echo "$raw" | sed '/^```/d')
+    # 2. Try direct parse
+    if JUDGMENT_RESULT=$(echo "$cleaned" | jq '.' 2>/dev/null); then
+      :  # success
+    # 3. Regex extract: find first {...} block (handles prose wrapping)
+    elif JUDGMENT_RESULT=$(echo "$cleaned" | grep -oP '\{[^{}]*(\{[^{}]*\}[^{}]*)*\}' | head -1 | jq '.' 2>/dev/null); then
+      :  # success
+    # 4. Skip — not parseable
+    else
+      JUDGMENT_RESULT='{"error":"response not valid JSON"}'
+    fi
+  else
+    JUDGMENT_RESULT='{"error":"claude invocation failed"}'
+    return 1
+  fi
+}
+
+# Spawn a claude -p agent in a tmux pane with full OMC tool ecosystem.
+# Permission model: --permission-mode dontAsk auto-approves all tools.
+# --disallowedTools blocks file-mutation tools for architect/reviewer.
+# NOTE: Bash can still write files (required for signal file output). Prompt instructions
+# enforce read-only behavior; --disallowedTools prevents accidental use of dedicated write tools.
+# OMC hooks fire in -p mode: SessionStart, PreToolUse, PostToolUse, Stop.
+# MCP tools available: LSP, AST grep, python REPL, notepad, project memory, etc.
+# Audit: --verbose + --output-format stream-json + --include-hook-events = full JSONL trail.
+# Per-role deny lists:
+#   Architect: Write,Edit,NotebookEdit + mcp filesystem writes denied  (model: opus)
+#   Executor:  no restrictions                                         (worktree, model: sonnet)
+#   Reviewer:  Write,Edit,NotebookEdit + mcp filesystem writes denied  (model: sonnet)
+# Usage: pane_id=$(spawn_agent <prompt_file> <workdir> <log_file> [disallowed_tools] [model])
 spawn_agent() {
-  local prompt_file="$1" workdir="$2" log_file="$3" allowed_tools="${4:-}"
-  local tools_flag=""
-  [ -n "$allowed_tools" ] && tools_flag="--allowedTools $allowed_tools"
+  local prompt_file="$1" workdir="$2" log_file="$3"
+  local disallowed_tools="${4:-}" model="${5:-}"
+  local deny_flag="" model_flag=""
+  [ -n "$disallowed_tools" ] && deny_flag="--disallowedTools $disallowed_tools"
+  [ -n "$model" ] && model_flag="--model $model"
+  # Pipe prompt via stdin to avoid shell quoting issues (prompt contains ", $, backticks)
+  # --verbose required for --output-format stream-json in -p mode
+  # --include-hook-events makes OMC hook lifecycle visible in audit log
   tmux split-window -t "$TMUX_SESSION" -d -P -F '#{pane_id}' \
-    "cd '$workdir' && claude -p $tools_flag \"\$(cat '$prompt_file')\" > '$log_file' 2>&1; echo '[AGENT_DONE]' >> '$log_file'"
+    "cd '$workdir' && claude -p --verbose --permission-mode dontAsk $deny_flag $model_flag --output-format stream-json --include-hook-events < '$prompt_file' > '$log_file' 2>&1; echo '{\"event\":\"agent_done\",\"ts\":\"'$(date -Iseconds)'\"}' >> '$log_file'"
 }
 
 # Check if a tmux pane is still alive.
@@ -218,8 +311,11 @@ Description: $task_desc
 5. After writing the plan file, you are done. Do not implement anything.
 PROMPT
 
+  # No caveman for architect — needs full reasoning for plan quality
+
   local pane_id
-  pane_id=$(spawn_agent "$prompt_file" "$PROJECT_ROOT" "$agent_log" "Read,Bash,Glob,Grep")
+  local deny_tools="Write,Edit,NotebookEdit,mcp__filesystem__write_file,mcp__filesystem__edit_file,mcp__filesystem__move_file,mcp__filesystem__create_directory"
+  pane_id=$(spawn_agent "$prompt_file" "$PROJECT_ROOT" "$agent_log" "$deny_tools" "opus")
 
   update_state "$(printf '.stage = "architect" | .pane_id = "%s" | .stage_started = %d' "$pane_id" "$(date +%s)")"
   log_event "agent_spawned" "\"stage\":\"architect\",\"task_id\":\"$task_id\",\"pane_id\":\"$pane_id\""
@@ -266,8 +362,15 @@ $plan_json
    echo '{"status":"failed","task_id":"$task_id","test_status":"failing","error":"<description>"}' > $SIGNALS_DIR/executor/completion-$task_id.json
 PROMPT
 
+  # Inject caveman directive if active
+  local caveman_block
+  caveman_block=$(get_caveman_block)
+  if [ -n "$caveman_block" ]; then
+    echo "$caveman_block" >> "$prompt_file"
+  fi
+
   local pane_id
-  pane_id=$(spawn_agent "$prompt_file" "$wt_path" "$agent_log" "Read,Write,Edit,Bash,Glob,Grep")
+  pane_id=$(spawn_agent "$prompt_file" "$wt_path" "$agent_log" "" "sonnet")
 
   update_state "$(printf '.stage = "executor" | .pane_id = "%s" | .stage_started = %d | .worktree = "%s" | .branch = "%s"' \
     "$pane_id" "$(date +%s)" "$wt_path" "$branch")"
@@ -319,8 +422,16 @@ $diff_content
 6. The verdict JSON must include: task_id, verdict (approve/reject/request_changes), tier, contrarian_score, checklist, findings, summary.
 PROMPT
 
+  # Inject caveman directive if active
+  local caveman_block
+  caveman_block=$(get_caveman_block)
+  if [ -n "$caveman_block" ]; then
+    echo "$caveman_block" >> "$prompt_file"
+  fi
+
   local pane_id
-  pane_id=$(spawn_agent "$prompt_file" "$PROJECT_ROOT" "$agent_log" "Read,Bash,Glob,Grep")
+  local deny_tools="Write,Edit,NotebookEdit,mcp__filesystem__write_file,mcp__filesystem__edit_file,mcp__filesystem__move_file,mcp__filesystem__create_directory"
+  pane_id=$(spawn_agent "$prompt_file" "$PROJECT_ROOT" "$agent_log" "$deny_tools" "sonnet")
 
   update_state "$(printf '.stage = "reviewer" | .pane_id = "%s" | .stage_started = %d' "$pane_id" "$(date +%s)")"
   log_event "agent_spawned" "\"stage\":\"reviewer\",\"task_id\":\"$task_id\",\"pane_id\":\"$pane_id\""
@@ -343,9 +454,9 @@ do_merge() {
     log_event "stash_push" "\"task_id\":\"$task_id\""
   fi
 
-  # Merge into main
+  # Merge into main (--no-ff ensures a merge commit exists for clean revert)
   local merge_sha merge_ok=true
-  if merge_sha=$(git -C "$PROJECT_ROOT" merge "$branch" --no-edit 2>&1 | grep -oP '[0-9a-f]{7,}' | head -1); then
+  if merge_sha=$(git -C "$PROJECT_ROOT" merge --no-ff "$branch" --no-edit 2>&1 | grep -oP '[0-9a-f]{7,}' | head -1); then
     log_event "merge_complete" "\"task_id\":\"$task_id\",\"sha\":\"$merge_sha\""
   else
     log_event "merge_failed" "\"task_id\":\"$task_id\",\"branch\":\"$branch\""
@@ -363,14 +474,18 @@ do_merge() {
 
   $merge_ok || return 1
 
-  # Run post-merge tests
-  if (cd "$PROJECT_ROOT" && python -m pytest -q --tb=line 2>&1 | tail -5) | grep -q "passed"; then
+  # Run post-merge tests (check exit code, not grep on output)
+  local test_output
+  if test_output=$(cd "$PROJECT_ROOT" && python -m pytest -q --tb=line 2>&1); then
     log_event "post_merge_tests" "\"task_id\":\"$task_id\",\"result\":\"passed\""
   else
-    log_event "post_merge_tests" "\"task_id\":\"$task_id\",\"result\":\"failed\""
-    # Revert the merge using the captured SHA
-    git -C "$PROJECT_ROOT" revert --no-edit HEAD 2>/dev/null || true
+    local test_summary
+    test_summary=$(echo "$test_output" | tail -3 | tr '\n' ' ' | sed 's/"/\\"/g')
+    log_event "post_merge_tests" "\"task_id\":\"$task_id\",\"result\":\"failed\",\"summary\":\"$test_summary\""
+    # Revert the merge commit (--no-ff guarantees a merge commit; -m 1 reverts the full branch)
+    git -C "$PROJECT_ROOT" revert -m 1 --no-edit HEAD 2>/dev/null || true
     log_event "merge_reverted" "\"task_id\":\"$task_id\""
+    notify_discord "💥" "**Post-merge tests failed** for \`$task_id\` — merge reverted"
     return 1
   fi
 
@@ -384,6 +499,7 @@ do_merge() {
   update_state "$(printf '.active_task = null | .stage = null | .pane_id = null | .stage_started = null | .worktree = null | .branch = null | .last_merge = "%s" | .completed_tasks += ["%s"]' \
     "$(date -Iseconds)" "$task_id")"
   log_event "task_completed" "\"task_id\":\"$task_id\""
+  notify_discord "🎉" "**Task complete:** \`$task_id\` — merged and tests passing"
 }
 
 # ---------------------------------------------------------------------------
@@ -400,6 +516,8 @@ check_pipeline() {
   [ -z "$stage" ] && return
 
   # Check for permission prompt before anything else — proxy to Discord
+  # NOTE: With --permission-mode dontAsk, permission prompts should never appear.
+  # Kept as safety net for future roles with different permission modes.
   if [ -n "$pane_id" ] && check_pane_alive "$pane_id" && check_permission_prompt "$pane_id"; then
     handle_permission_prompt "$task_id" "$stage" "$pane_id" "$PERM_PROMPT_TEXT"
     return  # Let the agent resume; check signal files next cycle
@@ -420,6 +538,7 @@ check_pipeline() {
     log_event "task_failed" "\"task_id\":\"$task_id\",\"reason\":\"agent_timeout in $stage\""
     # Clear active task so conductor can pick up the next one
     update_state '.active_task = null | .stage = null | .pane_id = null | .stage_started = null'
+    notify_discord "⏰" "**Agent timeout** for \`$task_id\` — $stage stage exceeded ${AGENT_TIMEOUT}s"
     return
   fi
 
@@ -433,12 +552,14 @@ check_pipeline() {
         if [ -n "$pane_id" ] && check_pane_alive "$pane_id"; then
           tmux kill-pane -t "$pane_id" 2>/dev/null || true
         fi
+        notify_discord "📐" "**Architect done** for \`$task_id\` — plan delivered, launching Executor"
         launch_executor "$task_id"
       elif [ -n "$pane_id" ] && ! check_pane_alive "$pane_id"; then
         # Pane died without writing plan
         log_event "agent_died" "\"stage\":\"architect\",\"task_id\":\"$task_id\""
         update_state '.active_task = null | .stage = null | .pane_id = null | .stage_started = null'
         log_event "task_failed" "\"task_id\":\"$task_id\",\"reason\":\"architect died without plan\""
+        notify_discord "💀" "**Architect died** for \`$task_id\` — no plan delivered"
       fi
       ;;
 
@@ -453,16 +574,19 @@ check_pipeline() {
           tmux kill-pane -t "$pane_id" 2>/dev/null || true
         fi
         if [ "$exec_status" = "complete" ]; then
+          notify_discord "🔨" "**Executor done** for \`$task_id\` — tests passing, launching Reviewer"
           launch_reviewer "$task_id"
         else
           log_event "task_failed" "\"task_id\":\"$task_id\",\"reason\":\"executor reported: $exec_status\""
           update_state '.active_task = null | .stage = null | .pane_id = null | .stage_started = null'
+          notify_discord "❌" "**Executor failed** for \`$task_id\` — status: $exec_status"
         fi
       elif [ -n "$pane_id" ] && ! check_pane_alive "$pane_id"; then
         # Pane died without completion signal
         log_event "agent_died" "\"stage\":\"executor\",\"task_id\":\"$task_id\""
         update_state '.active_task = null | .stage = null | .pane_id = null | .stage_started = null'
         log_event "task_failed" "\"task_id\":\"$task_id\",\"reason\":\"executor died without completion signal\""
+        notify_discord "💀" "**Executor died** for \`$task_id\` — no completion signal"
       fi
       ;;
 
@@ -478,25 +602,30 @@ check_pipeline() {
         fi
         case $verdict in
           approve)
+            notify_discord "✅" "**Reviewer approved** \`$task_id\` — merging"
             do_merge "$task_id" || {
               log_event "task_failed" "\"task_id\":\"$task_id\",\"reason\":\"merge failed\""
               update_state '.active_task = null | .stage = null | .pane_id = null | .stage_started = null'
+              notify_discord "💥" "**Merge failed** for \`$task_id\`"
             }
             ;;
           reject|request_changes)
             log_event "review_rejected" "\"task_id\":\"$task_id\",\"verdict\":\"$verdict\""
             # For now, fail the task. Future: replan cycle.
             update_state '.active_task = null | .stage = null | .pane_id = null | .stage_started = null'
+            notify_discord "🔄" "**Reviewer: $verdict** for \`$task_id\`"
             ;;
           *)
             log_event "review_unknown" "\"task_id\":\"$task_id\",\"verdict\":\"$verdict\""
             update_state '.active_task = null | .stage = null | .pane_id = null | .stage_started = null'
+            notify_discord "⚠️" "**Unknown reviewer verdict** for \`$task_id\`: $verdict"
             ;;
         esac
       elif [ -n "$pane_id" ] && ! check_pane_alive "$pane_id"; then
         log_event "agent_died" "\"stage\":\"reviewer\",\"task_id\":\"$task_id\""
         update_state '.active_task = null | .stage = null | .pane_id = null | .stage_started = null'
         log_event "task_failed" "\"task_id\":\"$task_id\",\"reason\":\"reviewer died without verdict\""
+        notify_discord "💀" "**Reviewer died** for \`$task_id\` — no verdict"
       fi
       ;;
   esac
@@ -523,7 +652,14 @@ fi
 # Agent log compression: gzip logs older than 7 days
 find "$LOG_DIR/agents" -name "*.log" -mtime +7 -exec gzip -q {} \; 2>/dev/null || true
 
-log_event "startup" "\"version\":\"2.2\",\"pid\":$$"
+# Log caveman mode status at startup
+if [ -f "$CAVEMAN_FILE" ]; then
+  caveman_level=$(cat "$CAVEMAN_FILE" 2>/dev/null | tr -d '[:space:]')
+  [ -z "$caveman_level" ] && caveman_level="full"
+  log_event "startup" "\"version\":\"2.3\",\"pid\":$$,\"caveman\":\"$caveman_level\""
+else
+  log_event "startup" "\"version\":\"2.3\",\"pid\":$$,\"caveman\":\"off\""
+fi
 
 # Reconcile: if orch state shows an active task, check if its worktree still exists
 active_task=$(jq -r '.active_task // empty' "$ORCH_STATE" 2>/dev/null)
@@ -584,28 +720,44 @@ while true; do
       task_id=$(basename "$new_task" .json)
       log_event "signal_detected" "\"type\":\"new_task\",\"task_id\":\"$task_id\""
 
-      # -- Judgment call: classify task ------------------------------------
-      classify_input=$(jq -n \
-        --arg judgment "classify_task" \
-        --argjson task_file "$task_content" \
-        --argjson active_tasks '[]' \
-        --argjson state_summary "$(jq '{active_count: (if .active_task then 1 else 0 end), last_merge}' "$ORCH_STATE")" \
-        '{judgment: $judgment, task_file: $task_file, active_tasks: $active_tasks, orchestrator_state_summary: $state_summary}')
+      # -- Classify task: deterministic fast-path for human tasks ----------
+      task_source=$(echo "$task_content" | jq -r '.source // "unknown"')
+      action=""
 
-      mkdir -p "$LOG_DIR/judgments/$task_id"
-      echo "$classify_input" > "$LOG_DIR/judgments/$task_id/001-classify-input.json"
-      log_event "judgment_call" "\"reason\":\"task_classify\",\"task_id\":\"$task_id\""
-
-      if run_judgment "$CONDUCTOR_ROLE" "$classify_input"; then
-        classify_output="$JUDGMENT_RESULT"
+      if [ "$task_source" = "human" ] || [ "$task_source" = "ozy-cli" ]; then
+        # Human tasks: highest priority, no TTL. Deterministic classification.
+        current_active=$(jq -r '.active_task // empty' "$ORCH_STATE" 2>/dev/null)
+        if [ -n "$current_active" ]; then
+          action="defer"
+          log_event "fast_classify" "\"task_id\":\"$task_id\",\"action\":\"defer\",\"reason\":\"task active: $current_active\""
+        else
+          action="accept"
+          log_event "fast_classify" "\"task_id\":\"$task_id\",\"action\":\"accept\",\"source\":\"$task_source\""
+        fi
       else
-        classify_output='{"action":"defer","reason":"claude invocation failed"}'
-        log_event "error" "\"detail\":\"claude -p classify failed\",\"task_id\":\"$task_id\""
-      fi
-      echo "$classify_output" > "$LOG_DIR/judgments/$task_id/001-classify-output.json"
-      log_event "judgment_result" "\"task_id\":\"$task_id\""
+        # Bot-generated tasks: use LLM judgment (no tool access — pure classification)
+        classify_input=$(jq -n \
+          --arg judgment "classify_task" \
+          --argjson task_file "$task_content" \
+          --argjson active_tasks '[]' \
+          --argjson state_summary "$(jq '{active_count: (if .active_task then 1 else 0 end), last_merge}' "$ORCH_STATE")" \
+          '{judgment: $judgment, task_file: $task_file, active_tasks: $active_tasks, orchestrator_state_summary: $state_summary}')
 
-      action=$(echo "$classify_output" | jq -r '.action // "defer"')
+        mkdir -p "$LOG_DIR/judgments/$task_id"
+        echo "$classify_input" > "$LOG_DIR/judgments/$task_id/001-classify-input.json"
+        log_event "judgment_call" "\"reason\":\"task_classify\",\"task_id\":\"$task_id\""
+
+        if run_judgment_no_tools "$CONDUCTOR_ROLE" "$classify_input"; then
+          classify_output="$JUDGMENT_RESULT"
+        else
+          classify_output='{"action":"defer","reason":"claude invocation failed"}'
+          log_event "error" "\"detail\":\"claude -p classify failed\",\"task_id\":\"$task_id\""
+        fi
+        echo "$classify_output" > "$LOG_DIR/judgments/$task_id/001-classify-output.json"
+        log_event "judgment_result" "\"task_id\":\"$task_id\""
+
+        action=$(echo "$classify_output" | jq -r '.action // "defer"')
+      fi
 
       case $action in
         accept)
@@ -615,6 +767,7 @@ while true; do
 
           update_state "$(printf '.active_task = "%s"' "$task_id")"
           log_event "task_accepted" "\"task_id\":\"$task_id\""
+          notify_discord "📋" "**Task accepted:** \`$task_id\` — starting Architect"
 
           # Start the pipeline: launch architect
           launch_architect "$task_id"
@@ -625,6 +778,7 @@ while true; do
           cp "$new_task" "$LOG_DIR/signals/$task_id/001-task-rejected.json"
           rm -f "$new_task"
           log_event "task_rejected" "\"task_id\":\"$task_id\",\"reason\":\"$reject_reason\""
+          notify_discord "🚫" "**Task rejected:** \`$task_id\` — $reject_reason"
           ;;
         *)
           log_event "task_deferred" "\"task_id\":\"$task_id\""

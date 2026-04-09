@@ -13,6 +13,7 @@ from harness.lib.pipeline import (
     PipelineState,
     ProjectConfig,
     VALID_CAVEMAN_LEVELS,
+    VALID_STAGES,
 )
 from harness.lib.signals import TaskSignal
 
@@ -43,6 +44,49 @@ class TestPipelineState:
         assert pipeline_state.active_task is None
         assert pipeline_state.stage is None
 
+    def test_advance_rejects_invalid_stage(self, pipeline_state):
+        task = TaskSignal(task_id="t1", description="Test")
+        pipeline_state.activate(task)
+        with pytest.raises(ValueError, match="Invalid stage"):
+            pipeline_state.advance("reviwer")  # typo
+
+    def test_advance_accepts_all_valid_stages(self, pipeline_state):
+        task = TaskSignal(task_id="t1", description="Test")
+        pipeline_state.activate(task)
+        for stage in VALID_STAGES:
+            pipeline_state.advance(stage)
+            assert pipeline_state.stage == stage
+
+    def test_escalation_started_ts_set_on_escalation(self, pipeline_state):
+        task = TaskSignal(task_id="t1", description="Test")
+        pipeline_state.activate(task)
+        assert pipeline_state.escalation_started_ts is None
+        pipeline_state.advance("escalation_wait")
+        assert pipeline_state.escalation_started_ts is not None
+
+    def test_escalation_started_ts_preserved_across_tiers(self, pipeline_state):
+        task = TaskSignal(task_id="t1", description="Test")
+        pipeline_state.activate(task)
+        pipeline_state.advance("escalation_wait")
+        ts = pipeline_state.escalation_started_ts
+        pipeline_state.advance("escalation_tier1")
+        assert pipeline_state.escalation_started_ts == ts  # preserved, not reset
+
+    def test_escalation_started_ts_cleared_on_non_escalation(self, pipeline_state):
+        task = TaskSignal(task_id="t1", description="Test")
+        pipeline_state.activate(task)
+        pipeline_state.advance("escalation_wait")
+        assert pipeline_state.escalation_started_ts is not None
+        pipeline_state.advance("executor")
+        assert pipeline_state.escalation_started_ts is None
+
+    def test_escalation_started_ts_cleared_by_clear_active(self, pipeline_state):
+        task = TaskSignal(task_id="t1", description="Test")
+        pipeline_state.activate(task)
+        pipeline_state.advance("escalation_wait")
+        pipeline_state.clear_active()
+        assert pipeline_state.escalation_started_ts is None
+
     def test_save_load_roundtrip(self, tmp_path):
         path = tmp_path / "state.json"
         state = PipelineState(active_task="t1", stage="executor", retry_count=2)
@@ -53,6 +97,46 @@ class TestPipelineState:
         assert loaded.stage == "executor"
         assert loaded.retry_count == 2
         assert loaded.worktree == tmp_path / "worktree"
+
+    def test_save_load_roundtrip_escalation_started_ts(self, tmp_path):
+        path = tmp_path / "state.json"
+        state = PipelineState(active_task="t1", stage="escalation_wait")
+        state.advance("escalation_wait")
+        ts = state.escalation_started_ts
+        assert ts is not None
+        state.save(path)
+        loaded = PipelineState.load(path)
+        assert loaded.escalation_started_ts == ts
+
+    def test_pre_escalation_fields_default_none(self):
+        state = PipelineState()
+        assert state.pre_escalation_stage is None
+        assert state.pre_escalation_agent is None
+
+    def test_pre_escalation_fields_cleared_by_activate(self, pipeline_state):
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        task = TaskSignal(task_id="t1", description="Test")
+        pipeline_state.activate(task)
+        assert pipeline_state.pre_escalation_stage is None
+        assert pipeline_state.pre_escalation_agent is None
+
+    def test_pre_escalation_fields_cleared_by_clear_active(self, pipeline_state):
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.clear_active()
+        assert pipeline_state.pre_escalation_stage is None
+        assert pipeline_state.pre_escalation_agent is None
+
+    def test_save_load_roundtrip_pre_escalation_fields(self, tmp_path):
+        path = tmp_path / "state.json"
+        state = PipelineState(active_task="t1", stage="escalation_tier1")
+        state.pre_escalation_stage = "executor"
+        state.pre_escalation_agent = "executor"
+        state.save(path)
+        loaded = PipelineState.load(path)
+        assert loaded.pre_escalation_stage == "executor"
+        assert loaded.pre_escalation_agent == "executor"
 
     def test_load_missing_file(self, tmp_path):
         state = PipelineState.load(tmp_path / "nonexistent.json")
@@ -82,6 +166,11 @@ class TestAgentDef:
         copy = agent.with_cwd(tmp_path)
         assert copy.lifecycle == "per-task"
         assert copy.auto_start is False
+        assert copy.cwd == tmp_path
+
+    def test_cwd_default_none(self):
+        agent = AgentDef(name="exec", model="sonnet", mode="full", lifecycle="per-task")
+        assert agent.cwd is None
 
 
 class TestCavemanConfig:

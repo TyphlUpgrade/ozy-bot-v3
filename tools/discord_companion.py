@@ -112,7 +112,10 @@ COMMANDS: dict[str, str] = {
     "!shutdown-conductor": "Shut down the conductor wrapper",
     "!approve": "Approve a pending agent permission request",
     "!deny": "Deny a pending agent permission request",
+    "!caveman": "Toggle caveman mode for agents (lite|full|ultra|off)",
 }
+
+_VALID_CAVEMAN_LEVELS = {"lite", "full", "ultra", "on", "off"}
 
 
 async def handle_command(content: str) -> str | None:
@@ -141,12 +144,19 @@ async def handle_command(content: str) -> str | None:
         data = _read_json(SIGNALS_DIR / "status.json")
         if data is None:
             return "No status file found -- bot may not be running."
+        # Include caveman mode in status
+        caveman_path = STATE_DIR / "CAVEMAN_MODE"
+        caveman_status = "off"
+        if caveman_path.exists():
+            level = caveman_path.read_text().strip()
+            caveman_status = level if level else "full"
         return (
             f"**Equity:** ${data.get('equity', 0):,.2f}\n"
             f"**Positions:** {data.get('position_count', 0)}\n"
             f"**Open orders:** {data.get('open_order_count', 0)}\n"
             f"**Last update:** {data.get('ts', 'unknown')}\n"
-            f"**Health:** {json.dumps(data.get('loop_health', {}))}"
+            f"**Health:** {json.dumps(data.get('loop_health', {}))}\n"
+            f"**Caveman:** {caveman_status}"
         )
 
     elif cmd == "!exit":
@@ -196,6 +206,36 @@ async def handle_command(content: str) -> str | None:
         )
         verb = "approved" if decision == "approve" else "denied"
         return f"Permission **{verb}** for task `{task_id}`."
+
+    elif cmd == "!caveman":
+        caveman_path = STATE_DIR / "CAVEMAN_MODE"
+        arg = args.strip().lower()
+
+        if not arg:
+            # Status check
+            if caveman_path.exists():
+                level = caveman_path.read_text().strip()
+                return f"Caveman mode: **{level or 'full'}**"
+            return "Caveman mode: **off**"
+
+        if arg == "off":
+            removed = _remove(caveman_path)
+            return "Caveman mode: **off**" if removed else "Caveman was already off."
+
+        if arg == "on":
+            arg = "full"
+
+        if arg not in {"lite", "full", "ultra"}:
+            return "Usage: `!caveman [lite|full|ultra|off]`"
+
+        caveman_path.parent.mkdir(parents=True, exist_ok=True)
+        caveman_path.write_text(arg)
+        descriptions = {
+            "lite": "No filler. Full sentences.",
+            "full": "Drop articles, fragments OK.",
+            "ultra": "Max compression. Abbreviations + arrows.",
+        }
+        return f"Caveman mode: **{arg}** — {descriptions[arg]}"
 
     elif cmd == "!help":
         lines = ["**Available commands:**"]

@@ -36,16 +36,19 @@ def _make_session_mgr():
 
 def _make_signal_reader():
     reader = MagicMock()
-    reader.check_stage_complete = AsyncMock(return_value=None)
     return reader
+
+
+def _make_event_log():
+    log = MagicMock()
+    log.record = AsyncMock()
+    return log
 
 
 def _make_proc(returncode=0, stdout=b"", stderr=b""):
     proc = MagicMock()
     proc.returncode = returncode
     proc.communicate = AsyncMock(return_value=(stdout, stderr))
-    proc.kill = MagicMock()
-    proc.wait = AsyncMock()
     return proc
 
 
@@ -63,7 +66,7 @@ class TestClassifyTask:
         session_mgr = _make_session_mgr()
 
         with patch("lib.claude.classify", new=AsyncMock(return_value="complex")):
-            await classify_task(pipeline_state, session_mgr, config)
+            await classify_task(pipeline_state, session_mgr, config, _make_event_log())
 
         assert pipeline_state.stage == "architect"
         assert pipeline_state.stage_agent == "architect"
@@ -81,7 +84,7 @@ class TestClassifyTask:
         session_mgr = _make_session_mgr()
 
         with patch("lib.claude.classify", new=AsyncMock(return_value="simple")):
-            await classify_task(pipeline_state, session_mgr, config)
+            await classify_task(pipeline_state, session_mgr, config, _make_event_log())
 
         assert pipeline_state.stage == "executor"
         assert pipeline_state.stage_agent == "executor"
@@ -101,7 +104,7 @@ class TestClassifyTask:
             return "simple"
 
         with patch("lib.claude.classify", new=fake_classify):
-            await classify_task(state, session_mgr, config)
+            await classify_task(state, session_mgr, config, _make_event_log())
 
         assert captured[0] == "Specific description"
 
@@ -120,7 +123,7 @@ class TestClassifyTask:
             return "simple"
 
         with patch("lib.claude.classify", new=fake_classify):
-            await classify_task(state, session_mgr, config)
+            await classify_task(state, session_mgr, config, _make_event_log())
 
         assert captured[0] == "task-fallback"
 
@@ -140,7 +143,7 @@ class TestCheckStage:
         signal_reader = _make_signal_reader()
         signal_reader.check_stage_complete = AsyncMock(return_value={"plan": "do the thing"})
 
-        await check_stage(pipeline_state, signal_reader, "architect")
+        await check_stage(pipeline_state, signal_reader, "architect", _make_event_log())
 
         assert pipeline_state.stage == "executor"
 
@@ -155,7 +158,7 @@ class TestCheckStage:
         signal_reader = _make_signal_reader()
         signal_reader.check_stage_complete = AsyncMock(return_value={"status": "done"})
 
-        await check_stage(pipeline_state, signal_reader, "executor")
+        await check_stage(pipeline_state, signal_reader, "executor", _make_event_log())
 
         assert pipeline_state.stage == "reviewer"
 
@@ -170,7 +173,7 @@ class TestCheckStage:
         signal_reader = _make_signal_reader()
         signal_reader.check_stage_complete = AsyncMock(return_value={"verdict": "approved"})
 
-        await check_stage(pipeline_state, signal_reader, "reviewer")
+        await check_stage(pipeline_state, signal_reader, "reviewer", _make_event_log())
 
         assert pipeline_state.stage == "merge"
 
@@ -185,7 +188,7 @@ class TestCheckStage:
         signal_reader = _make_signal_reader()
         signal_reader.check_stage_complete = AsyncMock(return_value=None)
 
-        await check_stage(pipeline_state, signal_reader, "executor")
+        await check_stage(pipeline_state, signal_reader, "executor", _make_event_log())
 
         assert pipeline_state.stage == "executor"
 
@@ -200,7 +203,7 @@ class TestCheckStage:
         signal_reader = _make_signal_reader()
         signal_reader.check_stage_complete = AsyncMock(return_value=None)
 
-        await check_stage(pipeline_state, signal_reader, "executor")
+        await check_stage(pipeline_state, signal_reader, "executor", _make_event_log())
 
         signal_reader.check_stage_complete.assert_awaited_once_with("executor", "task-xyz")
 
@@ -223,7 +226,7 @@ class TestCheckReviewer:
         )
         session_mgr = _make_session_mgr()
 
-        await check_reviewer(pipeline_state, signal_reader, session_mgr, config)
+        await check_reviewer(pipeline_state, signal_reader, session_mgr, config, _make_event_log())
 
         assert pipeline_state.stage == "merge"
         session_mgr.send.assert_not_awaited()
@@ -241,7 +244,7 @@ class TestCheckReviewer:
         )
         session_mgr = _make_session_mgr()
 
-        await check_reviewer(pipeline_state, signal_reader, session_mgr, config)
+        await check_reviewer(pipeline_state, signal_reader, session_mgr, config, _make_event_log())
 
         assert pipeline_state.stage == "merge"
 
@@ -257,7 +260,7 @@ class TestCheckReviewer:
         signal_reader.check_stage_complete = AsyncMock(return_value=None)
         session_mgr = _make_session_mgr()
 
-        await check_reviewer(pipeline_state, signal_reader, session_mgr, config)
+        await check_reviewer(pipeline_state, signal_reader, session_mgr, config, _make_event_log())
 
         assert pipeline_state.stage == "reviewer"
         session_mgr.send.assert_not_awaited()
@@ -279,7 +282,7 @@ class TestCheckReviewer:
 
         with patch("lib.claude.reformulate",
                    new=AsyncMock(return_value="[REFORMULATED] Add tests for X")):
-            await check_reviewer(pipeline_state, signal_reader, session_mgr, config)
+            await check_reviewer(pipeline_state, signal_reader, session_mgr, config, _make_event_log())
 
         assert pipeline_state.stage == "executor"
         assert pipeline_state.retry_count == 1
@@ -302,7 +305,7 @@ class TestCheckReviewer:
         )
         session_mgr = _make_session_mgr()
 
-        await check_reviewer(pipeline_state, signal_reader, session_mgr, config)
+        await check_reviewer(pipeline_state, signal_reader, session_mgr, config, _make_event_log())
 
         assert pipeline_state.active_task is None
         assert pipeline_state.stage is None
@@ -324,7 +327,7 @@ class TestCheckReviewer:
         session_mgr = _make_session_mgr()
 
         with patch("lib.claude.reformulate", new=AsyncMock(return_value=None)):
-            await check_reviewer(pipeline_state, signal_reader, session_mgr, config)
+            await check_reviewer(pipeline_state, signal_reader, session_mgr, config, _make_event_log())
 
         assert pipeline_state.stage == "executor"
         assert pipeline_state.retry_count == 1
@@ -352,7 +355,7 @@ class TestCheckReviewer:
             return None  # triggers raw fallback path
 
         with patch("lib.claude.reformulate", new=fake_reformulate):
-            await check_reviewer(pipeline_state, signal_reader, session_mgr, config)
+            await check_reviewer(pipeline_state, signal_reader, session_mgr, config, _make_event_log())
 
         # Default feedback message is passed to reformulate
         assert len(captured_feedback) == 1
@@ -373,7 +376,7 @@ class TestDoMerge:
         pipeline_state.advance("merge")
         pipeline_state.worktree = None
 
-        await do_merge(pipeline_state, config)
+        await do_merge(pipeline_state, config, _make_event_log())
 
         assert pipeline_state.stage == "wiki"
 
@@ -392,7 +395,7 @@ class TestDoMerge:
 
         with patch("asyncio.create_subprocess_exec",
                    side_effect=[fail_proc, abort_proc]) as mock_exec:
-            await do_merge(pipeline_state, config)
+            await do_merge(pipeline_state, config, _make_event_log())
 
         assert pipeline_state.active_task is None
         assert pipeline_state.stage is None
@@ -419,7 +422,7 @@ class TestDoMerge:
                    side_effect=[merge_ok, tests_fail, revert_proc]) as mock_exec:
             with patch("asyncio.wait_for",
                        side_effect=lambda coro, timeout: coro):
-                await do_merge(pipeline_state, config)
+                await do_merge(pipeline_state, config, _make_event_log())
 
         assert pipeline_state.active_task is None
         revert_call_args = mock_exec.call_args_list[2][0]
@@ -444,7 +447,7 @@ class TestDoMerge:
                    side_effect=[merge_ok, tests_ok]):
             with patch("asyncio.wait_for",
                        side_effect=lambda coro, timeout: coro):
-                await do_merge(pipeline_state, config)
+                await do_merge(pipeline_state, config, _make_event_log())
 
         assert pipeline_state.stage == "wiki"
 
@@ -469,7 +472,7 @@ class TestDoWiki:
             return True
 
         with patch("lib.claude.document_task", new=fake_document_task):
-            await do_wiki(pipeline_state, config)
+            await do_wiki(pipeline_state, config, _make_event_log())
 
         assert captured_ids == ["task-999"]
         assert pipeline_state.active_task is None  # cleared after
@@ -483,7 +486,7 @@ class TestDoWiki:
         pipeline_state.activate(task)
 
         with patch("lib.claude.document_task", new=AsyncMock(return_value=True)):
-            await do_wiki(pipeline_state, config)
+            await do_wiki(pipeline_state, config, _make_event_log())
 
         assert pipeline_state.active_task is None
 
@@ -496,7 +499,7 @@ class TestDoWiki:
         pipeline_state.activate(task)
 
         with patch("lib.claude.document_task", new=AsyncMock(return_value=False)):
-            await do_wiki(pipeline_state, config)
+            await do_wiki(pipeline_state, config, _make_event_log())
 
         assert pipeline_state.active_task is None
 
@@ -559,3 +562,384 @@ class TestCreateWorktree:
         assert result is not None
         assert result.parent == config.worktree_base
         assert result.name == "my-task"
+
+
+# ---------- check_for_escalation ----------
+
+
+class TestCheckForEscalation:
+    @pytest.mark.asyncio
+    async def test_no_escalation_returns_false(self, config, pipeline_state):
+        """No escalation signal means check returns False, state unchanged."""
+        from harness.orchestrator import check_for_escalation
+
+        task = TaskSignal(task_id="task-001", description="Do work")
+        pipeline_state.activate(task)
+        pipeline_state.advance("executor", "executor")
+        signal_reader = _make_signal_reader()
+        signal_reader.read_escalation = AsyncMock(return_value=None)
+        session_mgr = _make_session_mgr()
+
+        result = await check_for_escalation(
+            pipeline_state, signal_reader, session_mgr, config, _make_event_log()
+        )
+
+        assert result is False
+        assert pipeline_state.stage == "executor"
+
+    @pytest.mark.asyncio
+    async def test_tier1_escalation_routes_to_architect(self, config, pipeline_state):
+        """Tier 1 category routes escalation to architect, saves pre-escalation state."""
+        from harness.orchestrator import check_for_escalation
+        from harness.lib.signals import EscalationRequest
+
+        task = TaskSignal(task_id="task-001", description="Do work")
+        pipeline_state.activate(task)
+        pipeline_state.advance("executor", "executor")
+        esc = EscalationRequest(
+            task_id="task-001", agent="executor", stage="executor",
+            severity="blocking", category="ambiguous_requirement",
+            question="What do?", options=["a", "b"], context="ctx",
+        )
+        signal_reader = _make_signal_reader()
+        signal_reader.read_escalation = AsyncMock(return_value=esc)
+        session_mgr = _make_session_mgr()
+
+        result = await check_for_escalation(
+            pipeline_state, signal_reader, session_mgr, config, _make_event_log()
+        )
+
+        assert result is True
+        assert pipeline_state.stage == "escalation_tier1"
+        assert pipeline_state.pre_escalation_stage == "executor"
+        assert pipeline_state.pre_escalation_agent == "executor"
+        session_mgr.send.assert_awaited_once()
+        assert "architect" == session_mgr.send.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_tier2_escalation_routes_to_operator(self, config, pipeline_state):
+        """Operator-direct category skips architect, goes to escalation_wait."""
+        from harness.orchestrator import check_for_escalation
+        from harness.lib.signals import EscalationRequest
+
+        task = TaskSignal(task_id="task-001", description="Do work")
+        pipeline_state.activate(task)
+        pipeline_state.advance("executor", "executor")
+        esc = EscalationRequest(
+            task_id="task-001", agent="executor", stage="executor",
+            severity="blocking", category="security_concern",
+            question="Is this safe?", options=["yes", "no"], context="ctx",
+        )
+        signal_reader = _make_signal_reader()
+        signal_reader.read_escalation = AsyncMock(return_value=esc)
+        session_mgr = _make_session_mgr()
+
+        with patch("harness.orchestrator.notify", new=AsyncMock()):
+            result = await check_for_escalation(
+                pipeline_state, signal_reader, session_mgr, config, _make_event_log()
+            )
+
+        assert result is True
+        assert pipeline_state.stage == "escalation_wait"
+        assert pipeline_state.pre_escalation_stage == "executor"
+
+
+# ---------- handle_escalation_tier1 ----------
+
+
+class TestHandleEscalationTier1:
+    @pytest.mark.asyncio
+    async def test_high_confidence_resolution_resumes_original_agent(self, config, pipeline_state):
+        """High confidence resolution injects into original agent and resumes."""
+        from harness.orchestrator import handle_escalation_tier1
+        from harness.lib.signals import ArchitectResolution
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_tier1", "architect")
+
+        resolution = ArchitectResolution(
+            task_id="task-001", resolution="option_a",
+            reasoning="Clear from codebase", confidence="high",
+        )
+        signal_reader = _make_signal_reader()
+        signal_reader.read_architect_resolution = AsyncMock(return_value=resolution)
+        session_mgr = _make_session_mgr()
+        session_mgr.sessions = {"executor": MagicMock(), "architect": MagicMock()}
+
+        await handle_escalation_tier1(
+            pipeline_state, signal_reader, session_mgr, config, _make_event_log()
+        )
+
+        assert pipeline_state.stage == "executor"
+        assert pipeline_state.stage_agent == "executor"
+        assert pipeline_state.pre_escalation_stage is None
+        session_mgr.send.assert_awaited_once()
+        assert "executor" == session_mgr.send.call_args[0][0]
+        assert "ESCALATION RESOLVED" in session_mgr.send.call_args[0][1]
+
+    @pytest.mark.asyncio
+    async def test_low_confidence_promotes_to_tier2(self, config, pipeline_state):
+        """Low confidence promotes escalation to Tier 2."""
+        from harness.orchestrator import handle_escalation_tier1
+        from harness.lib.signals import ArchitectResolution, EscalationRequest
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_tier1", "architect")
+
+        resolution = ArchitectResolution(
+            task_id="task-001", resolution="option_a",
+            reasoning="Not sure", confidence="low",
+        )
+        esc = EscalationRequest(
+            task_id="task-001", agent="executor", stage="executor",
+            severity="blocking", category="ambiguous_requirement",
+            question="What?", options=["a"], context="ctx",
+        )
+        signal_reader = _make_signal_reader()
+        signal_reader.read_architect_resolution = AsyncMock(return_value=resolution)
+        signal_reader.read_escalation = AsyncMock(return_value=esc)
+        session_mgr = _make_session_mgr()
+
+        with patch("harness.orchestrator.notify", new=AsyncMock()):
+            await handle_escalation_tier1(
+                pipeline_state, signal_reader, session_mgr, config, _make_event_log()
+            )
+
+        assert pipeline_state.stage == "escalation_wait"
+
+    @pytest.mark.asyncio
+    async def test_no_resolution_is_noop(self, config, pipeline_state):
+        """No resolution signal leaves state unchanged."""
+        from harness.orchestrator import handle_escalation_tier1
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.advance("escalation_tier1", "architect")
+        signal_reader = _make_signal_reader()
+        signal_reader.read_architect_resolution = AsyncMock(return_value=None)
+        session_mgr = _make_session_mgr()
+
+        await handle_escalation_tier1(
+            pipeline_state, signal_reader, session_mgr, config, _make_event_log()
+        )
+
+        assert pipeline_state.stage == "escalation_tier1"
+
+
+# ---------- handle_escalation_wait ----------
+
+
+class TestHandleEscalationWait:
+    @pytest.mark.asyncio
+    async def test_missing_escalation_signal_is_noop(self, config, pipeline_state):
+        """No escalation signal on disk → early return, state unchanged."""
+        from harness.orchestrator import handle_escalation_wait
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_wait")
+
+        signal_reader = _make_signal_reader()
+        signal_reader.read_escalation = AsyncMock(return_value=None)
+        event_log = _make_event_log()
+
+        await handle_escalation_wait(pipeline_state, signal_reader, config, event_log)
+
+        assert pipeline_state.stage == "escalation_wait"  # unchanged
+        event_log.record.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_advisory_auto_proceeds_after_timeout(self, config, pipeline_state):
+        """Advisory escalation resumes pre-escalation stage after timeout."""
+        from harness.orchestrator import handle_escalation_wait
+        from harness.lib.signals import EscalationRequest
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_wait")
+
+        esc = EscalationRequest(
+            task_id="task-001", agent="executor", stage="executor",
+            severity="advisory", category="design_choice",
+            question="Which approach?", options=["a", "b"], context="ctx",
+        )
+        signal_reader = _make_signal_reader()
+        signal_reader.read_escalation = AsyncMock(return_value=esc)
+        signal_reader.clear_escalation = MagicMock()
+        event_log = _make_event_log()
+
+        with patch("harness.orchestrator.escalation.should_auto_proceed", return_value=True):
+            await handle_escalation_wait(pipeline_state, signal_reader, config, event_log)
+
+        assert pipeline_state.stage == "executor"
+        assert pipeline_state.pre_escalation_stage is None
+        signal_reader.clear_escalation.assert_called_once_with("task-001")
+        event_log.record.assert_awaited_once()
+        assert event_log.record.call_args[0][0] == "escalation_auto_proceeded"
+
+    @pytest.mark.asyncio
+    async def test_blocking_renotifies_operator_at_interval(self, config, pipeline_state):
+        """Blocking escalation sends reminder notification at re-notify interval."""
+        from harness.orchestrator import handle_escalation_wait
+        from harness.lib.signals import EscalationRequest
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_wait")
+
+        esc = EscalationRequest(
+            task_id="task-001", agent="executor", stage="executor",
+            severity="blocking", category="security_concern",
+            question="Is this safe?", options=["yes", "no"], context="ctx",
+        )
+        signal_reader = _make_signal_reader()
+        signal_reader.read_escalation = AsyncMock(return_value=esc)
+        event_log = _make_event_log()
+
+        with patch("harness.orchestrator.escalation.should_auto_proceed", return_value=False), \
+             patch("harness.orchestrator.escalation.should_renotify", return_value=True), \
+             patch("harness.orchestrator.notify", new=AsyncMock()) as mock_notify:
+            await handle_escalation_wait(pipeline_state, signal_reader, config, event_log)
+
+        assert pipeline_state.stage == "escalation_wait"  # still waiting
+        mock_notify.assert_awaited_once()
+        assert "REMINDER" in mock_notify.call_args[0][2]
+
+
+# ---------- check_for_escalation — informational bypass ----------
+
+
+class TestInformationalEscalation:
+    @pytest.mark.asyncio
+    async def test_informational_sends_fyi_without_pausing(self, config, pipeline_state):
+        """Informational severity sends notification but does NOT pause pipeline."""
+        from harness.orchestrator import check_for_escalation
+        from harness.lib.signals import EscalationRequest
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.advance("executor", "executor")
+        esc = EscalationRequest(
+            task_id="task-001", agent="executor", stage="executor",
+            severity="informational", category="design_choice",
+            question="FYI: I chose approach A", options=[], context="ctx",
+        )
+        signal_reader = _make_signal_reader()
+        signal_reader.read_escalation = AsyncMock(return_value=esc)
+        signal_reader.clear_escalation = MagicMock()
+        session_mgr = _make_session_mgr()
+
+        with patch("harness.orchestrator.notify", new=AsyncMock()) as mock_notify:
+            result = await check_for_escalation(
+                pipeline_state, signal_reader, session_mgr, config, _make_event_log()
+            )
+
+        assert result is False  # no state transition
+        assert pipeline_state.stage == "executor"  # unchanged
+        assert pipeline_state.pre_escalation_stage is None  # never set
+        mock_notify.assert_awaited_once()
+        signal_reader.clear_escalation.assert_called_once()
+
+
+# ---------- _apply_reply ----------
+
+
+class TestApplyReply:
+    @pytest.mark.asyncio
+    async def test_happy_path_resumes_original_agent(self, pipeline_state):
+        """Operator reply injects into original agent and resumes original stage."""
+        from harness.discord_companion import _apply_reply
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_wait")
+        session_mgr = _make_session_mgr()
+        session_mgr.sessions = {"executor": MagicMock()}
+
+        await _apply_reply(pipeline_state, session_mgr, "task-001", "use option B")
+
+        assert pipeline_state.stage == "executor"
+        assert pipeline_state.pre_escalation_stage is None
+        session_mgr.send.assert_awaited_once()
+        assert "[OPERATOR REPLY]" in session_mgr.send.call_args[0][1]
+
+    @pytest.mark.asyncio
+    async def test_wrong_task_id_is_noop(self, pipeline_state):
+        """Reply for wrong task_id is silently ignored."""
+        from harness.discord_companion import _apply_reply
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.advance("escalation_wait")
+        session_mgr = _make_session_mgr()
+
+        await _apply_reply(pipeline_state, session_mgr, "task-999", "reply")
+
+        assert pipeline_state.stage == "escalation_wait"  # unchanged
+
+    @pytest.mark.asyncio
+    async def test_wrong_stage_is_noop(self, pipeline_state):
+        """Reply when not in escalation stage is rejected."""
+        from harness.discord_companion import _apply_reply
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.advance("executor", "executor")
+        session_mgr = _make_session_mgr()
+
+        await _apply_reply(pipeline_state, session_mgr, "task-001", "reply")
+
+        assert pipeline_state.stage == "executor"  # unchanged
+
+    @pytest.mark.asyncio
+    async def test_dead_session_still_advances_state(self, pipeline_state):
+        """Reply with dead agent session logs warning but still advances state."""
+        from harness.discord_companion import _apply_reply
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_wait")
+        session_mgr = _make_session_mgr()
+        session_mgr.sessions = {}  # no sessions alive
+
+        await _apply_reply(pipeline_state, session_mgr, "task-001", "reply")
+
+        assert pipeline_state.stage == "executor"  # state advanced despite dead session
+        session_mgr.send.assert_not_awaited()  # but message not delivered
+
+    @pytest.mark.asyncio
+    async def test_signal_reader_clears_escalation_on_reply(self, pipeline_state):
+        """When signal_reader is provided, clear_escalation is called after resume."""
+        from harness.discord_companion import _apply_reply
+
+        task = TaskSignal(task_id="task-001", description="Work")
+        pipeline_state.activate(task)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_wait")
+        session_mgr = _make_session_mgr()
+        session_mgr.sessions = {"executor": MagicMock()}
+        signal_reader = _make_signal_reader()
+        signal_reader.clear_escalation = MagicMock()
+
+        await _apply_reply(pipeline_state, session_mgr, "task-001", "go with B",
+                           signal_reader=signal_reader)
+
+        assert pipeline_state.stage == "executor"
+        signal_reader.clear_escalation.assert_called_once_with("task-001")

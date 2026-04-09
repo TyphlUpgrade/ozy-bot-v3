@@ -4,6 +4,11 @@ title: Wiki Log
 
 # Wiki Operation Log
 
+## 2026-04-08
+
+- **UPDATE** `v5-harness-known-bugs` — marked BUG-004 and BUG-010 as RESOLVED; added Phase 2 prerequisite batch section (6 fixes + 6 improvements); added found-bugs table from autopilot validation reviews
+- **UPDATE** `v5-harness-architecture` — added escalation.py to module table, updated pipeline diagram with escalation flow, added Tiered Escalation Protocol section (Phase 2)
+
 ## 2026-04-09
 
 - **ADD** `v5-harness-architecture` — 7-module overview, stage pipeline, FIFO model, agent roles
@@ -22,6 +27,12 @@ title: Wiki Log
 - **UPDATE** `v5-harness-design-decisions` — added "Sessions never talk to each other" invariant (star topology, orchestrator as single hub)
 - **UPDATE** `index.md` — updated bug count (9 → 11)
 
+- **ADD** `v5-omc-agent-integration.md` — OMC agent integration plan for v5 harness; Fold principle (analyst→architect, test-engineer→reviewer, document-specialist in both); ad-hoc agents (writer, verifier, debugger, tracer); reviewer→executor feedback loop closure; 3 implementation phases
+- **UPDATE** `index.md` — added v5-omc-agent-integration.md under Architecture subsection
+- **ADD** `v5-phase3-readiness.md` — Pre-Phase 3 due diligence: Phase 3 scope, stall-triad blockers (BUG-015/016/017), code review findings, P0/P1 test gaps, architecture gaps, Phase 3 ordering, loose ends, sign-off checklist
+- **UPDATE** `index.md` — added Phase 3 Readiness Assessment under new "Phase Planning" section
+- **UPDATE** `log.md` — recorded Phase 3 readiness assessment creation
+
 ## [2026-04-09T02:57:00.244Z] ingest
 - **Pages:** session-log-2026-04-09-fcca83d5.md
 - **Summary:** Auto-captured session log for f5ef5960-d825-4a46-bf6c-2ec6fcca83d5
@@ -33,4 +44,7 @@ title: Wiki Log
 ## [2026-04-09T02:57:08.706Z] ingest
 - **Pages:** session-log-2026-04-09-fc5d90e4.md
 - **Summary:** Auto-captured session log for cb06dc9c-5d09-48aa-b188-4277fc5d90e4
+
+- **ADD** `v5-conversational-discord-operator.md` — Natural language inbound routing, agent status posts via `clawhip send`, escalation dialogue; approved design based on Claw Code patterns; 3-piece architecture (agent outbound, NL inbound, escalation dialogue); prerequisites and acceptance criteria
+- **UPDATE** `index.md` — added v5-conversational-discord-operator.md under Decisions subsection
 

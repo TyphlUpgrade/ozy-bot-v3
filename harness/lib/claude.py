@@ -28,7 +28,7 @@ async def _run_claude(
     if level != "off" and level in directives:
         system_prompt = directives[level] + "\n\n" + system_prompt
 
-    cmd: list[str] = ["claude", "-p", "--permission-mode", "dontAsk"]
+    cmd: list[str] = [config.claude_binary, "-p", "--permission-mode", "dontAsk"]
     if tools:
         cmd += ["--allowedTools", ",".join(tools)]
     cmd += ["--system-prompt", system_prompt, user_prompt]

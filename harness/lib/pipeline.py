@@ -33,6 +33,7 @@ class AgentDef:
     auto_start: bool = True
     deny_flags: list[str] = field(default_factory=list)
     role_file: Path | None = None       # path to agent role markdown
+    cwd: Path | None = None             # working directory (worktree for per-task sessions)
 
     @property
     def deny_flags_str(self) -> str:
@@ -54,7 +55,7 @@ class AgentDef:
             lifecycle="per-task", stale_minutes=self.stale_minutes,
             keywords=self.keywords, discord_channel=self.discord_channel,
             auto_start=False, deny_flags=self.deny_flags,
-            role_file=self.role_file,
+            role_file=self.role_file, cwd=worktree,
         )
 
 
@@ -182,6 +183,7 @@ class ProjectConfig:
     agents: dict[str, AgentDef]
     caveman: CavemanConfig
     timeouts: dict[str, int] = field(default_factory=dict)
+    claude_binary: str = "claude"       # configurable LLM CLI binary
     commands_module: str | None = None
 
     @classmethod
@@ -204,6 +206,7 @@ class ProjectConfig:
             escalation_timeout=pipeline.get("escalation_timeout", 14400),
             agents=_default_agents(agents_dir),
             caveman=CavemanConfig.from_toml(data),
+            claude_binary=pipeline.get("claude_binary", "claude"),
             timeouts={
                 "classify": pipeline.get("classify_timeout", 120),
                 "summarize": pipeline.get("summarize_timeout", 120),
@@ -212,6 +215,13 @@ class ProjectConfig:
             },
             commands_module=data.get("commands", {}).get("module"),
         )
+
+
+# Valid pipeline stages — advance() validates against this set
+VALID_STAGES = frozenset({
+    "classify", "architect", "executor", "reviewer", "merge", "wiki",
+    "escalation_wait", "escalation_tier1",
+})
 
 
 # ---------- Pipeline State ----------
@@ -227,6 +237,9 @@ class PipelineState:
     retry_count: int = 0
     heartbeat_ts: str | None = None
     shutdown_ts: str | None = None
+    escalation_started_ts: str | None = None  # when current escalation began (for tier promotion timing)
+    pre_escalation_stage: str | None = None  # stage before escalation, for resume routing
+    pre_escalation_agent: str | None = None  # agent before escalation, for reply injection
 
     def activate(self, task: "TaskSignal") -> None:
         from .signals import TaskSignal  # avoid circular at module level
@@ -236,10 +249,29 @@ class PipelineState:
         self.stage_agent = None
         self.worktree = None
         self.retry_count = 0
+        self.escalation_started_ts = None
+        self.pre_escalation_stage = None
+        self.pre_escalation_agent = None
 
     def advance(self, next_stage: str, agent: str | None = None) -> None:
+        if next_stage not in VALID_STAGES:
+            raise ValueError(f"Invalid stage: {next_stage!r}. Valid: {', '.join(sorted(VALID_STAGES))}")
         self.stage = next_stage
         self.stage_agent = agent
+        # Track escalation timing for tier promotion
+        if next_stage.startswith("escalation_"):
+            if self.escalation_started_ts is None:
+                self.escalation_started_ts = datetime.now(UTC).isoformat()
+        else:
+            self.escalation_started_ts = None
+
+    def resume_from_escalation(self) -> None:
+        """Restore pre-escalation stage/agent and clear escalation context."""
+        original_stage = self.pre_escalation_stage or "executor"
+        original_agent = self.pre_escalation_agent
+        self.advance(original_stage, original_agent)
+        self.pre_escalation_stage = None
+        self.pre_escalation_agent = None
 
     def clear_active(self) -> None:
         self.active_task = None
@@ -248,6 +280,9 @@ class PipelineState:
         self.stage_agent = None
         self.worktree = None
         self.retry_count = 0
+        self.escalation_started_ts = None
+        self.pre_escalation_stage = None
+        self.pre_escalation_agent = None
 
     def heartbeat(self) -> None:
         self.heartbeat_ts = datetime.now(UTC).isoformat()

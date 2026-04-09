@@ -17,7 +17,7 @@ from harness.lib.signals import EscalationRequest, TaskSignal
 
 
 def _make_session(name: str, pid: int | None = 12345, lifecycle: str = "persistent"):
-    session = Session(name=name, fd=3, fifo=MagicMock(), log=MagicMock(), pid=pid)
+    session = Session(name=name, role=name, fd=3, fifo=MagicMock(), log=MagicMock(), pid=pid)
     return session
 
 

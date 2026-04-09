@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 
 from harness.lib.signals import (
-    EscalationReply,
     EscalationRequest,
     SignalReader,
     TaskSignal,
@@ -123,6 +122,20 @@ class TestSignalReader:
         reader = SignalReader(tmp_dir / "signals")
         result = await reader.check_stage_complete("architect", "missing")
         assert result is None
+
+    def test_clear_escalation(self, tmp_dir):
+        esc_dir = tmp_dir / "signals" / "escalation"
+        res_dir = tmp_dir / "signals" / "escalation_resolution"
+        (esc_dir / "t1.json").write_text('{"task_id": "t1"}')
+        (res_dir / "t1.json").write_text('{"task_id": "t1"}')
+        reader = SignalReader(tmp_dir / "signals")
+        reader.clear_escalation("t1")
+        assert not (esc_dir / "t1.json").exists()
+        assert not (res_dir / "t1.json").exists()
+
+    def test_clear_escalation_missing_files_is_noop(self, tmp_dir):
+        reader = SignalReader(tmp_dir / "signals")
+        reader.clear_escalation("nonexistent")  # should not raise
 
     def test_archive(self, tmp_dir):
         esc_dir = tmp_dir / "signals" / "escalation"

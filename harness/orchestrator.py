@@ -10,7 +10,8 @@ import sys
 from datetime import datetime, UTC
 from pathlib import Path
 
-from lib import claude, lifecycle
+from lib import claude, escalation, lifecycle
+from lib.events import EventLog
 from lib.pipeline import PipelineState, ProjectConfig
 from lib.sessions import SessionManager, compress_startup_files
 from lib.signals import SignalReader
@@ -22,35 +23,43 @@ logging.basicConfig(
 )
 logger = logging.getLogger("harness.orchestrator")
 
+# Cache escalation requests across poll cycles to avoid TOCTOU re-reads.
+# check_for_escalation stashes here; handle_escalation_tier1 pops.
+_escalation_cache: dict[str, "EscalationRequest"] = {}
+
 
 # ---------- Stage Handlers ----------
 
 
 async def classify_task(state: PipelineState, session_mgr: SessionManager,
-                        config: ProjectConfig) -> None:
+                        config: ProjectConfig, event_log: EventLog) -> None:
     """Classify task complexity, route to architect or executor."""
     result = await claude.classify(state.task_description or state.active_task or "", config)
     if result == "complex":
         state.advance("architect", "architect")
+        await event_log.record("stage_advanced", {"task": state.active_task, "from": "classify", "to": "architect"})
         # Send task to architect for planning
         await session_mgr.send("architect", f"[TASK] Plan this task: {state.active_task}")
     else:
         state.advance("executor", "executor")
+        await event_log.record("stage_advanced", {"task": state.active_task, "from": "classify", "to": "executor"})
 
 
 async def check_stage(state: PipelineState, signal_reader: SignalReader,
-                      stage: str) -> None:
+                      stage: str, event_log: EventLog) -> None:
     """Poll for stage completion signal."""
     result = await signal_reader.check_stage_complete(stage, state.active_task or "")
     if result is not None:
         next_stages = {"architect": "executor", "executor": "reviewer", "reviewer": "merge"}
         next_stage = next_stages.get(stage, "merge")
         state.advance(next_stage, next_stage if next_stage != "merge" else None)
+        await event_log.record("stage_advanced", {"task": state.active_task, "from": stage, "to": next_stage})
         logger.info("Stage %s complete for %s → %s", stage, state.active_task, next_stage)
 
 
 async def check_reviewer(state: PipelineState, signal_reader: SignalReader,
-                         session_mgr: SessionManager, config: ProjectConfig) -> None:
+                         session_mgr: SessionManager, config: ProjectConfig,
+                         event_log: EventLog) -> None:
     """Check reviewer verdict — approve or trigger retry."""
     result = await signal_reader.check_stage_complete("reviewer", state.active_task or "")
     if result is None:
@@ -58,6 +67,7 @@ async def check_reviewer(state: PipelineState, signal_reader: SignalReader,
     verdict = result.get("verdict", "").lower()
     if verdict == "approve" or verdict == "approved":
         state.advance("merge")
+        await event_log.record("stage_advanced", {"task": state.active_task, "from": "reviewer", "to": "merge", "verdict": "approved"})
         logger.info("Reviewer approved %s", state.active_task)
     else:
         if state.retry_count >= config.max_retries:
@@ -71,15 +81,17 @@ async def check_reviewer(state: PipelineState, signal_reader: SignalReader,
             state.retry_count += 1
             state.advance("executor", "executor")
             await session_mgr.send("executor", reformulated)
+            await event_log.record("stage_advanced", {"task": state.active_task, "from": "reviewer", "to": "executor", "retry": state.retry_count})
             logger.info("Retry %d for %s", state.retry_count, state.active_task)
         else:
             # Reformulate failed — send raw feedback as fallback
             state.retry_count += 1
             state.advance("executor", "executor")
             await session_mgr.send("executor", f"[RETRY] {feedback}")
+            await event_log.record("stage_advanced", {"task": state.active_task, "from": "reviewer", "to": "executor", "retry": state.retry_count})
 
 
-async def do_merge(state: PipelineState, config: ProjectConfig) -> None:
+async def do_merge(state: PipelineState, config: ProjectConfig, event_log: EventLog) -> None:
     """Merge worktree, run tests, revert on failure."""
     if state.worktree is None:
         state.advance("wiki")
@@ -94,7 +106,11 @@ async def do_merge(state: PipelineState, config: ProjectConfig) -> None:
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
         logger.error("Merge failed for %s: %s", state.active_task, stderr.decode()[:200])
-        await asyncio.create_subprocess_exec("git", "merge", "--abort", cwd=cwd)
+        abort = await asyncio.create_subprocess_exec(
+            "git", "merge", "--abort", cwd=cwd,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await abort.communicate()
         state.clear_active()
         return
     # Run tests
@@ -109,23 +125,28 @@ async def do_merge(state: PipelineState, config: ProjectConfig) -> None:
         logger.error("Tests timed out for %s — killing and reverting", state.active_task)
         proc.kill()
         await proc.wait()
-        await asyncio.create_subprocess_exec(
+        revert = await asyncio.create_subprocess_exec(
             "git", "revert", "--no-edit", "-m", "1", "HEAD", cwd=cwd,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
+        await revert.communicate()
         state.clear_active()
         return
     if proc.returncode != 0:
         logger.error("Tests failed after merge for %s — reverting", state.active_task)
-        await asyncio.create_subprocess_exec(
+        revert = await asyncio.create_subprocess_exec(
             "git", "revert", "--no-edit", "-m", "1", "HEAD", cwd=cwd,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
+        await revert.communicate()
         state.clear_active()
         return
     state.advance("wiki")
+    await event_log.record("stage_advanced", {"task": state.active_task, "from": "merge", "to": "wiki"})
     logger.info("Merge + tests passed for %s", state.active_task)
 
 
-async def do_wiki(state: PipelineState, config: ProjectConfig) -> None:
+async def do_wiki(state: PipelineState, config: ProjectConfig, event_log: EventLog) -> None:
     """Document task via claude -p + /wiki."""
     task_id = state.active_task or ""
     description = state.task_description or task_id
@@ -139,8 +160,134 @@ async def do_wiki(state: PipelineState, config: ProjectConfig) -> None:
     )
     if not success:
         logger.warning("Wiki documentation failed for %s — continuing", task_id)
+    await event_log.record("task_completed", {"task": task_id})
     state.clear_active()
     logger.info("Task %s complete", task_id)
+
+
+# ---------- Escalation Handlers ----------
+
+
+async def check_for_escalation(state: PipelineState, signal_reader: SignalReader,
+                               session_mgr: SessionManager, config: ProjectConfig,
+                               event_log: EventLog) -> bool:
+    """Check for new escalation signal during an active agent stage.
+
+    Returns True if an escalation was found and state transitioned, False otherwise.
+    Only called when state.stage is an agent stage (architect, executor, reviewer).
+    """
+    esc = await signal_reader.read_escalation(state.active_task or "")
+    if esc is None:
+        return False
+
+    # Informational escalations: FYI to operator, no pipeline pause (spec line 301)
+    if esc.severity == "informational":
+        summary = escalation.format_tier2_notification(esc)
+        await notify("info", esc.agent, summary)
+        signal_reader.clear_escalation(state.active_task or "")
+        await event_log.record("escalation_informational", {
+            "task": state.active_task, "category": esc.category, "agent": esc.agent,
+        })
+        logger.info("Informational escalation from %s — FYI sent, no pause", esc.agent)
+        return False
+
+    tier = escalation.route_escalation(esc)
+    # Store pre-escalation context for resume routing
+    state.pre_escalation_stage = state.stage
+    state.pre_escalation_agent = state.stage_agent
+
+    if tier == "tier1":
+        _escalation_cache[esc.task_id] = esc  # cache for handle_escalation_tier1
+        msg = escalation.format_escalation_for_architect(esc)
+        await session_mgr.send("architect", msg)
+        state.advance("escalation_tier1", "architect")
+        await event_log.record("escalation_routed", {
+            "task": state.active_task, "category": esc.category,
+            "tier": 1, "agent": esc.agent,
+        })
+        logger.info("Escalation from %s routed to architect (Tier 1)", esc.agent)
+    else:
+        summary = escalation.format_tier2_notification(esc)
+        await notify("blocked", esc.agent, summary)
+        state.advance("escalation_wait")
+        await event_log.record("escalation_routed", {
+            "task": state.active_task, "category": esc.category,
+            "tier": 2, "agent": esc.agent,
+        })
+        logger.info("Escalation from %s routed to operator (Tier 2)", esc.agent)
+    return True
+
+
+async def handle_escalation_tier1(state: PipelineState, signal_reader: SignalReader,
+                                  session_mgr: SessionManager, config: ProjectConfig,
+                                  event_log: EventLog) -> None:
+    """Poll for architect resolution of a Tier 1 escalation."""
+    resolution = await signal_reader.read_architect_resolution(state.active_task or "")
+    if resolution is None:
+        return
+
+    if escalation.should_promote(resolution):
+        # Promote to Tier 2 — architect couldn't resolve or has low confidence
+        task_id = state.active_task or ""
+        esc = _escalation_cache.pop(task_id, None) or await signal_reader.read_escalation(task_id)
+        architect_assessment = f"{resolution.resolution} (confidence: {resolution.confidence}): {resolution.reasoning}"
+        summary = escalation.format_tier2_notification(esc, architect_assessment) if esc else architect_assessment
+        await notify("blocked", state.pre_escalation_agent or "unknown", summary)
+        state.advance("escalation_wait")
+        await event_log.record("escalation_promoted", {
+            "task": state.active_task, "from_tier": 1, "to_tier": 2,
+            "reason": resolution.resolution, "confidence": resolution.confidence,
+        })
+        logger.info("Escalation for %s promoted to Tier 2 (confidence: %s)",
+                     state.active_task, resolution.confidence)
+    else:
+        # Resolved — inject resolution into the original agent and resume
+        _escalation_cache.pop(state.active_task or "", None)
+        original_agent = state.pre_escalation_agent
+        if original_agent and original_agent in session_mgr.sessions:
+            await session_mgr.send(
+                original_agent,
+                f"[ESCALATION RESOLVED] {resolution.resolution}\nReasoning: {resolution.reasoning}",
+            )
+        state.resume_from_escalation()
+        signal_reader.clear_escalation(state.active_task or "")
+        await event_log.record("escalation_resolved", {
+            "task": state.active_task, "resolver": "architect",
+            "confidence": resolution.confidence,
+        })
+        logger.info("Escalation for %s resolved by architect (confidence: %s)",
+                     state.active_task, resolution.confidence)
+
+
+async def handle_escalation_wait(state: PipelineState, signal_reader: SignalReader,
+                                 config: ProjectConfig, event_log: EventLog) -> None:
+    """Handle Tier 2 escalation wait — timeout and re-notify logic.
+
+    Operator replies are handled via discord_companion !reply → _apply_reply mutation.
+    This function only handles timeout behaviors: re-notify for blocking, auto-proceed
+    for advisory.
+    """
+    esc = await signal_reader.read_escalation(state.active_task or "")
+    if esc is None:
+        return
+
+    started_ts = state.escalation_started_ts
+
+    # Advisory escalations auto-proceed after timeout
+    if escalation.should_auto_proceed(esc, started_ts, config.escalation_timeout):
+        state.resume_from_escalation()
+        signal_reader.clear_escalation(state.active_task or "")
+        await event_log.record("escalation_auto_proceeded", {
+            "task": state.active_task, "severity": esc.severity,
+        })
+        logger.info("Advisory escalation for %s auto-proceeded after timeout", state.active_task)
+        return
+
+    # Blocking escalations re-notify at interval
+    if esc.severity == "blocking" and escalation.should_renotify(started_ts, config.escalation_timeout):
+        summary = escalation.format_tier2_notification(esc)
+        await notify("blocked", esc.agent, f"REMINDER: {summary}")
+        logger.info("Re-notified operator for blocking escalation on %s", state.active_task)
 
 
 # ---------- Worktree Management ----------
@@ -188,6 +335,7 @@ async def main_loop(config: ProjectConfig) -> None:
     state = PipelineState.load(config.state_file)
     session_mgr = SessionManager(config.session_dir, config)
     signal_reader = SignalReader(config.signal_dir)
+    event_log = EventLog(config.project_root / "harness_events.jsonl")
 
     # Compress CLAUDE.md and role files at startup (idempotent, graceful fallback)
     await compress_startup_files(config)
@@ -227,21 +375,31 @@ async def main_loop(config: ProjectConfig) -> None:
 
         # 1. Check pipeline progress
         if state.active_task:
+            # Check for new escalation from active agent stages
+            if state.stage in ("architect", "executor", "reviewer"):
+                if await check_for_escalation(state, signal_reader, session_mgr, config, event_log):
+                    state.heartbeat()
+                    state.save(config.state_file)
+                    await asyncio.sleep(config.poll_interval)
+                    continue
+
             match state.stage:
                 case "classify":
-                    await classify_task(state, session_mgr, config)
+                    await classify_task(state, session_mgr, config, event_log)
                 case "architect":
-                    await check_stage(state, signal_reader, "architect")
+                    await check_stage(state, signal_reader, "architect", event_log)
                 case "executor":
-                    await check_stage(state, signal_reader, "executor")
+                    await check_stage(state, signal_reader, "executor", event_log)
                 case "reviewer":
-                    await check_reviewer(state, signal_reader, session_mgr, config)
+                    await check_reviewer(state, signal_reader, session_mgr, config, event_log)
                 case "merge":
-                    await do_merge(state, config)
+                    await do_merge(state, config, event_log)
                 case "wiki":
-                    await do_wiki(state, config)
-                case "escalation_wait" | "escalation_tier1":
-                    pass  # Phase 2 — checked by lifecycle.reconcile on recovery
+                    await do_wiki(state, config, event_log)
+                case "escalation_tier1":
+                    await handle_escalation_tier1(state, signal_reader, session_mgr, config, event_log)
+                case "escalation_wait":
+                    await handle_escalation_wait(state, signal_reader, config, event_log)
         else:
             # Check for new tasks
             new_task = await signal_reader.next_task(config.task_dir)
@@ -254,6 +412,7 @@ async def main_loop(config: ProjectConfig) -> None:
                     state.worktree = worktree
                     executor_def = config.agents["executor"].with_cwd(worktree)
                     await session_mgr.launch("executor", executor_def)
+                    await event_log.record("task_activated", {"task": new_task.task_id, "source": new_task.source})
                     await notify("task_started", "orchestrator", f"New task: {new_task.task_id}")
 
         # 2. Health checks (persistent sessions only)

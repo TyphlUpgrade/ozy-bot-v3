@@ -29,15 +29,24 @@ Claude Code sessions (work) — persistent FIFO-fed agent sessions doing actual 
 | `sessions.py` | FIFO session management | `SessionManager`, `Session` |
 | `claude.py` | On-demand `claude -p` subprocess calls | `classify()`, `summarize()`, `reformulate()`, `document_task()` |
 | `lifecycle.py` | Recovery and health monitoring | `reconcile()`, `check_sessions()`, `is_alive()` |
-| `orchestrator.py` | Main async loop, stage dispatch | `main_loop()`, stage handlers |
+| `escalation.py` | Tiered escalation routing, confidence gating, timeouts | `route_escalation()`, `should_promote()`, `format_tier2_notification()` |
+| `orchestrator.py` | Main async loop, stage dispatch | `main_loop()`, stage handlers, escalation handlers |
 | `discord_companion.py` | Discord command handler | `DiscordCompanion`, `parse_caveman()`, `parse_tell()` |
 
 ## Stage Pipeline
 
 ```
 classify -> architect -> executor -> reviewer -> merge -> wiki
-                                        |
-                                    (reject) -> reformulate -> executor (retry, max 3)
+                |            |            |
+            (escalation) (escalation) (escalation)
+                |            |            |
+            escalation_tier1 (architect-first)
+                |                    |
+            (resolved)        (low confidence / cannot_resolve)
+                |                    |
+            resume stage      escalation_wait (operator)
+                                     |
+                                 (reject) -> reformulate -> executor (retry, max 3)
 ```
 
 - **classify**: `claude -p` call decides "complex" (needs architect) or "simple" (straight to executor)
@@ -77,6 +86,26 @@ Single asyncio event loop. No threading. Discord commands queue mutations via `p
 - `config/harness/project.toml` — all paths, timeouts, caveman levels, pipeline settings
 - `config/harness/clawhip.toml.template` — clawhip config with `$PROJECT_ROOT` substitution
 - `config/harness/agents/*.md` — agent role prompts
+
+## Tiered Escalation Protocol (Phase 2)
+
+Agents escalate via `signals/escalation/$task_id.json`. The orchestrator routes by category:
+
+| Category | Tier | Rationale |
+|----------|------|-----------|
+| `ambiguous_requirement` | 1 (architect) | Technical — architect can infer from codebase |
+| `design_choice` | 1 (architect) | Architecture is the architect's job |
+| `persistent_failure` (retries < 2) | 1 (architect) | Architect may spot root cause |
+| `persistent_failure` (retries >= 2) | 2 (operator) | Circular replanning risk |
+| `security_concern` | 2 (operator) | Human judgment for risk |
+| `cost_approval` | 2 (operator) | Human judgment for spend |
+| `scope_question` | 2 (operator) | Business priority |
+| `permission_request` | 2 (operator) | Human authority |
+
+**Tier 1**: Inject into architect FIFO → poll resolution → high confidence resolves, low promotes to Tier 2.
+**Tier 2**: Notify Discord via `clawhip agent blocked` → pipeline pauses (`escalation_wait`) → operator replies via `!reply`.
+
+State fields: `pre_escalation_stage` and `pre_escalation_agent` store where to resume after resolution. `escalation_started_ts` tracks timeout for re-notify (blocking, 4h interval) and auto-proceed (advisory).
 
 ## Cross-References
 

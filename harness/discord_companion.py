@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from lib.pipeline import PipelineState, ProjectConfig
     from lib.sessions import SessionManager
+    from lib.signals import SignalReader
 
 logger = logging.getLogger("harness.discord")
 
@@ -64,9 +65,11 @@ class DiscordCompanion:
     """Handles inbound Discord commands for the harness."""
 
     def __init__(self, config: "ProjectConfig",
-                 pending_mutations: list[Mutation]):
+                 pending_mutations: list[Mutation],
+                 signal_reader: "SignalReader"):
         self.config = config
         self.pending_mutations = pending_mutations
+        self.signal_reader = signal_reader
         self._project_commands: dict[str, str] = {}
         self._project_handler: Any = None
         self._load_project_commands()
@@ -107,8 +110,14 @@ class DiscordCompanion:
             task_id, response = parse_reply(args)
             if not task_id or not response:
                 return "Usage: !reply <task_id> <response>"
+            try:
+                from lib.signals import _safe_task_id
+                _safe_task_id(task_id)
+            except ValueError:
+                return f"Invalid task_id: {task_id!r}"
+            sr = self.signal_reader
             self.pending_mutations.append(
-                lambda s, sm, t=task_id, r=response: _apply_reply(s, sm, t, r)
+                lambda s, sm, t=task_id, r=response, _sr=sr: _apply_reply(s, sm, t, r, _sr)
             )
             return f"Reply queued for {task_id}."
 
@@ -137,12 +146,12 @@ class DiscordCompanion:
         if agent == "all":
             self.config.caveman.set_all(level)
             return f"All agents set to caveman {level}."
-        if agent not in self.config.agents and agent not in ("all", "status", "reset"):
+        if agent not in self.config.agents:
             return f"Unknown agent '{agent}'. Active: {', '.join(self.config.agents.keys())}"
         self.config.caveman.set_agent(agent, level)
         # NOTE: default-argument binding to avoid late-binding closure bug
         self.pending_mutations.append(
-            lambda s, sm, a=agent, l=level: sm.inject_caveman_update(a, l)
+            lambda s, sm, a=agent, lvl=level: sm.inject_caveman_update(a, lvl)
         )
         return f"{agent} caveman level -> {level}."
 
@@ -160,15 +169,22 @@ class DiscordCompanion:
 
 
 async def _apply_reply(state: "PipelineState", session_mgr: "SessionManager",
-                       task_id: str, response: str) -> None:
-    """Apply an escalation reply — inject into the blocked agent."""
+                       task_id: str, response: str,
+                       signal_reader: "SignalReader | None" = None) -> None:
+    """Apply an escalation reply — inject into the original agent and resume."""
     if state.active_task != task_id:
         logger.warning("Reply for %s but active task is %s", task_id, state.active_task)
         return
-    if state.stage_agent and state.stage_agent in session_mgr.sessions:
-        await session_mgr.send(
-            state.stage_agent,
-            f"[OPERATOR REPLY] {response}"
-        )
-        state.advance(state.stage or "executor", state.stage_agent)
-        logger.info("Operator reply applied for %s", task_id)
+    if state.stage not in ("escalation_wait", "escalation_tier1"):
+        logger.warning("Reply for %s but stage is %s (not escalation)", task_id, state.stage)
+        return
+    original_agent = state.pre_escalation_agent
+    if original_agent and original_agent in session_mgr.sessions:
+        await session_mgr.send(original_agent, f"[OPERATOR REPLY] {response}")
+    elif original_agent:
+        logger.warning("Session %s dead during escalation — reply not delivered", original_agent)
+    state.resume_from_escalation()
+    if signal_reader is not None:
+        signal_reader.clear_escalation(task_id)
+    logger.info("Operator reply applied for %s → resuming %s at %s",
+                task_id, original_agent, state.stage)

@@ -49,14 +49,6 @@ class ArchitectResolution:
 
 
 @dataclass
-class EscalationReply:
-    task_id: str
-    response: str
-    operator_note: str = ""
-    ts: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
-
-
-@dataclass
 class TaskSignal:
     """Inbound task from Discord or bot agents."""
     task_id: str
@@ -80,6 +72,8 @@ class SignalReader:
         """Return the oldest unprocessed task signal, or None."""
         if not task_dir.exists():
             return None
+        # TODO(Phase 3): sort by TaskSignal.priority, not just mtime.
+        # Priority field is parsed but unused — FIFO by arrival time is current behavior.
         files = sorted(task_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
         for f in files:
             if f.name in self._processed:
@@ -87,8 +81,10 @@ class SignalReader:
             try:
                 data = json.loads(f.read_text())
                 self._processed.add(f.name)
-                return TaskSignal(**data)
-            except (json.JSONDecodeError, TypeError) as e:
+                task = TaskSignal(**data)
+                _safe_task_id(task.task_id)
+                return task
+            except (json.JSONDecodeError, TypeError, ValueError) as e:
                 logger.warning("Bad task signal %s: %s", f.name, e)
                 self._processed.add(f.name)
         return None
@@ -137,6 +133,15 @@ class SignalReader:
         except json.JSONDecodeError as e:
             logger.warning("Bad stage signal %s: %s", path, e)
             return None
+
+    def clear_escalation(self, task_id: str) -> None:
+        """Remove processed escalation and resolution signals for a task."""
+        _safe_task_id(task_id)
+        for subdir in ("escalation", "escalation_resolution"):
+            path = self.signal_dir / subdir / f"{task_id}.json"
+            if path.exists():
+                path.unlink()
+                logger.info("Cleared %s signal for %s", subdir, task_id)
 
     def archive(self, task_id: str, archive_dir: Path) -> None:
         """Move processed signal files to archive directory."""
