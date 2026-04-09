@@ -1,3 +1,7 @@
+> **Migration in progress:** This file's content is being migrated to the OMC wiki.
+> See `.omc/wiki/ozy-doc-index.md` for the wiki routing table.
+> **Cutoff: 2026-04-14.** After this date, new entries go in wiki pages only. This file is frozen.
+
 # Spec Drift Log
 
 Deviations from `ozymandias_v3_spec_revised.md` introduced during implementation. This file takes precedence over the spec on any listed item.

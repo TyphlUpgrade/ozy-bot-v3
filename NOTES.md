@@ -1,3 +1,7 @@
+> **Migration in progress:** This file's content is being migrated to the OMC wiki.
+> See `.omc/wiki/ozy-doc-index.md` for the wiki routing table.
+> **Cutoff: 2026-04-14.** After this date, new entries go in wiki pages only. This file is frozen.
+
 # Engineering Notes
 
 Permanent record of open concerns, deferred work, and architectural analyses.
@@ -146,6 +150,20 @@ The plan declares "signal files are the universal bus" (Principle 1) but the arc
 **Solution (2026-04-07):** TTL + startup sweep + max count cap. (1) 48-hour TTL on failed worktrees (timestamp recorded in `orchestrator_state.json`, configurable). (2) Startup sweep removes worktrees past TTL. (3) Max-5 cap — if a new failure exceeds the cap, remove the oldest. Tarball archiving rejected: adds compression logic and its own cleanup problem. After 48h, the git branch still exists — `git log`/`git diff`/`git show` recover all committed state. Uncommitted changes are the only loss, and Executors commit before signaling completion.
 
 **First observed:** 2026-04-07 architectural review of agentic-workflow-v3.md
+
+---
+
+### PERF-1: parse_token_usage re-reads entire log every poll cycle
+**Status:** `open`  
+**Severity:** Medium (performance, not correctness)
+
+`SessionManager.parse_token_usage()` in `harness/lib/sessions.py` reads the entire stream-json log file on every call. Called once per poll cycle per active session. Log grows monotonically throughout session lifetime — O(n) per poll, O(n²) cumulative over a session's life.
+
+**Fix:** Track file byte offset on the `Session` object. On each call, `seek()` to last offset, read only new lines, accumulate into running totals. Reset offset on session restart. ~15 lines of code.
+
+**Workaround:** Current token threshold (100K) triggers rotation relatively early, which caps log size. Only becomes a real problem with high thresholds or long-running sessions.
+
+**First observed:** 2026-04-09 Phase 3 critic audit
 
 ---
 

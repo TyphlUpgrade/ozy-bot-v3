@@ -48,3 +48,28 @@ title: Wiki Log
 - **ADD** `v5-conversational-discord-operator.md` — Natural language inbound routing, agent status posts via `clawhip send`, escalation dialogue; approved design based on Claw Code patterns; 3-piece architecture (agent outbound, NL inbound, escalation dialogue); prerequisites and acceptance criteria
 - **UPDATE** `index.md` — added v5-conversational-discord-operator.md under Decisions subsection
 
+### Ozymandias Documentation Migration (RALPLAN-DR consensus)
+- **ADD** `ozy-doc-index.md` — File-to-page routing table, decision tree, grep fallback docs
+- **ADD** `ozy-drift-log.md` — Active drift log page (Spec/Impl/Why format, 8KB ceiling)
+- **ADD** `ozy-drift-log-eras-02-10.md` — Frozen archive: Phases 02-10 + Post-MVP anti-bias
+- **ADD** `ozy-drift-log-eras-11-14.md` — Frozen archive: Phases 11-14 + Context Blindness + Post-14
+- **ADD** `ozy-drift-log-eras-15-17.md` — Frozen archive: Phases 15-17 + Post-16 + Ops + Quant
+- **ADD** `ozy-drift-log-eras-18.md` — Frozen archive: Post-Phase-17 Bugs + Phase 18 sessions
+- **ADD** `ozy-drift-log-eras-19-21.md` — Frozen archive: Phases 19-21
+- **ADD** `ozy-drift-log-eras-22-23.md` — Frozen archive: Phases 22-23 + post-phase + agentic workflow
+- **ADD** `ozy-open-concerns.md` — CONCERN-2 through CONCERN-5 (Ozy trading concerns)
+- **ADD** `ozy-analyses.md` — 7 Ozy-specific engineering analyses (frozen archive)
+- **ADD** `ozy-completed-phases.md` — Phases 11-18 + Paper Session Fixes (frozen archive)
+- **ADD** `ozy-completed-phases-postmvp.md` — Post-MVP: Orch Extraction + Agentic Workflow
+- **ADD** `ozy-operator-guide.md` — Operational reference migrated from docs/operator-guide.md
+- **UPDATE** `wiki-guide.md` — Added Ozy routing entries, disambiguation update, naming conventions
+- **UPDATE** `index.md` — Added Ozymandias section with 5 primary pages
+
+### Wiki Bridge Pass (RALPLAN-DR consensus)
+- **ADD** `v5-harness-drift-log.md` — 4 seed entries tracking v5 plan deviations (Plan/Impl/Why format)
+- **ADD** `v5-harness-open-concerns.md` — PERF-1 moved from known-bugs + 3 engineering concerns (CONCERN-1 through CONCERN-3)
+- **SLIM** `v5-harness-dev-reference.md` (9.2KB → 5.3KB) — cut SessionManager table, Code Patterns, Diagnostic Flows, Open Bug Summary
+- **SLIM** `wiki-guide.md` (10.2KB → 9.1KB) — added routing + disambiguation, slimmed cross-refs + quick rules
+- **MOVE** PERF-1 from `v5-harness-known-bugs.md` to `v5-harness-open-concerns.md`
+- **UPDATE** `index.md` — added drift log + open concerns under Quality
+

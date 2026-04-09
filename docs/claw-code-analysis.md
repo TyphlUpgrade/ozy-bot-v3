@@ -1,3 +1,5 @@
+> **Deprecated:** One-time historical analysis. Not migrated to wiki.
+
 # Claw-Code Ecosystem — Engineering Analysis
 
 **Date:** 2026-04-07 (revised)

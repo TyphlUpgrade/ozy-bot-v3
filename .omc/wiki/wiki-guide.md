@@ -15,14 +15,27 @@ updated: 2026-04-09
 | How a module/system works | [[v5-harness-architecture]] | Signal reader design, 7-module flow, FIFO queue |
 | Design rationale or trade-off | [[v5-harness-design-decisions]] | Why O_NONBLOCK, why caveman config |
 | Known bug with repro + severity | [[v5-harness-known-bugs]] | Race condition with ID, impact level |
+| Implementation that differs from v5 plan | [[v5-harness-drift-log]] | Plan said clawhip launches sessions, impl uses Python orchestrator |
+| Open engineering concern (not a bug) | [[v5-harness-open-concerns]] | Performance issue, unbounded cache, unvalidated shape |
 | Code review finding or audit issue | [[v5-harness-reviewer-findings]] | Refactoring opportunity, safety concern |
 | Feature proposal or integration plan | [[v5-omc-agent-integration]], [[v5-conversational-discord-operator]] | New capability, architecture change |
 | Phase completion checklist | [[v5-phase3-readiness]] | Sign-off criteria, due diligence |
 | Per-session discovery or experiment | Session Logs (auto-named) | Dead-end investigation, prototype notes |
+| Trading bot spec deviation | [[ozy-drift-log]] | Spec says X, impl does Y |
+| Trading bot engineering concern | [[ozy-open-concerns]] | Entry conditions bypass, prompt inefficiency |
+| Completed Ozy phase narrative | [[ozy-completed-phases]] | Phase 18 summary |
+| Ozy doc navigation | [[ozy-doc-index]] | Where is X documented? |
+
+**Disambiguation — two drift logs coexist:**
+- `DRIFT_LOG.md` (project root) → **deprecated**, see [[ozy-drift-log]] and frozen archives
+- [[ozy-drift-log]] → **trading bot** spec deviations (Spec/Impl/Why)
+- [[v5-harness-drift-log]] → **v5 harness** plan deviations (Plan/Impl/Why)
+- Bugs with repro steps → [[v5-harness-known-bugs]], not the drift log
+- Engineering concerns without repro → [[v5-harness-open-concerns]] (harness) or [[ozy-open-concerns]] (trading bot)
 
 ## Directory Structure
 
-All wiki pages live directly in the wiki root. No subdirectories. This is required because `listPages()` uses a flat `readdirSync` and does not recurse into subdirectories — pages in subfolders are invisible to `wiki_query`, `wiki_lint`, and auto-indexing.
+All wiki pages live in the wiki root — no subdirectories (pages in subfolders are invisible to wiki tooling).
 
 ```text
 .omc/wiki/
@@ -37,6 +50,7 @@ All wiki pages live directly in the wiki root. No subdirectories. This is requir
 ```
 
 **Naming conventions:**
+- Ozymandias pages: `ozy-{topic}.md`
 - Harness core pages: `v5-harness-{topic}.md`
 - Feature proposals: `v5-{feature-name}.md`
 - Phase readiness: `v5-phase{N}-readiness.md`
@@ -44,11 +58,9 @@ All wiki pages live directly in the wiki root. No subdirectories. This is requir
 - Archive pages: `{original-page-name}-archive-YYYY.md`
 - Operation log: `wiki-log.md` (not `log.md` — that name is reserved by the wiki plugin)
 
-Do NOT create subdirectories. Any page placed in a subfolder will be invisible to all wiki tooling.
-
 ## Page Size Policy
 
-File size is the only observable proxy for context ingestion cost. Per-category ceilings enforced via `wiki_lint` (or manual `wc -c` until per-category lint ships).
+Per-category byte ceilings (enforced via `wiki_lint` or manual `wc -c`):
 
 | WikiCategory | Ceiling | Rationale |
 |---|---|---|
@@ -65,16 +77,12 @@ File size is the only observable proxy for context ingestion cost. Per-category 
 
 When a page exceeds its ceiling, archive resolved/completed items first (cheapest intervention). If still over, split by topic coherence. See [[wiki-operations]] for archive rotation and split procedures.
 
-**Phase 3+:** Add `section` parameter to `wiki_read` with auto-generated section indexes at write time — structurally bounds ingestion cost regardless of file size.
-
 ## Freshness Policy
 
-Stale pages waste agent context on outdated information — worse than large pages with correct information.
-
-- **`updated:` field is mandatory.** Every edit must bump the `updated:` date in frontmatter.
-- **30-day staleness flag:** Pages with `updated:` >30 days old are flagged for review. The author (or any contributor) either confirms the content is still current (bump `updated:`) or revises it.
-- **Enforcement:** `wiki_lint` staleness check (existing `stale` lint code). Manual audit until per-page staleness is automated.
-- **Exemptions:** Archive pages (`reference` category with `archive` tag) and session logs are exempt — they are historical records.
+- **`updated:` field is mandatory.** Every edit must bump the date.
+- **30-day staleness flag:** Pages >30 days old flagged for review (confirm or revise).
+- **Enforcement:** `wiki_lint` staleness check. Manual audit until automated.
+- **Exemptions:** Archive pages and session logs (historical records).
 
 ## Archive Rotation
 
@@ -130,21 +138,9 @@ Tags are free-form strings (not enum-constrained like categories). They drive `w
 
 ## Cross-References: When to Use Links
 
-**Use `[[page-name]]` when:**
-- You mention another wiki page by name — readers may want to navigate
-- You're establishing a relationship (depends on, conflicts with, extends)
-- You reference a concept documented elsewhere
+**Use `[[page-name]]` when** mentioning another wiki page, establishing a relationship, or referencing a documented concept.
 
-**Example:**
-```
-This design extends [[v5-harness-architecture]] by adding priority queuing
-to the FIFO intake. See [[v5-phase3-readiness]] for sign-off criteria.
-```
-
-**Do NOT use links for:**
-- File paths (use `file:line` format instead)
-- Commit hashes (use `git log` instead)
-- Code snippet references (inline code or `file:line`)
+**Do NOT link:** file paths (use `file:line`), commit hashes (use `git log`), or code snippets.
 
 ## When to Split a Page
 
@@ -162,18 +158,6 @@ See [[wiki-operations]] for full split procedures and naming conventions. Key po
 - **Exact code snippets** → Reference `file:line` instead (stays fresh)
 - **Individual method signatures** → Use LSP hover or code comments
 
-Example of "wrong way":
-```
-The `_process_signal()` method in conductor.py line 42 checks
-if signal.status == "READY" and then...
-```
-
-Right way:
-```
-See `conductor.py:42` for signal intake logic. The method validates
-status before processing.
-```
-
 ## Relationship to Other Docs
 
 | Document | Purpose | When to Write |
@@ -183,16 +167,20 @@ status before processing.
 | `DRIFT_LOG.md` | Spec deviations (signatures, edge cases) | When implementation differs from spec in non-obvious ways |
 | `plans/` | Approved designs (before building) | For non-trivial architectural work, before coding |
 | `.omc/wiki/` | Living knowledge base (now+future) | For ongoing architecture, roadmap, quality tracking, progress |
+| `.omc/wiki/v5-harness-drift-log.md` | V5 plan deviations (Plan/Impl/Why) | When harness implementation differs from `plans/2026-04-08-v5-harness-architecture.md` |
+| `.omc/wiki/v5-harness-open-concerns.md` | Engineering concerns (not bugs) | Performance issues, unvalidated assumptions, unbounded growth |
+| `.omc/wiki/ozy-drift-log.md` | Ozy spec deviations (Spec/Impl/Why) | When trading bot implementation differs from spec |
+| `.omc/wiki/ozy-open-concerns.md` | Ozy trading concerns | Entry condition gaps, prompt inefficiency, sizing issues |
 
 ## Quick Rules
 
-1. **One concern per page** — Keep pages focused. Link liberally.
-2. **Frontmatter required** — Use the template above. Category must be a valid `WikiCategory` enum value.
-3. **Link as you write** — When you mention another wiki topic, add `[[page-name]]`.
-4. **Reference files, not snippets** — Use `file:line`, not copy-pasted code.
-5. **Update the timestamp** — Change `updated:` field when you edit.
-6. **Index is auto-built** — Don't manually edit `index.md` for content. Structure it via frontmatter.
-7. **Flat root only** — Never create subdirectories. All pages go directly in `.omc/wiki/`.
-8. **Lint alignment** — `wiki_lint` enforces a byte-based page size ceiling (default 10KB via `config.maxPageSize`). Per-category byte overrides (8KB for `debugging`/`decision`, 10KB for `architecture`/`pattern`/`environment`/`convention`, 12KB for `reference`) and `archive-candidate` detection are tracked as future `wiki_lint` enhancements.
-9. **Link, don't duplicate.** When the same information exists in multiple pages, designate one as the canonical source and have the others link to it via `[[page-name]]`. If you find duplicated content, remove the copy and add a cross-reference. The canonical source is the page whose primary topic matches the information.
-10. **Agents: prefer `wiki_query`** for targeted lookup. Use `wiki_read` only when you need full page context of one topic.
+1. **One concern per page** — focused pages, link liberally.
+2. **Frontmatter required** — valid `WikiCategory` enum, template above.
+3. **Link as you write** — mention a wiki topic → add `[[page-name]]`.
+4. **Reference files, not snippets** — `file:line`, not copy-pasted code.
+5. **Update `updated:` on every edit.**
+6. **Index is auto-built** — don't manually edit `index.md`.
+7. **Flat root only** — no subdirectories in `.omc/wiki/`.
+8. **Link, don't duplicate** — one canonical source, others cross-reference via `[[page-name]]`.
+9. **Agents: prefer `wiki_query`** — use `wiki_read` only for full page context.
+10. **Check drift log** after implementation — file deviations from v5 plan in [[v5-harness-drift-log]].

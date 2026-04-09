@@ -16,62 +16,57 @@ Central timeline mapping v5 harness features to phases with dependencies and sta
 |-------|------|--------|-----------------|---|
 | 1 | Foundation | COMPLETE | Async orchestrator, FIFO sessions, stage pipeline | 86 tests |
 | 2 | Escalation | COMPLETE | Tiered escalation (Tier 1 architect, Tier 2 operator), confidence gating, timeouts | 150 tests |
-| 2.5 | Stall Triad | COMPLETE | BUG-015/016/017 fixes, DiscordCompanion tests | Prerequisite for Phase 3 |
-| 3 | Intelligence + Disputes | NOT STARTED | `claude.reformulate()`, `claude.summarize()`, session rotation, frozen-pipeline mitigation | Phase 2.5 prerequisite |
-| 4 | Wiki + Documentation | NOT STARTED | Wiki stage integration, document-task improvements | Phase 3 prerequisite |
+| 2.5 | Stall Triad | COMPLETE | BUG-015/016/017 fixes, DiscordCompanion tests (43 tests) | Prerequisite for Phase 3 |
+| 3 | Intelligence + Disputes | COMPLETE | `claude.reformulate()`, `claude.summarize()`, session rotation, frozen-pipeline mitigation | 256 tests (full suite) |
+| 4 | Wiki + Documentation | COMPLETE | Wiki stage integration, document-task improvements | 272 tests (full suite) |
 | 5 | Bot Pipeline + Extensibility | NOT STARTED | Configurable pipelines, trading bot integration, sessions.toml | Phase 4 prerequisite |
 
 ---
 
-## Phase 2.5: Stall Triad — COMPLETE
+## Phase 2.5: Stall Triad — COMPLETE (2026-04-09)
 
-All stall triad bugs fixed + P0 Discord tests added. See [[v5-harness-roadmap-archive-2026]] for full details.
+All three stall triad bugs fixed and P0 Discord tests added. See [[v5-harness-known-bugs-archive-2026]] for fix details.
 
----
+| Bug | Fix Summary |
+|-----|-------------|
+| BUG-015 | Timeout-based force-resume on missing escalation signal |
+| BUG-016 | `escalation_tier1` crash recovery in `lifecycle.reconcile()` |
+| BUG-017 | `tier1_timeout` config + auto-promote to Tier 2 |
 
-## Phase 3: Intelligence + Disputes
-
-Deliver Claude-driven dispute mitigation and context preservation across stage boundaries. **Depends:** Phase 2.5 complete.
-
-### Features
-
-| Feature | Module | Purpose | Effort |
-|---------|--------|---------|--------|
-| `claude.reformulate()` | `claude.py` | Reviewer rejects → `reformulate()` reframes for executor. Prevents circular replanning. | ~40 lines |
-| `claude.summarize()` | `claude.py` | Context transfer between stages. Compresses 500-line diff to "changed 3 files, added retry logic". | ~40 lines |
-| Session rotation | `sessions.py`, `orchestrator.py` | Track token usage from stream-json output. Restart session on threshold, re-inject context. | ~60 lines |
-| Pipeline-frozen mitigation | `orchestrator.py` | Escalated task blocks progress. Shelve it, process next from queue. Requires task queue refactor. | ~80 lines |
-| Stage wall-clock timeout (BUG-011) | `orchestrator.py` | Add `max_stage_minutes` per stage in config. Track `stage_started_ts`. Auto-kill session if exceeded. | ~50 lines |
-
-### Additional Improvements
-
-- **Priority sort TODO** (Phase 3 gap): `next_task()` line 75. Current: FIFO by mtime. Future: configurable sort (priority label, age, etc.)
-- **Cache cleanup on resolution**: Add `_escalation_cache.pop(task_id, None)` to `clear_active()` — prevents stale cache on task abandonment
-- **Signal reader type hint**: Fix `_apply_reply(signal_reader: SignalReader)` — remove `None` default
-
-### Test Coverage
-
-| Scenario | Status | Lines |
-|----------|--------|-------|
-| `reformulate()` with low-confidence rejection | New | ~20 |
-| `summarize()` with large diff | New | ~25 |
-| Session restart on token threshold | New | ~30 |
-| Shelve + dequeue on escalation | New | ~40 |
-| Stage timeout boundary (4h, 10s window) | New | ~20 |
-
-**Entry Criteria:** Phase 2.5 fixes + P0 Discord tests complete. All Phase 2 tests passing.
+**Tests added:** 43 (DiscordCompanion dispatch + stall triad scenarios). All passing.
 
 ---
 
-## Phase 4: Wiki + Documentation
+## Phase 3: Intelligence + Disputes — COMPLETE (2026-04-09)
 
-Post-merge documentation integration. **Depends:** Phase 3 complete.
+All features implemented. 256 tests passing (full suite).
 
-| Feature | Scope | Purpose |
-|---------|-------|---------|
-| Wiki stage integration | `orchestrator.py`, `do_wiki()` | After successful merge, call `claude.document_task()` with task context |
-| Document-task improvements | `claude.py` | Accept: task description, plan summary, diff stat, review verdict. Output: formatted wiki entry via `/wiki` skill. |
-| OMC hook dependency | `claude.py` | `/wiki` skill requires OMC hooks. Fail gracefully if hooks don't fire (warn, don't block pipeline). |
+| Feature | Module | Status |
+|---------|--------|--------|
+| `claude.reformulate()` | `claude.py` | Done — reviewer→executor dispute resolution |
+| `claude.summarize()` | `claude.py` | Done — context transfer between stages |
+| Session rotation | `sessions.py`, `orchestrator.py` | Done — `token_rotation_threshold` config, `needs_rotation()` check |
+| Pipeline-frozen mitigation | `orchestrator.py`, `pipeline.py` | Done — `shelve()`/`unshelve()` LIFO queue, operator reply injection, lifecycle reconciliation |
+| Stage wall-clock timeout (BUG-011) | `orchestrator.py` | Done — fixed in Phase 2 fix batch |
+
+### Residual Items (deferred)
+
+- **Priority sort TODO**: `next_task()` line 75. Current: FIFO by mtime. Future: configurable sort.
+- **BUG-019**: `should_renotify` window coupling to poll_interval — low severity, defer to Phase 4+.
+
+---
+
+## Phase 4: Wiki + Documentation — COMPLETE (2026-04-09)
+
+Real data now flows to wiki stage. 272 tests passing (full suite).
+
+| Feature | Module | Status |
+|---------|--------|--------|
+| Wiki stage data collection | `pipeline.py`, `orchestrator.py` | Done — plan_summary, diff_stat, review_verdict accumulated on PipelineState |
+| Diff stat capture | `orchestrator.py:do_merge` | Done — `git diff --stat HEAD~1` after successful merge |
+| Wiki fallbacks | `orchestrator.py:do_wiki` | Done — sensible defaults when data is None |
+| wiki_failed event | `orchestrator.py:do_wiki` | Done — event_log records failures for telemetry |
+| OMC hook graceful degradation | `claude.py:document_task` | Pre-existing — warn and continue on failure |
 
 ---
 
@@ -131,14 +126,14 @@ Phase 1 (DONE)
     ↓
 Phase 2 (DONE)
     ↓
-Phase 2.5 (Fix stall triad + Discord tests) ← BLOCKS Phase 3
+Phase 2.5 (DONE — stall triad + Discord tests)
     ↓
-Phase 3 (reformulate, summarize, session rotation, frozen-pipeline)
+Phase 3 (DONE — reformulate, summarize, session rotation, frozen-pipeline)
     ↓
     ├─→ OMC agent integration Tier 1-2 (parallel, feeds into Phase 4)
     ├─→ Discord conversational operator Piece 1-2 (parallel, independent)
     ↓
-Phase 4 (Wiki integration, document-task)
+Phase 4 (DONE — Wiki integration, document-task)
     ↓
     └─→ Discord operator Piece 3 (uses Pieces 1-2)
     ↓
@@ -149,9 +144,10 @@ Phase 5 (Configurable pipelines, bot integration, extensibility)
 
 ## Open Questions
 
-1. **BUG-019 fix timing?** `should_renotify` window coupling to poll_interval is low severity — defer to Phase 3 or Phase 4?
-2. **Analyst trigger criteria?** "Complex + vague tasks" is heuristic. Define concrete thresholds in Phase 3 design review.
-3. **Verifier mandatory or opt-in?** Phase 3 spec needed to decide if pre-merge gate is standard or per-task.
+1. ~~**Phase 2.5 ownership?**~~ Resolved — stall triad fixed, 43 Discord tests added (2026-04-09).
+2. **BUG-019 fix timing?** `should_renotify` window coupling to poll_interval is low severity — defer to Phase 4+.
+3. **Analyst trigger criteria?** "Complex + vague tasks" is heuristic. Define concrete thresholds in Phase 4 design review.
+4. **Verifier mandatory or opt-in?** Decide if pre-merge gate is standard or per-task in Phase 4.
 
 ---
 
@@ -159,7 +155,6 @@ Phase 5 (Configurable pipelines, bot integration, extensibility)
 
 - [[v5-harness-architecture]] — Architecture design, module structure, orchestrator logic
 - [[v5-phase3-readiness]] — Readiness assessment, full blocker analysis, test coverage gaps
-- [[v5-harness-known-bugs]] — Bug tracking (24 total, 9 open, 15 resolved)
-- [[v5-harness-roadmap-archive-2026]] — Archived Phase 2.5 (Stall Triad) details
+- [[v5-harness-known-bugs]] — Bug tracking (21 total, 9 open, 12 resolved)
 - [[v5-omc-agent-integration]] — Tier 1-3 agent folding and ad-hoc delegation
 - [[v5-conversational-discord-operator]] — Three-piece Discord operator design

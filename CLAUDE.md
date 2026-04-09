@@ -160,14 +160,16 @@ See `COMPLETED_PHASES.md`. When completing a phase or named feature session, doc
 
 ## Reference Documents
 
-Six documents together form the complete knowledge base. Each has a distinct purpose — read the right one for the job.
+Nine sources together form the complete knowledge base. Each has a distinct purpose — read the right one for the job.
 
-**Convention:** All standalone documentation files go in `docs/`. Root-level docs (CLAUDE.md,
-COMPLETED_PHASES.md, DRIFT_LOG.md, NOTES.md) are the exception — they exist at root for
-historical reasons and quick discoverability. New reference documents, architecture guides,
-operational docs, and feature-specific writeups go in `docs/`.
+**Convention:** Standalone documentation files go in `docs/`. Root-level docs (CLAUDE.md,
+COMPLETED_PHASES.md, DRIFT_LOG.md, NOTES.md) exist at root for historical reasons.
+`.omc/wiki/` is the persistent knowledge base for content that benefits from structured
+navigation, tagging, and cross-session search — see `ozy-doc-index.md` for Ozy routing.
 
 ### `COMPLETED_PHASES.md` — What was built and why
+> **Wiki migration:** Content migrated to `.omc/wiki/ozy-completed-phases.md` and `ozy-completed-phases-postmvp.md`. Cutoff 2026-04-14 — new entries go in wiki only.
+
 Phase-level narrative history. Answers: *"What did this phase introduce? What are the key methods, fields, and behaviors it added? What constraints must I respect when touching this area?"* One entry per phase or named feature session. Written for someone who is about to work in that area and needs a mental model of what exists and why.
 
 - **Read before:** modifying a module built in a post-MVP phase, or when you need to understand the intent behind an existing feature.
@@ -175,6 +177,8 @@ Phase-level narrative history. Answers: *"What did this phase introduce? What ar
 - **Does not belong here:** individual method signatures, interface deviations, or per-change rationale — those go in DRIFT_LOG.
 
 ### `DRIFT_LOG.md` — How specific changes deviate from the spec
+> **Wiki migration:** Content migrated to `.omc/wiki/ozy-drift-log.md` (active) and 6 frozen archive pages. Cutoff 2026-04-14 — new entries go in wiki only.
+
 Change-level technical record. Answers: *"How does this method's signature or behavior differ from what the spec said? What is the exact interface contract? What edge case was decided during implementation?"* One entry per non-obvious deviation, keyed to a file and spec section. Written for someone debugging unexpected behavior or verifying a method's contract.
 
 - **Read before:** modifying or debugging any method whose behavior might differ from a naive spec reading — especially signatures, return types, and behavioral edge cases.
@@ -182,6 +186,8 @@ Change-level technical record. Answers: *"How does this method's signature or be
 - **Does not belong here:** phase narratives, session summaries, or anything a reader would immediately understand from the code alone. Signal-to-noise ratio is the drift log's value.
 
 ### `NOTES.md` — Open concerns and engineering analyses
+> **Wiki migration:** Ozy concerns migrated to `.omc/wiki/ozy-open-concerns.md`. Analyses migrated to `.omc/wiki/ozy-analyses.md`. Harness concerns in `.omc/wiki/v5-harness-open-concerns.md`. Cutoff 2026-04-14.
+
 Living register of open problems and the reasoning behind past architectural decisions. Answers: *"Is there a known issue in this area? Has this problem been analyzed before?"*
 
 - **Read before:** starting work on any component with an open concern, or planning a new architectural change.
@@ -195,8 +201,17 @@ Design rationale for non-trivial architectural work. Answers: *"What were the ke
 - **Update when:** plan mode produces an approved design. Decision rule: small fixes (≤2 files, self-evident) → DRIFT_LOG only; formal phases → `phases/` spec file; everything in between → `plans/` file.
 - **Does not belong here:** post-implementation notes, resolved bugs, or anything already captured by commit messages and DRIFT_LOG.
 
+### `.omc/wiki/` — Persistent knowledge base
+Cross-session documentation for both Ozymandias (trading bot) and v5 harness (dev pipeline). For Ozy trading bot work, navigate via `ozy-doc-index.md`. For v5 harness work, navigate via `index.md`. After **2026-04-14**, new Ozy drift log, completed phase, and concern entries go to wiki only — root files are frozen.
+
+### `phases/` — Immutable phase specification files
+29 files (phases 01-28 + `context_compression_historical.md`). The original build specs for each phase. Never modify — these are historical records. Read when you need to understand what a phase was *supposed* to build; consult DRIFT_LOG for how it actually deviated.
+
+### `ozymandias_v3_spec_revised.md` — Foundational system specification
+The original system design. Consult to resolve ambiguities about intended behavior. DRIFT_LOG.md takes precedence where it contradicts the spec. Never modify.
+
 ### `docs/agentic-workflow.md` — Development pipeline architecture and operations
-Reference for the v4 agentic development workflow (phases 22-28). Covers: architecture, 7 agent roles, signal file conventions, Discord commands, conductor judgment calls, task flow, shutdown protocol, and implementation history. This is development infrastructure — it builds and maintains the trading bot but is not part of the bot itself.
+Reference for the v4 agentic development workflow (phases 22-28). Covers: architecture, 7 agent roles, signal file conventions, Discord commands, conductor judgment calls, task flow, shutdown protocol, and implementation history. This is development infrastructure — it builds and maintains the trading bot but is not part of the bot itself. (Companion PDF: `docs/Multilayer agentic workflow spec.pdf`.)
 
 - **Read before:** modifying any file in `tools/`, `config/agent_roles/`, or `clawhip.toml`; debugging signal file routing; understanding how agents interact with the trading bot.
 - **Update when:** a new role is added, signal conventions change, or the conductor workflow is modified.

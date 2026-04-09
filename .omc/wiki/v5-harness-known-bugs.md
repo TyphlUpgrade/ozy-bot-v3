@@ -10,7 +10,7 @@ updated: 2026-04-09
 
 Bugs found during review that are deferred or represent latent risks. Tracked here for future phases.
 
-**8 open bugs tracked** — 16 resolved (see [[v5-harness-known-bugs-archive-2026]])
+**8 open bugs tracked** — 22 resolved (see [[v5-harness-known-bugs-archive-2026]])
 
 ## Open (Deferred)
 
@@ -23,6 +23,7 @@ Bugs found during review that are deferred or represent latent risks. Tracked he
 **Severity**: Low | **File**: `pipeline.py` | **Phase**: 2
 If a newer harness writes extra fields to `state.json`, an older harness catches `TypeError` and discards the entire state ("starting fresh"). A version downgrade silently loses the active task.
 **Mitigation**: Pop unknown keys before `cls(**data)` construction. Keep `TypeError` catch only for genuine type mismatches.
+**Partial fix (Phase 3)**: `load()` now pops unknown keys before `cls(**data)` construction. Version downgrades no longer crash — they silently drop unknown fields. Full fix (version negotiation) remains deferred.
 
 ### BUG-003: Frontmatter stripping is fragile
 **Severity**: Low | **File**: `sessions.py` | **Phase**: 2
@@ -62,6 +63,39 @@ Found by architect + critic + code-reviewer agents after Phase 2 escalation impl
 ### ~~BUG-022: restart() re-launches session on stage timeout — wasteful~~ RESOLVED
 **Severity**: Medium | **File**: `orchestrator.py`, `sessions.py` | **Phase**: 3
 **Fix**: Extracted `kill()` method on `SessionManager` — teardown without relaunch. `restart()` now calls `kill()` + `launch()`. Stage timeout path uses `kill()` instead of `restart()`.
+
+## Phase 3 Pre-Implementation Bug Fixes (2026-04-09)
+
+Found by code-reviewer, debugger, critic, and architect agents during Phase 3 preparation. All 6 fixed and tested (256 tests passing).
+
+### ~~BUG-023: FD leak on session overwrite~~ RESOLVED
+**Severity**: Medium | **File**: `sessions.py:134-143` | **Phase**: 3
+`launch()` overwrote `sessions[name]` dict entry without closing old fd, orphaning the file descriptor. On repeated `restart()` calls, leaked fds accumulate.
+**Fix**: Auto-close existing session (fd + FIFO) before creating new one in `launch()`.
+
+### ~~BUG-024: Stale stage signal causes spurious advancement~~ RESOLVED
+**Severity**: High | **File**: `signals.py:137-152`, `orchestrator.py` | **Phase**: 3
+When a task enters escalation, the stage completion signal (e.g. `completion-{task_id}.json`) persists. After shelve→unshelve→resume, the orchestrator re-reads the stale signal and spuriously advances the pipeline.
+**Fix**: Added `clear_stage_signal()` to `SignalReader`. Orchestrator calls it on escalation entry to remove stale signals.
+
+### ~~BUG-025: reconcile() ignores shelved tasks~~ RESOLVED
+**Severity**: Medium | **File**: `lifecycle.py:104-117` | **Phase**: 3
+Crash recovery (`reconcile()`) only checked active task state. Shelved tasks stuck in `escalation_wait` or `escalation_tier1` were silently ignored — no re-notification to Discord.
+**Fix**: Added shelved task iteration in `reconcile()`. Both `escalation_wait` and `escalation_tier1` are handled. Tier1 with missing signal promotes to `escalation_wait`.
+
+### ~~BUG-026: Lost operator reply for shelved tasks~~ RESOLVED
+**Severity**: High | **File**: `discord_companion.py`, `orchestrator.py` | **Phase**: 3
+`_apply_reply` only checked active task. If an operator replied to a shelved task's escalation, the reply was silently dropped.
+**Fix**: Rewrote `_apply_reply` to search shelved tasks. Resolves escalation in-place, stores `pending_operator_reply` on the shelved dict. Reply injected when task is unshelved in `do_wiki()`.
+
+### ~~BUG-027: do_wiki reply injection timing concern~~ RESOLVED (documented)
+**Severity**: Low | **File**: `orchestrator.py` | **Phase**: 3
+After unshelving a task with `pending_operator_reply`, the executor session may belong to the just-completed task, not the unshelved one. Reply goes to correct agent name but stale context.
+**Fix**: Added warning log when session unavailable. Documented timing concern with inline comment. Not a crash path — edge case with graceful degradation.
+
+### ~~PERF-1: parse_token_usage O(n) re-read~~ MOVED
+**Severity**: Low (Performance) | **File**: `sessions.py:266-296` | **Phase**: 3
+Moved to [[v5-harness-open-concerns]] — this is a performance concern, not a bug.
 
 ## Cross-References
 

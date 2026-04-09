@@ -8,7 +8,7 @@ updated: 2026-04-09
 
 # v5 Harness Developer Reference
 
-Quick-reference for agents and developers working in the v5 harness. Covers extension points, key interfaces, code patterns, and diagnostic flows. For architecture overview see [[v5-harness-architecture]]; for bugs see [[v5-harness-known-bugs]].
+Quick-reference for agents and developers working in the v5 harness. Covers extension points and key interfaces. For architecture overview see [[v5-harness-architecture]]; for bugs see [[v5-harness-known-bugs]].
 
 ---
 
@@ -66,8 +66,9 @@ Dataclass — the mutable state of the pipeline. Persisted to JSON via `save()`/
 | `retry_count` | `int` | orchestrator | `clear_active()` |
 | `heartbeat_ts` | `str \| None` | `heartbeat()` | — |
 | `shutdown_ts` | `str \| None` | orchestrator (graceful shutdown) | — |
+| `shelved_tasks` | `list[dict]` | `shelve()` | `unshelve()`, `clear_active()` does NOT clear |
 
-**Key methods**: `activate(task)`, `advance(stage, agent=None)`, `clear_active()`, `resume_from_escalation()`, `save(path)`, `load(path)`, `heartbeat()`
+**Key methods**: `activate(task)`, `advance(stage, agent=None)`, `clear_active()`, `resume_from_escalation()`, `shelve()`, `unshelve()`, `save(path)`, `load(path)`, `heartbeat()`
 
 ### ProjectConfig TOML keys (`[pipeline]` section)
 
@@ -80,6 +81,7 @@ Dataclass — the mutable state of the pipeline. Persisted to JSON via `save()`/
 | `test_command` | `test_command` | `"python3 -m pytest tests/ -x"` |
 | `claude_binary` | `claude_binary` | `"claude"` |
 | `{stage}_max_minutes` | `max_stage_minutes[stage]` | classify=10, architect=60, executor=120, reviewer=60, merge=15, wiki=15 |
+| `token_rotation_threshold` | `token_rotation_threshold` | `100000` |
 
 ### SignalReader (`harness/lib/signals.py`)
 
@@ -94,76 +96,6 @@ Dataclass — the mutable state of the pipeline. Persisted to JSON via `save()`/
 | `archive(task_id, archive_dir)` | — | moves signal files to `archive_dir/` |
 
 All reader methods return `None` on missing file or malformed JSON (never crash).
-
-### SessionManager (`harness/lib/sessions.py`)
-
-| Method | Description |
-|--------|-------------|
-| `launch(name, agent_def)` | Start tmux session + open FIFO for writing |
-| `send(name, message)` | Write message to agent's FIFO |
-| `restart(name)` | Kill tmux session + relaunch (see BUG-022) |
-| `inject_caveman_update(name, level)` | Send caveman level change to agent |
-| `shutdown()` | Close all FIFOs (EOF), wait 5s, force-kill remaining tmux sessions |
-
-Sessions use `O_NONBLOCK` FIFO pipes. 0.5s sleep after tmux launch before FIFO open (BUG-006 race window).
-
----
-
-## Code Patterns
-
-**Single asyncio loop** — All harness code runs in one event loop. No threading. Mutable state passed by reference is safe because there's no concurrent mutation.
-
-**Lookup tables over if/elif** — Stage dispatch uses `match/case`. Valid stages, caveman levels, and timeouts are `frozenset` or `dict` constants. To add a new value, add one entry to one table.
-
-**Module-level cache** — `_escalation_cache: dict[str, EscalationRequest]` in `orchestrator.py` avoids TOCTOU re-reads. Must be popped before every `clear_active()` call (9 sites as of Phase 2).
-
-**Late init** — Modules that depend on runtime state (like `_risk_manager`) are initialized in `_startup()`, not `__init__()`. Tests can reassign without stale-reference bugs.
-
-**Atomic file writes** — `write_signal()` writes to a temp file then renames. Prevents partial-read corruption on crash.
-
----
-
-## Diagnostic Flows
-
-**Pipeline stuck (no progress):**
-1. Check `state.stage` — is it `escalation_wait` or `escalation_tier1`?
-2. Check `escalation_started_ts` — is it None? (BUG-015/017 fix: now logs warning)
-3. Check signal files — was the escalation file deleted? (force-resume after `2 * escalation_timeout`)
-4. Check `stage_started_ts` — has `max_stage_minutes` been exceeded? (stage timeout should fire)
-
-**Session won't launch:**
-1. FIFO race (BUG-006) — tmux slow to start, `os.open(O_NONBLOCK)` gets `ENXIO`
-2. Check tmux: `tmux list-sessions` — is the session alive?
-3. Check agent role file exists in `config/harness/agents/`
-
-**Escalation stalled:**
-1. Tier 1: `tier1_timeout` (default 30min) auto-promotes to Tier 2
-2. Tier 2: `escalation_timeout` (default 4h) auto-proceeds for advisory, re-notifies for blocking
-3. Missing signal: force-resumes after `2 * escalation_timeout`
-4. Crash during tier1: `lifecycle.reconcile()` re-sends to architect or promotes
-
-**Test failures in merge stage:**
-1. `do_merge()` runs `config.test_command` (configurable via TOML)
-2. Total suite timeout: `asyncio.wait_for(..., timeout=180)`
-3. On failure: `git revert --no-edit -m 1 HEAD`, task cleared
-
----
-
-## Open Bug Summary
-
-8 open bugs tracked in [[v5-harness-known-bugs]]. Key patterns by area:
-
-| Area | Bugs | Pattern |
-|------|------|---------|
-| Signals | BUG-001, BUG-005 | Unbounded state (`_processed` set), missing path validation |
-| Sessions | BUG-006, BUG-007 | FIFO race window, clawhip bypass |
-| Pipeline | BUG-002, BUG-008 | State deserialization fragility, hardcoded stage graph |
-| Templates | BUG-003 | Fragile frontmatter stripping regex |
-| Tests | BUG-012 | AsyncMock GC warning (cosmetic) |
-
-All open bugs are Low/Info severity. No blocking issues remain.
-
-16 resolved bugs archived in [[v5-harness-known-bugs-archive-2026]].
 
 ---
 
