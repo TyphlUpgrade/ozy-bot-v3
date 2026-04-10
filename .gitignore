@@ -18,6 +18,8 @@ build/
 harness_events.jsonl
 
 # Transient/generated
+clawhip.toml
+.run/
 .worktrees/
 claw-code-main/
 debug/

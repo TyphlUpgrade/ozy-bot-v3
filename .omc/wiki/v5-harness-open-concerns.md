@@ -52,6 +52,17 @@ Engineering concerns that are not bugs (no repro steps, no crash) but represent 
 
 ---
 
+### CONCERN-4: Clawhip GitHub API rate limit (no auth)
+**Status:** mitigated (git monitor disabled) | **Severity:** Medium | **First observed:** 2026-04-09 | **Area:** `config/harness/clawhip.toml.template`
+
+Clawhip git monitor polls GitHub API every 5s = 720 req/hr. Unauthenticated limit = 60 req/hr. Burns through in ~5 minutes → 403 Forbidden spam in logs. No paid GitHub plan available.
+
+**Current mitigation:** Git monitor commented out in clawhip template. Local git commit routing (`event = "git.commit"`) still works — subtask completion tracked through local commits. Only GitHub issue/PR polling disabled.
+
+**Design intent:** Two-tier model. Local git commits = subtask completion (already working). GitHub API = finalized task detection (push/merge). Re-enable `[[monitors.git.repos]]` when GitHub PAT available (free account = 5,000 req/hr). Store in `.env` as `GITHUB_TOKEN`, set `github_token_env` in `[monitors]`.
+
+---
+
 ## Cross-References
 
 - [[v5-harness-known-bugs]] — bugs with repro steps (different from concerns)

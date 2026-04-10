@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from harness.discord_companion import (
+    DIALOGUE_CONFIRM_WORDS,
     DiscordCompanion,
+    _CONTROL_PATTERN,
+    _apply_pause,
+    _do_update,
     parse_caveman,
     parse_reply,
     parse_tell,
 )
-from harness.lib.claude import classify_target
+from harness.lib.claude import classify_intent, classify_resolution, classify_target
 from harness.lib.pipeline import PipelineState
 from harness.lib.signals import TaskSignal
 
@@ -21,7 +26,8 @@ from harness.lib.signals import TaskSignal
 # ---------- Helpers ----------
 
 
-def _make_companion(config, mutations=None, active_agents_fn=None):
+def _make_companion(config, mutations=None, active_agents_fn=None, pipeline_stage_fn=None,
+                    pipeline_paused_fn=None, shutdown_event=None):
     sr = MagicMock()
     sr.clear_escalation = MagicMock()
     return DiscordCompanion(
@@ -29,6 +35,9 @@ def _make_companion(config, mutations=None, active_agents_fn=None):
         pending_mutations=mutations if mutations is not None else [],
         signal_reader=sr,
         active_agents_fn=active_agents_fn,
+        pipeline_stage_fn=pipeline_stage_fn,
+        pipeline_paused_fn=pipeline_paused_fn,
+        shutdown_event=shutdown_event,
     )
 
 
@@ -445,7 +454,8 @@ class TestHandleRawMessage:
     async def test_nl_message_routes_to_single_agent(self, config):
         mutations = []
         dc = _make_companion(config, mutations, active_agents_fn=lambda: ["executor"])
-        with patch("lib.claude.classify_target") as mock_ct:
+        with patch("lib.claude.classify_intent", new_callable=AsyncMock, return_value="feedback"), \
+             patch("lib.claude.classify_target") as mock_ct:
             resp = await dc.handle_raw_message("focus on error handling")
         assert resp == "Message routed to executor."
         assert len(mutations) == 1
@@ -455,7 +465,8 @@ class TestHandleRawMessage:
     async def test_nl_message_strips_whitespace(self, config):
         mutations = []
         dc = _make_companion(config, mutations, active_agents_fn=lambda: ["executor"])
-        resp = await dc.handle_raw_message("  focus on tests  ")
+        with patch("lib.claude.classify_intent", new_callable=AsyncMock, return_value="feedback"):
+            resp = await dc.handle_raw_message("  focus on tests  ")
         assert resp == "Message routed to executor."
 
     @pytest.mark.asyncio
@@ -618,3 +629,711 @@ class TestRunClaudeModelParam:
             await _run_claude("sys", "user", 10, "test", config)
         cmd_args = mock_exec.call_args.args
         assert "--model" not in cmd_args
+
+
+# ---------- TestDialogueConfirmWords ----------
+
+
+class TestDialogueConfirmWords:
+    def test_is_frozenset(self):
+        assert isinstance(DIALOGUE_CONFIRM_WORDS, frozenset)
+
+    def test_contains_expected_words(self):
+        for word in ("yes", "y", "confirm", "go", "approved", "ok", "okay", "proceed"):
+            assert word in DIALOGUE_CONFIRM_WORDS
+
+
+# ---------- TestEscalationDialogueRouting ----------
+
+
+class TestEscalationDialogueRouting:
+    @pytest.mark.asyncio
+    async def test_nl_during_escalation_wait_routes_to_pre_esc_agent(self, config):
+        """NL message during escalation_wait routes to blocked agent, classify_target not called."""
+        mutations = []
+        dc = _make_companion(
+            config, mutations,
+            active_agents_fn=lambda: ["architect", "executor"],
+            pipeline_stage_fn=lambda: ("escalation_wait", "executor"),
+        )
+        with patch("lib.claude.classify_target") as mock_ct:
+            resp = await dc._route_natural_language("try approach B instead")
+        assert "executor" in resp
+        assert "escalation dialogue" in resp
+        assert len(mutations) == 1
+        mock_ct.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_nl_during_escalation_dialogue_routes_to_pre_esc_agent(self, config):
+        """NL message during escalation_dialogue also routes directly."""
+        mutations = []
+        dc = _make_companion(
+            config, mutations,
+            active_agents_fn=lambda: ["architect", "executor"],
+            pipeline_stage_fn=lambda: ("escalation_dialogue", "executor"),
+        )
+        resp = await dc._route_natural_language("what about the timeout?")
+        assert "executor" in resp
+        assert len(mutations) == 1
+
+    @pytest.mark.asyncio
+    async def test_nl_during_normal_stage_uses_classify(self, config):
+        """Non-escalation NL uses normal classify_target flow."""
+        mutations = []
+        dc = _make_companion(
+            config, mutations,
+            active_agents_fn=lambda: ["executor"],
+            pipeline_stage_fn=lambda: ("executor", None),
+        )
+        resp = await dc._route_natural_language("focus on error handling")
+        assert resp == "Message routed to executor."
+
+    @pytest.mark.asyncio
+    async def test_nl_escalation_no_pre_esc_agent_falls_through(self, config):
+        """Escalation stage with no pre_escalation_agent falls through to normal routing."""
+        mutations = []
+        dc = _make_companion(
+            config, mutations,
+            active_agents_fn=lambda: ["executor"],
+            pipeline_stage_fn=lambda: ("escalation_wait", None),
+        )
+        resp = await dc._route_natural_language("fix the bug")
+        assert resp == "Message routed to executor."
+
+
+# ---------- TestDialogueMessageMutation ----------
+
+
+class TestDialogueMessageMutation:
+    @pytest.mark.asyncio
+    async def test_dialogue_message_sends_to_agent(self, config):
+        """Mutation delivers [OPERATOR] prefixed message to blocked agent."""
+        task = TaskSignal(task_id="task-xyz", description="Work")
+        state = PipelineState()
+        state.activate(task)
+        state.pre_escalation_stage = "executor"
+        state.pre_escalation_agent = "executor"
+        state.advance("escalation_wait")
+
+        mutations = []
+        dc = _make_companion(
+            config, mutations,
+            pipeline_stage_fn=lambda: ("escalation_wait", "executor"),
+        )
+        await dc._route_natural_language("try approach B")
+        sm = _make_session_mgr()
+        await mutations[0](state, sm)
+
+        sm.send.assert_awaited_once_with("executor", "[OPERATOR] try approach B")
+
+    @pytest.mark.asyncio
+    async def test_dialogue_message_transitions_wait_to_dialogue(self, config):
+        """Mutation transitions from escalation_wait to escalation_dialogue."""
+        task = TaskSignal(task_id="task-xyz", description="Work")
+        state = PipelineState()
+        state.activate(task)
+        state.pre_escalation_stage = "executor"
+        state.pre_escalation_agent = "executor"
+        state.advance("escalation_wait")
+
+        mutations = []
+        dc = _make_companion(
+            config, mutations,
+            pipeline_stage_fn=lambda: ("escalation_wait", "executor"),
+        )
+        await dc._route_natural_language("try approach B")
+        sm = _make_session_mgr()
+        await mutations[0](state, sm)
+
+        assert state.stage == "escalation_dialogue"
+
+    @pytest.mark.asyncio
+    async def test_dialogue_message_refreshes_timestamp(self, config):
+        """Mutation sets dialogue_last_message_ts."""
+        task = TaskSignal(task_id="task-xyz", description="Work")
+        state = PipelineState()
+        state.activate(task)
+        state.pre_escalation_stage = "executor"
+        state.pre_escalation_agent = "executor"
+        state.advance("escalation_wait")
+
+        mutations = []
+        dc = _make_companion(
+            config, mutations,
+            pipeline_stage_fn=lambda: ("escalation_wait", "executor"),
+        )
+        await dc._route_natural_language("try approach B")
+        sm = _make_session_mgr()
+        await mutations[0](state, sm)
+
+        assert state.dialogue_last_message_ts is not None
+        assert state.dialogue_last_message == "try approach B"
+
+    @pytest.mark.asyncio
+    async def test_dialogue_message_clears_pending_confirmation(self, config):
+        """New dialogue message clears pending confirmation flag."""
+        task = TaskSignal(task_id="task-xyz", description="Work")
+        state = PipelineState()
+        state.activate(task)
+        state.pre_escalation_stage = "executor"
+        state.pre_escalation_agent = "executor"
+        state.advance("escalation_dialogue")
+        state.dialogue_pending_confirmation = True
+
+        mutations = []
+        dc = _make_companion(
+            config, mutations,
+            pipeline_stage_fn=lambda: ("escalation_dialogue", "executor"),
+        )
+        await dc._route_natural_language("actually wait, what about X?")
+        sm = _make_session_mgr()
+        await mutations[0](state, sm)
+
+        assert state.dialogue_pending_confirmation is False
+
+    @pytest.mark.asyncio
+    async def test_dialogue_confirmation_yes_resumes_pipeline(self, config):
+        """'yes' during pending confirmation resumes pipeline."""
+        task = TaskSignal(task_id="task-xyz", description="Work")
+        state = PipelineState()
+        state.activate(task)
+        state.pre_escalation_stage = "executor"
+        state.pre_escalation_agent = "executor"
+        state.advance("escalation_dialogue")
+        state.dialogue_pending_confirmation = True
+
+        mutations = []
+        dc = _make_companion(
+            config, mutations,
+            pipeline_stage_fn=lambda: ("escalation_dialogue", "executor"),
+        )
+        await dc._route_natural_language("yes")
+        sm = _make_session_mgr()
+        await mutations[0](state, sm)
+
+        assert state.stage == "executor"
+        assert state.dialogue_pending_confirmation is False
+        assert state.dialogue_last_message_ts is None
+        dc.signal_reader.clear_escalation.assert_called_once_with("task-xyz")
+
+    @pytest.mark.asyncio
+    async def test_dialogue_confirmation_clears_escalation_signal(self, config):
+        """Confirmation calls signal_reader.clear_escalation."""
+        task = TaskSignal(task_id="task-xyz", description="Work")
+        state = PipelineState()
+        state.activate(task)
+        state.pre_escalation_stage = "executor"
+        state.pre_escalation_agent = "executor"
+        state.advance("escalation_dialogue")
+        state.dialogue_pending_confirmation = True
+
+        mutations = []
+        dc = _make_companion(
+            config, mutations,
+            pipeline_stage_fn=lambda: ("escalation_dialogue", "executor"),
+        )
+        await dc._route_natural_language("confirm")
+        sm = _make_session_mgr()
+        await mutations[0](state, sm)
+
+        dc.signal_reader.clear_escalation.assert_called_once_with("task-xyz")
+
+    @pytest.mark.asyncio
+    async def test_apply_reply_accepts_escalation_dialogue(self, config):
+        """!reply works during escalation_dialogue stage."""
+        task = TaskSignal(task_id="task-xyz", description="Work")
+        state = PipelineState()
+        state.activate(task)
+        state.pre_escalation_stage = "executor"
+        state.pre_escalation_agent = "executor"
+        state.advance("escalation_dialogue")
+
+        mutations = []
+        dc = _make_companion(config, mutations)
+        await dc.handle_message("!reply", "task-xyz go with plan B")
+        sm = _make_session_mgr()
+        await mutations[0](state, sm)
+
+        sm.send.assert_awaited_once_with("executor", "[OPERATOR REPLY] go with plan B")
+        assert state.stage == "executor"
+
+    @pytest.mark.asyncio
+    async def test_apply_reply_shelved_dialogue_accepted(self, config):
+        """!reply on shelved task in escalation_dialogue is accepted."""
+        task1 = TaskSignal(task_id="task-shelved", description="Shelved")
+        task2 = TaskSignal(task_id="task-active", description="Active")
+        state = PipelineState()
+        state.activate(task1)
+        state.pre_escalation_stage = "executor"
+        state.pre_escalation_agent = "executor"
+        state.advance("escalation_dialogue")
+        state.shelve()
+        state.activate(task2)
+
+        mutations = []
+        dc = _make_companion(config, mutations)
+        await dc.handle_message("!reply", "task-shelved go ahead")
+        sm = _make_session_mgr()
+        await mutations[0](state, sm)
+
+        assert state.shelved_tasks[0]["stage"] == "executor"
+        dc.signal_reader.clear_escalation.assert_called_once_with("task-shelved")
+
+    @pytest.mark.asyncio
+    async def test_dialogue_no_pre_esc_agent_drops_message(self, config):
+        """Mutation drops message when pre_escalation_agent is None."""
+        task = TaskSignal(task_id="task-xyz", description="Work")
+        state = PipelineState()
+        state.activate(task)
+        state.advance("escalation_wait")
+        # pre_escalation_agent is None
+
+        mutations = []
+        dc = _make_companion(
+            config, mutations,
+            pipeline_stage_fn=lambda: ("escalation_wait", "executor"),
+        )
+        await dc._route_natural_language("some message")
+        sm = _make_session_mgr()
+        await mutations[0](state, sm)
+
+        sm.send.assert_not_awaited()
+
+
+# ---------- TestClassifyResolution ----------
+
+
+class TestClassifyResolution:
+    @pytest.mark.asyncio
+    async def test_returns_resolution(self, config):
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value="resolution"):
+            result = await classify_resolution("go with approach B", config)
+        assert result == "resolution"
+
+    @pytest.mark.asyncio
+    async def test_returns_continuation(self, config):
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value="continuation"):
+            result = await classify_resolution("what about X?", config)
+        assert result == "continuation"
+
+    @pytest.mark.asyncio
+    async def test_timeout_defaults_continuation(self, config):
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value=None):
+            result = await classify_resolution("anything", config)
+        assert result == "continuation"
+
+    @pytest.mark.asyncio
+    async def test_uses_haiku_model(self, config):
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value="resolution") as mock:
+            await classify_resolution("go ahead", config)
+        assert mock.call_args.kwargs.get("model") == "haiku"
+
+    @pytest.mark.asyncio
+    async def test_unexpected_value_defaults_continuation(self, config):
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value="maybe"):
+            result = await classify_resolution("something", config)
+        assert result == "continuation"
+
+    @pytest.mark.asyncio
+    async def test_case_insensitive(self, config):
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value="RESOLUTION"):
+            result = await classify_resolution("approved", config)
+        assert result == "resolution"
+
+
+# ---------- TestControlPreFilter ----------
+
+
+class TestControlPreFilter:
+    def test_stop_matches(self):
+        assert _CONTROL_PATTERN.match("stop")
+
+    def test_pause_the_pipeline_matches(self):
+        assert _CONTROL_PATTERN.match("pause the pipeline")
+
+    def test_halt_matches(self):
+        assert _CONTROL_PATTERN.match("halt")
+
+    def test_resume_matches(self):
+        assert _CONTROL_PATTERN.match("resume")
+
+    def test_unpause_matches(self):
+        assert _CONTROL_PATTERN.match("unpause")
+
+    def test_status_matches(self):
+        assert _CONTROL_PATTERN.match("status")
+
+    def test_case_insensitive(self):
+        assert _CONTROL_PATTERN.match("STOP")
+        assert _CONTROL_PATTERN.match("Pause The Pipeline")
+
+    def test_with_punctuation(self):
+        assert _CONTROL_PATTERN.match("stop!")
+        assert _CONTROL_PATTERN.match("pause.")
+
+    def test_embedded_control_word_no_match(self):
+        """'tell executor to stop' should NOT match the pre-filter."""
+        assert _CONTROL_PATTERN.match("tell executor to stop") is None
+
+    def test_longer_sentence_no_match(self):
+        assert _CONTROL_PATTERN.match("please stop the pipeline now") is None
+
+    def test_stop_the_harness_matches(self):
+        assert _CONTROL_PATTERN.match("stop the harness")
+
+    def test_resume_everything_matches(self):
+        assert _CONTROL_PATTERN.match("resume everything")
+
+
+# ---------- TestHandleControl ----------
+
+
+class TestHandleControl:
+    @pytest.mark.asyncio
+    async def test_stop_queues_pause_mutation(self, config):
+        mutations = []
+        dc = _make_companion(config, mutations)
+        resp = dc._handle_control("stop")
+        assert "pausing" in resp.lower()
+        assert len(mutations) == 1
+
+    @pytest.mark.asyncio
+    async def test_pause_mutation_sets_paused_true(self, config, pipeline_state):
+        mutations = []
+        dc = _make_companion(config, mutations)
+        dc._handle_control("pause")
+        sm = _make_session_mgr()
+        await mutations[0](pipeline_state, sm)
+        assert pipeline_state.paused is True
+
+    @pytest.mark.asyncio
+    async def test_resume_mutation_sets_paused_false(self, config, pipeline_state):
+        mutations = []
+        dc = _make_companion(config, mutations)
+        pipeline_state.paused = True
+        dc._handle_control("resume")
+        sm = _make_session_mgr()
+        await mutations[0](pipeline_state, sm)
+        assert pipeline_state.paused is False
+
+    def test_status_returns_status_text(self, config):
+        dc = _make_companion(config)
+        resp = dc._handle_control("status")
+        assert "harness" in resp.lower()
+        assert "caveman" in resp.lower()
+
+
+# ---------- TestHandleNewTask ----------
+
+
+class TestHandleNewTask:
+    @pytest.mark.asyncio
+    async def test_creates_task_signal_file(self, config):
+        dc = _make_companion(config)
+        resp = await dc._handle_new_task("fix the auth bug in broker.py")
+        assert "Task created:" in resp
+        assert "discord-" in resp
+        # Verify signal file written
+        task_files = list(config.task_dir.glob("discord-*.json"))
+        assert len(task_files) == 1
+
+    @pytest.mark.asyncio
+    async def test_task_signal_content(self, config):
+        import json
+        dc = _make_companion(config)
+        await dc._handle_new_task("add retry logic to the fetcher")
+        task_files = list(config.task_dir.glob("discord-*.json"))
+        data = json.loads(task_files[0].read_text())
+        assert data["description"] == "add retry logic to the fetcher"
+        assert data["source"] == "discord"
+
+    @pytest.mark.asyncio
+    async def test_truncates_long_description_in_response(self, config):
+        dc = _make_companion(config)
+        long_msg = "x" * 200
+        resp = await dc._handle_new_task(long_msg)
+        assert len(resp) < 200  # response is truncated
+
+
+# ---------- TestClassifyIntent ----------
+
+
+class TestClassifyIntent:
+    @pytest.mark.asyncio
+    async def test_returns_feedback(self, config):
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value="feedback"):
+            result = await classify_intent("focus on error handling", True, config)
+        assert result == "feedback"
+
+    @pytest.mark.asyncio
+    async def test_returns_new_task(self, config):
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value="new_task"):
+            result = await classify_intent("fix the auth bug in broker.py", False, config)
+        assert result == "new_task"
+
+    @pytest.mark.asyncio
+    async def test_timeout_defaults_feedback(self, config):
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value=None):
+            result = await classify_intent("anything", True, config)
+        assert result == "feedback"
+
+    @pytest.mark.asyncio
+    async def test_unexpected_value_defaults_feedback(self, config):
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value="unknown"):
+            result = await classify_intent("something", True, config)
+        assert result == "feedback"
+
+    @pytest.mark.asyncio
+    async def test_uses_haiku_model(self, config):
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value="feedback") as mock:
+            await classify_intent("fix it", True, config)
+        assert mock.call_args.kwargs.get("model") == "haiku"
+
+    @pytest.mark.asyncio
+    async def test_includes_active_task_context(self, config):
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value="feedback") as mock:
+            await classify_intent("fix it", True, config)
+        system_prompt = mock.call_args.args[0]
+        assert "IS an active task" in system_prompt
+
+    @pytest.mark.asyncio
+    async def test_includes_no_active_task_context(self, config):
+        with patch("harness.lib.claude._run_claude", new_callable=AsyncMock, return_value="new_task") as mock:
+            await classify_intent("fix the bug", False, config)
+        system_prompt = mock.call_args.args[0]
+        assert "NO active task" in system_prompt
+
+
+# ---------- TestThreeWayDispatch ----------
+
+
+class TestThreeWayDispatch:
+    @pytest.mark.asyncio
+    async def test_control_word_dispatches_to_handle_control(self, config):
+        """'stop' goes to _handle_control, not classify_intent."""
+        mutations = []
+        dc = _make_companion(config, mutations)
+        with patch("lib.claude.classify_intent") as mock_ci:
+            resp = await dc.handle_raw_message("stop")
+        mock_ci.assert_not_called()
+        assert "pausing" in resp.lower()
+
+    @pytest.mark.asyncio
+    async def test_escalation_skips_classify_intent(self, config):
+        """During escalation, messages skip classify_intent."""
+        mutations = []
+        dc = _make_companion(
+            config, mutations,
+            active_agents_fn=lambda: ["executor"],
+            pipeline_stage_fn=lambda: ("escalation_wait", "executor"),
+        )
+        with patch("lib.claude.classify_intent") as mock_ci:
+            resp = await dc.handle_raw_message("try approach B")
+        mock_ci.assert_not_called()
+        assert "escalation dialogue" in resp
+
+    @pytest.mark.asyncio
+    async def test_feedback_intent_routes_to_agent(self, config):
+        mutations = []
+        dc = _make_companion(
+            config, mutations,
+            active_agents_fn=lambda: ["executor"],
+            pipeline_stage_fn=lambda: ("executor", None),
+        )
+        with patch("lib.claude.classify_intent", new_callable=AsyncMock, return_value="feedback"):
+            resp = await dc.handle_raw_message("focus on error handling")
+        assert resp == "Message routed to executor."
+
+    @pytest.mark.asyncio
+    async def test_new_task_intent_creates_signal(self, config):
+        dc = _make_companion(
+            config,
+            pipeline_stage_fn=lambda: (None, None),
+        )
+        with patch("lib.claude.classify_intent", new_callable=AsyncMock, return_value="new_task"):
+            resp = await dc.handle_raw_message("fix the auth bug in broker.py")
+        assert "Task created:" in resp
+        task_files = list(config.task_dir.glob("discord-*.json"))
+        assert len(task_files) == 1
+
+
+# ---------- TestStatusShowsPaused ----------
+
+
+class TestStatusShowsPaused:
+    def test_status_shows_paused(self, config):
+        dc = _make_companion(
+            config,
+            pipeline_stage_fn=lambda: ("executor", None),
+            pipeline_paused_fn=lambda: True,
+        )
+        resp = dc._format_status()
+        assert "PAUSED" in resp
+        assert "executor" in resp
+        assert "resume" in resp.lower()
+
+    def test_status_shows_running(self, config):
+        dc = _make_companion(
+            config,
+            pipeline_stage_fn=lambda: ("executor", None),
+            pipeline_paused_fn=lambda: False,
+        )
+        resp = dc._format_status()
+        assert "running" in resp.lower()
+        assert "executor" in resp
+
+    def test_status_shows_idle(self, config):
+        dc = _make_companion(
+            config,
+            pipeline_stage_fn=lambda: (None, None),
+            pipeline_paused_fn=lambda: False,
+        )
+        resp = dc._format_status()
+        assert "idle" in resp.lower()
+
+    @pytest.mark.asyncio
+    async def test_bang_status_shows_paused(self, config):
+        dc = _make_companion(
+            config,
+            pipeline_stage_fn=lambda: ("executor", None),
+            pipeline_paused_fn=lambda: True,
+        )
+        resp = await dc.handle_message("!status", "")
+        assert "PAUSED" in resp
+
+
+# ---------- TestHandleUpdate ----------
+
+
+class TestHandleUpdate:
+    def test_no_shutdown_event_returns_unavailable(self, config):
+        dc = _make_companion(config, shutdown_event=None)
+        resp = dc._handle_update()
+        assert "unavailable" in resp.lower()
+
+    def test_queues_mutation(self, config):
+        mutations = []
+        ev = asyncio.Event()
+        dc = _make_companion(config, mutations=mutations, shutdown_event=ev)
+        resp = dc._handle_update()
+        assert "Pulling" in resp
+        assert len(mutations) == 1
+
+    def test_debounce_rejects_second_call(self, config):
+        mutations = []
+        ev = asyncio.Event()
+        dc = _make_companion(config, mutations=mutations, shutdown_event=ev)
+        dc._handle_update()
+        resp2 = dc._handle_update()
+        assert "already in progress" in resp2.lower()
+        assert len(mutations) == 1
+
+    @pytest.mark.asyncio
+    async def test_dispatch_via_handle_message(self, config):
+        mutations = []
+        ev = asyncio.Event()
+        dc = _make_companion(config, mutations=mutations, shutdown_event=ev)
+        resp = await dc.handle_message("!update", "")
+        assert "Pulling" in resp
+        assert len(mutations) == 1
+
+
+class TestDoUpdateMutation:
+    @pytest.mark.asyncio
+    async def test_already_up_to_date(self, config, pipeline_state):
+        ev = asyncio.Event()
+        fake_head = "abc1234\n"
+
+        async def mock_exec(*args, **kwargs):
+            proc = AsyncMock()
+            proc.returncode = 0
+            proc.communicate = AsyncMock(return_value=(fake_head.encode(), b""))
+            return proc
+
+        with patch("harness.discord_companion.asyncio.create_subprocess_exec", side_effect=mock_exec):
+            with patch("harness.discord_companion._notify_update", new_callable=AsyncMock) as mock_notify:
+                sm = _make_session_mgr()
+                await _do_update(pipeline_state, sm, ev, str(config.project_root))
+                assert not ev.is_set()
+                mock_notify.assert_awaited()
+                last_msg = mock_notify.call_args[0][1]
+                assert "up to date" in last_msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_new_commits_sets_shutdown(self, config, pipeline_state):
+        ev = asyncio.Event()
+        call_count = 0
+
+        async def mock_exec(*args, **kwargs):
+            nonlocal call_count
+            proc = AsyncMock()
+            proc.returncode = 0
+            if args[0] == "git" and args[1] == "rev-parse":
+                call_count += 1
+                # First rev-parse returns old HEAD, second returns new HEAD
+                head = b"aaa1111\n" if call_count == 1 else b"bbb2222\n"
+                proc.communicate = AsyncMock(return_value=(head, b""))
+            else:
+                # git pull
+                proc.communicate = AsyncMock(return_value=(b"Updating aaa1111..bbb2222\n", b""))
+            return proc
+
+        with patch("harness.discord_companion.asyncio.create_subprocess_exec", side_effect=mock_exec):
+            with patch("harness.discord_companion._notify_update", new_callable=AsyncMock) as mock_notify:
+                sm = _make_session_mgr()
+                await _do_update(pipeline_state, sm, ev, str(config.project_root))
+                assert ev.is_set()
+                last_msg = mock_notify.call_args[0][1]
+                assert "Restarting" in last_msg
+
+    @pytest.mark.asyncio
+    async def test_pull_failure_no_restart(self, config, pipeline_state):
+        ev = asyncio.Event()
+
+        async def mock_exec(*args, **kwargs):
+            proc = AsyncMock()
+            if args[0] == "git" and args[1] == "rev-parse":
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(b"aaa1111\n", b""))
+            else:
+                # git pull fails
+                proc.returncode = 1
+                proc.communicate = AsyncMock(return_value=(b"", b"fatal: not a git repo\n"))
+            return proc
+
+        with patch("harness.discord_companion.asyncio.create_subprocess_exec", side_effect=mock_exec):
+            with patch("harness.discord_companion._notify_update", new_callable=AsyncMock) as mock_notify:
+                sm = _make_session_mgr()
+                await _do_update(pipeline_state, sm, ev, str(config.project_root))
+                assert not ev.is_set()
+                last_msg = mock_notify.call_args[0][1]
+                assert "failed" in last_msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_timeout_no_restart(self, config, pipeline_state):
+        ev = asyncio.Event()
+
+        async def mock_exec(*args, **kwargs):
+            proc = AsyncMock()
+            if args[0] == "git" and args[1] == "rev-parse":
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(b"aaa1111\n", b""))
+            else:
+                # git pull hangs
+                async def hang():
+                    await asyncio.sleep(999)
+                proc.communicate = hang
+            return proc
+
+        async def _raise_timeout(coro, timeout):
+            coro.close()
+            raise asyncio.TimeoutError()
+
+        with patch("harness.discord_companion.asyncio.create_subprocess_exec", side_effect=mock_exec):
+            with patch("harness.discord_companion.asyncio.wait_for", new=_raise_timeout):
+                with patch("harness.discord_companion._notify_update", new_callable=AsyncMock) as mock_notify:
+                    sm = _make_session_mgr()
+                    await _do_update(pipeline_state, sm, ev, str(config.project_root))
+                    assert not ev.is_set()
+                    last_msg = mock_notify.call_args[0][1]
+                    assert "timed out" in last_msg.lower()

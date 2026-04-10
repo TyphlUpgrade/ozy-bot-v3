@@ -544,3 +544,85 @@ class TestCheckSessions:
 
         # Only reviewer restarted
         session_mgr.restart.assert_awaited_once_with("reviewer")
+
+
+# ---------- TestReconcileEscalationDialogue ----------
+
+
+class TestReconcileEscalationDialogue:
+    @pytest.mark.asyncio
+    async def test_reconcile_dialogue_falls_back_to_wait(self, config):
+        """reconcile demotes escalation_dialogue to escalation_wait and clears dialogue fields."""
+        state = PipelineState(
+            active_task="task-001",
+            stage="escalation_dialogue",
+            stage_agent=None,
+            pre_escalation_stage="executor",
+            pre_escalation_agent="executor",
+        )
+        state.dialogue_last_message_ts = "2026-04-09T12:00:00+00:00"
+        state.dialogue_last_message = "some message"
+        state.dialogue_pending_confirmation = True
+        esc = EscalationRequest(
+            task_id="task-001", agent="executor", stage="executor",
+            severity="blocking", category="design_choice",
+            question="Which approach?", options=["a", "b"], context="ctx",
+        )
+        session_mgr = _make_session_mgr(sessions={}, config=config)
+        signal_reader = _make_signal_reader(escalation=esc)
+        notify_fn = AsyncMock()
+
+        await reconcile(state, session_mgr, signal_reader, notify_fn)
+
+        assert state.stage == "escalation_wait"
+        assert state.dialogue_last_message_ts is None
+        assert state.dialogue_last_message is None
+        assert state.dialogue_pending_confirmation is False
+        notify_fn.assert_awaited_once_with(esc)
+
+    @pytest.mark.asyncio
+    async def test_reconcile_dialogue_no_signal(self, config):
+        """reconcile demotes escalation_dialogue even when no signal found."""
+        state = PipelineState(
+            active_task="task-001",
+            stage="escalation_dialogue",
+            stage_agent=None,
+            pre_escalation_stage="executor",
+            pre_escalation_agent="executor",
+        )
+        session_mgr = _make_session_mgr(sessions={}, config=config)
+        signal_reader = _make_signal_reader(escalation=None)
+        notify_fn = AsyncMock()
+
+        await reconcile(state, session_mgr, signal_reader, notify_fn)
+
+        assert state.stage == "escalation_wait"
+        notify_fn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reconcile_shelved_dialogue_reverts_to_wait(self, config):
+        """reconcile demotes shelved escalation_dialogue to escalation_wait."""
+        state = PipelineState()
+        state.shelved_tasks = [
+            {"task_id": "task-shelved", "stage": "escalation_dialogue",
+             "stage_agent": None, "worktree": None, "retry_count": 0,
+             "dialogue_last_message_ts": "2026-04-09T12:00:00+00:00",
+             "dialogue_last_message": "some msg",
+             "dialogue_pending_confirmation": True},
+        ]
+        esc = EscalationRequest(
+            task_id="task-shelved", agent="executor", stage="executor",
+            severity="blocking", category="design_choice",
+            question="Which approach?", options=["a", "b"], context="ctx",
+        )
+        session_mgr = _make_session_mgr(sessions={}, config=config)
+        signal_reader = _make_signal_reader(escalation=esc)
+        notify_fn = AsyncMock()
+
+        await reconcile(state, session_mgr, signal_reader, notify_fn)
+
+        assert state.shelved_tasks[0]["stage"] == "escalation_wait"
+        assert state.shelved_tasks[0]["dialogue_last_message_ts"] is None
+        assert state.shelved_tasks[0]["dialogue_last_message"] is None
+        assert state.shelved_tasks[0]["dialogue_pending_confirmation"] is False
+        notify_fn.assert_awaited_once_with(esc)

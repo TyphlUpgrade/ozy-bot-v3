@@ -189,6 +189,9 @@ class ProjectConfig:
     commands_module: str | None = None
     test_command: str = "python3 -m pytest tests/ -x"  # command run after merge; override for non-Python projects
     token_rotation_threshold: int = 100_000  # cumulative tokens before session rotation
+    dialogue_timeout: int = 1800             # seconds before dialogue falls back to escalation_wait
+    auto_escalate_on_max_retries: bool = True   # auto-escalate to architect after max_retries exhausted
+    max_tier1_escalations: int = 2           # architect attempts before circuit breaker fires to operator
 
     @classmethod
     def load(cls, config_path: Path) -> ProjectConfig:
@@ -220,6 +223,8 @@ class ProjectConfig:
                 "reformulate": pipeline.get("reformulate_timeout", 120),
                 "wiki": pipeline.get("wiki_timeout", 300),
                 "classify_target": pipeline.get("classify_target_timeout", 10),
+                "classify_intent": pipeline.get("classify_intent_timeout", 10),
+                "classify_resolution": pipeline.get("classify_resolution_timeout", 10),
             },
             max_stage_minutes={
                 stage: pipeline.get(f"{stage}_max_minutes", default)
@@ -233,13 +238,16 @@ class ProjectConfig:
                 ]
             },
             commands_module=data.get("commands", {}).get("module"),
+            dialogue_timeout=pipeline.get("dialogue_timeout", 1800),
+            auto_escalate_on_max_retries=pipeline.get("auto_escalate_on_max_retries", True),
+            max_tier1_escalations=pipeline.get("max_tier1_escalations", 2),
         )
 
 
 # Valid pipeline stages — advance() validates against this set
 VALID_STAGES = frozenset({
     "classify", "architect", "executor", "reviewer", "merge", "wiki",
-    "escalation_wait", "escalation_tier1",
+    "escalation_wait", "escalation_tier1", "escalation_dialogue",
 })
 
 
@@ -265,6 +273,11 @@ class PipelineState:
     plan_summary: str | None = None        # architect plan output, collected in check_stage
     diff_stat: str | None = None           # git diff --stat, collected in do_merge
     review_verdict: str | None = None      # reviewer verdict, collected in check_reviewer
+    dialogue_last_message_ts: str | None = None    # refreshed per exchange, drives dialogue timeout
+    dialogue_last_message: str | None = None       # stored for orchestrator to classify
+    dialogue_pending_confirmation: bool = False    # resolution detected, awaiting operator confirm
+    tier1_escalation_count: int = 0                # circuit breaker: architect attempts per task
+    paused: bool = False                             # pipeline-wide pause (operator control, not per-task)
 
     def activate(self, task: "TaskSignal") -> None:
         from .signals import TaskSignal  # avoid circular at module level
@@ -282,6 +295,10 @@ class PipelineState:
         self.plan_summary = None
         self.diff_stat = None
         self.review_verdict = None
+        self.dialogue_last_message_ts = None
+        self.dialogue_last_message = None
+        self.dialogue_pending_confirmation = False
+        self.tier1_escalation_count = 0
 
     def advance(self, next_stage: str, agent: str | None = None) -> None:
         if next_stage not in VALID_STAGES:
@@ -303,6 +320,9 @@ class PipelineState:
         self.advance(original_stage, original_agent)
         self.pre_escalation_stage = None
         self.pre_escalation_agent = None
+        self.dialogue_last_message_ts = None
+        self.dialogue_last_message = None
+        self.dialogue_pending_confirmation = False
 
     def clear_active(self) -> None:
         self.active_task = None
@@ -319,6 +339,10 @@ class PipelineState:
         self.plan_summary = None
         self.diff_stat = None
         self.review_verdict = None
+        self.dialogue_last_message_ts = None
+        self.dialogue_last_message = None
+        self.dialogue_pending_confirmation = False
+        self.tier1_escalation_count = 0
 
     def shelve(self) -> None:
         """Save current active task to shelf and clear pipeline for next task."""
@@ -339,6 +363,10 @@ class PipelineState:
             "plan_summary": self.plan_summary,
             "diff_stat": self.diff_stat,
             "review_verdict": self.review_verdict,
+            "dialogue_last_message_ts": self.dialogue_last_message_ts,
+            "dialogue_last_message": self.dialogue_last_message,
+            "dialogue_pending_confirmation": self.dialogue_pending_confirmation,
+            "tier1_escalation_count": self.tier1_escalation_count,
         })
         self.clear_active()
 
@@ -361,6 +389,10 @@ class PipelineState:
         self.plan_summary = task.get("plan_summary")
         self.diff_stat = task.get("diff_stat")
         self.review_verdict = task.get("review_verdict")
+        self.dialogue_last_message_ts = task.get("dialogue_last_message_ts")
+        self.dialogue_last_message = task.get("dialogue_last_message")
+        self.dialogue_pending_confirmation = False  # stale after context-switch
+        self.tier1_escalation_count = task.get("tier1_escalation_count", 0)
         self.stage_started_ts = datetime.now(UTC).isoformat()
         # Reset escalation clock so shelved duration doesn't count toward timeout
         if self.stage and self.stage.startswith("escalation_"):

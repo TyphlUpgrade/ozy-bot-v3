@@ -401,3 +401,98 @@ wiki = "off"
         assert cfg.caveman.default_level == "lite"
         assert cfg.caveman.level_for("architect") == "off"
         assert "architect" in cfg.agents
+
+
+class TestDialogueFields:
+    def test_dialogue_fields_default(self):
+        state = PipelineState()
+        assert state.dialogue_last_message_ts is None
+        assert state.dialogue_last_message is None
+        assert state.dialogue_pending_confirmation is False
+        assert state.tier1_escalation_count == 0
+
+    def test_escalation_dialogue_in_valid_stages(self):
+        assert "escalation_dialogue" in VALID_STAGES
+
+    def test_activate_resets_dialogue_fields(self, pipeline_state):
+        pipeline_state.dialogue_last_message_ts = "some-ts"
+        pipeline_state.dialogue_last_message = "some-msg"
+        pipeline_state.dialogue_pending_confirmation = True
+        pipeline_state.tier1_escalation_count = 5
+        task = TaskSignal(task_id="t1", description="Test")
+        pipeline_state.activate(task)
+        assert pipeline_state.dialogue_last_message_ts is None
+        assert pipeline_state.dialogue_last_message is None
+        assert pipeline_state.dialogue_pending_confirmation is False
+        assert pipeline_state.tier1_escalation_count == 0
+
+    def test_clear_active_resets_dialogue_fields(self, pipeline_state):
+        pipeline_state.dialogue_last_message_ts = "some-ts"
+        pipeline_state.dialogue_last_message = "some-msg"
+        pipeline_state.dialogue_pending_confirmation = True
+        pipeline_state.tier1_escalation_count = 3
+        pipeline_state.clear_active()
+        assert pipeline_state.dialogue_last_message_ts is None
+        assert pipeline_state.dialogue_last_message is None
+        assert pipeline_state.dialogue_pending_confirmation is False
+        assert pipeline_state.tier1_escalation_count == 0
+
+    def test_resume_from_escalation_clears_dialogue_not_tier1_count(self, pipeline_state):
+        task = TaskSignal(task_id="t1", description="Test")
+        pipeline_state.activate(task)
+        pipeline_state.pre_escalation_stage = "executor"
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.advance("escalation_dialogue")
+        pipeline_state.dialogue_last_message_ts = "some-ts"
+        pipeline_state.dialogue_last_message = "some-msg"
+        pipeline_state.dialogue_pending_confirmation = True
+        pipeline_state.tier1_escalation_count = 2
+        pipeline_state.resume_from_escalation()
+        assert pipeline_state.dialogue_last_message_ts is None
+        assert pipeline_state.dialogue_last_message is None
+        assert pipeline_state.dialogue_pending_confirmation is False
+        assert pipeline_state.tier1_escalation_count == 2  # NOT reset
+
+    def test_shelve_preserves_dialogue_fields(self, pipeline_state):
+        task = TaskSignal(task_id="t1", description="Test")
+        pipeline_state.activate(task)
+        pipeline_state.advance("escalation_dialogue")
+        pipeline_state.dialogue_last_message_ts = "2026-04-09T12:00:00+00:00"
+        pipeline_state.dialogue_last_message = "try approach B"
+        pipeline_state.dialogue_pending_confirmation = True
+        pipeline_state.tier1_escalation_count = 1
+        pipeline_state.shelve()
+        shelved = pipeline_state.shelved_tasks[0]
+        assert shelved["dialogue_last_message_ts"] == "2026-04-09T12:00:00+00:00"
+        assert shelved["dialogue_last_message"] == "try approach B"
+        assert shelved["dialogue_pending_confirmation"] is True
+        assert shelved["tier1_escalation_count"] == 1
+
+    def test_unshelve_clears_pending_confirmation(self, pipeline_state):
+        task = TaskSignal(task_id="t1", description="Test")
+        pipeline_state.activate(task)
+        pipeline_state.advance("escalation_dialogue")
+        pipeline_state.dialogue_last_message_ts = "2026-04-09T12:00:00+00:00"
+        pipeline_state.dialogue_last_message = "try approach B"
+        pipeline_state.dialogue_pending_confirmation = True
+        pipeline_state.tier1_escalation_count = 2
+        pipeline_state.shelve()
+        pipeline_state.unshelve()
+        assert pipeline_state.dialogue_last_message_ts == "2026-04-09T12:00:00+00:00"
+        assert pipeline_state.dialogue_last_message == "try approach B"
+        assert pipeline_state.dialogue_pending_confirmation is False  # force-cleared
+        assert pipeline_state.tier1_escalation_count == 2  # preserved
+
+    def test_dialogue_fields_save_load_roundtrip(self, tmp_path):
+        path = tmp_path / "state.json"
+        state = PipelineState(active_task="t1", stage="escalation_dialogue")
+        state.dialogue_last_message_ts = "2026-04-09T12:00:00+00:00"
+        state.dialogue_last_message = "try approach B"
+        state.dialogue_pending_confirmation = True
+        state.tier1_escalation_count = 2
+        state.save(path)
+        loaded = PipelineState.load(path)
+        assert loaded.dialogue_last_message_ts == "2026-04-09T12:00:00+00:00"
+        assert loaded.dialogue_last_message == "try approach B"
+        assert loaded.dialogue_pending_confirmation is True
+        assert loaded.tier1_escalation_count == 2

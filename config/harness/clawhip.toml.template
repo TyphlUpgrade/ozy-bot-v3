@@ -1,46 +1,80 @@
 # v5 Harness — Clawhip Configuration Template
-# Generated from this template by start.sh with $PROJECT_ROOT substitution.
+# Generated from this template by harness.sh with $PROJECT_ROOT substitution.
 # Do NOT edit clawhip.toml directly — edit this template instead.
 
-[general]
-log_level = "info"
+[providers.discord]
+token = "${DISCORD_BOT_TOKEN}"
+default_channel = "${ALERTS_CHANNEL}"
 
-[discord]
-bot_token_env = "DISCORD_BOT_TOKEN"
+[daemon]
+port = 25294
 
-[[routes]]
-name = "dev-pipeline"
-watch = "$PROJECT_ROOT/ozymandias/state/signals/conductor"
-patterns = ["*.json"]
-channel = "dev-agents"
+[defaults]
+format = "compact"
 
-[[routes]]
-name = "escalations"
-watch = "$PROJECT_ROOT/ozymandias/state/signals/escalation"
-patterns = ["*.json"]
-channel = "escalations"
+# --- Monitors ---
 
-[[routes]]
-name = "agent-tasks"
-watch = "$PROJECT_ROOT/ozymandias/state/signals/agent_tasks"
-patterns = ["*.json"]
-channel = "dev-agents"
+[monitors]
+poll_interval_secs = 5
 
-# Session monitoring — clawhip watches tmux sessions for stale/keyword alerts
-[[sessions]]
-name = "agent-architect"
+[[monitors.workspace]]
+path = "$PROJECT_ROOT"
+watch_dirs = ["ozymandias/state/signals"]
+poll_interval_secs = 5
+channel = "${AGENT_CHANNEL}"
+
+# Git monitor disabled — GitHub API rate limit (60 req/hr unauthenticated).
+# Clawhip polls every 5s = 720 req/hr, burns limit in ~5min.
+# Re-enable with a GitHub PAT in [monitors] github_token_env or increase poll interval.
+# [[monitors.git.repos]]
+# path = "."
+
+# --- Session monitoring (tmux) ---
+
+[[monitors.tmux.sessions]]
+session = "agent-architect"
 stale_minutes = 15
 keywords = ["ERROR", "CRITICAL", "BLOCKED"]
-channel = "dev-agents"
+channel = "${AGENT_CHANNEL}"
 
-[[sessions]]
-name = "agent-executor"
+[[monitors.tmux.sessions]]
+session = "agent-executor"
 stale_minutes = 30
 keywords = ["ERROR", "CRITICAL", "BLOCKED"]
-channel = "dev-agents"
+channel = "${AGENT_CHANNEL}"
 
-[[sessions]]
-name = "agent-reviewer"
+[[monitors.tmux.sessions]]
+session = "agent-reviewer"
 stale_minutes = 15
 keywords = ["ERROR", "CRITICAL", "BLOCKED"]
-channel = "dev-agents"
+channel = "${AGENT_CHANNEL}"
+
+# --- Routes ---
+
+# Pipeline signal files → #agents
+[[routes]]
+event = "workspace.file.changed"
+filter = { path = "**/conductor/*" }
+channel = "${AGENT_CHANNEL}"
+format = "compact"
+
+# Escalations → #alerts (with operator ping)
+[[routes]]
+event = "workspace.file.changed"
+filter = { path = "**/escalation/*" }
+channel = "${ALERTS_CHANNEL}"
+format = "alert"
+mention = "${OPERATOR_MENTION}"
+
+# Agent tasks → #agents
+[[routes]]
+event = "workspace.file.changed"
+filter = { path = "**/agent_tasks/*" }
+channel = "${AGENT_CHANNEL}"
+format = "compact"
+
+# Git commits → #dev
+[[routes]]
+event = "git.commit"
+channel = "${DEV_CHANNEL}"
+format = "compact"

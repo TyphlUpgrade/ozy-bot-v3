@@ -143,6 +143,67 @@ async def document_task(
     return True
 
 
+async def classify_resolution(
+    message: str,
+    config: "ProjectConfig",
+) -> str:
+    """Classify operator message during escalation dialogue.
+
+    Returns 'resolution' (decision made, go-ahead) or 'continuation'
+    (question, discussion, clarification). Defaults to 'continuation'
+    on failure — safe because it keeps dialogue open.
+    """
+    system = (
+        "You are an escalation dialogue classifier. The operator is having a multi-turn "
+        "conversation with a blocked agent. Classify the operator's message:\n"
+        "- 'resolution': The operator has made a decision, given a go-ahead, or indicated "
+        "the issue is resolved. Examples: 'go with approach B', 'approved', 'yes do that'\n"
+        "- 'continuation': The operator is asking questions, providing context, or continuing "
+        "discussion. Examples: 'what about X?', 'can you explain?', 'also consider...'\n"
+        "Reply with exactly one word: 'resolution' or 'continuation'."
+    )
+    timeout = config.timeouts.get("classify_resolution", 10)
+    result = await _run_claude(system, message, timeout, "classify_resolution", config, model="haiku")
+    if result is None:
+        return "continuation"
+    normalized = result.strip().lower()
+    if normalized not in ("resolution", "continuation"):
+        logger.warning("classify_resolution returned %r — defaulting to continuation", result)
+        return "continuation"
+    return normalized
+
+
+async def classify_intent(
+    message: str,
+    has_active_task: bool,
+    config: "ProjectConfig",
+) -> str:
+    """Classify operator NL message as 'feedback' or 'new_task'.
+
+    Control commands are handled by the deterministic pre-filter in
+    discord_companion — this only distinguishes feedback (comment/instruction
+    for active agent) from new_task (request for new work).
+    Defaults to 'feedback' on failure (safe — routes to agent via existing path).
+    """
+    context = "There IS an active task." if has_active_task else "There is NO active task."
+    system = (
+        "You are an operator intent classifier. " + context + "\n"
+        "Classify the operator's message:\n"
+        "- 'feedback': Comment, instruction, or guidance for an active agent\n"
+        "- 'new_task': Request for new work to be done\n"
+        "Reply with exactly one word: 'feedback' or 'new_task'."
+    )
+    timeout = config.timeouts.get("classify_intent", 10)
+    result = await _run_claude(system, message, timeout, "classify_intent", config, model="haiku")
+    if result is None:
+        return "feedback"
+    normalized = result.strip().lower()
+    if normalized not in ("feedback", "new_task"):
+        logger.warning("classify_intent returned %r — defaulting to feedback", result)
+        return "feedback"
+    return normalized
+
+
 async def classify_target(
     message: str,
     agents: list[str],

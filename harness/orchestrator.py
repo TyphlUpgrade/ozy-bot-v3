@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import shlex
 import signal
 import sys
 from datetime import datetime, UTC
 from pathlib import Path
 
+import discord_companion as dc
 from lib import claude, escalation, lifecycle
 from lib.events import EventLog
 from lib.pipeline import PipelineState, ProjectConfig
@@ -93,9 +95,61 @@ async def check_reviewer(state: PipelineState, signal_reader: SignalReader,
         logger.info("Reviewer approved %s", state.active_task)
     else:
         if state.retry_count >= config.max_retries:
-            logger.error("Task %s failed after %d retries", state.active_task, state.retry_count)
-            _escalation_cache.pop(state.active_task or "", None)
-            state.clear_active()
+            if not config.auto_escalate_on_max_retries:
+                logger.error("Task %s failed after %d retries", state.active_task, state.retry_count)
+                _escalation_cache.pop(state.active_task or "", None)
+                state.clear_active()
+                return
+
+            # Guard against overwriting existing escalation
+            existing = await signal_reader.read_escalation(state.active_task or "")
+            if existing:
+                logger.info("Task %s already has escalation — skipping auto-escalate",
+                            state.active_task)
+                _escalation_cache.pop(state.active_task or "", None)
+                state.clear_active()
+                return
+
+            feedback = result.get("feedback", "Reviewer rejected — no specific feedback.")
+            logger.warning("Task %s failed after %d retries — auto-escalating",
+                           state.active_task, state.retry_count)
+
+            from lib.signals import EscalationRequest, write_signal
+            esc = EscalationRequest(
+                task_id=state.active_task or "",
+                agent=state.stage_agent or "executor",
+                stage=state.stage or "reviewer",
+                severity="blocking",
+                category="persistent_failure",
+                question=f"Task failed {state.retry_count} reviewer rounds. Last rejection: {feedback[:200]}",
+                options=["replan_approach", "simplify_scope", "escalate_to_operator"],
+                context=f"retry_count={state.retry_count}, last_feedback={feedback[:500]}",
+                retry_count=0,  # BUG-023 fix: use 0 so circuit breaker can route Tier 1 first
+            )
+            write_signal(config.signal_dir / "escalation", f"{state.active_task}.json", esc)
+
+            # Route through circuit breaker — resume at executor, not reviewer
+            # BUG-024 fix: reviewer rejected, so resuming at reviewer loops forever
+            state.pre_escalation_stage = "executor"
+            state.pre_escalation_agent = "executor"
+            tier = _route_with_circuit_breaker(state, esc, config)
+            if tier == "tier1":
+                _escalation_cache[esc.task_id] = esc
+                msg = escalation.format_escalation_for_architect(esc)
+                await session_mgr.send("architect", msg)
+                state.advance("escalation_tier1", "architect")
+            else:
+                summary = escalation.format_tier2_notification(esc)
+                await notify("blocked", esc.agent, summary)
+                state.advance("escalation_wait")
+
+            await event_log.record("auto_escalated", {
+                "task": state.active_task,
+                "retry_count": state.retry_count,
+                "tier": 1 if tier == "tier1" else 2,
+                "reason": "max_retries_exhausted",
+                "circuit_breaker_count": state.tier1_escalation_count,
+            })
             return
         # Reformulate and retry
         feedback = result.get("feedback", "Reviewer rejected — no specific feedback.")
@@ -202,6 +256,7 @@ async def do_wiki(state: PipelineState, config: ProjectConfig, event_log: EventL
         logger.warning("Wiki documentation failed for %s — continuing", task_id)
         await event_log.record("wiki_failed", {"task": task_id})
     await event_log.record("task_completed", {"task": task_id})
+    await notify("task_completed", "orchestrator", f"Task {task_id} completed: {description}")
     _escalation_cache.pop(task_id, None)
     state.clear_active()
     # Unshelve next task if any are waiting
@@ -230,6 +285,23 @@ async def do_wiki(state: PipelineState, config: ProjectConfig, event_log: EventL
 # ---------- Escalation Handlers ----------
 
 
+def _route_with_circuit_breaker(state: PipelineState, esc: "EscalationRequest",
+                                 config: ProjectConfig) -> str:
+    """Route escalation through standard tiers, with circuit breaker override.
+
+    After max_tier1_escalations architect attempts for the same task,
+    skip architect and go straight to operator (Tier 2).
+    """
+    tier = escalation.route_escalation(esc)
+    if tier == "tier1":
+        if state.tier1_escalation_count >= config.max_tier1_escalations:
+            logger.warning("Circuit breaker: Tier 1 exhausted for %s (%d attempts) — forcing Tier 2",
+                           state.active_task, state.tier1_escalation_count)
+            return "tier2"
+        state.tier1_escalation_count += 1
+    return tier
+
+
 async def check_for_escalation(state: PipelineState, signal_reader: SignalReader,
                                session_mgr: SessionManager, config: ProjectConfig,
                                event_log: EventLog) -> bool:
@@ -253,7 +325,7 @@ async def check_for_escalation(state: PipelineState, signal_reader: SignalReader
         logger.info("Informational escalation from %s — FYI sent, no pause", esc.agent)
         return False
 
-    tier = escalation.route_escalation(esc)
+    tier = _route_with_circuit_breaker(state, esc, config)
     # Store pre-escalation context for resume routing
     state.pre_escalation_stage = state.stage
     state.pre_escalation_agent = state.stage_agent
@@ -392,6 +464,43 @@ async def handle_escalation_wait(state: PipelineState, signal_reader: SignalRead
         logger.info("Re-notified operator for blocking escalation on %s", state.active_task)
 
 
+async def handle_escalation_dialogue(state: PipelineState, config: ProjectConfig,
+                                      event_log: EventLog) -> None:
+    """Handle active escalation dialogue — classify messages, detect resolution.
+
+    Dialogue timeout is separate from max_stage_minutes — do not add
+    'escalation_dialogue' to that dict. This handler manages its own timeout
+    via dialogue_last_message_ts.
+    """
+    # Timeout: no operator message in dialogue_timeout seconds -> fall back to wait
+    ts = state.dialogue_last_message_ts or state.escalation_started_ts or state.stage_started_ts
+    if ts:
+        elapsed = (datetime.now(UTC) - datetime.fromisoformat(ts)).total_seconds()
+        if elapsed > config.dialogue_timeout:
+            logger.warning("Escalation dialogue timed out for %s after %.0fs",
+                           state.active_task, elapsed)
+            state.advance("escalation_wait")
+            state.dialogue_last_message_ts = None
+            state.dialogue_last_message = None
+            state.dialogue_pending_confirmation = False
+            await event_log.record("dialogue_timeout", {"task": state.active_task})
+            return
+
+    # Classify new operator message (if any, and no pending confirmation)
+    if state.dialogue_last_message and not state.dialogue_pending_confirmation:
+        intent = await claude.classify_resolution(state.dialogue_last_message, config)
+        if intent == "resolution":
+            state.dialogue_pending_confirmation = True
+            msg = state.dialogue_last_message
+            await notify("dialogue_confirm", state.pre_escalation_agent or "unknown",
+                        f'Resolution detected: "{msg[:100]}". '
+                        f'Confirm: say "yes" or `!reply {state.active_task} <instruction>`')
+            await event_log.record("dialogue_resolution_detected", {
+                "task": state.active_task, "message_preview": msg[:200],
+            })
+        state.dialogue_last_message = None  # consumed — classify once per message
+
+
 # ---------- Worktree Management ----------
 
 
@@ -465,12 +574,6 @@ async def main_loop(config: ProjectConfig) -> None:
 
     await lifecycle.reconcile(state, session_mgr, signal_reader, notify_escalation)
 
-    # Discord companion placeholder — Phase 1 runs without Discord
-    # In Phase 2, discord_companion.start() runs as asyncio.create_task() here.
-    pending_mutations: list = []
-
-    await notify("started", "orchestrator", "Harness started")
-
     # Handle graceful shutdown
     shutdown_event = asyncio.Event()
 
@@ -481,14 +584,42 @@ async def main_loop(config: ProjectConfig) -> None:
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
+    # Discord companion — routes inbound messages + NL to agents
+    pending_mutations: list = []
+    companion = dc.DiscordCompanion(
+        config=config,
+        pending_mutations=pending_mutations,
+        signal_reader=signal_reader,
+        active_agents_fn=lambda: list(session_mgr.sessions.keys()),
+        pipeline_stage_fn=lambda: (state.stage, state.pre_escalation_agent),
+        pipeline_paused_fn=lambda: state.paused,
+        shutdown_event=shutdown_event,
+    )
+    channel_ids = [int(ch) for ch in [
+        os.environ.get("AGENT_CHANNEL", ""),
+        os.environ.get("DEV_CHANNEL", ""),
+    ] if ch]
+    discord_task = asyncio.create_task(dc.start(companion, channel_ids))
+
+    def _log_discord_error(task):
+        if not task.cancelled() and task.exception():
+            logger.error("Discord companion crashed: %s", task.exception())
+
+    discord_task.add_done_callback(_log_discord_error)
+    logger.info("Discord companion task started")
+
+    await notify("started", "orchestrator", "Harness started")
+
     while not shutdown_event.is_set():
         # 0. Apply pending mutations from Discord (concurrency-safe)
         for mutation in pending_mutations:
             await mutation(state, session_mgr)
         pending_mutations.clear()
 
-        # 1. Check pipeline progress
-        if state.active_task:
+        # 1. Check pipeline progress (skip when paused — health checks still run)
+        if state.paused:
+            pass  # mutations applied above; health checks + heartbeat below
+        elif state.active_task:
             # Check for new escalation from active agent stages
             if state.stage in ("architect", "executor", "reviewer"):
                 if await check_for_escalation(state, signal_reader, session_mgr, config, event_log):
@@ -538,9 +669,11 @@ async def main_loop(config: ProjectConfig) -> None:
                     await handle_escalation_tier1(state, signal_reader, session_mgr, config, event_log)
                 case "escalation_wait":
                     await handle_escalation_wait(state, signal_reader, config, event_log)
+                case "escalation_dialogue":
+                    await handle_escalation_dialogue(state, config, event_log)
 
             # F3: Check for new tasks while current is blocked in escalation_wait
-            if state.stage == "escalation_wait":
+            if state.stage in ("escalation_wait", "escalation_dialogue"):
                 new_task = await signal_reader.next_task(config.task_dir)
                 if new_task:
                     worktree = await create_worktree(new_task.task_id, config)
@@ -603,6 +736,11 @@ async def main_loop(config: ProjectConfig) -> None:
         await asyncio.sleep(config.poll_interval)
 
     # Graceful shutdown
+    discord_task.cancel()
+    try:
+        await discord_task
+    except asyncio.CancelledError:
+        pass
     await session_mgr.shutdown()
     await notify("finished", "orchestrator", "Harness shut down gracefully")
     state.shutdown_ts = datetime.now(UTC).isoformat()

@@ -104,16 +104,22 @@ Approved designs not yet assigned to a phase. Most likely timeline noted.
 
 **Reference:** [[v5-omc-agent-integration]]
 
-### Conversational Discord Operator
+### Conversational Discord Operator — COMPLETE
 
-**Status:** Approved design, unscheduled  
-**Phases:** Most likely 4-5
+**Status:** All pieces implemented (2026-04-09). Discord Integration Revisions also executed.
 
 **Three-Piece Architecture:**
 
-1. **Agent Outbound (Status Posts)** — Agents post to Discord via `clawhip send --channel "$AGENT_CHANNEL"` (no code changes, prompt-only)
-2. **Natural Language Inbound Routing** — Operator sends messages without `!` prefix. Companion interprets → routes to correct agent. (~50 lines in `discord_companion.py`)
-3. **Escalation Dialogue** — Multi-turn conversation during Tier 2 escalation. Operator message → FIFO route → agent responds via `clawhip send`. Stateless, max 30s timeout.
+1. **Agent Outbound (Status Posts)** — DONE. Agents post to Discord via `clawhip send` (prompt-only).
+2. **Natural Language Inbound Routing** — DONE. `classify_target()` (haiku), `handle_raw_message()`, `start()` coroutine.
+3. **Escalation Dialogue** — DONE. `classify_resolution()`, `escalation_dialogue` stage, dialogue state fields, circuit breaker, auto-escalation.
+
+**Discord Integration Revisions** — DONE. Three-way NL classify (`classify_intent`), deterministic control pre-filter (`_CONTROL_PATTERN`), pipeline pause/resume, NL-initiated task creation via `TaskSignal`.
+
+**Resolved design gaps:**
+- NL pipeline commands: control pre-filter catches "stop", "pause", "resume", "status" deterministically before any LLM call.
+- NL-initiated tasks: `classify_intent` distinguishes feedback from new_task. New tasks create `TaskSignal` → full pipeline.
+- Subtask vs task completion: `notify("task_completed", ...)` in `do_wiki()` sends distinct notification. Subtask commits still route via clawhip `git.commit`.
 
 **Reference:** [[v5-conversational-discord-operator]]
 
@@ -131,11 +137,10 @@ Phase 2.5 (DONE — stall triad + Discord tests)
 Phase 3 (DONE — reformulate, summarize, session rotation, frozen-pipeline)
     ↓
     ├─→ OMC agent integration Tier 1-2 (parallel, feeds into Phase 4)
-    ├─→ Discord conversational operator Piece 1-2 (parallel, independent)
+    ├─→ Discord conversational operator Pieces 1-3 (DONE)
+    ├─→ Discord Integration Revisions (DONE — three-way classify, pause, NL tasks)
     ↓
 Phase 4 (DONE — Wiki integration, document-task)
-    ↓
-    └─→ Discord operator Piece 3 (uses Pieces 1-2)
     ↓
 Phase 5 (Configurable pipelines, bot integration, extensibility)
 ```

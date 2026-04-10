@@ -292,9 +292,10 @@ class TestCheckReviewer:
 
     @pytest.mark.asyncio
     async def test_reject_at_max_retries_clears_active(self, config, pipeline_state):
-        """Rejection at max_retries clears active task instead of retrying."""
+        """Rejection at max_retries clears active task when auto_escalate disabled."""
         from harness.orchestrator import check_reviewer
 
+        config.auto_escalate_on_max_retries = False  # legacy behavior
         task = TaskSignal(task_id="task-001", description="Code change")
         pipeline_state.activate(task)
         pipeline_state.retry_count = config.max_retries  # already at limit
@@ -420,9 +421,7 @@ class TestDoMerge:
 
         with patch("asyncio.create_subprocess_exec",
                    side_effect=[merge_ok, tests_fail, revert_proc]) as mock_exec:
-            with patch("asyncio.wait_for",
-                       side_effect=lambda coro, timeout: coro):
-                await do_merge(pipeline_state, config, _make_event_log())
+            await do_merge(pipeline_state, config, _make_event_log())
 
         assert pipeline_state.active_task is None
         revert_call_args = mock_exec.call_args_list[2][0]
@@ -446,9 +445,7 @@ class TestDoMerge:
 
         with patch("asyncio.create_subprocess_exec",
                    side_effect=[merge_ok, tests_ok, diff_ok]):
-            with patch("asyncio.wait_for",
-                       side_effect=lambda coro, timeout: coro):
-                await do_merge(pipeline_state, config, _make_event_log())
+            await do_merge(pipeline_state, config, _make_event_log())
 
         assert pipeline_state.stage == "wiki"
         assert pipeline_state.diff_stat is not None
@@ -1718,9 +1715,7 @@ class TestWikiDataCollection:
 
         with patch("asyncio.create_subprocess_exec",
                    side_effect=[merge_ok, tests_ok, diff_ok]):
-            with patch("asyncio.wait_for",
-                       side_effect=lambda coro, timeout: coro):
-                await do_merge(pipeline_state, config, _make_event_log())
+            await do_merge(pipeline_state, config, _make_event_log())
 
         assert pipeline_state.diff_stat == "src/auth.py | 42 +++\n 1 file changed, 42 insertions(+)"
 
@@ -1739,9 +1734,7 @@ class TestWikiDataCollection:
 
         with patch("asyncio.create_subprocess_exec",
                    side_effect=[merge_ok, tests_ok, diff_fail]):
-            with patch("asyncio.wait_for",
-                       side_effect=lambda coro, timeout: coro):
-                await do_merge(pipeline_state, config, _make_event_log())
+            await do_merge(pipeline_state, config, _make_event_log())
 
         assert pipeline_state.stage == "wiki"
         assert pipeline_state.diff_stat is None
@@ -1828,3 +1821,470 @@ class TestWikiDataCollection:
         wiki_event = next(c for c in event_log.record.call_args_list
                          if c[0][0] == "wiki_failed")
         assert wiki_event[0][1]["task"] == "task-001"
+
+
+# ---------- TestPausedPipeline ----------
+
+
+class TestPausedPipeline:
+    def test_paused_field_defaults_false(self):
+        state = PipelineState()
+        assert state.paused is False
+
+    def test_paused_persists_across_save_load(self, config):
+        state = PipelineState()
+        state.paused = True
+        state.save(config.state_file)
+        loaded = PipelineState.load(config.state_file)
+        assert loaded.paused is True
+
+    def test_paused_not_reset_by_clear_active(self):
+        """Pause is pipeline-wide, not per-task — clear_active must not reset it."""
+        state = PipelineState()
+        state.paused = True
+        task = TaskSignal(task_id="task-001", description="Work")
+        state.activate(task)
+        state.clear_active()
+        assert state.paused is True
+
+    def test_paused_not_in_shelved_dict(self):
+        """Pause is pipeline-wide — it should not be stored per-shelved-task."""
+        state = PipelineState()
+        state.paused = True
+        task = TaskSignal(task_id="task-001", description="Work")
+        state.activate(task)
+        state.advance("executor")
+        state.shelve()
+        assert "paused" not in state.shelved_tasks[0]
+
+
+class TestDoWikiNotification:
+    @pytest.mark.asyncio
+    async def test_task_completed_notification_sent(self, config, pipeline_state):
+        """do_wiki sends task_completed notification via notify."""
+        from harness.orchestrator import do_wiki
+
+        task = TaskSignal(task_id="task-001", description="Fix the bug")
+        pipeline_state.activate(task)
+        pipeline_state.advance("wiki")
+        event_log = _make_event_log()
+
+        with patch("lib.claude.document_task", new=AsyncMock(return_value=True)), \
+             patch("harness.orchestrator.notify", new=AsyncMock()) as mock_notify:
+            await do_wiki(pipeline_state, config, event_log)
+
+        # Find task_completed call among notify calls
+        completed_calls = [c for c in mock_notify.call_args_list
+                          if c[0][0] == "task_completed"]
+        assert len(completed_calls) == 1
+
+
+# ---------- TestHandleEscalationDialogue ----------
+
+
+class TestHandleEscalationDialogue:
+    @pytest.mark.asyncio
+    async def test_timeout_falls_back_to_escalation_wait(self, config, pipeline_state):
+        """dialogue_last_message_ts older than dialogue_timeout advances to escalation_wait and clears dialogue fields."""
+        from datetime import datetime, UTC, timedelta
+        from harness.orchestrator import handle_escalation_dialogue
+
+        pipeline_state.advance("escalation_dialogue")
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.dialogue_last_message_ts = (
+            datetime.now(UTC) - timedelta(seconds=2000)
+        ).isoformat()
+        pipeline_state.dialogue_last_message = "any message"
+        pipeline_state.dialogue_pending_confirmation = False
+        event_log = _make_event_log()
+        config.dialogue_timeout = 1800
+
+        await handle_escalation_dialogue(pipeline_state, config, event_log)
+
+        assert pipeline_state.stage == "escalation_wait"
+        assert pipeline_state.dialogue_last_message_ts is None
+        assert pipeline_state.dialogue_last_message is None
+        assert pipeline_state.dialogue_pending_confirmation is False
+        events = [c[0][0] for c in event_log.record.call_args_list]
+        assert "dialogue_timeout" in events
+
+    @pytest.mark.asyncio
+    async def test_no_timeout_when_within_threshold(self, config, pipeline_state):
+        """Recent dialogue_last_message_ts with no message leaves state unchanged."""
+        from datetime import datetime, UTC, timedelta
+        from harness.orchestrator import handle_escalation_dialogue
+
+        pipeline_state.advance("escalation_dialogue")
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.dialogue_last_message_ts = (
+            datetime.now(UTC) - timedelta(seconds=10)
+        ).isoformat()
+        pipeline_state.dialogue_last_message = None
+        event_log = _make_event_log()
+        config.dialogue_timeout = 1800
+
+        with patch("harness.orchestrator.claude.classify_resolution", new_callable=AsyncMock) as mock_classify:
+            await handle_escalation_dialogue(pipeline_state, config, event_log)
+
+        assert pipeline_state.stage == "escalation_dialogue"
+        mock_classify.assert_not_awaited()
+        event_log.record.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_resolution_detected_sets_pending_confirmation(self, config, pipeline_state):
+        """classify_resolution returning 'resolution' sets pending_confirmation and calls notify."""
+        from harness.orchestrator import handle_escalation_dialogue
+
+        pipeline_state.advance("escalation_dialogue")
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.dialogue_last_message = "I think we should proceed"
+        pipeline_state.dialogue_last_message_ts = None
+        pipeline_state.dialogue_pending_confirmation = False
+        event_log = _make_event_log()
+        config.dialogue_timeout = 1800
+
+        with patch("harness.orchestrator.claude.classify_resolution",
+                   new_callable=AsyncMock, return_value="resolution") as mock_classify, \
+             patch("harness.orchestrator.notify", new_callable=AsyncMock) as mock_notify:
+            await handle_escalation_dialogue(pipeline_state, config, event_log)
+
+        mock_classify.assert_awaited_once()
+        assert pipeline_state.dialogue_pending_confirmation is True
+        mock_notify.assert_awaited_once()
+        notify_args = mock_notify.call_args[0]
+        assert notify_args[0] == "dialogue_confirm"
+        assert notify_args[1] == "executor"
+        assert pipeline_state.dialogue_last_message is None  # consumed
+
+    @pytest.mark.asyncio
+    async def test_continuation_consumes_message(self, config, pipeline_state):
+        """classify_resolution returning 'continuation' consumes message but leaves pending_confirmation False."""
+        from harness.orchestrator import handle_escalation_dialogue
+
+        pipeline_state.advance("escalation_dialogue")
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.dialogue_last_message = "Can you explain more?"
+        pipeline_state.dialogue_last_message_ts = None
+        pipeline_state.dialogue_pending_confirmation = False
+        event_log = _make_event_log()
+        config.dialogue_timeout = 1800
+
+        with patch("harness.orchestrator.claude.classify_resolution",
+                   new_callable=AsyncMock, return_value="continuation"), \
+             patch("harness.orchestrator.notify", new_callable=AsyncMock) as mock_notify:
+            await handle_escalation_dialogue(pipeline_state, config, event_log)
+
+        assert pipeline_state.dialogue_last_message is None  # consumed
+        assert pipeline_state.dialogue_pending_confirmation is False
+        mock_notify.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_classify_when_pending_confirmation(self, config, pipeline_state):
+        """When dialogue_pending_confirmation is True, classify is not called and message is not consumed."""
+        from harness.orchestrator import handle_escalation_dialogue
+
+        pipeline_state.advance("escalation_dialogue")
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.dialogue_last_message = "yes, proceed"
+        pipeline_state.dialogue_last_message_ts = None
+        pipeline_state.dialogue_pending_confirmation = True
+        event_log = _make_event_log()
+        config.dialogue_timeout = 1800
+
+        with patch("harness.orchestrator.claude.classify_resolution",
+                   new_callable=AsyncMock) as mock_classify:
+            await handle_escalation_dialogue(pipeline_state, config, event_log)
+
+        mock_classify.assert_not_awaited()
+        assert pipeline_state.dialogue_last_message == "yes, proceed"  # NOT consumed
+
+    @pytest.mark.asyncio
+    async def test_timeout_uses_escalation_started_when_no_message_ts(self, config, pipeline_state):
+        """When dialogue_last_message_ts is None, escalation_started_ts drives timeout."""
+        from datetime import datetime, UTC, timedelta
+        from harness.orchestrator import handle_escalation_dialogue
+
+        pipeline_state.advance("escalation_dialogue")
+        pipeline_state.pre_escalation_agent = "executor"
+        pipeline_state.dialogue_last_message_ts = None
+        pipeline_state.dialogue_last_message = None
+        pipeline_state.dialogue_pending_confirmation = False
+        pipeline_state.escalation_started_ts = (
+            datetime.now(UTC) - timedelta(seconds=2000)
+        ).isoformat()
+        event_log = _make_event_log()
+        config.dialogue_timeout = 1800
+
+        await handle_escalation_dialogue(pipeline_state, config, event_log)
+
+        assert pipeline_state.stage == "escalation_wait"
+        assert pipeline_state.dialogue_last_message_ts is None
+        assert pipeline_state.dialogue_last_message is None
+        assert pipeline_state.dialogue_pending_confirmation is False
+        events = [c[0][0] for c in event_log.record.call_args_list]
+        assert "dialogue_timeout" in events
+
+
+# ---------- TestCircuitBreaker ----------
+
+
+class TestCircuitBreaker:
+    def test_tier1_increments_count(self):
+        """route_escalation returns tier1, count=0, max=2 → returns tier1, count becomes 1."""
+        from harness.orchestrator import _route_with_circuit_breaker
+
+        state = _make_state()
+        state.tier1_escalation_count = 0
+        esc = MagicMock()
+        config = MagicMock()
+        config.max_tier1_escalations = 2
+
+        with patch("harness.orchestrator.escalation.route_escalation", return_value="tier1"):
+            result = _route_with_circuit_breaker(state, esc, config)
+
+        assert result == "tier1"
+        assert state.tier1_escalation_count == 1
+
+    def test_tier1_at_max_forces_tier2(self):
+        """count=2, max=2 → circuit breaker fires, returns tier2, count stays 2."""
+        from harness.orchestrator import _route_with_circuit_breaker
+
+        state = _make_state()
+        state.tier1_escalation_count = 2
+        esc = MagicMock()
+        config = MagicMock()
+        config.max_tier1_escalations = 2
+
+        with patch("harness.orchestrator.escalation.route_escalation", return_value="tier1"):
+            result = _route_with_circuit_breaker(state, esc, config)
+
+        assert result == "tier2"
+        assert state.tier1_escalation_count == 2  # not incremented
+
+    def test_tier2_passthrough(self):
+        """route_escalation returns tier2 → returns tier2, tier1 count unchanged."""
+        from harness.orchestrator import _route_with_circuit_breaker
+
+        state = _make_state()
+        state.tier1_escalation_count = 0
+        esc = MagicMock()
+        config = MagicMock()
+        config.max_tier1_escalations = 2
+
+        with patch("harness.orchestrator.escalation.route_escalation", return_value="tier2"):
+            result = _route_with_circuit_breaker(state, esc, config)
+
+        assert result == "tier2"
+        assert state.tier1_escalation_count == 0  # untouched
+
+    def test_tier1_below_max_allows_through(self):
+        """count=1, max=2 → still below limit, returns tier1, count becomes 2."""
+        from harness.orchestrator import _route_with_circuit_breaker
+
+        state = _make_state()
+        state.tier1_escalation_count = 1
+        esc = MagicMock()
+        config = MagicMock()
+        config.max_tier1_escalations = 2
+
+        with patch("harness.orchestrator.escalation.route_escalation", return_value="tier1"):
+            result = _route_with_circuit_breaker(state, esc, config)
+
+        assert result == "tier1"
+        assert state.tier1_escalation_count == 2
+
+
+# ---------- TestAutoEscalation ----------
+
+
+class TestAutoEscalation:
+    """Tests for the auto-escalation path in check_reviewer (BUG-023, BUG-024 fixes)."""
+
+    def _setup_config(self, config):
+        config.max_retries = 3
+        config.auto_escalate_on_max_retries = True
+        config.max_tier1_escalations = 2
+        return config
+
+    @pytest.mark.asyncio
+    async def test_auto_escalate_creates_escalation_and_routes_tier1(
+        self, config, pipeline_state
+    ):
+        """Tier 1 path: architect receives message, state advances to escalation_tier1."""
+        from harness.orchestrator import check_reviewer
+
+        self._setup_config(config)
+        task = TaskSignal(task_id="task-001", description="Fix the bug")
+        pipeline_state.activate(task)
+        pipeline_state.advance("reviewer", "reviewer")
+        pipeline_state.retry_count = 3  # at max_retries
+
+        signal_reader = _make_signal_reader()
+        signal_reader.check_stage_complete = AsyncMock(
+            return_value={"verdict": "reject", "feedback": "Code has issues"}
+        )
+        signal_reader.read_escalation = AsyncMock(return_value=None)
+        session_mgr = _make_session_mgr()
+
+        with patch("harness.orchestrator.notify", new_callable=AsyncMock), \
+             patch("lib.signals.write_signal") as mock_write_signal, \
+             patch("harness.orchestrator.escalation") as mock_escalation:
+            mock_escalation.route_escalation.return_value = "tier1"
+            mock_escalation.format_escalation_for_architect.return_value = "esc msg"
+            await check_reviewer(
+                pipeline_state, signal_reader, session_mgr, config, _make_event_log()
+            )
+
+        assert pipeline_state.stage == "escalation_tier1"
+        assert pipeline_state.stage_agent == "architect"
+        mock_write_signal.assert_called_once()
+        session_mgr.send.assert_awaited_once()
+        assert session_mgr.send.call_args[0][0] == "architect"
+
+    @pytest.mark.asyncio
+    async def test_auto_escalate_routes_tier2_when_circuit_breaker_trips(
+        self, config, pipeline_state
+    ):
+        """tier1_escalation_count >= max_tier1_escalations → tier2, operator notified, escalation_wait."""
+        from harness.orchestrator import check_reviewer
+
+        self._setup_config(config)
+        task = TaskSignal(task_id="task-001", description="Fix the bug")
+        pipeline_state.activate(task)
+        pipeline_state.advance("reviewer", "reviewer")
+        pipeline_state.retry_count = 3
+        pipeline_state.tier1_escalation_count = 2  # circuit breaker tripped
+
+        signal_reader = _make_signal_reader()
+        signal_reader.check_stage_complete = AsyncMock(
+            return_value={"verdict": "reject", "feedback": "Code has issues"}
+        )
+        signal_reader.read_escalation = AsyncMock(return_value=None)
+        session_mgr = _make_session_mgr()
+
+        with patch("harness.orchestrator.notify", new_callable=AsyncMock) as mock_notify, \
+             patch("lib.signals.write_signal"), \
+             patch("harness.orchestrator.escalation") as mock_escalation:
+            mock_escalation.route_escalation.return_value = "tier1"
+            mock_escalation.format_tier2_notification.return_value = "tier2 summary"
+            await check_reviewer(
+                pipeline_state, signal_reader, session_mgr, config, _make_event_log()
+            )
+
+        assert pipeline_state.stage == "escalation_wait"
+        mock_notify.assert_awaited_once()
+        session_mgr.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_auto_escalate_skips_when_existing_escalation(
+        self, config, pipeline_state
+    ):
+        """read_escalation returns truthy → clear_active called, no new escalation written."""
+        from harness.orchestrator import check_reviewer
+        from harness.lib.signals import EscalationRequest
+
+        self._setup_config(config)
+        task = TaskSignal(task_id="task-001", description="Fix the bug")
+        pipeline_state.activate(task)
+        pipeline_state.advance("reviewer", "reviewer")
+        pipeline_state.retry_count = 3
+
+        existing_esc = EscalationRequest(
+            task_id="task-001", agent="executor", stage="executor",
+            severity="blocking", category="ambiguous_requirement",
+            question="Already escalated?", options=["yes"], context="ctx",
+        )
+        signal_reader = _make_signal_reader()
+        signal_reader.check_stage_complete = AsyncMock(
+            return_value={"verdict": "reject", "feedback": "Code has issues"}
+        )
+        signal_reader.read_escalation = AsyncMock(return_value=existing_esc)
+        session_mgr = _make_session_mgr()
+
+        with patch("harness.orchestrator.notify", new_callable=AsyncMock), \
+             patch("lib.signals.write_signal") as mock_write_signal:
+            await check_reviewer(
+                pipeline_state, signal_reader, session_mgr, config, _make_event_log()
+            )
+
+        mock_write_signal.assert_not_called()
+        assert pipeline_state.active_task is None
+        assert pipeline_state.stage is None
+        session_mgr.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_auto_escalate_uses_retry_count_zero(
+        self, config, pipeline_state
+    ):
+        """EscalationRequest.retry_count is 0, not state.retry_count (BUG-023 fix)."""
+        from harness.orchestrator import check_reviewer
+
+        self._setup_config(config)
+        task = TaskSignal(task_id="task-001", description="Fix the bug")
+        pipeline_state.activate(task)
+        pipeline_state.advance("reviewer", "reviewer")
+        pipeline_state.retry_count = 3
+
+        signal_reader = _make_signal_reader()
+        signal_reader.check_stage_complete = AsyncMock(
+            return_value={"verdict": "reject", "feedback": "Code has issues"}
+        )
+        signal_reader.read_escalation = AsyncMock(return_value=None)
+        session_mgr = _make_session_mgr()
+
+        captured_requests = []
+
+        def capture_write(directory, filename, obj):
+            captured_requests.append(obj)
+
+        with patch("harness.orchestrator.notify", new_callable=AsyncMock), \
+             patch("lib.signals.write_signal", side_effect=capture_write), \
+             patch("harness.orchestrator.escalation") as mock_escalation:
+            mock_escalation.route_escalation.return_value = "tier1"
+            mock_escalation.format_escalation_for_architect.return_value = "esc msg"
+            await check_reviewer(
+                pipeline_state, signal_reader, session_mgr, config, _make_event_log()
+            )
+
+        assert len(captured_requests) == 1
+        assert captured_requests[0].retry_count == 0
+
+    @pytest.mark.asyncio
+    async def test_auto_escalate_sets_pre_escalation_to_executor(
+        self, config, pipeline_state
+    ):
+        """pre_escalation_stage and pre_escalation_agent are 'executor', not 'reviewer' (BUG-024 fix)."""
+        from harness.orchestrator import check_reviewer
+
+        self._setup_config(config)
+        task = TaskSignal(task_id="task-001", description="Fix the bug")
+        pipeline_state.activate(task)
+        pipeline_state.advance("reviewer", "reviewer")
+        pipeline_state.retry_count = 3
+
+        signal_reader = _make_signal_reader()
+        signal_reader.check_stage_complete = AsyncMock(
+            return_value={"verdict": "reject", "feedback": "Code has issues"}
+        )
+        signal_reader.read_escalation = AsyncMock(return_value=None)
+        session_mgr = _make_session_mgr()
+
+        captured = {}
+
+        def capture_route(state, esc, cfg):
+            captured["pre_escalation_stage"] = state.pre_escalation_stage
+            captured["pre_escalation_agent"] = state.pre_escalation_agent
+            return "tier1"
+
+        with patch("harness.orchestrator.notify", new_callable=AsyncMock), \
+             patch("lib.signals.write_signal"), \
+             patch("harness.orchestrator.escalation") as mock_escalation, \
+             patch("harness.orchestrator._route_with_circuit_breaker",
+                   side_effect=capture_route):
+            mock_escalation.format_escalation_for_architect.return_value = "esc msg"
+            await check_reviewer(
+                pipeline_state, signal_reader, session_mgr, config, _make_event_log()
+            )
+
+        assert captured["pre_escalation_stage"] == "executor"
+        assert captured["pre_escalation_agent"] == "executor"

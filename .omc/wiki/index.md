@@ -20,6 +20,7 @@ _Full listing: `wiki_list` · Targeted lookup: `wiki_query`_
 - [v5 Harness Roadmap](v5-harness-roadmap.md) — Phase timeline with feature assignments
 - [v5 OMC Agent Integration](v5-omc-agent-integration.md) — Fold agent capabilities into pipeline roles
 - [v5 Conversational Discord Operator](v5-conversational-discord-operator.md) — 3-piece Discord architecture
+- [Auto-Escalate After Max Retries](v5-harness-auto-escalate-proposal.md) — Bridge retry exhaustion to escalation pipeline
 
 ## Progress
 - [v5 Phase 3 Readiness](v5-phase3-readiness.md) — Pre-Phase 3 due diligence and sign-off

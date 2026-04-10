@@ -8,7 +8,7 @@ updated: 2026-04-09
 
 # v5 Conversational Discord Operator
 
-**Status**: Approved design, not yet scheduled  
+**Status**: All 3 pieces implemented (2026-04-09). Discord Integration Revisions (three-way classify, pipeline pause, NL tasks) also implemented.  
 **Depends on**: Phase 2 (escalation) complete  
 **Reference**: [Conversational Discord Operator Plan](../../plans/2026-04-09-conversational-discord-operator.md)
 
@@ -51,7 +51,7 @@ Operator sends messages without `!` prefix; companion interprets and routes to c
 
 #### Caller Contract: `handle_raw_message`
 
-The Discord `on_message` handler (not yet written — part of this feature) sends the **full raw message text** to a new method:
+The Discord `on_message` handler (implemented in `start()` coroutine, `harness/discord_companion.py`) sends the **full raw message text** to:
 
 ```python
 async def handle_raw_message(self, text: str) -> str | None:
@@ -183,14 +183,26 @@ New tasks arriving during `escalation_dialogue` are handled identically to `esca
 ## Implementation Order
 
 ```text
-1. Piece 1 (agent outbound)     ← no code changes, do anytime
+1. Piece 1 (agent outbound)     ✅ implemented (prompt-only, zero harness changes)
    ↓
-2. Piece 2 (NL inbound routing) ← ~50 lines in discord_companion
+2. Piece 2 (NL inbound routing) ✅ implemented (classify_target, handle_raw_message)
    ↓
-3. Piece 3 (escalation dialogue) ← uses Pieces 1+2, PipelineState changes
+3. Piece 3 (escalation dialogue) ✅ implemented (classify_resolution, dialogue state, circuit breaker)
+   ↓
+4. Discord Integration Revisions ✅ implemented (three-way classify, pipeline pause, NL tasks)
 ```
 
-Pieces 1 and 2 are independently useful; Piece 3 depends on both.
+All pieces complete. Discord Integration Revisions added: control pre-filter, classify_intent, pipeline pause/resume, NL-initiated tasks via TaskSignal.
+
+## Agent Presence Model
+
+Agents and conductor have **presence** in Discord — not direct access. Clawhip manages all Discord I/O, but presents it as if agents are there:
+
+- **Outbound**: Agents call `clawhip send` to post status updates. Clawhip formats and delivers. From the operator's view, "the architect said X."
+- **Inbound**: Operator pings an agent by name (NL or `!tell`). Clawhip/companion routes to FIFO. From the operator's view, "I told the executor to do Y."
+- **Conversational responsiveness**: Agents appear responsive and present. Operator gets feedback, can direct work, sees progress — without agents having any Discord awareness.
+
+This is a **mediated presence** pattern: clawhip is the proxy that creates the illusion of agents being in the channel. Star topology preserved — agents never see Discord directly.
 
 ## Design Constraints (Load-Bearing)
 
@@ -198,6 +210,7 @@ Pieces 1 and 2 are independently useful; Piece 3 depends on both.
 |-----------|-----------:|
 | **Star topology** | Preserves central audit trail, escalation routing, pipeline state consistency, FIFO concurrency model |
 | **Agent outbound is write-only** | Agents post status but never read Discord responses |
+| **Mediated presence** | Clawhip proxies agent/conductor presence in Discord for operator clarity — agents unaware |
 | **Harness remains project-agnostic** | No Claw Code-specific code in `harness/`; uses signal types + clawhip |
 | **No agent Discord read access** | Security boundary; all inbound mediated by orchestrator |
 | **Orchestrator is mediator** | All messages routed through FIFO, never agent-to-agent or agent-to-Discord direct |
@@ -226,7 +239,7 @@ Pieces 1 and 2 are independently useful; Piece 3 depends on both.
 - [x] Phase 2 (escalation) committed and stable
 - [ ] `clawhip send` supports `--channel` flag for targeted posting — verify with `clawhip send --help` before Piece 1
 - [ ] Verify agents can call `clawhip send` from Bash tool in their tmux sessions
-- [ ] Discord `on_message` handler exists and calls `handle_raw_message(text)` — written as part of Piece 2, not a prerequisite
+- [x] Discord `on_message` handler exists and calls `handle_raw_message(text)` — `start()` coroutine added to `harness/discord_companion.py`, wired into orchestrator via `asyncio.create_task()`
 
 **Channel routing**: Agents post to the channel matching their role as defined in `AgentDef.discord_channel` (default: `"dev-agents"`). Override per-agent in `config/agent_roles/*.md` prompt or future `sessions.toml`.
 

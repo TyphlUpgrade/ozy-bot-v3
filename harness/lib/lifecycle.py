@@ -89,6 +89,19 @@ async def reconcile(
                     state.active_task,
                 )
                 state.advance("escalation_wait")
+        elif state.stage == "escalation_dialogue":
+            # Crash during dialogue — demote to escalation_wait for re-notify.
+            # Dialogue context (which message, pending confirmation) is ephemeral.
+            esc = await signal_reader.read_escalation(state.active_task)
+            if esc is not None:
+                logger.info("Re-notifying escalation for task %s (was in dialogue)", state.active_task)
+                await notify_fn(esc)
+            else:
+                logger.warning("escalation_dialogue for %s but no escalation signal", state.active_task)
+            state.advance("escalation_wait")
+            state.dialogue_last_message_ts = None
+            state.dialogue_last_message = None
+            state.dialogue_pending_confirmation = False
         elif state.worktree is not None and not state.worktree.exists():
             logger.warning(
                 "Worktree %s missing for task %s — clearing active state",
@@ -108,8 +121,15 @@ async def reconcile(
     for shelved in state.shelved_tasks:
         stask_id = shelved.get("task_id", "")
         sstage = shelved.get("stage", "")
-        if sstage in ("escalation_wait", "escalation_tier1"):
+        if sstage in ("escalation_wait", "escalation_tier1", "escalation_dialogue"):
             esc = await signal_reader.read_escalation(stask_id)
+            # Demote escalation_dialogue to escalation_wait (dialogue is ephemeral)
+            if sstage == "escalation_dialogue":
+                logger.warning("Shelved task %s was in escalation_dialogue — reverting to escalation_wait", stask_id)
+                shelved["stage"] = "escalation_wait"
+                shelved["dialogue_last_message_ts"] = None
+                shelved["dialogue_last_message"] = None
+                shelved["dialogue_pending_confirmation"] = False
             if esc is not None:
                 logger.info("Re-notifying escalation for shelved task %s (stage=%s)", stask_id, sstage)
                 await notify_fn(esc)
@@ -120,6 +140,8 @@ async def reconcile(
                         stask_id,
                     )
                     shelved["stage"] = "escalation_wait"
+                elif sstage == "escalation_dialogue":
+                    pass  # already demoted above
                 else:
                     logger.warning(
                         "Shelved task %s in escalation_wait but no escalation signal found",

@@ -45,6 +45,9 @@ classify = "ultra"                      # One-word answer wrapped in JSON
 summarize = "ultra"                     # Internal context transfer
 reformulate = "full"                    # Executor needs to understand the reformulation
 wiki = "off"                            # Documentation must be readable by humans
+classify_resolution = "ultra"           # One-word answer, ephemeral haiku call
+classify_intent = "ultra"               # One-word answer, ephemeral haiku call
+classify_target = "ultra"              # One-word answer, ephemeral haiku call
 
 # Wenyan mode (classical Chinese token compression)
 # Experimental — keep off until benchmarked
