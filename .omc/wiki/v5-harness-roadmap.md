@@ -3,7 +3,7 @@ title: v5 Harness Roadmap
 tags: [harness, roadmap, timeline, phases]
 category: architecture
 created: 2026-04-09
-updated: 2026-04-09
+updated: 2026-04-11
 ---
 
 # v5 Harness Roadmap
@@ -131,7 +131,7 @@ Approved designs not yet assigned to a phase. Most likely timeline noted.
 
 ### Discord Presence Polish (Visual Identity + Proactive Reporting)
 
-**Status:** Approved design, unscheduled  
+**Status:** In progress (2026-04-11) — avatars + stage announcements done  
 **Depends:** Webhook per-agent (DONE), agent outbound via clawhip (DONE)  
 **Reference:** [[v5-conversational-discord-operator]]
 
@@ -139,7 +139,7 @@ Gap analysis against production-grade bot Discord presence (Devin-style). Five i
 
 | # | Feature | Effort | Impact | What |
 |---|---------|--------|--------|------|
-| 1 | **Avatar URLs per agent** | Trivial | High visual | Expand `AGENT_DISPLAY_NAMES` → `AGENT_IDENTITIES` with `avatar_url`. Host 4 colored circle PNGs. Pass through webhook POST. |
+| 1 | **Avatar URLs per agent** | DONE | High visual | `AGENT_IDENTITIES` with `avatar_url` + configurable via `[discord.agents.*]` in project.toml. Webhook POST includes `avatar_url` when set. |
 | 2 | **Stage transition announcements** | ~15 lines | High operational | Orchestrator posts to Discord on every stage change via `clawhip send` or webhook. Format: role + task ID + description. |
 | 3 | **Agent progress prompts** | Prompt-only | Medium | Update `config/harness/agents/*.md` to instruct agents to post work-in-progress summaries via `clawhip send`. Zero code changes. |
 | 4 | **Structured message formatting** | Low | Polish | Message templates for stage transitions, escalations, completions. Markdown formatting with sections and bullets. |
@@ -152,9 +152,9 @@ Gap analysis against production-grade bot Discord presence (Devin-style). Five i
 
 Items 1+2 get 80% of the polished feel. Items 3-5 are incremental polish.
 
-### Message Accumulator (Multi-Message Handling)
+### Message Accumulator (Multi-Message Handling) — COMPLETE
 
-**Status:** Approved design, unscheduled  
+**Status:** Implemented (2026-04-10)  
 **Depends:** Reactions (DONE), webhook per-agent (DONE)
 
 Three-lane design replacing FIFO queue approach:
@@ -185,8 +185,8 @@ Phase 3 (DONE — reformulate, summarize, session rotation, frozen-pipeline)
     ├─→ Discord conversational operator Pieces 1-3 (DONE)
     ├─→ Discord Integration Revisions (DONE — three-way classify, pause, NL tasks)
     ├─→ Reactions + Webhook per-agent + Mention filter (DONE)
-    ├─→ Message accumulator (approved, unscheduled)
-    ├─→ Discord presence polish (approved, unscheduled — avatars, stage announcements, progress prompts)
+    ├─→ Message accumulator (DONE)
+    ├─→ Discord presence polish (in progress — avatars DONE, stage announcements DONE, progress prompts/formatting/commits remaining)
     ↓
 Phase 4 (DONE — Wiki integration, document-task)
     ↓

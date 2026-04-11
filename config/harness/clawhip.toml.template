@@ -23,11 +23,15 @@ watch_dirs = ["ozymandias/state/signals"]
 poll_interval_secs = 5
 channel = "${AGENT_CHANNEL}"
 
-# Git monitor disabled — GitHub API rate limit (60 req/hr unauthenticated).
-# Clawhip polls every 5s = 720 req/hr, burns limit in ~5min.
-# Re-enable with a GitHub PAT in [monitors] github_token_env or increase poll interval.
-# [[monitors.git.repos]]
-# path = "."
+# Git monitor — requires GITHUB_PAT env var for 5000 req/hr limit.
+# Poll every 30s = 120 req/hr, well within budget.
+[monitors.git]
+github_token_env = "GITHUB_PAT"
+poll_interval_secs = 30
+
+[[monitors.git.repos]]
+path = "."
+channel = "${DEV_CHANNEL}"
 
 # --- Session monitoring (tmux) ---
 

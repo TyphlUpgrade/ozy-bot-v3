@@ -270,14 +270,17 @@ Messages receive reaction feedback for receipt confirmation:
 - ❌ replaces 👀 on error/exception
 - All reaction calls wrapped in try/except — cosmetic, never blocks message processing
 
-## Webhook Per-Agent Identity (2026-04-10)
+## Webhook Per-Agent Identity (2026-04-10, updated 2026-04-11)
 
-Responses sent via Discord webhook with agent-specific display name:
+Responses sent via Discord webhook with agent-specific display name and avatar:
 - `discord_webhook_url` configured in `[discord]` section of project.toml
+- `[discord.agents.*]` TOML tables configure `name` and `avatar_url` per agent — falls back to hardcoded `AGENT_IDENTITIES` defaults
 - `_send_response()` infers agent from response text ("routed to executor" → Executor)
-- Webhook POST uses `username` field — Discord renders each agent as a separate identity
+- `announce_stage()` maps stage → agent and posts transitions via webhook
+- Webhook POST uses `username` + `avatar_url` fields — Discord renders each agent as a separate visual identity
 - Three-layer fallback: no webhook → channel.send, HTTP error → channel.send, aiohttp missing → channel.send
-- `AGENT_DISPLAY_NAMES` map: orchestrator/architect/executor/reviewer
+- `AGENT_IDENTITIES` map (hardcoded fallback): orchestrator/architect/executor/reviewer
+- `ProjectConfig.discord_agent_identities` (config override): loaded from `[discord.agents.*]` in project.toml
 
 ## What We Are NOT Building
 

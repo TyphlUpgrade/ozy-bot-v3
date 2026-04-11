@@ -21,20 +21,20 @@ escalation_channel = "escalations"
 # Per-agent Discord identity — username and avatar_url for webhook messages.
 # To add a new agent, add one entry here.
 [discord.agents.orchestrator]
-name = "Orchestrator"
-# avatar_url = "https://example.com/orchestrator.png"
+name = "'executive manager'"
+avatar_url = "https://i.imgur.com/CugpSrN.png"
 
 [discord.agents.architect]
-name = "Architect"
-# avatar_url = "https://example.com/architect.png"
+name = "losing my fucking mind bruh"
+avatar_url = "https://i.imgur.com/Q2cEJxa.png"
 
 [discord.agents.executor]
-name = "Executor"
-# avatar_url = "https://example.com/executor.png"
+name = "gamblimg man"
+avatar_url = "https://i.imgur.com/mwqGEp9.png"
 
 [discord.agents.reviewer]
-name = "Reviewer"
-# avatar_url = "https://example.com/reviewer.png"
+name = "JESSE"
+avatar_url = "https://i.imgur.com/QBC2IGY.png"
 
 [pipeline]
 poll_interval = 5.0                     # seconds between main loop iterations
