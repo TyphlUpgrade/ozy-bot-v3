@@ -34,9 +34,9 @@ function validateCompletion(raw: unknown): CompletionSignal | null {
 
 export interface GitOps {
   createWorktree(basePath: string, branchName: string, worktreePath: string): void;
-  removeWorktree(worktreePath: string): void;
-  branchExists(branchName: string): boolean;
-  deleteBranch(branchName: string): void;
+  removeWorktree(repoPath: string, worktreePath: string): void;
+  branchExists(repoPath: string, branchName: string): boolean;
+  deleteBranch(repoPath: string, branchName: string): void;
 }
 
 export const realGitOps: GitOps = {
@@ -48,21 +48,21 @@ export const realGitOps: GitOps = {
     });
   },
 
-  removeWorktree(worktreePath: string): void {
-    execSync(`git worktree remove --force ${worktreePath}`, { stdio: "pipe" });
+  removeWorktree(repoPath: string, worktreePath: string): void {
+    execSync(`git worktree remove --force ${worktreePath}`, { cwd: repoPath, stdio: "pipe" });
   },
 
-  branchExists(branchName: string): boolean {
+  branchExists(repoPath: string, branchName: string): boolean {
     try {
-      execSync(`git rev-parse --verify ${branchName}`, { stdio: "pipe" });
+      execSync(`git rev-parse --verify ${branchName}`, { cwd: repoPath, stdio: "pipe" });
       return true;
     } catch {
       return false;
     }
   },
 
-  deleteBranch(branchName: string): void {
-    execSync(`git branch -D ${branchName}`, { stdio: "pipe" });
+  deleteBranch(repoPath: string, branchName: string): void {
+    execSync(`git branch -D ${branchName}`, { cwd: repoPath, stdio: "pipe" });
   },
 };
 
@@ -116,13 +116,13 @@ export class SessionManager {
     const branchName = session?.branchName ?? `harness/task-${taskId}`;
 
     try {
-      this.gitOps.removeWorktree(worktreePath);
+      this.gitOps.removeWorktree(this.config.project.root, worktreePath);
     } catch {
       // Already removed
     }
     try {
-      if (this.gitOps.branchExists(branchName)) {
-        this.gitOps.deleteBranch(branchName);
+      if (this.gitOps.branchExists(this.config.project.root, branchName)) {
+        this.gitOps.deleteBranch(this.config.project.root, branchName);
       }
     } catch {
       // Already deleted

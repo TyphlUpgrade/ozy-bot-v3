@@ -116,8 +116,8 @@ export const realMergeGitOps: MergeGitOps = {
       }) as unknown as string;
       return { success: true, output: output ?? "" };
     } catch (err) {
-      const e = err as { killed?: boolean; stdout?: string; stderr?: string; message?: string };
-      if (e.killed) {
+      const e = err as { killed?: boolean; signal?: string; stdout?: string; stderr?: string; message?: string };
+      if (e.killed || e.signal === "SIGTERM") {
         return { success: false, output: "TIMEOUT" };
       }
       return { success: false, output: e.stdout ?? e.stderr ?? e.message ?? "test failed" };

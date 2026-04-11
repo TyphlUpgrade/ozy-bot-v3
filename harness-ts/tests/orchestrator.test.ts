@@ -92,9 +92,9 @@ function mockGitOps(): GitOps {
     createWorktree: vi.fn((_base, _branch, wtPath) => {
       mkdirSync(wtPath, { recursive: true });
     }),
-    removeWorktree: vi.fn(),
-    branchExists: vi.fn().mockReturnValue(false),
-    deleteBranch: vi.fn(),
+    removeWorktree: vi.fn((_repoPath: string, _worktreePath: string) => {}),
+    branchExists: vi.fn((_repoPath: string, _branchName: string) => false),
+    deleteBranch: vi.fn((_repoPath: string, _branchName: string) => {}),
   };
 }
 

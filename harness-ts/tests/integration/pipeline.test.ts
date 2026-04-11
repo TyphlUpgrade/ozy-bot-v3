@@ -126,9 +126,9 @@ function setupIntegration(opts?: {
         }),
       );
     }),
-    removeWorktree: vi.fn(),
-    branchExists: vi.fn().mockReturnValue(false),
-    deleteBranch: vi.fn(),
+    removeWorktree: vi.fn((_repoPath: string, _worktreePath: string) => {}),
+    branchExists: vi.fn((_repoPath: string, _branchName: string) => false),
+    deleteBranch: vi.fn((_repoPath: string, _branchName: string) => {}),
   };
 
   const queryFn: QueryFn = opts?.queryFactory
