@@ -6,7 +6,9 @@ created: 2026-04-09
 updated: 2026-04-09
 ---
 
-# v5 Harness Design Decisions
+> **HISTORICAL (2026-04-11)** — Python harness archived. Design decisions here are Python-specific.
+
+# v5 Harness Design Decisions (Python — Archived)
 
 Key design choices made during v5 harness Phase 1 implementation, with rationale.
 

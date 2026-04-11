@@ -6,7 +6,9 @@ created: 2026-04-09
 updated: 2026-04-09
 ---
 
-# v5 Harness Known Bugs
+> **HISTORICAL (2026-04-11)** — Python harness archived. Bugs here are Python-specific.
+
+# v5 Harness Known Bugs (Python — Archived)
 
 Bugs found during review that are deferred or represent latent risks. Tracked here for future phases.
 

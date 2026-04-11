@@ -5,25 +5,28 @@ updated: 2026-04-09
 # Wiki Index
 _Full listing: `wiki_list` · Targeted lookup: `wiki_query`_
 
-## Architecture
-- [v5 Harness Architecture](v5-harness-architecture.md) — 7-module orchestrator, FIFO sessions, stage pipeline
-- [v5 Harness Design Decisions](v5-harness-design-decisions.md) — O_NONBLOCK, caveman config, concurrency
-- [v5 Harness Developer Reference](v5-harness-dev-reference.md) — Extension points, interfaces, patterns, diagnostics
+## Harness-TS (Active)
+- [Harness-TS Architecture](harness-ts-architecture.md) — 6-module orchestrator, SDK sessions, merge queue, 112 tests
+- [Ambiguity Protections](harness-ts-ambiguity-protections.md) — Prior art from Python harness, TS translation, dialogue agent design
+- [Graduated Response Model](harness-ts-graduated-response.md) — Signal-driven escalation levels, structured confidence, dialogue agent
 
-## Quality
-- [v5 Harness Known Bugs](v5-harness-known-bugs.md) — 8 open bugs (22 resolved → archive)
-- [v5 Harness Open Concerns](v5-harness-open-concerns.md) — Engineering concerns, perf issues
-- [v5 Harness Drift Log](v5-harness-drift-log.md) — V5 plan deviations (Plan/Impl/Why)
-- [v5 Harness Reviewer Findings](v5-harness-reviewer-findings.md) — 4 review rounds, 33 issues fixed
-
-## Roadmap
-- [v5 Harness Roadmap](v5-harness-roadmap.md) — Phase timeline with feature assignments
-- [v5 OMC Agent Integration](v5-omc-agent-integration.md) — Fold agent capabilities into pipeline roles
-- [v5 Conversational Discord Operator](v5-conversational-discord-operator.md) — 3-piece Discord architecture
+## Design Rationale (Still Relevant)
+- [Harness Efficiency Proposal](v5-harness-efficiency-proposal.md) — Adaptive pipeline, direct API, single-agent-first vision
+- [Supervised Session Architecture](v5-harness-supervised-session-architecture.md) — Daemon + SDK sessions, merge queue, concurrency model
+- [Harness Lessons Learned](v5-harness-lessons-learned.md) — Institutional knowledge extracted before TypeScript rewrite
 - [Auto-Escalate After Max Retries](v5-harness-auto-escalate-proposal.md) — Bridge retry exhaustion to escalation pipeline
 
-## Progress
-- [v5 Phase 3 Readiness](v5-phase3-readiness.md) — Pre-Phase 3 due diligence and sign-off
+## Python Harness (Archived 2026-04-11)
+- [v5 Architecture](v5-harness-architecture.md) — HISTORICAL: FIFO sessions, stage pipeline
+- [v5 Roadmap](v5-harness-roadmap.md) — HISTORICAL: Python phase timeline
+- [v5 Design Decisions](v5-harness-design-decisions.md) — HISTORICAL: O_NONBLOCK, caveman, concurrency
+- [v5 Known Bugs](v5-harness-known-bugs.md) — HISTORICAL: Python-specific bugs
+- [v5 Open Concerns](v5-harness-open-concerns.md) — HISTORICAL: Python-specific concerns
+- [v5 Drift Log](v5-harness-drift-log.md) — HISTORICAL: Python plan deviations
+- [v5 Reviewer Findings](v5-harness-reviewer-findings.md) — HISTORICAL: Python review rounds
+- [v5 Dev Reference](v5-harness-dev-reference.md) — HISTORICAL: Python extension points
+- [v5 Discord Operator](v5-conversational-discord-operator.md) — Design for Discord integration (partially applicable to TS)
+- [v5 OMC Agent Integration](v5-omc-agent-integration.md) — Agent folding design (partially applicable to TS)
 
 ## Ozymandias (Trading Bot)
 - [Ozy Documentation Index](ozy-doc-index.md) — File-to-page routing, navigation

@@ -7,7 +7,9 @@ updated: 2026-04-09
 entries: 7
 ---
 
-# v5 Harness Drift Log
+> **HISTORICAL (2026-04-11)** — Python harness archived. Drift entries here are Python-specific.
+
+# v5 Harness Drift Log (Python — Archived)
 
 Implementation deviations from `plans/2026-04-08-v5-harness-architecture.md`. Format matches Ozy DRIFT_LOG Spec/Impl/Why triple.
 

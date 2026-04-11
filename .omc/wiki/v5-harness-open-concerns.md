@@ -6,7 +6,9 @@ created: 2026-04-09
 updated: 2026-04-09
 ---
 
-# v5 Harness Open Concerns
+> **HISTORICAL (2026-04-11)** — Python harness archived. Concerns here are Python-specific and do not apply to harness-ts.
+
+# v5 Harness Open Concerns (Python — Archived)
 
 Engineering concerns that are not bugs (no repro steps, no crash) but represent latent risks, performance issues, or unvalidated assumptions. Migrated from Ozy NOTES.md pattern.
 

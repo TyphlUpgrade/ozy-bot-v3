@@ -6,7 +6,9 @@ created: 2026-04-09
 updated: 2026-04-11
 ---
 
-# v5 Harness Roadmap
+> **HISTORICAL (2026-04-11)** — Python harness archived. Roadmap replaced by harness-ts phased plan. See [[harness-ts-architecture]] for current system.
+
+# v5 Harness Roadmap (Python — Archived)
 
 Central timeline mapping v5 harness features to phases with dependencies and status. This is the "where are we, what's next" document.
 

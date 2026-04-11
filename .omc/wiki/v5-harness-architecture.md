@@ -6,7 +6,9 @@ created: 2026-04-09
 updated: 2026-04-10
 ---
 
-# v5 Harness Architecture
+> **HISTORICAL (2026-04-11)** — Python harness archived to `harness-archive/`. Replaced by TypeScript harness at `harness-ts/` built on `@anthropic-ai/claude-agent-sdk`. See [[harness-ts-architecture]] for current system.
+
+# v5 Harness Architecture (Python — Archived)
 
 The v5 harness is a Python asyncio orchestrator that manages Claude Code agent sessions for automated development workflows. A person types a sentence in Discord, and agents break work into tasks, assign roles, write code, test it, review it, and merge when everything passes.
 

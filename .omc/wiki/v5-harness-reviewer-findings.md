@@ -6,7 +6,9 @@ created: 2026-04-09
 updated: 2026-04-09
 ---
 
-# v5 Harness Reviewer Findings
+> **HISTORICAL (2026-04-11)** — Python harness archived. Findings here are Python-specific.
+
+# v5 Harness Reviewer Findings (Python — Archived)
 
 Four rounds of review. Rounds 1-2: 23 issues found and fixed — see [[v5-harness-reviewer-findings-archive-2026]] for full details. Round 3: Phase 2 post-implementation review (architect, critic, code-reviewer) found 9 new bugs + 3 test coverage gaps. Round 4: Phase 3 pre-implementation review found 6 bugs, all fixed.
 

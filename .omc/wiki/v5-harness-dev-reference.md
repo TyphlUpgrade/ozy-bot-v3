@@ -6,7 +6,9 @@ created: 2026-04-09
 updated: 2026-04-09
 ---
 
-# v5 Harness Developer Reference
+> **HISTORICAL (2026-04-11)** — Python harness archived. Reference here is Python-specific.
+
+# v5 Harness Developer Reference (Python — Archived)
 
 Quick-reference for agents and developers working in the v5 harness. Covers extension points and key interfaces. For architecture overview see [[v5-harness-architecture]]; for bugs see [[v5-harness-known-bugs]].
 
