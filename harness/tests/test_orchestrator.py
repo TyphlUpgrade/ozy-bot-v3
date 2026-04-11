@@ -76,7 +76,7 @@ class TestClassifyTask:
 
     @pytest.mark.asyncio
     async def test_simple_task_routes_to_executor(self, config, pipeline_state):
-        """Simple classification advances stage to executor without sending to architect."""
+        """Simple classification advances stage to executor and sends task description."""
         from harness.orchestrator import classify_task
 
         task = TaskSignal(task_id="task-002", description="Fix typo in README")
@@ -88,7 +88,12 @@ class TestClassifyTask:
 
         assert pipeline_state.stage == "executor"
         assert pipeline_state.stage_agent == "executor"
-        session_mgr.send.assert_not_awaited()
+        session_mgr.send.assert_awaited_once()
+        call_args = session_mgr.send.call_args
+        assert call_args[0][0] == "executor"
+        msg = call_args[0][1]
+        assert "[TASK] Fix typo in README" in msg
+        assert "completion-task-002.json" in msg
 
     @pytest.mark.asyncio
     async def test_classify_uses_task_description_when_set(self, config):
@@ -1393,7 +1398,11 @@ class TestCheckStageContextTransfer:
             await check_stage(state, signal_reader, session_mgr, config, "architect", event_log)
 
         assert state.stage == "executor"
-        session_mgr.send.assert_not_awaited()
+        # Task is always sent even without context summary
+        session_mgr.send.assert_awaited_once()
+        msg = session_mgr.send.call_args[0][1]
+        assert "[TASK]" in msg
+        assert "[CONTEXT]" not in msg  # no context when summarize fails
 
     @pytest.mark.asyncio
     async def test_proceeds_without_context_when_no_output(self, config):
@@ -1409,8 +1418,11 @@ class TestCheckStageContextTransfer:
             await check_stage(state, signal_reader, session_mgr, config, "architect", event_log)
 
         assert state.stage == "executor"
-        mock_sum.assert_not_awaited()
-        session_mgr.send.assert_not_awaited()
+        mock_sum.assert_not_awaited()  # no output to summarize
+        # Task is always sent even without context
+        session_mgr.send.assert_awaited_once()
+        msg = session_mgr.send.call_args[0][1]
+        assert "[TASK]" in msg
 
     @pytest.mark.asyncio
     async def test_no_context_transfer_on_reviewer_to_merge(self, config):
@@ -2288,3 +2300,158 @@ class TestAutoEscalation:
 
         assert captured["pre_escalation_stage"] == "executor"
         assert captured["pre_escalation_agent"] == "executor"
+
+
+# ---------- Full pipeline integration (BUG-025/026/027 regression) ----------
+
+
+class TestFullPipelineIntegration:
+    """Integration tests exercising full pipeline flow without Discord."""
+
+    @pytest.mark.asyncio
+    async def test_simple_task_full_pipeline(self, config, pipeline_state):
+        """Simple task flows: classify → executor → reviewer → merge → wiki → done."""
+        from harness.orchestrator import classify_task, check_stage, check_reviewer, do_merge, do_wiki
+
+        task = TaskSignal(task_id="integ-001", description="Add hello world command")
+        pipeline_state.activate(task)
+        session_mgr = _make_session_mgr()
+        event_log = _make_event_log()
+        signal_reader = _make_signal_reader()
+
+        # 1. classify → executor (simple)
+        with patch("lib.claude.classify", new=AsyncMock(return_value="simple")):
+            await classify_task(pipeline_state, session_mgr, config, event_log)
+        assert pipeline_state.stage == "executor"
+        # BUG-026 fix: executor receives task description + signal path
+        session_mgr.send.assert_awaited_once()
+        msg = session_mgr.send.call_args[0][1]
+        assert "[TASK] Add hello world command" in msg
+        assert "completion-integ-001.json" in msg
+
+        # 2. executor completes → reviewer
+        signal_reader.check_stage_complete = AsyncMock(
+            return_value={"output": "Implemented hello world command"})
+        with patch("lib.claude.summarize", new=AsyncMock(return_value="Added hello command")):
+            await check_stage(pipeline_state, signal_reader, session_mgr, config, "executor", event_log)
+        assert pipeline_state.stage == "reviewer"
+
+        # 3. reviewer approves → merge
+        signal_reader.check_stage_complete = AsyncMock(
+            return_value={"verdict": "approve", "feedback": "LGTM"})
+        await check_reviewer(pipeline_state, signal_reader, session_mgr, config, event_log)
+        assert pipeline_state.stage == "merge"
+        assert pipeline_state.review_verdict == "LGTM"
+
+        # 4. merge → wiki (no worktree in test = skip to wiki)
+        pipeline_state.worktree = None
+        await do_merge(pipeline_state, config, event_log)
+        assert pipeline_state.stage == "wiki"
+
+        # 5. wiki → done
+        with patch("lib.claude.document_task", new=AsyncMock(return_value=True)), \
+             patch("harness.orchestrator.notify", new_callable=AsyncMock) as mock_notify:
+            await do_wiki(pipeline_state, config, event_log)
+        assert pipeline_state.active_task is None
+        assert pipeline_state.stage is None
+        # Verify task_completed notification sent
+        mock_notify.assert_awaited_once()
+        assert mock_notify.call_args[0][0] == "task_completed"
+
+    @pytest.mark.asyncio
+    async def test_complex_task_full_pipeline(self, config, pipeline_state):
+        """Complex task flows: classify → architect → executor → reviewer → merge → wiki → done."""
+        from harness.orchestrator import classify_task, check_stage, check_reviewer, do_merge, do_wiki
+
+        task = TaskSignal(task_id="integ-002", description="Refactor auth module")
+        pipeline_state.activate(task)
+        session_mgr = _make_session_mgr()
+        event_log = _make_event_log()
+        signal_reader = _make_signal_reader()
+
+        # 1. classify → architect (complex)
+        with patch("lib.claude.classify", new=AsyncMock(return_value="complex")):
+            await classify_task(pipeline_state, session_mgr, config, event_log)
+        assert pipeline_state.stage == "architect"
+        session_mgr.send.assert_awaited_once()
+        assert "[TASK]" in session_mgr.send.call_args[0][1]
+
+        # 2. architect completes → executor (with context transfer)
+        signal_reader.check_stage_complete = AsyncMock(
+            return_value={"output": "Plan: refactor auth into 3 modules"})
+        session_mgr.send.reset_mock()
+        with patch("lib.claude.summarize", new=AsyncMock(return_value="Refactor plan summary")):
+            await check_stage(pipeline_state, signal_reader, session_mgr, config, "architect", event_log)
+        assert pipeline_state.stage == "executor"
+        # Executor receives [CONTEXT] + [TASK] from architect output
+        session_mgr.send.assert_awaited_once()
+        sent = session_mgr.send.call_args[0][1]
+        assert "[CONTEXT]" in sent
+        assert "[TASK]" in sent
+
+        # 3. executor completes → reviewer
+        signal_reader.check_stage_complete = AsyncMock(
+            return_value={"output": "Refactored auth module"})
+        session_mgr.send.reset_mock()
+        with patch("lib.claude.summarize", new=AsyncMock(return_value="Executor summary")):
+            await check_stage(pipeline_state, signal_reader, session_mgr, config, "executor", event_log)
+        assert pipeline_state.stage == "reviewer"
+
+        # 4. reviewer approves → merge
+        signal_reader.check_stage_complete = AsyncMock(
+            return_value={"verdict": "approved", "feedback": "Clean refactor"})
+        await check_reviewer(pipeline_state, signal_reader, session_mgr, config, event_log)
+        assert pipeline_state.stage == "merge"
+
+        # 5. merge → wiki (no worktree)
+        pipeline_state.worktree = None
+        await do_merge(pipeline_state, config, event_log)
+        assert pipeline_state.stage == "wiki"
+
+        # 6. wiki → done
+        with patch("lib.claude.document_task", new=AsyncMock(return_value=True)), \
+             patch("harness.orchestrator.notify", new_callable=AsyncMock):
+            await do_wiki(pipeline_state, config, event_log)
+        assert pipeline_state.active_task is None
+
+
+# ---------- Timeout notification (BUG-025 regression) ----------
+
+
+class TestTimeoutNotification:
+    """Tests that stage timeout sends a Discord notification before clearing state."""
+
+    @pytest.mark.asyncio
+    async def test_timeout_calls_notify_before_clear(self, config, pipeline_state):
+        """_handle_stage_timeout calls notify() with stage_timeout event before clear_active."""
+        from datetime import datetime, timezone, timedelta
+        from harness.orchestrator import _handle_stage_timeout
+
+        task = TaskSignal(task_id="timeout-001", description="Stuck task")
+        pipeline_state.activate(task)
+        pipeline_state.advance("executor", "executor")
+        past = datetime.now(timezone.utc) - timedelta(hours=4)
+        pipeline_state.stage_started_ts = past.isoformat()
+
+        session_mgr = _make_session_mgr()
+        session_mgr.sessions = {}
+        event_log = _make_event_log()
+
+        with patch("harness.orchestrator.notify", new_callable=AsyncMock) as mock_notify:
+            await _handle_stage_timeout(pipeline_state, session_mgr, event_log, config)
+
+        # notify called with correct event and content (before clear_active wiped state)
+        mock_notify.assert_awaited_once()
+        call_args = mock_notify.call_args[0]
+        assert call_args[0] == "stage_timeout"
+        assert call_args[1] == "executor"
+        assert "timeout-001" in call_args[2]
+        assert "executor" in call_args[2]
+
+        # State was cleared after notify
+        assert pipeline_state.active_task is None
+        assert pipeline_state.stage is None
+
+        # Event log also recorded
+        event_log.record.assert_awaited_once()
+        assert event_log.record.call_args[0][0] == "stage_timeout"

@@ -226,6 +226,59 @@ This is a **mediated presence** pattern: clawhip is the proxy that creates the i
 | Two write paths to Discord (orchestrator + agent) | Low | Both use `clawhip send`; clawhip orders messages |
 | Sensitive context leaked to Discord | Medium | Agent role prompts specify what to post; never raw state/credentials |
 
+## Message Accumulator (replaces message queue)
+
+**Decision (2026-04-10)**: Multi-message handling uses an **accumulation window**, not a FIFO queue.
+
+### Problem
+
+Rapid-fire Discord messages are a **message boundary** problem, not a queuing problem. When an operator types 3 messages in 4 seconds ("fix the auth bug" / "in broker.py" / "the one that crashes on refresh"), that's one instruction split across three messages. A FIFO queue serializes them but processes each independently — three `classify_intent` calls, possibly three tasks created. Wrong behavior.
+
+### Three-Lane Design
+
+| Lane | Trigger | Behavior |
+|------|---------|----------|
+| **Immediate** | `!` commands, control words | Process instantly, no buffering |
+| **Accumulate** | NL messages (normal + dialogue) | Buffer for 2s after last message, then process concatenated text |
+| **Bypass** | Bot's own messages, non-mentioned, dedup | Drop silently (already handled) |
+
+### How It Works
+
+- NL messages buffer per-channel with a 2-second debounce timer
+- Each new message resets the timer
+- When the timer fires, all buffered texts are concatenated and processed as one `handle_raw_message` call
+- `!` commands and control words (`stop`, `pause`) bypass the buffer — immediate processing
+- `asyncio.Lock` around the handler prevents concurrent mutation races
+- During escalation dialogue, accumulated text goes to the blocked agent as one coherent message
+
+### Why Not a Queue
+
+- **Wrong abstraction**: queues preserve individual message boundaries — we want to *erase* them for NL
+- **Latency**: queue processing adds serial delay to `!status` and control commands
+- **Complexity**: asyncio.Queue + consumer task adds lifecycle management (start, drain on shutdown, error handling)
+- **Overhead**: accumulator is ~40 lines in `on_message`; queue needs a new module
+
+### Escalation Dialogue Benefit
+
+`_apply_dialogue_message` currently overwrites `dialogue_last_message` — if two messages arrive in one poll cycle, the orchestrator's resolution classifier only sees the last one. With accumulation, multi-message operator explanations arrive as one coherent block.
+
+## Reaction Acknowledgments (2026-04-10)
+
+Messages receive reaction feedback for receipt confirmation:
+- 👀 added immediately on message receive
+- ✅ replaces 👀 on successful processing
+- ❌ replaces 👀 on error/exception
+- All reaction calls wrapped in try/except — cosmetic, never blocks message processing
+
+## Webhook Per-Agent Identity (2026-04-10)
+
+Responses sent via Discord webhook with agent-specific display name:
+- `discord_webhook_url` configured in `[discord]` section of project.toml
+- `_send_response()` infers agent from response text ("routed to executor" → Executor)
+- Webhook POST uses `username` field — Discord renders each agent as a separate identity
+- Three-layer fallback: no webhook → channel.send, HTTP error → channel.send, aiohttp missing → channel.send
+- `AGENT_DISPLAY_NAMES` map: orchestrator/architect/executor/reviewer
+
 ## What We Are NOT Building
 
 - Agents reading from Discord (breaks star topology)

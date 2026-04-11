@@ -3,12 +3,22 @@ title: v5 Harness Architecture
 tags: [harness, architecture, pipeline, agents]
 category: architecture
 created: 2026-04-09
-updated: 2026-04-09
+updated: 2026-04-10
 ---
 
 # v5 Harness Architecture
 
 The v5 harness is a Python asyncio orchestrator that manages Claude Code agent sessions for automated development workflows. A person types a sentence in Discord, and agents break work into tasks, assign roles, write code, test it, review it, and merge when everything passes.
+
+## Vision
+
+The harness is an **automated dev team** — not a single-shot code generator but a persistent, conversational development pipeline. The operator communicates intent through Discord in natural language; the harness decomposes that into tasks, delegates across specialized agents (architect, executor, reviewer), and each agent can spawn subagents for parallel work within isolated worktrees.
+
+**Scaling principles:**
+- **Budget-aware**: Agent model tiers (Opus for design, Sonnet for implementation, Haiku for classification) match cost to cognitive demand. Caveman compression reduces token spend on non-critical channels.
+- **Conversational**: Development is a dialogue — operators give feedback mid-task, agents escalate when blocked, the system adapts to clarification in real time rather than failing silently.
+- **Delegated**: Work fans out through a star topology. The orchestrator mediates all inbound; agents write outbound. Subagents within each super-agent (OMC instances in tmux) get their own worktree isolation to prevent write races.
+- **Self-iterating**: The harness can develop itself — `!update` pulls, restarts, and the pipeline continues. The long-term goal is that the harness improves its own code through the same task pipeline it uses for the trading bot.
 
 ## Three-Layer Stack
 

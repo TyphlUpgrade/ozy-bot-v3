@@ -9,11 +9,23 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from harness.discord_companion import (
+    ACCUM_WINDOW,
+    AGENT_DISPLAY_NAMES,
     DIALOGUE_CONFIRM_WORDS,
     DiscordCompanion,
+    _ANNOUNCE_STAGES,
     _CONTROL_PATTERN,
+    _accum_buffer,
+    _accum_timers,
     _apply_pause,
     _do_update,
+    _flush_accumulated,
+    _infer_agent_from_response,
+    _processing_lock,
+    _send_response,
+    _strip_mention,
+    _swap_reactions,
+    announce_stage,
     parse_caveman,
     parse_reply,
     parse_tell,
@@ -1337,3 +1349,368 @@ class TestDoUpdateMutation:
                     assert not ev.is_set()
                     last_msg = mock_notify.call_args[0][1]
                     assert "timed out" in last_msg.lower()
+
+
+# ---------- TestInferAgentFromResponse ----------
+
+
+class TestInferAgentFromResponse:
+    def test_detects_executor(self):
+        assert _infer_agent_from_response("Message routed to executor.", "") == "executor"
+
+    def test_detects_architect(self):
+        assert _infer_agent_from_response("Feedback queued for architect.", "") == "architect"
+
+    def test_detects_reviewer(self):
+        assert _infer_agent_from_response("Message sent to reviewer (escalation dialogue).", "") == "reviewer"
+
+    def test_defaults_to_orchestrator(self):
+        assert _infer_agent_from_response("Pipeline pausing.", "") == "orchestrator"
+
+    def test_status_is_orchestrator(self):
+        assert _infer_agent_from_response("Status: harness idle.", "") == "orchestrator"
+
+    def test_case_insensitive_detection(self):
+        assert _infer_agent_from_response("EXECUTOR caveman level -> ultra.", "") == "executor"
+
+
+# ---------- TestAgentDisplayNames ----------
+
+
+class TestAgentDisplayNames:
+    def test_all_standard_agents_have_names(self):
+        for agent in ("orchestrator", "architect", "executor", "reviewer"):
+            assert agent in AGENT_DISPLAY_NAMES
+
+    def test_values_are_title_case(self):
+        for name in AGENT_DISPLAY_NAMES.values():
+            assert name[0].isupper()
+
+
+# ---------- TestSendResponse ----------
+
+
+class TestSendResponse:
+    @pytest.mark.asyncio
+    async def test_no_webhook_uses_channel_send(self, config):
+        """Without webhook_url, falls back to channel.send."""
+        dc = _make_companion(config)
+        message = MagicMock()
+        message.channel.send = AsyncMock()
+        await _send_response(message, "test response", dc, "input")
+        message.channel.send.assert_awaited_once_with("test response")
+
+    @pytest.mark.asyncio
+    async def test_webhook_sends_with_agent_username(self, config):
+        """Webhook POST includes inferred agent username."""
+        config.discord_webhook_url = "https://discord.com/api/webhooks/test/token"
+        dc = _make_companion(config)
+        message = MagicMock()
+        message.channel.send = AsyncMock()
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = AsyncMock()
+        mock_session.post = MagicMock(return_value=mock_resp)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        mock_aiohttp = MagicMock()
+        mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
+        with patch("harness.discord_companion._get_aiohttp", return_value=mock_aiohttp):
+            await _send_response(message, "Feedback queued for executor.", dc, "do the thing")
+
+        mock_session.post.assert_called_once()
+        call_kwargs = mock_session.post.call_args
+        payload = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
+        assert payload["username"] == "Executor"
+        assert payload["content"] == "Feedback queued for executor."
+        message.channel.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_webhook_failure_falls_back_to_channel(self, config):
+        """HTTP error from webhook falls back to channel.send."""
+        config.discord_webhook_url = "https://discord.com/api/webhooks/test/token"
+        dc = _make_companion(config)
+        message = MagicMock()
+        message.channel.send = AsyncMock()
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 500
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = AsyncMock()
+        mock_session.post = MagicMock(return_value=mock_resp)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        mock_aiohttp = MagicMock()
+        mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
+        with patch("harness.discord_companion._get_aiohttp", return_value=mock_aiohttp):
+            await _send_response(message, "test response", dc, "input")
+
+        message.channel.send.assert_awaited_once_with("test response")
+
+    @pytest.mark.asyncio
+    async def test_webhook_aiohttp_missing_falls_back(self, config):
+        """Missing aiohttp falls back to channel.send."""
+        config.discord_webhook_url = "https://discord.com/api/webhooks/test/token"
+        dc = _make_companion(config)
+        message = MagicMock()
+        message.channel.send = AsyncMock()
+
+        with patch("harness.discord_companion._get_aiohttp", return_value=None):
+            await _send_response(message, "test response", dc, "input")
+
+        message.channel.send.assert_awaited_once_with("test response")
+
+    @pytest.mark.asyncio
+    async def test_webhook_exception_falls_back(self, config):
+        """Network exception from webhook falls back to channel.send."""
+        config.discord_webhook_url = "https://discord.com/api/webhooks/test/token"
+        dc = _make_companion(config)
+        message = MagicMock()
+        message.channel.send = AsyncMock()
+
+        mock_aiohttp = MagicMock()
+        mock_aiohttp.ClientSession = MagicMock(
+            side_effect=ConnectionError("network down")
+        )
+        with patch("harness.discord_companion._get_aiohttp", return_value=mock_aiohttp):
+            await _send_response(message, "test response", dc, "input")
+
+        message.channel.send.assert_awaited_once_with("test response")
+
+
+# ---------- TestStripMention ----------
+
+
+class TestStripMention:
+    def test_strips_standard_mention(self):
+        msg = MagicMock()
+        msg.content = "<@123456> do the thing"
+        user = MagicMock()
+        user.id = 123456
+        assert _strip_mention(msg, user) == "do the thing"
+
+    def test_strips_nickname_mention(self):
+        msg = MagicMock()
+        msg.content = "<@!123456> do the thing"
+        user = MagicMock()
+        user.id = 123456
+        assert _strip_mention(msg, user) == "do the thing"
+
+    def test_no_mention_returns_full_text(self):
+        msg = MagicMock()
+        msg.content = "do the thing"
+        user = MagicMock()
+        user.id = 999999
+        assert _strip_mention(msg, user) == "do the thing"
+
+
+# ---------- TestSwapReactions ----------
+
+
+class TestSwapReactions:
+    @pytest.mark.asyncio
+    async def test_swaps_on_all_messages(self):
+        user = MagicMock()
+        msgs = [MagicMock() for _ in range(3)]
+        for m in msgs:
+            m.remove_reaction = AsyncMock()
+            m.add_reaction = AsyncMock()
+        await _swap_reactions(msgs, user, "\u2705")
+        for m in msgs:
+            m.remove_reaction.assert_awaited_once_with("\U0001f440", user)
+            m.add_reaction.assert_awaited_once_with("\u2705")
+
+    @pytest.mark.asyncio
+    async def test_continues_on_failure(self):
+        """Failure on one message doesn't block others."""
+        user = MagicMock()
+        m1 = MagicMock()
+        m1.remove_reaction = AsyncMock(side_effect=Exception("discord error"))
+        m1.add_reaction = AsyncMock()
+        m2 = MagicMock()
+        m2.remove_reaction = AsyncMock()
+        m2.add_reaction = AsyncMock()
+        await _swap_reactions([m1, m2], user, "\u2705")
+        # m2 still processed despite m1 failure
+        m2.remove_reaction.assert_awaited_once()
+
+
+# ---------- TestFlushAccumulated ----------
+
+
+class TestFlushAccumulated:
+    @pytest.mark.asyncio
+    async def test_flushes_concatenated_messages(self, config):
+        """Multiple buffered messages flushed as one concatenated text."""
+        dc = _make_companion(config, active_agents_fn=lambda: ["executor"])
+        client = MagicMock()
+        client.user = MagicMock()
+
+        msg1 = MagicMock()
+        msg1.remove_reaction = AsyncMock()
+        msg1.add_reaction = AsyncMock()
+        msg1.channel.send = AsyncMock()
+        msg2 = MagicMock()
+        msg2.remove_reaction = AsyncMock()
+        msg2.add_reaction = AsyncMock()
+
+        _accum_buffer[999] = [(msg1, "fix the bug"), (msg2, "in broker.py")]
+
+        with patch("harness.discord_companion.ACCUM_WINDOW", 0.01):
+            with patch.object(dc, "handle_raw_message", new_callable=AsyncMock,
+                              return_value="Message routed to executor."):
+                await _flush_accumulated(999, dc, client)
+                dc.handle_raw_message.assert_awaited_once_with("fix the bug\nin broker.py")
+
+        # Buffer cleared
+        assert 999 not in _accum_buffer
+
+    @pytest.mark.asyncio
+    async def test_empty_buffer_no_op(self, config):
+        """Empty buffer does nothing."""
+        dc = _make_companion(config)
+        client = MagicMock()
+        client.user = MagicMock()
+        _accum_buffer.pop(888, None)
+
+        with patch("harness.discord_companion.ACCUM_WINDOW", 0.01):
+            await _flush_accumulated(888, dc, client)
+        # No exception, no calls
+
+    @pytest.mark.asyncio
+    async def test_error_swaps_to_x(self, config):
+        """Exception during processing swaps to x."""
+        dc = _make_companion(config)
+        client = MagicMock()
+        client.user = MagicMock()
+
+        msg = MagicMock()
+        msg.remove_reaction = AsyncMock()
+        msg.add_reaction = AsyncMock()
+        msg.channel.send = AsyncMock()
+
+        _accum_buffer[777] = [(msg, "crash me")]
+
+        with patch("harness.discord_companion.ACCUM_WINDOW", 0.01):
+            with patch.object(dc, "handle_raw_message", new_callable=AsyncMock,
+                              side_effect=RuntimeError("boom")):
+                await _flush_accumulated(777, dc, client)
+
+        msg.add_reaction.assert_awaited_once_with("\u274c")
+
+
+# ---------- TestAnnounceStage ----------
+
+
+class TestAnnounceStage:
+    def test_announce_stages_set(self):
+        """Standard pipeline stages are in announce set."""
+        for stage in ("classify", "architect", "executor", "reviewer", "merge", "wiki"):
+            assert stage in _ANNOUNCE_STAGES
+
+    @pytest.mark.asyncio
+    async def test_skips_non_announce_stage(self, config):
+        """Stages not in _ANNOUNCE_STAGES are silently skipped."""
+        with patch("harness.discord_companion._get_aiohttp") as mock:
+            await announce_stage("escalation_dialogue", "task-1", "desc", config)
+        mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_webhook_announcement(self, config):
+        """Announce via webhook when configured."""
+        config.discord_webhook_url = "https://discord.com/api/webhooks/test/token"
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = AsyncMock()
+        mock_session.post = MagicMock(return_value=mock_resp)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        mock_aiohttp = MagicMock()
+        mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
+
+        with patch("harness.discord_companion._get_aiohttp", return_value=mock_aiohttp):
+            await announce_stage("executor", "task-abc", "Fix auth bug", config)
+
+        mock_session.post.assert_called_once()
+        payload = mock_session.post.call_args.kwargs.get("json") or mock_session.post.call_args[1].get("json")
+        assert "executor" in payload["content"]
+        assert "task-abc" in payload["content"]
+        assert "Fix auth bug" in payload["content"]
+        assert payload["username"] == "Executor"
+
+    @pytest.mark.asyncio
+    async def test_clawhip_fallback(self, config):
+        """Without webhook, falls back to clawhip subprocess."""
+        config.discord_webhook_url = None
+
+        with patch("harness.discord_companion.asyncio.create_subprocess_exec",
+                    new_callable=AsyncMock) as mock_exec:
+            mock_proc = AsyncMock()
+            mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+            mock_exec.return_value = mock_proc
+            await announce_stage("architect", "task-1", "Plan design", config)
+
+        mock_exec.assert_called_once()
+        args = mock_exec.call_args.args
+        assert "clawhip" in args
+        assert "stage" in args
+
+    @pytest.mark.asyncio
+    async def test_format_with_task_and_description(self, config):
+        """Announcement includes task ID and description."""
+        config.discord_webhook_url = "https://example.com/webhook"
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+        mock_session = AsyncMock()
+        mock_session.post = MagicMock(return_value=mock_resp)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_aiohttp = MagicMock()
+        mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
+
+        with patch("harness.discord_companion._get_aiohttp", return_value=mock_aiohttp):
+            await announce_stage("merge", "task-xyz", "Merge feature branch", config)
+
+        payload = mock_session.post.call_args.kwargs.get("json") or mock_session.post.call_args[1].get("json")
+        # merge uses "orchestrator" as agent
+        assert payload["username"] == "Orchestrator"
+        assert "task-xyz" in payload["content"]
+
+    @pytest.mark.asyncio
+    async def test_format_without_description(self, config):
+        """Announcement works with None description."""
+        config.discord_webhook_url = "https://example.com/webhook"
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+        mock_session = AsyncMock()
+        mock_session.post = MagicMock(return_value=mock_resp)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_aiohttp = MagicMock()
+        mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
+
+        with patch("harness.discord_companion._get_aiohttp", return_value=mock_aiohttp):
+            await announce_stage("reviewer", "task-1", None, config)
+
+        payload = mock_session.post.call_args.kwargs.get("json") or mock_session.post.call_args[1].get("json")
+        assert "task-1" in payload["content"]
+        assert payload["username"] == "Reviewer"

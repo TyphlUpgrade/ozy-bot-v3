@@ -322,8 +322,196 @@ class DiscordCompanion:
         return "\n".join(lines)
 
 
+def _get_aiohttp():
+    """Lazy import aiohttp — returns module or None if not installed."""
+    try:
+        import aiohttp
+        return aiohttp
+    except ImportError:
+        logger.warning("aiohttp not installed — webhook disabled, using channel.send")
+        return None
+
+
+# --- Webhook per-agent identity ---
+
+# Agent display names for webhook messages. Extend when adding new agents.
+AGENT_DISPLAY_NAMES: dict[str, str] = {
+    "orchestrator": "Orchestrator",
+    "architect": "Architect",
+    "executor": "Executor",
+    "reviewer": "Reviewer",
+}
+
+
+def _infer_agent_from_response(response: str, text: str) -> str:
+    """Best-effort agent inference from companion response text.
+
+    Looks for patterns like "routed to executor", "queued for architect",
+    "sent to reviewer". Falls back to "orchestrator" for status/control/unknown.
+    """
+    lower = response.lower()
+    for agent in ("executor", "architect", "reviewer"):
+        if agent in lower:
+            return agent
+    return "orchestrator"
+
+
+async def _send_response(message: Any, response: str,
+                         companion: DiscordCompanion, text: str) -> None:
+    """Send response via webhook (agent identity) or fall back to channel.send."""
+    webhook_url = companion.config.discord_webhook_url
+    if not webhook_url:
+        await message.channel.send(response)
+        return
+
+    agent = _infer_agent_from_response(response, text)
+    username = AGENT_DISPLAY_NAMES.get(agent, agent.title())
+
+    try:
+        aiohttp = _get_aiohttp()
+        if aiohttp is None:
+            await message.channel.send(response)
+            return
+        payload = {
+            "content": response,
+            "username": username,
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(webhook_url, json=payload) as resp:
+                if resp.status >= 400:
+                    logger.warning("Webhook POST failed (status %d) — falling back", resp.status)
+                    await message.channel.send(response)
+    except Exception:
+        logger.warning("Webhook send failed — falling back to channel.send", exc_info=True)
+        await message.channel.send(response)
+
+
+# --- Stage transition announcements ---
+
+# Stages that get Discord announcements (skip internal/transient stages)
+_ANNOUNCE_STAGES = frozenset({
+    "classify", "architect", "executor", "reviewer", "merge", "wiki",
+    "escalation_wait", "escalation_tier1",
+})
+
+
+async def announce_stage(stage: str, task_id: str | None,
+                         description: str | None,
+                         config: "ProjectConfig") -> None:
+    """Post stage transition to Discord via webhook or clawhip.
+
+    Called from orchestrator after state.advance(). Non-blocking, best-effort.
+    """
+    if stage not in _ANNOUNCE_STAGES:
+        return
+
+    agent = stage if stage not in ("merge", "wiki", "classify") else "orchestrator"
+    desc_snippet = (description or "")[:80]
+    if task_id and desc_snippet:
+        text = f"\U0001f504 **{stage}** — `{task_id}`: {desc_snippet}"
+    elif task_id:
+        text = f"\U0001f504 **{stage}** — `{task_id}`"
+    else:
+        text = f"\U0001f504 **{stage}**"
+
+    webhook_url = config.discord_webhook_url
+    if webhook_url:
+        username = AGENT_DISPLAY_NAMES.get(agent, agent.title())
+        try:
+            aiohttp = _get_aiohttp()
+            if aiohttp:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(webhook_url, json={
+                        "content": text, "username": username,
+                    }) as resp:
+                        if resp.status >= 400:
+                            logger.debug("Stage announce webhook failed: %d", resp.status)
+                return
+        except Exception:
+            logger.debug("Stage announce webhook error — falling through to clawhip", exc_info=True)
+
+    # Fallback 1: clawhip notify
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "clawhip", "agent", "stage",
+            "--name", agent, "--summary", text,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        if proc.returncode == 0:
+            return
+    except Exception:
+        pass
+
+    # Fallback 2: direct channel send via Discord client
+    if _discord_client and _discord_channel_ids:
+        try:
+            ch = _discord_client.get_channel(_discord_channel_ids[0])
+            if ch:
+                await ch.send(text)
+        except Exception:
+            logger.debug("Stage announce unavailable for %s", stage)
+
+
+# Discord client + channel refs for direct sends (set by start())
+_discord_client: Any = None
+_discord_channel_ids: list[int] = []
+
 # Bounded dedup buffer for Discord gateway reconnect replays.
 _seen_message_ids: deque[int] = deque(maxlen=1000)
+
+# --- Message accumulator ---
+# NL messages buffer per-channel with debounce timer. ! commands bypass.
+# Single event loop assumption: these module globals are safe because
+# all Discord operations run in one asyncio event loop (see CLAUDE.md).
+ACCUM_WINDOW = 2.0  # seconds after last NL message before flush
+_accum_buffer: dict[int, list[tuple[Any, str]]] = {}   # channel_id → [(message, text)]
+_accum_timers: dict[int, asyncio.Task] = {}             # channel_id → debounce task
+_processing_lock = asyncio.Lock()
+
+
+def _strip_mention(message: Any, client_user: Any) -> str:
+    """Strip bot mention prefix from message text."""
+    text = message.content
+    for mention_str in (f"<@{client_user.id}>", f"<@!{client_user.id}>"):
+        text = text.replace(mention_str, "").strip()
+    return text
+
+
+async def _swap_reactions(messages: list[Any], client_user: Any,
+                          emoji: str) -> None:
+    """Remove 👀 and add final emoji on all messages. Best-effort."""
+    for msg in messages:
+        try:
+            await msg.remove_reaction("\U0001f440", client_user)
+            await msg.add_reaction(emoji)
+        except Exception:
+            pass
+
+
+async def _flush_accumulated(channel_id: int, companion: DiscordCompanion,
+                             client: Any) -> None:
+    """Flush accumulated NL messages for a channel after debounce window."""
+    await asyncio.sleep(ACCUM_WINDOW)
+
+    async with _processing_lock:
+        entries = _accum_buffer.pop(channel_id, [])
+        _accum_timers.pop(channel_id, None)
+        if not entries:
+            return
+
+        messages = [e[0] for e in entries]
+        texts = [e[1] for e in entries]
+        combined = "\n".join(texts)
+
+        try:
+            response = await companion.handle_raw_message(combined)
+            if response:
+                await _send_response(messages[0], response, companion, combined)
+            await _swap_reactions(messages, client.user, "\u2705")  # ✅
+        except Exception:
+            logger.exception("Flush handler failed for channel %d", channel_id)
+            await _swap_reactions(messages, client.user, "\u274c")  # ❌
 
 
 async def start(companion: DiscordCompanion,
@@ -332,6 +520,11 @@ async def start(companion: DiscordCompanion,
 
     Receives messages, delegates to companion.handle_raw_message(),
     and sends the response back. Filters to channel_ids if provided.
+
+    Three-lane message handling:
+    - Immediate: ! commands and control words — process under lock, no buffering
+    - Accumulate: NL messages — buffer per-channel, 2s debounce, flush concatenated
+    - Bypass: own messages, non-mentioned, dedup — drop silently
     """
     try:
         import discord
@@ -348,23 +541,68 @@ async def start(companion: DiscordCompanion,
     intents.message_content = True
     client = discord.Client(intents=intents)
 
+    global _discord_client, _discord_channel_ids
+    _discord_client = client
+    _discord_channel_ids = channel_ids or []
+
     @client.event
     async def on_ready():
         logger.info("Discord companion connected as %s", client.user)
+        # Post startup announcement to first configured channel
+        if channel_ids:
+            try:
+                ch = client.get_channel(channel_ids[0])
+                if ch:
+                    await ch.send("\U0001f7e2 **Orchestrator online** — ready for tasks")
+            except Exception:
+                logger.debug("Startup announcement failed", exc_info=True)
 
     @client.event
     async def on_message(message):
+        # --- Bypass lane ---
         if message.author == client.user:
             return
         if channel_ids and message.channel.id not in channel_ids:
+            return
+        if not client.user or client.user not in message.mentions:
             return
         if message.id in _seen_message_ids:
             return
         _seen_message_ids.append(message.id)
 
-        response = await companion.handle_raw_message(message.content)
-        if response:
-            await message.channel.send(response)
+        # Acknowledge receipt
+        try:
+            await message.add_reaction("\U0001f440")  # 👀
+        except Exception:
+            pass
+
+        text = _strip_mention(message, client.user)
+
+        # --- Immediate lane: ! commands and control words ---
+        if text.startswith("!") or _CONTROL_PATTERN.match(text):
+            async with _processing_lock:
+                try:
+                    response = await companion.handle_raw_message(text)
+                    if response:
+                        await _send_response(message, response, companion, text)
+                    await _swap_reactions([message], client.user, "\u2705")
+                except Exception:
+                    logger.exception("Immediate handler failed")
+                    await _swap_reactions([message], client.user, "\u274c")
+            return
+
+        # --- Accumulate lane: NL messages ---
+        ch_id = message.channel.id
+        _accum_buffer.setdefault(ch_id, []).append((message, text))
+
+        # Start debounce timer if none pending. Don't cancel in-progress
+        # flushes — cancelling a task holding _processing_lock can drop
+        # messages silently. Trade-off: window starts from first message
+        # rather than resetting on each, but safer and simpler.
+        if ch_id not in _accum_timers or _accum_timers[ch_id].done():
+            _accum_timers[ch_id] = asyncio.create_task(
+                _flush_accumulated(ch_id, companion, client)
+            )
 
     await client.start(token)
 

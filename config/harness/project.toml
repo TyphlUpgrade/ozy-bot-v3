@@ -16,9 +16,11 @@ bot_token_env = "DISCORD_BOT_TOKEN"     # Environment variable name, not the tok
 dev_channel = "dev-agents"
 ops_channel = "ops-monitor"
 escalation_channel = "escalations"
+# webhook_url = ""                      # Discord webhook URL — enables per-agent identity (username + avatar per message)
 
 [pipeline]
 poll_interval = 5.0                     # seconds between main loop iterations
+test_command = "python3 -m pytest harness/tests/ -x -q"
 max_retries = 3                         # reviewer rejection retries before task failure
 escalation_timeout = 14400              # 4 hours — re-notify for blocking escalations
 classify_timeout = 120                  # claude -p timeout for classify() calls

@@ -81,9 +81,27 @@ Append to the `history` array on each transition (started, completed, checkpoint
 At units marked CHECKPOINT in the plan:
 1. Commit all current work
 2. Run tests — record result in zone file
-3. Write checkpoint signal: `echo '{"status":"checkpoint","task_id":"..."}' > state/signals/executor/checkpoint.json`
+3. Write checkpoint signal: `echo '{"status":"checkpoint","task_id":"..."}' > ozymandias/state/signals/executor/checkpoint.json`
 4. STOP and wait. The wrapper will spawn an Architect review session.
 5. After review, a fresh Executor session resumes from the zone file state.
+
+## Completion Signal
+
+When ALL units are complete and tests pass, write a completion signal so the orchestrator
+advances the pipeline:
+
+```bash
+mkdir -p ozymandias/state/signals/executor
+cat <<'EOF' > ozymandias/state/signals/executor/completion-<task-id>.json
+{
+  "task_id": "<task-id>",
+  "status": "complete",
+  "summary": "<one paragraph: what was implemented>"
+}
+EOF
+```
+
+The orchestrator polls for this file. Without it, the pipeline stalls at the executor stage.
 
 ## Commit Convention
 

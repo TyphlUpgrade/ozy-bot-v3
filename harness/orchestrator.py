@@ -42,10 +42,35 @@ async def classify_task(state: PipelineState, session_mgr: SessionManager,
         state.advance("architect", "architect")
         await event_log.record("stage_advanced", {"task": state.active_task, "from": "classify", "to": "architect"})
         # Send task to architect for planning
-        await session_mgr.send("architect", f"[TASK] Plan this task: {state.active_task}")
+        desc = state.task_description or state.active_task
+        signal_path = f"{config.signal_dir}/architect/{state.active_task}/plan.json"
+        await session_mgr.send(
+            "architect",
+            f"[TASK] Plan this task (ID: {state.active_task}):\n{desc}\n\n"
+            f"IMPORTANT: When your plan is ready, write it to `{signal_path}` "
+            f"using Bash (mkdir -p the directory, then cat/echo the JSON). "
+            f"The orchestrator polls for this file to advance the pipeline.",
+        )
     else:
         state.advance("executor", "executor")
         await event_log.record("stage_advanced", {"task": state.active_task, "from": "classify", "to": "executor"})
+        desc = state.task_description or state.active_task
+        signal_path = f"{config.signal_dir}/executor/completion-{state.active_task}.json"
+        worktree_hint = ""
+        if state.worktree:
+            worktree_hint = (
+                f"\nYou are working in a git worktree at `{state.worktree}`. "
+                f"After making changes, you MUST `git add` and `git commit` your changes "
+                f"BEFORE writing the completion signal. Without a commit, the merge stage "
+                f"cannot pick up your work.\n"
+            )
+        await session_mgr.send(
+            "executor",
+            f"[TASK] {desc}\n\n"
+            f"Task ID: {state.active_task}\n"
+            f"{worktree_hint}"
+            f"When done, write your completion signal to `{signal_path}` via Bash.",
+        )
 
 
 async def check_stage(state: PipelineState, signal_reader: SignalReader,
@@ -56,28 +81,51 @@ async def check_stage(state: PipelineState, signal_reader: SignalReader,
     if result is not None:
         # Collect architect plan for wiki documentation
         if stage == "architect" and isinstance(result, dict):
-            state.plan_summary = result.get("output", "") or result.get("plan", "")
+            state.plan_summary = result.get("summary", "") or result.get("output", "") or result.get("plan", "")
         next_stages = {"architect": "executor", "executor": "reviewer", "reviewer": "merge"}
         next_stage = next_stages.get(stage, "merge")
         state.advance(next_stage, next_stage if next_stage != "merge" else None)
         await event_log.record("stage_advanced", {"task": state.active_task, "from": stage, "to": next_stage})
         logger.info("Stage %s complete for %s → %s", stage, state.active_task, next_stage)
-        # Send summarized context to next agent on architect→executor and executor→reviewer transitions
+        # Send task to next agent on architect→executor and executor→reviewer transitions
         if stage in ("architect", "executor") and next_stage in ("executor", "reviewer"):
-            output = result.get("output", "") if isinstance(result, dict) else ""
+            next_agent = next_stage
+            # Try to include summarized context from previous stage
+            output = result.get("output", "") or result.get("summary", "") if isinstance(result, dict) else ""
+            context_prefix = ""
             if output:
                 summary = await claude.summarize(output, config)
                 if summary:
-                    next_agent = next_stage
-                    await session_mgr.send(
-                        next_agent,
-                        f"[CONTEXT] Previous stage ({stage}) summary:\n{summary}\n\n"
-                        f"[TASK] Continue work on: {state.active_task}",
-                    )
-                else:
-                    logger.debug("summarize returned None for stage %s — proceeding without context", stage)
+                    context_prefix = f"[CONTEXT] Previous stage ({stage}) summary:\n{summary}\n\n"
+            desc = state.task_description or state.active_task
+            signal_dir = config.signal_dir
+            if next_stage == "executor":
+                signal_path = f"{signal_dir}/executor/completion-{state.active_task}.json"
             else:
-                logger.debug("No output in stage %s signal — proceeding without context", stage)
+                signal_path = f"{signal_dir}/reviewer/{state.active_task}/verdict.json"
+            # Tell executor to commit changes and where the worktree is
+            worktree_hint = ""
+            if next_stage == "executor" and state.worktree:
+                worktree_hint = (
+                    f"\nYou are working in a git worktree at `{state.worktree}`. "
+                    f"After making changes, you MUST `git add` and `git commit` your changes "
+                    f"BEFORE writing the completion signal. Without a commit, the merge stage "
+                    f"cannot pick up your work.\n"
+                )
+            # Tell reviewer where the worktree is so it reads changed files from there
+            if next_stage == "reviewer" and state.worktree:
+                worktree_hint = (
+                    f"\nIMPORTANT: The executor worked in a git worktree at `{state.worktree}`. "
+                    f"Read changed files from that path, not from the main project.\n"
+                )
+            await session_mgr.send(
+                next_agent,
+                f"{context_prefix}"
+                f"[TASK] {desc}\n\n"
+                f"Task ID: {state.active_task}\n"
+                f"{worktree_hint}"
+                f"When done, write your completion signal to `{signal_path}` via Bash.",
+            )
 
 
 async def check_reviewer(state: PipelineState, signal_reader: SignalReader,
@@ -175,6 +223,27 @@ async def do_merge(state: PipelineState, config: ProjectConfig, event_log: Event
         return
     cwd = str(config.project_root)
     branch = f"task/{state.active_task}"
+    # Safety net: auto-commit any uncommitted worktree changes
+    wt = state.worktree
+    if wt and Path(wt).is_dir():
+        status_proc = await asyncio.create_subprocess_exec(
+            "git", "status", "--porcelain",
+            cwd=wt,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        status_out, _ = await status_proc.communicate()
+        if status_out.strip():
+            logger.warning("Worktree has uncommitted changes for %s — auto-committing", state.active_task)
+            await (await asyncio.create_subprocess_exec(
+                "git", "add", "-A", "--", ".", ":!.omc/", cwd=wt,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )).communicate()
+            await (await asyncio.create_subprocess_exec(
+                "git", "commit", "-m", f"feat: {state.task_description or state.active_task}",
+                cwd=wt,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )).communicate()
+            logger.info("Auto-committed worktree changes for %s", state.active_task)
     proc = await asyncio.create_subprocess_exec(
         "git", "merge", "--no-ff", branch,
         cwd=cwd,
@@ -551,6 +620,34 @@ def _check_stage_timeout(state: PipelineState, config: ProjectConfig) -> bool:
     return elapsed > max_seconds
 
 
+async def _handle_stage_timeout(state: PipelineState, session_mgr: "SessionManager",
+                                event_log: EventLog, config: ProjectConfig) -> None:
+    """Handle a stage timeout: kill agent, notify Discord, clear task."""
+    elapsed = (
+        datetime.now(UTC) - datetime.fromisoformat(state.stage_started_ts)
+    ).total_seconds()
+    logger.warning(
+        "Stage timeout: stage=%s task=%s elapsed=%.0fs",
+        state.stage, state.active_task, elapsed,
+    )
+    agent_name = state.stage_agent
+    if agent_name and agent_name in session_mgr.sessions:
+        await session_mgr.kill(agent_name)
+    await event_log.record("stage_timeout", {
+        "task": state.active_task,
+        "stage": state.stage,
+        "elapsed_seconds": elapsed,
+    })
+    await notify(
+        "stage_timeout",
+        agent_name or state.stage or "orchestrator",
+        f"Stage timeout: {state.stage} timed out for {state.active_task} "
+        f"after {elapsed / 60:.0f}m — task cleared",
+    )
+    _escalation_cache.pop(state.active_task or "", None)
+    state.clear_active()
+
+
 # ---------- Main Loop ----------
 
 
@@ -630,28 +727,13 @@ async def main_loop(config: ProjectConfig) -> None:
 
             # Check wall-clock stage timeout
             if _check_stage_timeout(state, config):
-                elapsed = (
-                    datetime.now(UTC) - datetime.fromisoformat(state.stage_started_ts)
-                ).total_seconds()
-                logger.warning(
-                    "Stage timeout: stage=%s task=%s elapsed=%.0fs",
-                    state.stage, state.active_task, elapsed,
-                )
-                agent_name = state.stage_agent
-                if agent_name and agent_name in session_mgr.sessions:
-                    await session_mgr.kill(agent_name)
-                await event_log.record("stage_timeout", {
-                    "task": state.active_task,
-                    "stage": state.stage,
-                    "elapsed_seconds": elapsed,
-                })
-                _escalation_cache.pop(state.active_task or "", None)
-                state.clear_active()
+                await _handle_stage_timeout(state, session_mgr, event_log, config)
                 state.heartbeat()
                 state.save(config.state_file)
                 await asyncio.sleep(config.poll_interval)
                 continue
 
+            _prev_stage = state.stage
             match state.stage:
                 case "classify":
                     await classify_task(state, session_mgr, config, event_log)
@@ -671,6 +753,13 @@ async def main_loop(config: ProjectConfig) -> None:
                     await handle_escalation_wait(state, signal_reader, config, event_log)
                 case "escalation_dialogue":
                     await handle_escalation_dialogue(state, config, event_log)
+
+            # Announce stage transitions to Discord (best-effort, non-blocking)
+            if state.stage and state.stage != _prev_stage:
+                await dc.announce_stage(
+                    state.stage, state.active_task,
+                    state.task_description, config,
+                )
 
             # F3: Check for new tasks while current is blocked in escalation_wait
             if state.stage in ("escalation_wait", "escalation_dialogue"):

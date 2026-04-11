@@ -116,12 +116,57 @@ Approved designs not yet assigned to a phase. Most likely timeline noted.
 
 **Discord Integration Revisions** — DONE. Three-way NL classify (`classify_intent`), deterministic control pre-filter (`_CONTROL_PATTERN`), pipeline pause/resume, NL-initiated task creation via `TaskSignal`.
 
+**Post-completion enhancements (2026-04-10):**
+- Reaction acknowledgments: 👀 on receive, ✅/❌ on complete — operator knows message was seen
+- Webhook per-agent identity: responses sent via Discord webhook with agent-specific username (Orchestrator/Architect/Executor/Reviewer)
+- Message accumulator design: NL messages buffer for 2s debounce window, then process as one — replaces message queue approach. `!` commands and control words bypass buffer for instant processing.
+- Mention-only filter: bot only responds when @mentioned
+
 **Resolved design gaps:**
 - NL pipeline commands: control pre-filter catches "stop", "pause", "resume", "status" deterministically before any LLM call.
 - NL-initiated tasks: `classify_intent` distinguishes feedback from new_task. New tasks create `TaskSignal` → full pipeline.
 - Subtask vs task completion: `notify("task_completed", ...)` in `do_wiki()` sends distinct notification. Subtask commits still route via clawhip `git.commit`.
 
 **Reference:** [[v5-conversational-discord-operator]]
+
+### Discord Presence Polish (Visual Identity + Proactive Reporting)
+
+**Status:** Approved design, unscheduled  
+**Depends:** Webhook per-agent (DONE), agent outbound via clawhip (DONE)  
+**Reference:** [[v5-conversational-discord-operator]]
+
+Gap analysis against production-grade bot Discord presence (Devin-style). Five items, priority ordered:
+
+| # | Feature | Effort | Impact | What |
+|---|---------|--------|--------|------|
+| 1 | **Avatar URLs per agent** | Trivial | High visual | Expand `AGENT_DISPLAY_NAMES` → `AGENT_IDENTITIES` with `avatar_url`. Host 4 colored circle PNGs. Pass through webhook POST. |
+| 2 | **Stage transition announcements** | ~15 lines | High operational | Orchestrator posts to Discord on every stage change via `clawhip send` or webhook. Format: role + task ID + description. |
+| 3 | **Agent progress prompts** | Prompt-only | Medium | Update `config/harness/agents/*.md` to instruct agents to post work-in-progress summaries via `clawhip send`. Zero code changes. |
+| 4 | **Structured message formatting** | Low | Polish | Message templates for stage transitions, escalations, completions. Markdown formatting with sections and bullets. |
+| 5 | **Commit notifications** | Config-only | Medium | Unblock `git.commit` route in clawhip.toml. Either add GitHub PAT to `.env` (5000 req/hr) or increase poll to 60s (within unauthenticated limit). |
+
+**What NOT to do:**
+- Don't create separate Discord bots per agent — webhooks achieve same visual result with one token
+- Don't add Discord embeds — harder to read on mobile, more API complexity
+- Don't make agents read Discord — star topology stays intact; mediated presence is correct
+
+Items 1+2 get 80% of the polished feel. Items 3-5 are incremental polish.
+
+### Message Accumulator (Multi-Message Handling)
+
+**Status:** Approved design, unscheduled  
+**Depends:** Reactions (DONE), webhook per-agent (DONE)
+
+Three-lane design replacing FIFO queue approach:
+- **Immediate lane**: `!` commands, control words → process instantly
+- **Accumulate lane**: NL messages → 2s debounce window, concatenate, process once
+- **Bypass lane**: own messages, non-mentioned, dedup → drop
+
+~40 lines in `on_message` handler. No new dependencies, no new module. Stays in single event loop.
+
+**Key insight**: rapid-fire Discord messages are a message boundary problem, not a queueing problem. Operator types 3 messages in 4 seconds = one instruction, not three tasks.
+
+**Reference:** [[v5-conversational-discord-operator]] (Message Accumulator section)
 
 ---
 
@@ -139,6 +184,9 @@ Phase 3 (DONE — reformulate, summarize, session rotation, frozen-pipeline)
     ├─→ OMC agent integration Tier 1-2 (parallel, feeds into Phase 4)
     ├─→ Discord conversational operator Pieces 1-3 (DONE)
     ├─→ Discord Integration Revisions (DONE — three-way classify, pause, NL tasks)
+    ├─→ Reactions + Webhook per-agent + Mention filter (DONE)
+    ├─→ Message accumulator (approved, unscheduled)
+    ├─→ Discord presence polish (approved, unscheduled — avatars, stage announcements, progress prompts)
     ↓
 Phase 4 (DONE — Wiki integration, document-task)
     ↓

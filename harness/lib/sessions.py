@@ -145,6 +145,12 @@ class SessionManager:
         fifo_path = self.session_dir / f"{name}.fifo"
         log_path = self.session_dir / f"{name}.log"
 
+        # Kill stale tmux session from crashed harness instances (not tracked in self.sessions)
+        await asyncio.create_subprocess_exec(
+            "tmux", "kill-session", "-t", f"agent-{name}",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+
         # Clean up stale FIFO (crash recovery)
         fifo_path.unlink(missing_ok=True)
         os.mkfifo(fifo_path, mode=0o600)
@@ -157,7 +163,7 @@ class SessionManager:
         cmd = (
             f"{cwd_prefix}{binary} -p --verbose"
             f" --input-format stream-json --output-format stream-json"
-            f" --permission-mode dontAsk {agent_def.deny_flags_str}"
+            f" --dangerously-skip-permissions {agent_def.deny_flags_str}"
             f" --model {shlex.quote(agent_def.model)}"
             f" --include-hook-events"
             f" < {shlex.quote(str(fifo_path))} > {shlex.quote(str(log_path))} 2>&1"
@@ -173,12 +179,18 @@ class SessionManager:
         )
 
         # clawhip tmux new returns immediately (async tmux launch).
-        # Brief wait for the tmux pane to open the read end of the FIFO.
-        await asyncio.sleep(0.5)
-
-        # Now safe to open write end — reader exists in the tmux pane.
-        # O_NONBLOCK: avoids stalling the event loop if buffer is full.
-        fd = os.open(str(fifo_path), os.O_WRONLY | os.O_NONBLOCK)
+        # Wait for the tmux pane to open the read end of the FIFO.
+        # Retry with backoff — the pane needs time to start bash and open the FIFO.
+        fd = -1
+        for attempt in range(10):
+            await asyncio.sleep(0.5)
+            try:
+                fd = os.open(str(fifo_path), os.O_WRONLY | os.O_NONBLOCK)
+                break
+            except OSError:
+                if attempt == 9:
+                    raise
+                logger.debug("FIFO not ready for %s (attempt %d/10)", name, attempt + 1)
 
         # Capture tmux pane PID for health checks
         pid = None

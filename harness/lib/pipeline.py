@@ -192,6 +192,7 @@ class ProjectConfig:
     dialogue_timeout: int = 1800             # seconds before dialogue falls back to escalation_wait
     auto_escalate_on_max_retries: bool = True   # auto-escalate to architect after max_retries exhausted
     max_tier1_escalations: int = 2           # architect attempts before circuit breaker fires to operator
+    discord_webhook_url: str | None = None   # webhook URL for per-agent identity (username/avatar per message)
 
     @classmethod
     def load(cls, config_path: Path) -> ProjectConfig:
@@ -241,6 +242,7 @@ class ProjectConfig:
             dialogue_timeout=pipeline.get("dialogue_timeout", 1800),
             auto_escalate_on_max_retries=pipeline.get("auto_escalate_on_max_retries", True),
             max_tier1_escalations=pipeline.get("max_tier1_escalations", 2),
+            discord_webhook_url=data.get("discord", {}).get("webhook_url"),
         )
 
 

@@ -82,7 +82,7 @@ For every review, verify these conventions (violations are automatic rejection):
 
 ## Verdict Format
 
-Write the verdict to: `state/signals/reviewer/<task-id>/verdict.json`
+Write the verdict to: `ozymandias/state/signals/reviewer/<task-id>/verdict.json`
 
 ```json
 {
@@ -121,7 +121,7 @@ are not actionable and will be ignored.
 ## Context Access
 
 You have full filesystem read access. Key files for review:
-- The Architect's plan (in `state/signals/architect/<task-id>/plan.json`)
+- The Architect's plan (in `ozymandias/state/signals/architect/<task-id>/plan.json`)
 - The Executor's zone file (in worktree or `.worktrees/<task-id>/`)
 - `CLAUDE.md` — Active conventions
 - `DRIFT_LOG.md` — Known deviations
