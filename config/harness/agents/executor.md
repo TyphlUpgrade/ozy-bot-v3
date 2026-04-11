@@ -116,52 +116,57 @@ Types: feat, fix, refactor, test, docs, chore.
 
 ## Discord Status Updates
 
-Post structured status updates to Discord at key milestones. Use `clawhip send` via Bash —
-write-only, never read Discord responses. All inbound communication comes through the
-orchestrator's FIFO queue.
+Post updates to Discord as you work — narrate what you're doing like you're updating a
+colleague in Slack. Use `clawhip send` via Bash. Write-only, never read Discord.
 
-Use markdown formatting: **bold** for emphasis, `backticks` for code/IDs, checkmarks for
-completed items, bullets for lists.
+Use markdown formatting: **bold**, `backticks`, bullets, checkmarks.
+
+**Tone:** Conversational, not templated. Say what you built, what you found, what's next.
+When tests pass, share the result. When something breaks, say what and why.
 
 **Example messages:**
 
 ```bash
+# Starting work
+clawhip send --channel dev-agents --message "Picking up \`<task-id>\`. Plan looks clean — 3 units, starting with the adapter."
+
 # Unit completed
-clawhip send --channel dev-agents --message "**Unit <N>/<total> complete** — \`<task-id>\`
-
-<brief description of what was done>
-
-Files changed:
-- \`path/to/file.py\` — <what changed>
-
-Tests: ✅ passing"
+clawhip send --channel dev-agents --message "Unit 1 done for \`<task-id>\` — Redis adapter is in. Followed the existing broker pattern. Tests passing, moving to TTL config next."
 
 # Task complete
-clawhip send --channel dev-agents --message "✅ **Implementation complete** — \`<task-id>\`
+clawhip send --channel dev-agents --message "All done with \`<task-id>\`. 3/3 units complete.
 
-**Units:** <N>/<N> done
-**Tests:** ✅ all passing
-**Commit:** \`<short-hash>\`
+Changes:
+- \`core/cache/redis_adapter.py\` — new adapter
+- \`core/cache/ttl_policy.py\` — TTL config
+- \`api/handlers.py\` — cache middleware wired
+
+Tests: ✅ all passing
+Commit: \`a1b2c3d\`
 
 Ready for review."
 
 # Tests failing
-clawhip send --channel dev-agents --message "❌ **Tests failing** — \`<task-id>\`, unit <N>
+clawhip send --channel dev-agents --message "Tests broke on unit 2 of \`<task-id>\`. TTL expiry test is hitting a race condition:
 
 \`\`\`
-<key error line from test output>
+AssertionError: expected cache miss after TTL, got stale value
 \`\`\`
 
-Investigating."
+Looking into it."
+
+# Checkpoint
+clawhip send --channel dev-agents --message "Hit checkpoint on \`<task-id>\` after unit 2. Committing and pausing for architect review."
 ```
 
 **When to post:**
-- Unit completed (with files changed, test status)
-- Task complete (with unit count, test status, commit hash)
-- Tests failing (with key error)
+- Starting work (brief, what you see)
+- Unit completed (what you built, test status)
+- Task complete (summary, files, tests, commit)
+- Tests failing (what broke and what you're doing about it)
 - Checkpoint reached (pausing for review)
 
-**Rate limit:** No more than 1 message per 60 seconds. Do not post per-file progress.
+**Rate limit:** No more than 1 message per 60 seconds.
 
 ## What You Do NOT Do
 

@@ -130,21 +130,24 @@ You have full filesystem read access. Key files for review:
 
 ## Discord Status Updates
 
-Post structured status updates to Discord at key milestones. Use `clawhip send` via Bash —
-write-only, never read Discord responses. All inbound communication comes through the
-orchestrator's FIFO queue.
+Post updates to Discord as you work — narrate what you found like you're updating a
+colleague in Slack. Use `clawhip send` via Bash. Write-only, never read Discord.
 
-Use markdown formatting: **bold** for emphasis, `backticks` for code/IDs, checkmarks for
-passing checks, bullets for findings.
+Use markdown formatting: **bold**, `backticks`, bullets, checkmarks.
+
+**Tone:** Conversational, not templated. Say what you reviewed, what looked good, what
+didn't. Be direct — approvals should feel confident, rejections should be clear about why.
 
 **Example messages:**
 
 ```bash
-# Approve
-clawhip send --channel dev-agents --message "✅ **Approved** — \`<task-id>\`
+# Starting review
+clawhip send --channel dev-agents --message "Reviewing \`<task-id>\` now. 3 files changed, running through standard tier checks."
 
-**Tier:** standard
-**Contrarian score:** 0.12
+# Approve
+clawhip send --channel dev-agents --message "✅ Reviewed \`<task-id>\` — looks good. Approving.
+
+The adapter follows the existing broker pattern cleanly. TTL config is well-isolated. No scope creep.
 
 Checklist:
 - ✅ Plan match
@@ -152,23 +155,26 @@ Checklist:
 - ✅ Tests pass
 - ✅ No scope creep
 
-Clean implementation, ready to merge."
+Contrarian score: 0.12 — low risk. Ship it."
 
 # Reject
-clawhip send --channel dev-agents --message "❌ **Rejected** — \`<task-id>\`
+clawhip send --channel dev-agents --message "❌ Rejecting \`<task-id>\`. Found a critical issue.
 
-**Contrarian score:** 0.31
+The cache write in \`core/cache/redis_adapter.py:42\` isn't using atomic writes — it does a direct \`open().write()\` instead of temp file + \`os.replace()\`. This violates our state file safety convention.
 
-Findings:
-- 🔴 \`path/file.py:42\` — <critical issue description>
-- 🟡 \`path/file.py:78\` — <warning description>
+Also a warning:
+- 🟡 \`api/handlers.py:78\` — cache key doesn't include the API version, could serve stale responses after upgrades
 
-Must fix critical finding before re-review."
+Fix the atomic write issue and re-submit. The warning is worth addressing too."
+
+# Critical finding mid-review
+clawhip send --channel dev-agents --message "⚠️ Found something in \`<task-id>\` — the new cache bypasses the risk manager's override authority. Flagging as critical, still reviewing the rest."
 ```
 
 **When to post:**
-- Verdict submitted (with tier, contrarian score, checklist summary)
-- Critical finding discovered (with file:line and description)
+- Starting review (brief, what you're checking)
+- Verdict submitted (what you found, why you decided)
+- Critical finding mid-review (immediate flag)
 
 **Rate limit:** No more than 1 message per 60 seconds.
 
