@@ -1,4 +1,5 @@
 """Signal file I/O and dataclass schemas for inter-agent communication."""
+# v5 pipeline signal I/O module
 
 from __future__ import annotations
 
