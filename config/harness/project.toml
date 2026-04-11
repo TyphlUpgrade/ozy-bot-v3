@@ -16,7 +16,7 @@ bot_token_env = "DISCORD_BOT_TOKEN"     # Environment variable name, not the tok
 dev_channel = "dev-agents"
 ops_channel = "ops-monitor"
 escalation_channel = "escalations"
-# webhook_url = ""                      # Discord webhook URL — enables per-agent identity (username + avatar per message)
+webhook_url = "https://discord.com/api/webhooks/1492495828189708420/khRCiZLfBna_jMjOTnfhnGeEQaKDle7hWJO1OFfMnb8A-4Py4-JAh7nnWH_l6NpRDqU3"
 
 # Per-agent Discord identity — username and avatar_url for webhook messages.
 # To add a new agent, add one entry here.

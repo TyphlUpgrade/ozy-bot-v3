@@ -161,24 +161,24 @@ class DiscordCompanion:
             self.pending_mutations.append(
                 lambda s, sm, m=text, _sr=sr: _apply_dialogue_message(s, sm, m, _sr)
             )
-            return f"Message sent to {pre_esc_agent} (escalation dialogue)."
+            return f"Passing that to {pre_esc_agent} — they're waiting on your input."
 
         from lib.claude import classify_target
 
         agents = self._active_agents_fn()
         if not agents:
-            return "No active agents. Submit a task first."
+            return "Nobody's online right now — submit a task to spin up agents."
         if len(agents) == 1:
             target = agents[0]
         else:
             target = await classify_target(text, agents, self.config)
             if target is None:
-                return f"Who do you mean? Active agents: {', '.join(agents)}"
+                return f"Not sure who that's for — {', '.join(agents)} are active. Could you be more specific?"
         # NOTE: default-argument binding to avoid late-binding closure bug
         self.pending_mutations.append(
             lambda s, sm, a=target, m=text: sm.send(a, f"[OPERATOR] {m}")
         )
-        return f"Message routed to {target}."
+        return f"Got it, passing that to {target}."
 
     async def handle_message(self, cmd: str, args: str) -> str | None:
         """Dispatch a command. Returns response text or None.
@@ -198,7 +198,7 @@ class DiscordCompanion:
             self.pending_mutations.append(
                 lambda s, sm, a=agent, m=message: sm.send(a, f"[OPERATOR] {m}")
             )
-            return f"Feedback queued for {agent}."
+            return f"Got it, passing that to {agent}."
 
         if cmd == "!reply":
             task_id, response = parse_reply(args)
@@ -213,7 +213,7 @@ class DiscordCompanion:
             self.pending_mutations.append(
                 lambda s, sm, t=task_id, r=response, _sr=sr: _apply_reply(s, sm, t, r, _sr)
             )
-            return f"Reply queued for {task_id}."
+            return f"Got it, sending that reply to `{task_id}`."
 
         if cmd == "!caveman":
             return self._handle_caveman(args)
@@ -237,7 +237,7 @@ class DiscordCompanion:
             return self._format_caveman_status()
         if agent == "reset":
             self.config.caveman.reset_to_defaults()
-            return "Caveman levels reset to project.toml defaults."
+            return "Caveman levels reset to defaults."
         if level and level not in VALID_LEVELS:
             return f"Unknown level '{level}'. Valid: {', '.join(sorted(VALID_LEVELS))}"
         if agent == "all":
@@ -250,7 +250,7 @@ class DiscordCompanion:
         self.pending_mutations.append(
             lambda s, sm, a=agent, lvl=level: sm.inject_caveman_update(a, lvl)
         )
-        return f"{agent} caveman level -> {level}."
+        return f"Set {agent} to caveman `{level}`."
 
     def _format_caveman_status(self) -> str:
         lines = ["Caveman levels:"]
@@ -285,12 +285,12 @@ class DiscordCompanion:
             self.pending_mutations.append(
                 lambda s, sm, p=True: _apply_pause(s, sm, p)
             )
-            return "Pipeline pausing. Active task frozen — health checks continue."
+            return "Pausing the pipeline. Current task is frozen — I'll keep running health checks."
         if verb in ("resume", "unpause"):
             self.pending_mutations.append(
                 lambda s, sm, p=False: _apply_pause(s, sm, p)
             )
-            return "Pipeline resuming."
+            return "Resuming — picking up where we left off."
         if verb == "status":
             return self._format_status()
         return None
@@ -303,22 +303,22 @@ class DiscordCompanion:
         task = TaskSignal(task_id=task_id, description=text, source="discord")
         write_signal(self.config.task_dir, f"{task_id}.json", task)
         logger.info("NL task created: %s — '%s'", task_id, text[:80])
-        return f"Task created: {task_id} — '{text[:80]}'"
+        return f"On it — created task `{task_id}`. Pipeline will pick it up shortly."
 
     def _format_status(self) -> str:
         stage, _ = self._pipeline_stage_fn()
         is_paused = self._pipeline_paused_fn()
         lines = []
         if is_paused:
-            lines.append("Status: harness PAUSED.")
+            lines.append("\u23f8\ufe0f **Paused.**")
             if stage:
-                lines.append(f"  Frozen at stage: {stage}")
-            lines.append("  Send 'resume' to unpause.")
+                lines.append(f"Frozen at **{stage}** stage.")
+            lines.append("Say `resume` to unpause.")
         elif stage:
-            lines.append(f"Status: harness running. Active stage: {stage}.")
+            lines.append(f"\u25b6\ufe0f **Running** — currently at **{stage}** stage.")
         else:
-            lines.append("Status: harness idle.")
-        lines.append("Use !caveman status for compression levels. !update to pull + restart.")
+            lines.append("\U0001f7e2 **Idle** — waiting for tasks.")
+        lines.append("`!caveman status` for compression levels \u00b7 `!update` to pull + restart")
         return "\n".join(lines)
 
 

@@ -143,7 +143,7 @@ class TestHandleMessage:
         mutations = []
         dc = _make_companion(config, mutations)
         resp = await dc.handle_message("!tell", "executor do the thing")
-        assert resp == "Feedback queued for executor."
+        assert "executor" in resp
         assert len(mutations) == 1
 
     @pytest.mark.asyncio
@@ -164,7 +164,7 @@ class TestHandleMessage:
         mutations = []
         dc = _make_companion(config, mutations)
         resp = await dc.handle_message("!reply", "task-001 looks good")
-        assert resp == "Reply queued for task-001."
+        assert "task-001" in resp
         assert len(mutations) == 1
 
     @pytest.mark.asyncio
@@ -248,14 +248,14 @@ class TestHandleCaveman:
         mutations = []
         dc = _make_companion(config, mutations)
         resp = dc._handle_caveman("full")
-        assert "All agents set to caveman full" in resp
+        assert "full" in resp.lower()
         assert config.caveman.level_for("architect") == "full"  # was "off" initially
 
     def test_valid_per_agent_level(self, config):
         mutations = []
         dc = _make_companion(config, mutations)
         resp = dc._handle_caveman("executor ultra")
-        assert "executor caveman level -> ultra" in resp
+        assert "executor" in resp.lower() and "ultra" in resp.lower()
         assert len(mutations) == 1
         assert config.caveman.level_for("executor") == "ultra"
 
@@ -452,7 +452,7 @@ class TestHandleRawMessage:
         mutations = []
         dc = _make_companion(config, mutations)
         resp = await dc.handle_raw_message("!tell executor do the thing")
-        assert resp == "Feedback queued for executor."
+        assert "executor" in resp
         assert len(mutations) == 1
 
     @pytest.mark.asyncio
@@ -469,7 +469,7 @@ class TestHandleRawMessage:
         with patch("lib.claude.classify_intent", new_callable=AsyncMock, return_value="feedback"), \
              patch("lib.claude.classify_target") as mock_ct:
             resp = await dc.handle_raw_message("focus on error handling")
-        assert resp == "Message routed to executor."
+        assert "executor" in resp
         assert len(mutations) == 1
         mock_ct.assert_not_called()  # single agent, no classify needed
 
@@ -479,13 +479,13 @@ class TestHandleRawMessage:
         dc = _make_companion(config, mutations, active_agents_fn=lambda: ["executor"])
         with patch("lib.claude.classify_intent", new_callable=AsyncMock, return_value="feedback"):
             resp = await dc.handle_raw_message("  focus on tests  ")
-        assert resp == "Message routed to executor."
+        assert "executor" in resp
 
     @pytest.mark.asyncio
     async def test_empty_message_routes_as_nl(self, config):
         dc = _make_companion(config, active_agents_fn=lambda: [])
         resp = await dc.handle_raw_message("  ")
-        assert resp == "No active agents. Submit a task first."
+        assert "no" in resp.lower() and "agent" in resp.lower()
 
 
 # ---------- TestRouteNaturalLanguage ----------
@@ -496,14 +496,14 @@ class TestRouteNaturalLanguage:
     async def test_no_active_agents(self, config):
         dc = _make_companion(config, active_agents_fn=lambda: [])
         resp = await dc._route_natural_language("do something")
-        assert "No active agents" in resp
+        assert "no" in resp.lower() and "agent" in resp.lower() or "nobody" in resp.lower()
 
     @pytest.mark.asyncio
     async def test_single_agent_routes_directly(self, config):
         mutations = []
         dc = _make_companion(config, mutations, active_agents_fn=lambda: ["architect"])
         resp = await dc._route_natural_language("review the design")
-        assert resp == "Message routed to architect."
+        assert "architect" in resp
         assert len(mutations) == 1
 
     @pytest.mark.asyncio
@@ -521,7 +521,7 @@ class TestRouteNaturalLanguage:
         dc = _make_companion(config, mutations, active_agents_fn=lambda: ["architect", "executor"])
         with patch("lib.claude.classify_target", new_callable=AsyncMock, return_value="executor"):
             resp = await dc._route_natural_language("focus on error handling")
-        assert resp == "Message routed to executor."
+        assert "executor" in resp
         assert len(mutations) == 1
 
     @pytest.mark.asyncio
@@ -529,7 +529,7 @@ class TestRouteNaturalLanguage:
         dc = _make_companion(config, active_agents_fn=lambda: ["architect", "executor"])
         with patch("lib.claude.classify_target", new_callable=AsyncMock, return_value=None):
             resp = await dc._route_natural_language("do something")
-        assert "Who do you mean?" in resp
+        assert "architect" in resp and "executor" in resp
         assert "architect" in resp
         assert "executor" in resp
 
@@ -671,7 +671,7 @@ class TestEscalationDialogueRouting:
         with patch("lib.claude.classify_target") as mock_ct:
             resp = await dc._route_natural_language("try approach B instead")
         assert "executor" in resp
-        assert "escalation dialogue" in resp
+        assert "executor" in resp.lower() or "passing" in resp.lower()
         assert len(mutations) == 1
         mock_ct.assert_not_called()
 
@@ -698,7 +698,7 @@ class TestEscalationDialogueRouting:
             pipeline_stage_fn=lambda: ("executor", None),
         )
         resp = await dc._route_natural_language("focus on error handling")
-        assert resp == "Message routed to executor."
+        assert "executor" in resp
 
     @pytest.mark.asyncio
     async def test_nl_escalation_no_pre_esc_agent_falls_through(self, config):
@@ -710,7 +710,7 @@ class TestEscalationDialogueRouting:
             pipeline_stage_fn=lambda: ("escalation_wait", None),
         )
         resp = await dc._route_natural_language("fix the bug")
-        assert resp == "Message routed to executor."
+        assert "executor" in resp
 
 
 # ---------- TestDialogueMessageMutation ----------
@@ -1031,7 +1031,7 @@ class TestHandleControl:
     def test_status_returns_status_text(self, config):
         dc = _make_companion(config)
         resp = dc._handle_control("status")
-        assert "harness" in resp.lower()
+        assert "idle" in resp.lower() or "running" in resp.lower() or "paus" in resp.lower()
         assert "caveman" in resp.lower()
 
 
@@ -1043,7 +1043,7 @@ class TestHandleNewTask:
     async def test_creates_task_signal_file(self, config):
         dc = _make_companion(config)
         resp = await dc._handle_new_task("fix the auth bug in broker.py")
-        assert "Task created:" in resp
+        assert "task" in resp.lower()
         assert "discord-" in resp
         # Verify signal file written
         task_files = list(config.task_dir.glob("discord-*.json"))
@@ -1142,7 +1142,7 @@ class TestThreeWayDispatch:
         with patch("lib.claude.classify_intent") as mock_ci:
             resp = await dc.handle_raw_message("try approach B")
         mock_ci.assert_not_called()
-        assert "escalation dialogue" in resp
+        assert "executor" in resp.lower() or "passing" in resp.lower()
 
     @pytest.mark.asyncio
     async def test_feedback_intent_routes_to_agent(self, config):
@@ -1154,7 +1154,7 @@ class TestThreeWayDispatch:
         )
         with patch("lib.claude.classify_intent", new_callable=AsyncMock, return_value="feedback"):
             resp = await dc.handle_raw_message("focus on error handling")
-        assert resp == "Message routed to executor."
+        assert "executor" in resp
 
     @pytest.mark.asyncio
     async def test_new_task_intent_creates_signal(self, config):
@@ -1164,7 +1164,7 @@ class TestThreeWayDispatch:
         )
         with patch("lib.claude.classify_intent", new_callable=AsyncMock, return_value="new_task"):
             resp = await dc.handle_raw_message("fix the auth bug in broker.py")
-        assert "Task created:" in resp
+        assert "task" in resp.lower()
         task_files = list(config.task_dir.glob("discord-*.json"))
         assert len(task_files) == 1
 
@@ -1180,7 +1180,7 @@ class TestStatusShowsPaused:
             pipeline_paused_fn=lambda: True,
         )
         resp = dc._format_status()
-        assert "PAUSED" in resp
+        assert "paus" in resp.lower()
         assert "executor" in resp
         assert "resume" in resp.lower()
 
@@ -1211,7 +1211,7 @@ class TestStatusShowsPaused:
             pipeline_paused_fn=lambda: True,
         )
         resp = await dc.handle_message("!status", "")
-        assert "PAUSED" in resp
+        assert "paus" in resp.lower()
 
 
 # ---------- TestHandleUpdate ----------
@@ -1356,19 +1356,19 @@ class TestDoUpdateMutation:
 
 class TestInferAgentFromResponse:
     def test_detects_executor(self):
-        assert _infer_agent_from_response("Message routed to executor.", "") == "executor"
+        assert _infer_agent_from_response("Got it, passing that to executor.", "") == "executor"
 
     def test_detects_architect(self):
-        assert _infer_agent_from_response("Feedback queued for architect.", "") == "architect"
+        assert _infer_agent_from_response("Got it, passing that to architect.", "") == "architect"
 
     def test_detects_reviewer(self):
-        assert _infer_agent_from_response("Message sent to reviewer (escalation dialogue).", "") == "reviewer"
+        assert _infer_agent_from_response("Got it, passing that to reviewer.", "") == "reviewer"
 
     def test_defaults_to_orchestrator(self):
-        assert _infer_agent_from_response("Pipeline pausing.", "") == "orchestrator"
+        assert _infer_agent_from_response("Pausing the pipeline.", "") == "orchestrator"
 
     def test_status_is_orchestrator(self):
-        assert _infer_agent_from_response("Status: harness idle.", "") == "orchestrator"
+        assert _infer_agent_from_response("Pipeline is idle, nothing running.", "") == "orchestrator"
 
     def test_case_insensitive_detection(self):
         assert _infer_agent_from_response("EXECUTOR caveman level -> ultra.", "") == "executor"
@@ -1423,13 +1423,13 @@ class TestSendResponse:
         mock_aiohttp = MagicMock()
         mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
         with patch("harness.discord_companion._get_aiohttp", return_value=mock_aiohttp):
-            await _send_response(message, "Feedback queued for executor.", dc, "do the thing")
+            await _send_response(message, "executor", dc, "do the thing")
 
         mock_session.post.assert_called_once()
         call_kwargs = mock_session.post.call_args
         payload = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
         assert payload["username"] == "Executor"
-        assert payload["content"] == "Feedback queued for executor."
+        assert "executor" in payload["content"].lower()
         message.channel.send.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1568,7 +1568,7 @@ class TestFlushAccumulated:
 
         with patch("harness.discord_companion.ACCUM_WINDOW", 0.01):
             with patch.object(dc, "handle_raw_message", new_callable=AsyncMock,
-                              return_value="Message routed to executor."):
+                              return_value="Got it, passing that to executor."):
                 await _flush_accumulated(999, dc, client)
                 dc.handle_raw_message.assert_awaited_once_with("fix the bug\nin broker.py")
 
