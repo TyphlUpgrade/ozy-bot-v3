@@ -130,16 +130,45 @@ You have full filesystem read access. Key files for review:
 
 ## Discord Status Updates
 
-Post status updates to Discord at key milestones. Use `clawhip send` via Bash — write-only,
-never read Discord responses. All inbound communication comes through the orchestrator's FIFO queue.
+Post structured status updates to Discord at key milestones. Use `clawhip send` via Bash —
+write-only, never read Discord responses. All inbound communication comes through the
+orchestrator's FIFO queue.
+
+Use markdown formatting: **bold** for emphasis, `backticks` for code/IDs, checkmarks for
+passing checks, bullets for findings.
+
+**Example messages:**
 
 ```bash
-clawhip send --channel dev-agents --message "Reviewer: <verdict> for <task-id> — <summary>"
+# Approve
+clawhip send --channel dev-agents --message "✅ **Approved** — \`<task-id>\`
+
+**Tier:** standard
+**Contrarian score:** 0.12
+
+Checklist:
+- ✅ Plan match
+- ✅ Trading conventions
+- ✅ Tests pass
+- ✅ No scope creep
+
+Clean implementation, ready to merge."
+
+# Reject
+clawhip send --channel dev-agents --message "❌ **Rejected** — \`<task-id>\`
+
+**Contrarian score:** 0.31
+
+Findings:
+- 🔴 \`path/file.py:42\` — <critical issue description>
+- 🟡 \`path/file.py:78\` — <warning description>
+
+Must fix critical finding before re-review."
 ```
 
 **When to post:**
-- Verdict submitted (approve/reject/request_changes with brief reason)
-- Critical finding discovered (with severity and affected area)
+- Verdict submitted (with tier, contrarian score, checklist summary)
+- Critical finding discovered (with file:line and description)
 
 **Rate limit:** No more than 1 message per 60 seconds.
 

@@ -116,18 +116,50 @@ Types: feat, fix, refactor, test, docs, chore.
 
 ## Discord Status Updates
 
-Post status updates to Discord at key milestones. Use `clawhip send` via Bash — write-only,
-never read Discord responses. All inbound communication comes through the orchestrator's FIFO queue.
+Post structured status updates to Discord at key milestones. Use `clawhip send` via Bash —
+write-only, never read Discord responses. All inbound communication comes through the
+orchestrator's FIFO queue.
+
+Use markdown formatting: **bold** for emphasis, `backticks` for code/IDs, checkmarks for
+completed items, bullets for lists.
+
+**Example messages:**
 
 ```bash
-clawhip send --channel dev-agents --message "Executor: unit <N> complete for <task-id>"
+# Unit completed
+clawhip send --channel dev-agents --message "**Unit <N>/<total> complete** — \`<task-id>\`
+
+<brief description of what was done>
+
+Files changed:
+- \`path/to/file.py\` — <what changed>
+
+Tests: ✅ passing"
+
+# Task complete
+clawhip send --channel dev-agents --message "✅ **Implementation complete** — \`<task-id>\`
+
+**Units:** <N>/<N> done
+**Tests:** ✅ all passing
+**Commit:** \`<short-hash>\`
+
+Ready for review."
+
+# Tests failing
+clawhip send --channel dev-agents --message "❌ **Tests failing** — \`<task-id>\`, unit <N>
+
+\`\`\`
+<key error line from test output>
+\`\`\`
+
+Investigating."
 ```
 
 **When to post:**
-- Unit completed (with unit number and brief result)
+- Unit completed (with files changed, test status)
+- Task complete (with unit count, test status, commit hash)
+- Tests failing (with key error)
 - Checkpoint reached (pausing for review)
-- Tests failing after implementation (with brief error summary)
-- Task complete (all units done, tests passing)
 
 **Rate limit:** No more than 1 message per 60 seconds. Do not post per-file progress.
 

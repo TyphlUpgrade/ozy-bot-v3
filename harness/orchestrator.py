@@ -759,6 +759,10 @@ async def main_loop(config: ProjectConfig) -> None:
                 await dc.announce_stage(
                     state.stage, state.active_task,
                     state.task_description, config,
+                    plan_summary=state.plan_summary,
+                    diff_stat=state.diff_stat,
+                    review_verdict=state.review_verdict,
+                    retry_count=state.retry_count,
                 )
 
             # F3: Check for new tasks while current is blocked in escalation_wait

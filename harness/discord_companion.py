@@ -418,22 +418,47 @@ _ANNOUNCE_STAGES = frozenset({
 
 async def announce_stage(stage: str, task_id: str | None,
                          description: str | None,
-                         config: "ProjectConfig") -> None:
+                         config: "ProjectConfig",
+                         *,
+                         plan_summary: str | None = None,
+                         diff_stat: str | None = None,
+                         review_verdict: str | None = None,
+                         retry_count: int = 0) -> None:
     """Post stage transition to Discord via webhook or clawhip.
 
     Called from orchestrator after state.advance(). Non-blocking, best-effort.
+    Accepts optional pipeline context for richer messages.
     """
     if stage not in _ANNOUNCE_STAGES:
         return
 
     agent = stage if stage not in ("merge", "wiki", "classify") else "orchestrator"
     desc_snippet = (description or "")[:80]
+
+    # Build structured message with available context
+    lines: list[str] = []
     if task_id and desc_snippet:
-        text = f"\U0001f504 **{stage}** — `{task_id}`: {desc_snippet}"
+        lines.append(f"\U0001f504 **{stage}** — `{task_id}`: {desc_snippet}")
     elif task_id:
-        text = f"\U0001f504 **{stage}** — `{task_id}`"
+        lines.append(f"\U0001f504 **{stage}** — `{task_id}`")
     else:
-        text = f"\U0001f504 **{stage}**"
+        lines.append(f"\U0001f504 **{stage}**")
+
+    if stage == "architect" and plan_summary:
+        lines.append(f"> {plan_summary[:200]}")
+    elif stage == "executor" and plan_summary:
+        lines.append(f"Plan: {plan_summary[:150]}")
+    elif stage == "reviewer" and diff_stat:
+        lines.append(f"```\n{diff_stat[:300]}\n```")
+    elif stage == "merge":
+        if review_verdict:
+            lines.append(f"\u2705 Reviewer: **{review_verdict}**")
+        if retry_count > 0:
+            lines.append(f"\u26a0\ufe0f Retries: {retry_count}")
+    elif stage == "wiki":
+        lines.append("Documenting completed task")
+
+    text = "\n".join(lines)
 
     webhook_url = config.discord_webhook_url
     if webhook_url:

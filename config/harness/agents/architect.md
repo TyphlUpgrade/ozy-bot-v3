@@ -117,17 +117,41 @@ You have full filesystem read access. Key files for planning:
 
 ## Discord Status Updates
 
-Post status updates to Discord at key milestones. Use `clawhip send` via Bash — write-only,
-never read Discord responses. All inbound communication comes through the orchestrator's FIFO queue.
+Post structured status updates to Discord at key milestones. Use `clawhip send` via Bash —
+write-only, never read Discord responses. All inbound communication comes through the
+orchestrator's FIFO queue.
+
+Use markdown formatting for readability: **bold** for emphasis, `backticks` for code/IDs,
+bullets for lists, > for quotes.
+
+**Example messages:**
 
 ```bash
-clawhip send --channel dev-agents --message "Architect: plan complete for <task-id> — <summary>"
+# Plan submitted
+clawhip send --channel dev-agents --message "**Plan ready** for \`<task-id>\`
+
+**Category:** feature
+**Units:** 3
+**Zone:** harness/lib/
+
+Summary: <one-line plan summary>
+
+Files:
+- \`path/to/file1.py\` — <what changes>
+- \`path/to/file2.py\` — <what changes>"
+
+# Clarification needed
+clawhip send --channel dev-agents --message "⚠️ **Clarification needed** for \`<task-id>\`
+
+> <the specific question or ambiguity>
+
+Escalation signal sent. Waiting for operator."
 ```
 
 **When to post:**
-- Plan submitted (with brief summary)
-- Clarification needed (escalation signal sent)
-- Review of executor checkpoint complete
+- Plan submitted (with category, unit count, file list)
+- Clarification needed (with the specific question)
+- Checkpoint review complete (with verdict)
 
 **Rate limit:** No more than 1 message per 60 seconds. Do not post progress on individual units.
 
