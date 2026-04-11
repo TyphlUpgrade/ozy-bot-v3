@@ -1,3 +1,4 @@
+# presence test v2
 # discord presence test
 """Signal file I/O and dataclass schemas for inter-agent communication."""
 # v5 pipeline signal I/O module
