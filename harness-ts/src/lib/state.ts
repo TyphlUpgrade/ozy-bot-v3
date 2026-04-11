@@ -1,0 +1,296 @@
+/**
+ * Task state machine with atomic persistence.
+ * Lessons: B1 (sync mutations), B3 (shelve clock reset), B5 (resume at executor),
+ * B6 (escalation tier reset), B7 (unknown key drop), O3 (atomic writes), O9 (write-only log).
+ */
+
+import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+
+// --- Task States ---
+
+export const TASK_STATES = [
+  "pending",
+  "active",
+  "reviewing",
+  "merging",
+  "done",
+  "failed",
+  "shelved",
+  "escalation_wait",
+  "paused",
+] as const;
+
+export type TaskState = (typeof TASK_STATES)[number];
+
+// Valid transitions: from -> allowed destinations
+const VALID_TRANSITIONS: Record<TaskState, readonly TaskState[]> = {
+  pending: ["active", "failed"],
+  active: ["reviewing", "merging", "done", "failed", "shelved", "escalation_wait", "paused"],
+  reviewing: ["active", "merging", "done", "failed", "escalation_wait"],
+  merging: ["done", "failed", "shelved"],
+  done: [],
+  failed: ["pending"], // can retry
+  shelved: ["pending", "active", "failed"],
+  escalation_wait: ["active", "failed"],
+  paused: ["active", "failed"],
+};
+
+// --- Task Record ---
+
+export interface TaskRecord {
+  id: string;
+  state: TaskState;
+  prompt: string;
+  sessionId?: string;
+  worktreePath?: string;
+  branchName?: string;
+  createdAt: string;      // ISO timestamp
+  updatedAt: string;
+  completedAt?: string;
+  totalCostUsd: number;
+  retryCount: number;
+  escalationTier: number; // 1=normal, 2=complex, 3=operator
+  shelvedAt?: string;     // ISO — B3: shelve time tracked separately
+  rebaseAttempts: number;
+  lastError?: string;
+  summary?: string;
+  filesChanged?: string[];
+}
+
+// Known keys for defensive deserialization (B7)
+const KNOWN_KEYS: ReadonlySet<string> = new Set([
+  "id", "state", "prompt", "sessionId", "worktreePath", "branchName",
+  "createdAt", "updatedAt", "completedAt", "totalCostUsd", "retryCount",
+  "escalationTier", "shelvedAt", "rebaseAttempts", "lastError", "summary",
+  "filesChanged",
+]);
+
+// --- Event Log (O9: write-only) ---
+
+export interface StateEvent {
+  timestamp: string;
+  taskId: string;
+  event: string;
+  from?: TaskState;
+  to?: TaskState;
+  detail?: string;
+}
+
+// --- State Store ---
+
+export interface TaskStore {
+  tasks: Record<string, TaskRecord>;
+  version: number;
+}
+
+export class StateManager {
+  private store: TaskStore;
+  private readonly statePath: string;
+  private readonly logPath: string;
+
+  constructor(statePath: string) {
+    this.statePath = statePath;
+    this.logPath = statePath.replace(/\.json$/, ".log.jsonl");
+    this.store = this.load();
+  }
+
+  /** Load state from disk with defensive deserialization (B7) */
+  private load(): TaskStore {
+    if (!existsSync(this.statePath)) {
+      return { tasks: {}, version: 1 };
+    }
+    try {
+      const raw = readFileSync(this.statePath, "utf-8");
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const tasks: Record<string, TaskRecord> = {};
+
+      const rawTasks = (parsed.tasks ?? {}) as Record<string, Record<string, unknown>>;
+      for (const [id, rawTask] of Object.entries(rawTasks)) {
+        // B7: Drop unknown keys
+        const cleaned: Record<string, unknown> = {};
+        for (const [key, value] of Object.entries(rawTask)) {
+          if (KNOWN_KEYS.has(key)) {
+            cleaned[key] = value;
+          }
+          // Unknown keys silently dropped
+        }
+
+        // Validate state is known
+        const state = cleaned.state as string;
+        if (!TASK_STATES.includes(state as TaskState)) {
+          cleaned.state = "failed";
+        }
+
+        tasks[id] = cleaned as unknown as TaskRecord;
+      }
+
+      return { tasks, version: (parsed.version as number) ?? 1 };
+    } catch {
+      // Corrupt file — start fresh
+      return { tasks: {}, version: 1 };
+    }
+  }
+
+  /** Atomic write: temp file + rename (O3, B1: synchronous) */
+  private persist(): void {
+    const dir = dirname(this.statePath);
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true });
+    }
+    const tmpPath = join(dir, `.state-${randomUUID()}.tmp`);
+    writeFileSync(tmpPath, JSON.stringify(this.store, null, 2), "utf-8");
+    renameSync(tmpPath, this.statePath);
+  }
+
+  /** Append event to write-only log (O9) */
+  private logEvent(event: StateEvent): void {
+    const dir = dirname(this.logPath);
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true });
+    }
+    // Append-only, never read by control flow
+    writeFileSync(this.logPath, JSON.stringify(event) + "\n", { flag: "a" });
+  }
+
+  /** Create a new task in pending state */
+  createTask(prompt: string, id?: string): TaskRecord {
+    const taskId = id ?? randomUUID();
+    const now = new Date().toISOString();
+    const task: TaskRecord = {
+      id: taskId,
+      state: "pending",
+      prompt,
+      createdAt: now,
+      updatedAt: now,
+      totalCostUsd: 0,
+      retryCount: 0,
+      escalationTier: 1,
+      rebaseAttempts: 0,
+    };
+    this.store.tasks[taskId] = task;
+    this.persist();
+    this.logEvent({ timestamp: now, taskId, event: "created" });
+    return task;
+  }
+
+  /** Get a task by ID */
+  getTask(taskId: string): TaskRecord | undefined {
+    return this.store.tasks[taskId];
+  }
+
+  /** Get all tasks */
+  getAllTasks(): TaskRecord[] {
+    return Object.values(this.store.tasks);
+  }
+
+  /** Get tasks by state */
+  getTasksByState(state: TaskState): TaskRecord[] {
+    return this.getAllTasks().filter((t) => t.state === state);
+  }
+
+  /**
+   * Transition a task to a new state.
+   * Validates transition is legal. Applies business logic:
+   * - B3: shelve resets escalation clock
+   * - B5/B6: escalation tier reset on auto-escalation
+   */
+  transition(taskId: string, to: TaskState): TaskRecord {
+    const task = this.store.tasks[taskId];
+    if (!task) {
+      throw new Error(`Task not found: ${taskId}`);
+    }
+
+    const from = task.state;
+    const allowed = VALID_TRANSITIONS[from];
+    if (!allowed.includes(to)) {
+      throw new Error(`Invalid transition: ${from} -> ${to} for task ${taskId}`);
+    }
+
+    const now = new Date().toISOString();
+    task.state = to;
+    task.updatedAt = now;
+
+    // B3: Shelve resets escalation clock
+    if (to === "shelved") {
+      task.shelvedAt = now;
+    }
+
+    // Unshelve: clear shelvedAt
+    if (from === "shelved" && (to === "pending" || to === "active")) {
+      task.shelvedAt = undefined;
+    }
+
+    // Terminal states
+    if (to === "done" || to === "failed") {
+      task.completedAt = now;
+    }
+
+    this.persist();
+    this.logEvent({ timestamp: now, taskId, event: "transition", from, to });
+    return task;
+  }
+
+  /**
+   * Escalate task tier. B5: resume at executor (not reviewer). B6: reset retry count.
+   */
+  escalate(taskId: string, newTier: number): TaskRecord {
+    const task = this.store.tasks[taskId];
+    if (!task) {
+      throw new Error(`Task not found: ${taskId}`);
+    }
+    if (newTier <= task.escalationTier) {
+      throw new Error(`Cannot de-escalate: ${task.escalationTier} -> ${newTier}`);
+    }
+
+    const now = new Date().toISOString();
+    const fromTier = task.escalationTier;
+    task.escalationTier = newTier;
+    task.retryCount = 0; // B6: reset retry count on escalation
+    task.updatedAt = now;
+
+    this.persist();
+    this.logEvent({
+      timestamp: now,
+      taskId,
+      event: "escalated",
+      detail: `tier ${fromTier} -> ${newTier}`,
+    });
+    return task;
+  }
+
+  /** Increment retry count, return updated count */
+  incrementRetry(taskId: string): number {
+    const task = this.store.tasks[taskId];
+    if (!task) throw new Error(`Task not found: ${taskId}`);
+    task.retryCount += 1;
+    task.updatedAt = new Date().toISOString();
+    this.persist();
+    return task.retryCount;
+  }
+
+  /** Increment rebase attempts, return updated count */
+  incrementRebaseAttempts(taskId: string): number {
+    const task = this.store.tasks[taskId];
+    if (!task) throw new Error(`Task not found: ${taskId}`);
+    task.rebaseAttempts += 1;
+    task.updatedAt = new Date().toISOString();
+    this.persist();
+    return task.rebaseAttempts;
+  }
+
+  /** Update task fields (partial update, then persist) */
+  updateTask(taskId: string, updates: Partial<Omit<TaskRecord, "id" | "state">>): TaskRecord {
+    const task = this.store.tasks[taskId];
+    if (!task) throw new Error(`Task not found: ${taskId}`);
+    Object.assign(task, updates, { updatedAt: new Date().toISOString() });
+    this.persist();
+    return task;
+  }
+
+  /** Reload from disk (for crash recovery) */
+  reload(): void {
+    this.store = this.load();
+  }
+}

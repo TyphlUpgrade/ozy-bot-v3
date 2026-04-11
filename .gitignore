@@ -29,3 +29,5 @@ tests/sentiment_indicator_analysis.py
 tests/trade_journal_backtest.jsonl
 tests/vix_backtest.py
 *.kate-swp
+node_modules/
+*.tsbuildinfo
