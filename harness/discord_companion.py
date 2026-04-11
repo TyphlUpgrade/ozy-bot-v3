@@ -35,6 +35,23 @@ DIALOGUE_CONFIRM_WORDS = frozenset({
     "yes", "y", "confirm", "go", "approved", "ok", "okay", "proceed",
 })
 
+# Template fallback for response generation when haiku is unavailable.
+# To add a response type, add one entry here.
+_RESPONSE_TEMPLATES: dict[str, str] = {
+    "route": "Got it, passing that to {agent}.",
+    "escalation_route": "Passing that to {agent} — they're waiting on your input.",
+    "no_agents": "Nobody's online right now — submit a task to spin up agents.",
+    "ambiguous": "Not sure who that's for — {agents} are active. Could you be more specific?",
+    "pause": "Pausing the pipeline. Current task is frozen — I'll keep running health checks.",
+    "resume": "Resuming — picking up where we left off.",
+    "task_created": "On it — created task `{task_id}`. Pipeline will pick it up shortly.",
+    "reply_sent": "Got it, sending that reply to `{task_id}`.",
+    "caveman_set": "Set {agent} to caveman `{level}`.",
+    "caveman_set_all": "All agents set to caveman {level}.",
+    "caveman_reset": "Caveman levels reset to defaults.",
+    "update_started": "Pulling latest code...",
+}
+
 # Deterministic control pre-filter — catches unambiguous pipeline control
 # commands before any LLM call. Matches standalone words or "X the pipeline" forms.
 _CONTROL_PATTERN = re.compile(
@@ -102,6 +119,40 @@ class DiscordCompanion:
         self._project_handler: Any = None
         self._load_project_commands()
 
+    async def _respond(self, action: dict | None) -> str | None:
+        """Convert an action dict into a response string.
+
+        Tries haiku for conversational output, falls back to templates.
+        Passthrough types (status, error, display) return detail as-is.
+        """
+        if action is None:
+            return None
+
+        atype = action["type"]
+
+        # Passthrough — structured display or error, no LLM needed
+        if atype in ("status", "caveman_status", "error"):
+            return action.get("detail")
+
+        # Try haiku for conversational response
+        try:
+            from lib.claude import generate_response
+            haiku_resp = await generate_response(action, self.config)
+            if haiku_resp:
+                return haiku_resp
+        except Exception:
+            pass
+
+        # Template fallback
+        template = _RESPONSE_TEMPLATES.get(atype)
+        if template:
+            fmt = {k: v for k, v in action.items() if k != "type"}
+            if "agents" in fmt and isinstance(fmt["agents"], list):
+                fmt["agents"] = ", ".join(fmt["agents"])
+            return template.format(**fmt)
+
+        return action.get("detail", "Done.")
+
     def _load_project_commands(self) -> None:
         """Load project-specific commands from config module."""
         if not self.config.commands_module:
@@ -122,6 +173,9 @@ class DiscordCompanion:
         3. Escalation shortcut → _route_natural_language (skip classify_intent)
         4. classify_intent → new_task → _handle_new_task
         5. classify_intent → feedback → _route_natural_language
+
+        Internal handlers return action dicts; _respond converts to strings
+        (haiku for conversational output, template fallback).
         """
         text = text.strip()
         if text.startswith("!"):
@@ -132,16 +186,16 @@ class DiscordCompanion:
 
         # Empty after strip — route directly (no LLM call for empty messages)
         if not text:
-            return await self._route_natural_language(text)
+            return await self._respond(await self._route_natural_language(text))
 
         # Deterministic control pre-filter — no LLM call for stop/pause/resume
         if _CONTROL_PATTERN.match(text):
-            return self._handle_control(text)
+            return await self._respond(self._handle_control(text))
 
         # Escalation shortcut — during dialogue, route directly to blocked agent
         stage, pre_esc_agent = self._pipeline_stage_fn()
         if stage in ("escalation_wait", "escalation_dialogue") and pre_esc_agent:
-            return await self._route_natural_language(text)
+            return await self._respond(await self._route_natural_language(text))
 
         # Three-way intent classification: feedback vs new_task
         from lib.claude import classify_intent
@@ -149,11 +203,14 @@ class DiscordCompanion:
         has_active_task = stage is not None
         intent = await classify_intent(text, has_active_task, self.config)
         if intent == "new_task":
-            return await self._handle_new_task(text)
-        return await self._route_natural_language(text)
+            return await self._respond(await self._handle_new_task(text))
+        return await self._respond(await self._route_natural_language(text))
 
-    async def _route_natural_language(self, text: str) -> str | None:
-        """Route a non-prefixed operator message to the correct agent."""
+    async def _route_natural_language(self, text: str) -> dict:
+        """Route a non-prefixed operator message to the correct agent.
+
+        Returns an action dict — caller wraps with _respond for string output.
+        """
         # Escalation dialogue: route directly to blocked agent (skip classify)
         stage, pre_esc_agent = self._pipeline_stage_fn()
         if stage in ("escalation_wait", "escalation_dialogue") and pre_esc_agent:
@@ -161,31 +218,32 @@ class DiscordCompanion:
             self.pending_mutations.append(
                 lambda s, sm, m=text, _sr=sr: _apply_dialogue_message(s, sm, m, _sr)
             )
-            return f"Passing that to {pre_esc_agent} — they're waiting on your input."
+            return {"type": "escalation_route", "agent": pre_esc_agent}
 
         from lib.claude import classify_target
 
         agents = self._active_agents_fn()
         if not agents:
-            return "Nobody's online right now — submit a task to spin up agents."
+            return {"type": "no_agents", "agent": "orchestrator"}
         if len(agents) == 1:
             target = agents[0]
         else:
             target = await classify_target(text, agents, self.config)
             if target is None:
-                return f"Not sure who that's for — {', '.join(agents)} are active. Could you be more specific?"
+                return {"type": "ambiguous", "agent": "orchestrator", "agents": agents}
         # NOTE: default-argument binding to avoid late-binding closure bug
         self.pending_mutations.append(
             lambda s, sm, a=target, m=text: sm.send(a, f"[OPERATOR] {m}")
         )
-        return f"Got it, passing that to {target}."
+        return {"type": "route", "agent": target}
 
     async def handle_message(self, cmd: str, args: str) -> str | None:
         """Dispatch a command. Returns response text or None.
 
         Called from the Discord on_message handler. This method does NOT
         mutate PipelineState directly — it queues mutations for the main
-        loop to apply.
+        loop to apply. Conversational responses go through _respond (haiku
+        with template fallback); error/usage strings returned directly.
         """
         if cmd == "!tell":
             agent, message = parse_tell(args)
@@ -198,7 +256,7 @@ class DiscordCompanion:
             self.pending_mutations.append(
                 lambda s, sm, a=agent, m=message: sm.send(a, f"[OPERATOR] {m}")
             )
-            return f"Got it, passing that to {agent}."
+            return await self._respond({"type": "route", "agent": agent})
 
         if cmd == "!reply":
             task_id, response = parse_reply(args)
@@ -213,13 +271,13 @@ class DiscordCompanion:
             self.pending_mutations.append(
                 lambda s, sm, t=task_id, r=response, _sr=sr: _apply_reply(s, sm, t, r, _sr)
             )
-            return f"Got it, sending that reply to `{task_id}`."
+            return await self._respond({"type": "reply_sent", "agent": "orchestrator", "task_id": task_id})
 
         if cmd == "!caveman":
-            return self._handle_caveman(args)
+            return await self._respond(self._handle_caveman(args))
 
         if cmd == "!update":
-            return self._handle_update()
+            return await self._respond(self._handle_update())
 
         if cmd == "!status":
             return self._format_status()
@@ -231,26 +289,27 @@ class DiscordCompanion:
 
         return None
 
-    def _handle_caveman(self, args: str) -> str:
+    def _handle_caveman(self, args: str) -> dict:
+        """Handle !caveman command. Returns action dict."""
         agent, level = parse_caveman(args)
         if agent == "status":
-            return self._format_caveman_status()
+            return {"type": "caveman_status", "detail": self._format_caveman_status()}
         if agent == "reset":
             self.config.caveman.reset_to_defaults()
-            return "Caveman levels reset to defaults."
+            return {"type": "caveman_reset"}
         if level and level not in VALID_LEVELS:
-            return f"Unknown level '{level}'. Valid: {', '.join(sorted(VALID_LEVELS))}"
+            return {"type": "error", "detail": f"Unknown level '{level}'. Valid: {', '.join(sorted(VALID_LEVELS))}"}
         if agent == "all":
             self.config.caveman.set_all(level)
-            return f"All agents set to caveman {level}."
+            return {"type": "caveman_set_all", "agent": "all", "level": level}
         if agent not in self.config.agents:
-            return f"Unknown agent '{agent}'. Active: {', '.join(self.config.agents.keys())}"
+            return {"type": "error", "detail": f"Unknown agent '{agent}'. Active: {', '.join(self.config.agents.keys())}"}
         self.config.caveman.set_agent(agent, level)
         # NOTE: default-argument binding to avoid late-binding closure bug
         self.pending_mutations.append(
             lambda s, sm, a=agent, lvl=level: sm.inject_caveman_update(a, lvl)
         )
-        return f"Set {agent} to caveman `{level}`."
+        return {"type": "caveman_set", "agent": agent, "level": level}
 
     def _format_caveman_status(self) -> str:
         lines = ["Caveman levels:"]
@@ -261,11 +320,12 @@ class DiscordCompanion:
         lines.append(f"  default: {self.config.caveman.default_level}")
         return "\n".join(lines)
 
-    def _handle_update(self) -> str:
+    def _handle_update(self) -> dict:
+        """Handle !update command. Returns action dict."""
         if self._update_in_progress:
-            return "Update already in progress."
+            return {"type": "error", "detail": "Update already in progress."}
         if not self._shutdown_event:
-            return "Update unavailable — no shutdown event wired."
+            return {"type": "error", "detail": "Update unavailable — no shutdown event wired."}
         self._update_in_progress = True
         ev = self._shutdown_event
         cwd = str(self.config.project_root)
@@ -276,34 +336,37 @@ class DiscordCompanion:
         self.pending_mutations.append(
             lambda s, sm, _ev=ev, _cwd=cwd, _reset=reset: _do_update(s, sm, _ev, _cwd, _reset)
         )
-        return "Pulling latest code..."
+        return {"type": "update_started", "agent": "orchestrator"}
 
-    def _handle_control(self, text: str) -> str | None:
-        """Handle control commands detected by deterministic pre-filter."""
+    def _handle_control(self, text: str) -> dict | None:
+        """Handle control commands detected by deterministic pre-filter.
+
+        Returns action dict — caller wraps with _respond for string output.
+        """
         verb = text.strip().split()[0].lower()
         if verb in ("stop", "pause", "halt"):
             self.pending_mutations.append(
                 lambda s, sm, p=True: _apply_pause(s, sm, p)
             )
-            return "Pausing the pipeline. Current task is frozen — I'll keep running health checks."
+            return {"type": "pause", "agent": "orchestrator"}
         if verb in ("resume", "unpause"):
             self.pending_mutations.append(
                 lambda s, sm, p=False: _apply_pause(s, sm, p)
             )
-            return "Resuming — picking up where we left off."
+            return {"type": "resume", "agent": "orchestrator"}
         if verb == "status":
-            return self._format_status()
+            return {"type": "status", "agent": "orchestrator", "detail": self._format_status()}
         return None
 
-    async def _handle_new_task(self, text: str) -> str:
-        """Create a TaskSignal from operator NL message."""
+    async def _handle_new_task(self, text: str) -> dict:
+        """Create a TaskSignal from operator NL message. Returns action dict."""
         from lib.signals import TaskSignal, write_signal
 
         task_id = f"discord-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
         task = TaskSignal(task_id=task_id, description=text, source="discord")
         write_signal(self.config.task_dir, f"{task_id}.json", task)
         logger.info("NL task created: %s — '%s'", task_id, text[:80])
-        return f"On it — created task `{task_id}`. Pipeline will pick it up shortly."
+        return {"type": "task_created", "agent": "orchestrator", "task_id": task_id}
 
     def _format_status(self) -> str:
         stage, _ = self._pipeline_stage_fn()

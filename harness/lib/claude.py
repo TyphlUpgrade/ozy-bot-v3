@@ -229,3 +229,20 @@ async def classify_target(
             return agent
     logger.warning("classify_target returned unknown agent %r — treating as ambiguous", result)
     return None
+
+
+async def generate_response(action: dict, config: "ProjectConfig") -> str | None:
+    """Generate a conversational Discord response from a structured action dict.
+
+    Uses haiku for cheap, fast generation. Returns None on failure —
+    caller should use template fallback.
+    """
+    import json
+    system = (
+        "You are a Discord bot for a dev pipeline. Write a short, natural "
+        "response (1-2 sentences) for the action below. Be conversational, "
+        "not robotic. Use Discord markdown sparingly. No emojis."
+    )
+    user = json.dumps(action, default=str)
+    timeout = config.timeouts.get("generate_response", 5)
+    return await _run_claude(system, user, timeout, "generate_response", config, model="haiku")

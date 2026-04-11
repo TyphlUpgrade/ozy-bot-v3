@@ -6,9 +6,19 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _mock_generate_response():
+    """Prevent real LLM calls for response generation in all tests.
+
+    Returns None so _respond falls through to template output.
+    """
+    with patch("lib.claude.generate_response", new_callable=AsyncMock, return_value=None):
+        yield
 
 from harness.lib.pipeline import (
     AgentDef,

@@ -223,51 +223,58 @@ class TestHandleMessage:
 class TestHandleCaveman:
     def test_no_args_returns_status(self, config):
         dc = _make_companion(config)
-        resp = dc._handle_caveman("")
-        assert "Caveman levels" in resp
+        action = dc._handle_caveman("")
+        assert action["type"] == "caveman_status"
+        assert "Caveman levels" in action["detail"]
 
     def test_status_returns_formatted_status(self, config):
         dc = _make_companion(config)
         dc.config.caveman.set_agent("executor", "ultra")
-        resp = dc._handle_caveman("status")
-        assert "Caveman levels" in resp
-        assert "architect" in resp
-        assert "executor" in resp
-        assert "ultra" in resp
-        assert "(runtime)" in resp
+        action = dc._handle_caveman("status")
+        assert action["type"] == "caveman_status"
+        detail = action["detail"]
+        assert "architect" in detail
+        assert "executor" in detail
+        assert "ultra" in detail
+        assert "(runtime)" in detail
 
     def test_reset_resets_to_defaults(self, config):
         dc = _make_companion(config)
         dc.config.caveman.set_agent("executor", "ultra")
         assert dc.config.caveman.level_for("executor") == "ultra"  # precondition
-        resp = dc._handle_caveman("reset")
-        assert "reset" in resp.lower()
+        action = dc._handle_caveman("reset")
+        assert action["type"] == "caveman_reset"
         assert dc.config.caveman.level_for("executor") == "full"  # back to config default
 
     def test_full_sets_all_agents(self, config):
         mutations = []
         dc = _make_companion(config, mutations)
-        resp = dc._handle_caveman("full")
-        assert "full" in resp.lower()
+        action = dc._handle_caveman("full")
+        assert action["type"] == "caveman_set_all"
+        assert action["level"] == "full"
         assert config.caveman.level_for("architect") == "full"  # was "off" initially
 
     def test_valid_per_agent_level(self, config):
         mutations = []
         dc = _make_companion(config, mutations)
-        resp = dc._handle_caveman("executor ultra")
-        assert "executor" in resp.lower() and "ultra" in resp.lower()
+        action = dc._handle_caveman("executor ultra")
+        assert action["type"] == "caveman_set"
+        assert action["agent"] == "executor"
+        assert action["level"] == "ultra"
         assert len(mutations) == 1
         assert config.caveman.level_for("executor") == "ultra"
 
     def test_invalid_level_returns_error(self, config):
         dc = _make_companion(config)
-        resp = dc._handle_caveman("executor badlevel")
-        assert "Unknown level 'badlevel'" in resp
+        action = dc._handle_caveman("executor badlevel")
+        assert action["type"] == "error"
+        assert "badlevel" in action["detail"]
 
     def test_unknown_agent_returns_error(self, config):
         dc = _make_companion(config)
-        resp = dc._handle_caveman("fakeagent full")
-        assert "Unknown agent 'fakeagent'" in resp
+        action = dc._handle_caveman("fakeagent full")
+        assert action["type"] == "error"
+        assert "fakeagent" in action["detail"]
 
 
 # ---------- TestMutationExecution ----------
@@ -495,15 +502,16 @@ class TestRouteNaturalLanguage:
     @pytest.mark.asyncio
     async def test_no_active_agents(self, config):
         dc = _make_companion(config, active_agents_fn=lambda: [])
-        resp = await dc._route_natural_language("do something")
-        assert "no" in resp.lower() and "agent" in resp.lower() or "nobody" in resp.lower()
+        action = await dc._route_natural_language("do something")
+        assert action["type"] == "no_agents"
 
     @pytest.mark.asyncio
     async def test_single_agent_routes_directly(self, config):
         mutations = []
         dc = _make_companion(config, mutations, active_agents_fn=lambda: ["architect"])
-        resp = await dc._route_natural_language("review the design")
-        assert "architect" in resp
+        action = await dc._route_natural_language("review the design")
+        assert action["type"] == "route"
+        assert action["agent"] == "architect"
         assert len(mutations) == 1
 
     @pytest.mark.asyncio
@@ -520,18 +528,19 @@ class TestRouteNaturalLanguage:
         mutations = []
         dc = _make_companion(config, mutations, active_agents_fn=lambda: ["architect", "executor"])
         with patch("lib.claude.classify_target", new_callable=AsyncMock, return_value="executor"):
-            resp = await dc._route_natural_language("focus on error handling")
-        assert "executor" in resp
+            action = await dc._route_natural_language("focus on error handling")
+        assert action["type"] == "route"
+        assert action["agent"] == "executor"
         assert len(mutations) == 1
 
     @pytest.mark.asyncio
     async def test_multiple_agents_ambiguous_returns_prompt(self, config):
         dc = _make_companion(config, active_agents_fn=lambda: ["architect", "executor"])
         with patch("lib.claude.classify_target", new_callable=AsyncMock, return_value=None):
-            resp = await dc._route_natural_language("do something")
-        assert "architect" in resp and "executor" in resp
-        assert "architect" in resp
-        assert "executor" in resp
+            action = await dc._route_natural_language("do something")
+        assert action["type"] == "ambiguous"
+        assert "architect" in action["agents"]
+        assert "executor" in action["agents"]
 
     @pytest.mark.asyncio
     async def test_mutation_late_binding_safe(self, config, pipeline_state):
@@ -669,9 +678,9 @@ class TestEscalationDialogueRouting:
             pipeline_stage_fn=lambda: ("escalation_wait", "executor"),
         )
         with patch("lib.claude.classify_target") as mock_ct:
-            resp = await dc._route_natural_language("try approach B instead")
-        assert "executor" in resp
-        assert "executor" in resp.lower() or "passing" in resp.lower()
+            action = await dc._route_natural_language("try approach B instead")
+        assert action["type"] == "escalation_route"
+        assert action["agent"] == "executor"
         assert len(mutations) == 1
         mock_ct.assert_not_called()
 
@@ -684,8 +693,9 @@ class TestEscalationDialogueRouting:
             active_agents_fn=lambda: ["architect", "executor"],
             pipeline_stage_fn=lambda: ("escalation_dialogue", "executor"),
         )
-        resp = await dc._route_natural_language("what about the timeout?")
-        assert "executor" in resp
+        action = await dc._route_natural_language("what about the timeout?")
+        assert action["type"] == "escalation_route"
+        assert action["agent"] == "executor"
         assert len(mutations) == 1
 
     @pytest.mark.asyncio
@@ -697,8 +707,9 @@ class TestEscalationDialogueRouting:
             active_agents_fn=lambda: ["executor"],
             pipeline_stage_fn=lambda: ("executor", None),
         )
-        resp = await dc._route_natural_language("focus on error handling")
-        assert "executor" in resp
+        action = await dc._route_natural_language("focus on error handling")
+        assert action["type"] == "route"
+        assert action["agent"] == "executor"
 
     @pytest.mark.asyncio
     async def test_nl_escalation_no_pre_esc_agent_falls_through(self, config):
@@ -709,8 +720,9 @@ class TestEscalationDialogueRouting:
             active_agents_fn=lambda: ["executor"],
             pipeline_stage_fn=lambda: ("escalation_wait", None),
         )
-        resp = await dc._route_natural_language("fix the bug")
-        assert "executor" in resp
+        action = await dc._route_natural_language("fix the bug")
+        assert action["type"] == "route"
+        assert action["agent"] == "executor"
 
 
 # ---------- TestDialogueMessageMutation ----------
@@ -1005,8 +1017,8 @@ class TestHandleControl:
     async def test_stop_queues_pause_mutation(self, config):
         mutations = []
         dc = _make_companion(config, mutations)
-        resp = dc._handle_control("stop")
-        assert "pausing" in resp.lower()
+        action = dc._handle_control("stop")
+        assert action["type"] == "pause"
         assert len(mutations) == 1
 
     @pytest.mark.asyncio
@@ -1030,9 +1042,10 @@ class TestHandleControl:
 
     def test_status_returns_status_text(self, config):
         dc = _make_companion(config)
-        resp = dc._handle_control("status")
-        assert "idle" in resp.lower() or "running" in resp.lower() or "paus" in resp.lower()
-        assert "caveman" in resp.lower()
+        action = dc._handle_control("status")
+        assert action["type"] == "status"
+        assert "idle" in action["detail"].lower() or "running" in action["detail"].lower()
+        assert "caveman" in action["detail"].lower()
 
 
 # ---------- TestHandleNewTask ----------
@@ -1042,9 +1055,9 @@ class TestHandleNewTask:
     @pytest.mark.asyncio
     async def test_creates_task_signal_file(self, config):
         dc = _make_companion(config)
-        resp = await dc._handle_new_task("fix the auth bug in broker.py")
-        assert "task" in resp.lower()
-        assert "discord-" in resp
+        action = await dc._handle_new_task("fix the auth bug in broker.py")
+        assert action["type"] == "task_created"
+        assert action["task_id"].startswith("discord-")
         # Verify signal file written
         task_files = list(config.task_dir.glob("discord-*.json"))
         assert len(task_files) == 1
@@ -1060,11 +1073,11 @@ class TestHandleNewTask:
         assert data["source"] == "discord"
 
     @pytest.mark.asyncio
-    async def test_truncates_long_description_in_response(self, config):
+    async def test_task_id_is_compact(self, config):
         dc = _make_companion(config)
-        long_msg = "x" * 200
-        resp = await dc._handle_new_task(long_msg)
-        assert len(resp) < 200  # response is truncated
+        action = await dc._handle_new_task("x" * 200)
+        # Action dict stays compact regardless of description length
+        assert len(action["task_id"]) < 50
 
 
 # ---------- TestClassifyIntent ----------
@@ -1220,15 +1233,16 @@ class TestStatusShowsPaused:
 class TestHandleUpdate:
     def test_no_shutdown_event_returns_unavailable(self, config):
         dc = _make_companion(config, shutdown_event=None)
-        resp = dc._handle_update()
-        assert "unavailable" in resp.lower()
+        action = dc._handle_update()
+        assert action["type"] == "error"
+        assert "unavailable" in action["detail"].lower()
 
     def test_queues_mutation(self, config):
         mutations = []
         ev = asyncio.Event()
         dc = _make_companion(config, mutations=mutations, shutdown_event=ev)
-        resp = dc._handle_update()
-        assert "Pulling" in resp
+        action = dc._handle_update()
+        assert action["type"] == "update_started"
         assert len(mutations) == 1
 
     def test_debounce_rejects_second_call(self, config):
@@ -1236,8 +1250,9 @@ class TestHandleUpdate:
         ev = asyncio.Event()
         dc = _make_companion(config, mutations=mutations, shutdown_event=ev)
         dc._handle_update()
-        resp2 = dc._handle_update()
-        assert "already in progress" in resp2.lower()
+        action2 = dc._handle_update()
+        assert action2["type"] == "error"
+        assert "already in progress" in action2["detail"].lower()
         assert len(mutations) == 1
 
     @pytest.mark.asyncio
