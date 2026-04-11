@@ -10,7 +10,7 @@ import pytest
 
 from harness.discord_companion import (
     ACCUM_WINDOW,
-    AGENT_DISPLAY_NAMES,
+    AGENT_IDENTITIES,
     DIALOGUE_CONFIRM_WORDS,
     DiscordCompanion,
     _ANNOUNCE_STAGES,
@@ -1377,14 +1377,16 @@ class TestInferAgentFromResponse:
 # ---------- TestAgentDisplayNames ----------
 
 
-class TestAgentDisplayNames:
-    def test_all_standard_agents_have_names(self):
+class TestAgentIdentities:
+    def test_all_standard_agents_have_identities(self):
         for agent in ("orchestrator", "architect", "executor", "reviewer"):
-            assert agent in AGENT_DISPLAY_NAMES
+            assert agent in AGENT_IDENTITIES
+            assert "name" in AGENT_IDENTITIES[agent]
+            assert "avatar_url" in AGENT_IDENTITIES[agent]
 
-    def test_values_are_title_case(self):
-        for name in AGENT_DISPLAY_NAMES.values():
-            assert name[0].isupper()
+    def test_names_are_title_case(self):
+        for identity in AGENT_IDENTITIES.values():
+            assert identity["name"][0].isupper()
 
 
 # ---------- TestSendResponse ----------

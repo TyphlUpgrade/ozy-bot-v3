@@ -334,13 +334,23 @@ def _get_aiohttp():
 
 # --- Webhook per-agent identity ---
 
-# Agent display names for webhook messages. Extend when adding new agents.
-AGENT_DISPLAY_NAMES: dict[str, str] = {
-    "orchestrator": "Orchestrator",
-    "architect": "Architect",
-    "executor": "Executor",
-    "reviewer": "Reviewer",
+# Agent identities for webhook messages. Extend when adding new agents.
+# avatar_url: Discord renders this as the webhook sender's avatar.
+# Set to None to use the default webhook avatar.
+AGENT_IDENTITIES: dict[str, dict[str, str | None]] = {
+    "orchestrator": {"name": "Orchestrator", "avatar_url": None},
+    "architect":    {"name": "Architect",    "avatar_url": None},
+    "executor":     {"name": "Executor",     "avatar_url": None},
+    "reviewer":     {"name": "Reviewer",     "avatar_url": None},
 }
+
+def _agent_display_name(agent: str) -> str:
+    identity = AGENT_IDENTITIES.get(agent)
+    return identity["name"] if identity else agent.title()
+
+def _agent_avatar_url(agent: str) -> str | None:
+    identity = AGENT_IDENTITIES.get(agent)
+    return identity["avatar_url"] if identity else None
 
 
 def _infer_agent_from_response(response: str, text: str) -> str:
@@ -365,17 +375,20 @@ async def _send_response(message: Any, response: str,
         return
 
     agent = _infer_agent_from_response(response, text)
-    username = AGENT_DISPLAY_NAMES.get(agent, agent.title())
+    username = _agent_display_name(agent)
+    avatar_url = _agent_avatar_url(agent)
 
     try:
         aiohttp = _get_aiohttp()
         if aiohttp is None:
             await message.channel.send(response)
             return
-        payload = {
+        payload: dict[str, str] = {
             "content": response,
             "username": username,
         }
+        if avatar_url:
+            payload["avatar_url"] = avatar_url
         async with aiohttp.ClientSession() as session:
             async with session.post(webhook_url, json=payload) as resp:
                 if resp.status >= 400:
@@ -416,14 +429,18 @@ async def announce_stage(stage: str, task_id: str | None,
 
     webhook_url = config.discord_webhook_url
     if webhook_url:
-        username = AGENT_DISPLAY_NAMES.get(agent, agent.title())
+        username = _agent_display_name(agent)
+        avatar = _agent_avatar_url(agent)
         try:
             aiohttp = _get_aiohttp()
             if aiohttp:
+                payload: dict[str, Any] = {
+                    "content": text, "username": username,
+                }
+                if avatar:
+                    payload["avatar_url"] = avatar
                 async with aiohttp.ClientSession() as session:
-                    async with session.post(webhook_url, json={
-                        "content": text, "username": username,
-                    }) as resp:
+                    async with session.post(webhook_url, json=payload) as resp:
                         if resp.status >= 400:
                             logger.debug("Stage announce webhook failed: %d", resp.status)
                 return
