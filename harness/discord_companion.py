@@ -334,9 +334,8 @@ def _get_aiohttp():
 
 # --- Webhook per-agent identity ---
 
-# Agent identities for webhook messages. Extend when adding new agents.
-# avatar_url: Discord renders this as the webhook sender's avatar.
-# Set to None to use the default webhook avatar.
+# Hardcoded fallback — used when config has no [discord.agents] section.
+# To add a new agent, add one entry here AND in project.toml [discord.agents.*].
 AGENT_IDENTITIES: dict[str, dict[str, str | None]] = {
     "orchestrator": {"name": "Orchestrator", "avatar_url": None},
     "architect":    {"name": "Architect",    "avatar_url": None},
@@ -344,13 +343,22 @@ AGENT_IDENTITIES: dict[str, dict[str, str | None]] = {
     "reviewer":     {"name": "Reviewer",     "avatar_url": None},
 }
 
-def _agent_display_name(agent: str) -> str:
-    identity = AGENT_IDENTITIES.get(agent)
-    return identity["name"] if identity else agent.title()
 
-def _agent_avatar_url(agent: str) -> str | None:
-    identity = AGENT_IDENTITIES.get(agent)
-    return identity["avatar_url"] if identity else None
+def _agent_identity(agent: str, config: "ProjectConfig | None" = None) -> dict[str, str | None]:
+    """Resolve agent identity from config, falling back to hardcoded defaults."""
+    if config and config.discord_agent_identities:
+        ident = config.discord_agent_identities.get(agent)
+        if ident:
+            return ident
+    return AGENT_IDENTITIES.get(agent, {"name": agent.title(), "avatar_url": None})
+
+
+def _agent_display_name(agent: str, config: "ProjectConfig | None" = None) -> str:
+    return _agent_identity(agent, config)["name"]  # type: ignore[return-value]
+
+
+def _agent_avatar_url(agent: str, config: "ProjectConfig | None" = None) -> str | None:
+    return _agent_identity(agent, config)["avatar_url"]
 
 
 def _infer_agent_from_response(response: str, text: str) -> str:
@@ -375,8 +383,8 @@ async def _send_response(message: Any, response: str,
         return
 
     agent = _infer_agent_from_response(response, text)
-    username = _agent_display_name(agent)
-    avatar_url = _agent_avatar_url(agent)
+    username = _agent_display_name(agent, companion.config)
+    avatar_url = _agent_avatar_url(agent, companion.config)
 
     try:
         aiohttp = _get_aiohttp()
@@ -429,8 +437,8 @@ async def announce_stage(stage: str, task_id: str | None,
 
     webhook_url = config.discord_webhook_url
     if webhook_url:
-        username = _agent_display_name(agent)
-        avatar = _agent_avatar_url(agent)
+        username = _agent_display_name(agent, config)
+        avatar = _agent_avatar_url(agent, config)
         try:
             aiohttp = _get_aiohttp()
             if aiohttp:

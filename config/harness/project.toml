@@ -18,6 +18,24 @@ ops_channel = "ops-monitor"
 escalation_channel = "escalations"
 # webhook_url = ""                      # Discord webhook URL — enables per-agent identity (username + avatar per message)
 
+# Per-agent Discord identity — username and avatar_url for webhook messages.
+# To add a new agent, add one entry here.
+[discord.agents.orchestrator]
+name = "Orchestrator"
+# avatar_url = "https://example.com/orchestrator.png"
+
+[discord.agents.architect]
+name = "Architect"
+# avatar_url = "https://example.com/architect.png"
+
+[discord.agents.executor]
+name = "Executor"
+# avatar_url = "https://example.com/executor.png"
+
+[discord.agents.reviewer]
+name = "Reviewer"
+# avatar_url = "https://example.com/reviewer.png"
+
 [pipeline]
 poll_interval = 5.0                     # seconds between main loop iterations
 test_command = "python3 -m pytest harness/tests/ -x -q"

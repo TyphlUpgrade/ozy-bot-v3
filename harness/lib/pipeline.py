@@ -193,6 +193,7 @@ class ProjectConfig:
     auto_escalate_on_max_retries: bool = True   # auto-escalate to architect after max_retries exhausted
     max_tier1_escalations: int = 2           # architect attempts before circuit breaker fires to operator
     discord_webhook_url: str | None = None   # webhook URL for per-agent identity (username/avatar per message)
+    discord_agent_identities: dict[str, dict[str, str | None]] = field(default_factory=dict)  # agent → {name, avatar_url}
 
     @classmethod
     def load(cls, config_path: Path) -> ProjectConfig:
@@ -243,6 +244,10 @@ class ProjectConfig:
             auto_escalate_on_max_retries=pipeline.get("auto_escalate_on_max_retries", True),
             max_tier1_escalations=pipeline.get("max_tier1_escalations", 2),
             discord_webhook_url=data.get("discord", {}).get("webhook_url"),
+            discord_agent_identities={
+                agent: {"name": info.get("name", agent.title()), "avatar_url": info.get("avatar_url")}
+                for agent, info in data.get("discord", {}).get("agents", {}).items()
+            },
         )
 
 
