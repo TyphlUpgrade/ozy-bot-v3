@@ -13,6 +13,73 @@ RUN_DIR="$PROJECT_ROOT/.run"
 
 _write_pid() { echo "$2" > "$RUN_DIR/$1.pid"; }
 
+# --- cmd_clean ---
+
+cmd_clean() {
+  echo "[harness] Cleaning stale artifacts..."
+
+  # Remove orphaned worktrees
+  local wt_base="/tmp/harness-worktrees"
+  if [[ -d "$wt_base" ]]; then
+    local wt
+    for wt in "$wt_base"/*/; do
+      [[ -d "$wt" ]] || continue
+      local task_id
+      task_id=$(basename "$wt")
+      git -C "$PROJECT_ROOT" worktree remove --force "$wt" 2>/dev/null || rm -rf "$wt"
+      echo "  removed worktree: $task_id"
+    done
+  fi
+  git -C "$PROJECT_ROOT" worktree prune 2>/dev/null || true
+
+  # Delete orphaned task branches
+  local branch
+  for branch in $(git -C "$PROJECT_ROOT" branch --list 'task/*' 2>/dev/null); do
+    branch="${branch#  }"  # trim leading whitespace
+    git -C "$PROJECT_ROOT" branch -D "$branch" 2>/dev/null && echo "  deleted branch: $branch"
+  done
+
+  # Remove stale task files (completed tasks still in queue)
+  local state_file="$PROJECT_ROOT/ozymandias/state/signals/conductor/pipeline_state.json"
+  if [[ -f "$state_file" ]]; then
+    local active
+    active=$(python3 -c "import json; print(json.load(open('$state_file')).get('active_task') or '')" 2>/dev/null)
+    local task_dir="$PROJECT_ROOT/ozymandias/state/signals/agent_tasks"
+    if [[ -d "$task_dir" ]]; then
+      local tf
+      for tf in "$task_dir"/*.json; do
+        [[ -f "$tf" ]] || continue
+        local tid
+        tid=$(basename "$tf" .json)
+        # Don't remove the currently active task
+        if [[ "$tid" != "$active" ]]; then
+          rm -f "$tf"
+          echo "  removed stale task: $tid"
+        fi
+      done
+    fi
+  fi
+
+  # Reset pipeline state to idle
+  if [[ -f "$state_file" ]]; then
+    python3 -c "
+import json
+s = json.load(open('$state_file'))
+s['active_task'] = None
+s['stage'] = None
+s['stage_agent'] = None
+s['worktree'] = None
+s['shutdown_ts'] = None
+s['plan_summary'] = None
+s['diff_stat'] = None
+s['review_verdict'] = None
+json.dump(s, open('$state_file', 'w'), indent=2)
+" 2>/dev/null && echo "  pipeline state reset"
+  fi
+
+  echo "[harness] Clean complete."
+}
+
 # --- cmd_start ---
 
 cmd_start() {
@@ -20,6 +87,9 @@ cmd_start() {
     echo "[harness] ERROR: Config not found: $CONFIG" >&2
     exit 1
   fi
+
+  # Auto-cleanup stale artifacts from previous runs
+  cmd_clean
 
   mkdir -p "$RUN_DIR"
   _write_pid "start" $$
@@ -191,5 +261,6 @@ case "${1:-}" in
   stop)    cmd_stop ;;
   restart) cmd_stop; sleep 2; cmd_start ;;
   status)  cmd_status ;;
-  *)       echo "Usage: $0 {start|stop|restart|status}" >&2; exit 1 ;;
+  clean)   cmd_clean ;;
+  *)       echo "Usage: $0 {start|stop|restart|status|clean}" >&2; exit 1 ;;
 esac
