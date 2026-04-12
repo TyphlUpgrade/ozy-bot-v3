@@ -10,6 +10,7 @@ import type { Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { SDKClient, type SessionConfig, type SessionResult } from "./sdk.js";
 import { StateManager, type TaskRecord } from "../lib/state.js";
 import type { HarnessConfig } from "../lib/config.js";
+import type { ConfidenceAssessment } from "../lib/types.js";
 
 // --- Completion signal schema ---
 
@@ -18,16 +19,69 @@ export interface CompletionSignal {
   commitSha: string;
   summary: string;
   filesChanged: string[];
+  // Phase 2A enrichment (optional — backward compatible)
+  understanding?: string;
+  assumptions?: string[];
+  nonGoals?: string[];
+  confidence?: ConfidenceAssessment;
+}
+
+const VALID_SCOPE_CLARITY = new Set(["clear", "partial", "unclear"]);
+const VALID_DESIGN_CERTAINTY = new Set(["obvious", "alternatives_exist", "guessing"]);
+const VALID_TEST_COVERAGE = new Set(["verifiable", "partial", "untestable"]);
+
+/** Validate a ConfidenceAssessment object. Returns null if malformed. */
+function validateConfidence(raw: unknown): ConfidenceAssessment | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  if (!VALID_SCOPE_CLARITY.has(obj.scopeClarity as string)) return null;
+  if (!VALID_DESIGN_CERTAINTY.has(obj.designCertainty as string)) return null;
+  if (!VALID_TEST_COVERAGE.has(obj.testCoverage as string)) return null;
+  if (!Array.isArray(obj.assumptions)) return null;
+  if (!Array.isArray(obj.openQuestions)) return null;
+  // Validate each assumption has required shape
+  for (const a of obj.assumptions) {
+    if (!a || typeof a !== "object") return null;
+    if (typeof a.description !== "string") return null;
+    if (a.impact !== "high" && a.impact !== "low") return null;
+    if (typeof a.reversible !== "boolean") return null;
+  }
+  return obj as unknown as ConfidenceAssessment;
 }
 
 function validateCompletion(raw: unknown): CompletionSignal | null {
   if (!raw || typeof raw !== "object") return null;
   const obj = raw as Record<string, unknown>;
+  // Required fields
   if (typeof obj.status !== "string" || !["success", "failure"].includes(obj.status)) return null;
   if (typeof obj.commitSha !== "string" || obj.commitSha.length === 0) return null;
   if (typeof obj.summary !== "string") return null;
   if (!Array.isArray(obj.filesChanged)) return null;
-  return obj as unknown as CompletionSignal;
+
+  const signal: CompletionSignal = {
+    status: obj.status as "success" | "failure",
+    commitSha: obj.commitSha as string,
+    summary: obj.summary as string,
+    filesChanged: obj.filesChanged as string[],
+  };
+
+  // Optional enrichment fields — strip malformed, keep valid (B7 pattern)
+  if (typeof obj.understanding === "string") signal.understanding = obj.understanding;
+  if (Array.isArray(obj.assumptions)) {
+    const valid = obj.assumptions.filter((a) => typeof a === "string");
+    if (valid.length > 0) signal.assumptions = valid;
+  }
+  if (Array.isArray(obj.nonGoals)) {
+    const valid = obj.nonGoals.filter((g) => typeof g === "string");
+    if (valid.length > 0) signal.nonGoals = valid;
+  }
+  if (obj.confidence !== undefined) {
+    const validated = validateConfidence(obj.confidence);
+    if (validated) signal.confidence = validated;
+    // Malformed confidence silently stripped (B7)
+  }
+
+  return signal;
 }
 
 // --- Git helpers (injectable for testing) ---
@@ -152,6 +206,8 @@ export class SessionManager {
       settingSources: ["project"],
       permissionMode: "bypassPermissions",
       persistSession: false,
+      ...(this.config.pipeline.max_budget_usd ? { maxBudgetUsd: this.config.pipeline.max_budget_usd } : {}),
+      ...(this.config.systemPrompt ? { systemPrompt: this.config.systemPrompt } : {}),
     };
 
     const { query, abortController } = this.sdk.spawnSession(sessionConfig);

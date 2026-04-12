@@ -121,7 +121,7 @@ export class SDKClient {
       permissionMode: config.permissionMode ?? "bypassPermissions",
       allowDangerouslySkipPermissions: config.permissionMode === "bypassPermissions" || config.permissionMode === undefined,
       settingSources: config.settingSources ?? ["project"],
-      persistSession: config.persistSession ?? false,
+      persistSession: config.persistSession ?? true,
     };
 
     if (config.model) options.model = config.model;

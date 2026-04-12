@@ -54,6 +54,7 @@ export interface TaskRecord {
   escalationTier: number; // 1=normal, 2=complex, 3=operator
   shelvedAt?: string;     // ISO — B3: shelve time tracked separately
   rebaseAttempts: number;
+  tier1EscalationCount: number; // circuit breaker counter for auto-escalation cycles
   lastError?: string;
   summary?: string;
   filesChanged?: string[];
@@ -63,8 +64,8 @@ export interface TaskRecord {
 const KNOWN_KEYS: ReadonlySet<string> = new Set([
   "id", "state", "prompt", "sessionId", "worktreePath", "branchName",
   "createdAt", "updatedAt", "completedAt", "totalCostUsd", "retryCount",
-  "escalationTier", "shelvedAt", "rebaseAttempts", "lastError", "summary",
-  "filesChanged",
+  "escalationTier", "shelvedAt", "rebaseAttempts", "tier1EscalationCount",
+  "lastError", "summary", "filesChanged",
 ]);
 
 // --- Event Log (O9: write-only) ---
@@ -168,6 +169,7 @@ export class StateManager {
       retryCount: 0,
       escalationTier: 1,
       rebaseAttempts: 0,
+      tier1EscalationCount: 0,
     };
     this.store.tasks[taskId] = task;
     this.persist();

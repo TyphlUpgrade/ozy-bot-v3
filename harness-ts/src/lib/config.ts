@@ -3,8 +3,8 @@
  * Reads config/harness/project.toml and returns typed HarnessConfig.
  */
 
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { readFileSync, existsSync } from "node:fs";
+import { resolve, join } from "node:path";
 import { parse } from "smol-toml";
 
 // --- Types ---
@@ -26,6 +26,10 @@ export interface PipelineConfig {
   test_timeout: number;
   escalation_timeout: number;
   retry_delay_ms: number;
+  max_session_retries?: number;           // session-failure retries (default 3, separate from max_retries which caps rebase retries)
+  max_budget_usd?: number;                // per-task budget cap — budget_report events at 50%/80%
+  auto_escalate_on_max_retries?: boolean; // auto-escalate after max_session_retries exhausted (default true)
+  max_tier1_escalations?: number;         // circuit breaker — max escalation cycles before permanent failure (default 2)
 }
 
 export interface DiscordAgentIdentity {
@@ -46,6 +50,7 @@ export interface HarnessConfig {
   project: ProjectConfig;
   pipeline: PipelineConfig;
   discord: DiscordConfig;
+  systemPrompt?: string;  // loaded from prompt file at startup, cached
 }
 
 // --- Defaults ---
@@ -103,9 +108,16 @@ function parseProject(raw: Record<string, unknown>): ProjectConfig {
   };
 }
 
+function optionalBoolean(obj: Record<string, unknown>, field: string, fallback: boolean): boolean {
+  const val = obj[field];
+  if (val === undefined || val === null) return fallback;
+  if (typeof val !== "boolean") return fallback;
+  return val;
+}
+
 function parsePipeline(raw: Record<string, unknown>): PipelineConfig {
   const section = "pipeline";
-  return {
+  const config: PipelineConfig = {
     poll_interval: optionalNumber(raw, "poll_interval", PIPELINE_DEFAULTS.poll_interval!),
     test_command: requireString(raw, "test_command", section),
     max_retries: optionalNumber(raw, "max_retries", PIPELINE_DEFAULTS.max_retries!),
@@ -113,6 +125,12 @@ function parsePipeline(raw: Record<string, unknown>): PipelineConfig {
     escalation_timeout: optionalNumber(raw, "escalation_timeout", PIPELINE_DEFAULTS.escalation_timeout!),
     retry_delay_ms: optionalNumber(raw, "retry_delay_ms", PIPELINE_DEFAULTS.retry_delay_ms!),
   };
+  // Phase 2A optional fields
+  if (raw.max_session_retries !== undefined) config.max_session_retries = optionalNumber(raw, "max_session_retries", 3);
+  if (raw.max_budget_usd !== undefined) config.max_budget_usd = optionalNumber(raw, "max_budget_usd", 0);
+  if (raw.auto_escalate_on_max_retries !== undefined) config.auto_escalate_on_max_retries = optionalBoolean(raw, "auto_escalate_on_max_retries", true);
+  if (raw.max_tier1_escalations !== undefined) config.max_tier1_escalations = optionalNumber(raw, "max_tier1_escalations", 2);
+  return config;
 }
 
 function parseDiscordAgent(raw: Record<string, unknown>, agentName: string): DiscordAgentIdentity {
@@ -175,4 +193,20 @@ export function loadConfig(configPath: string): HarnessConfig {
     pipeline: parsePipeline(pipelineRaw as Record<string, unknown>),
     discord: parseDiscord(discordRaw as Record<string, unknown>),
   };
+}
+
+// --- System Prompt Loader ---
+
+/**
+ * Load system prompt from a markdown file.
+ * Returns empty string if the file does not exist (prompt is optional).
+ */
+export function loadSystemPrompt(promptPath: string): string {
+  const absPath = resolve(promptPath);
+  if (!existsSync(absPath)) return "";
+  try {
+    return readFileSync(absPath, "utf-8");
+  } catch {
+    return "";
+  }
 }

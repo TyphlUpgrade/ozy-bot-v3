@@ -289,7 +289,9 @@ describe("Pipeline Integration", () => {
   });
 
   it("agent failure (no completion) -> state=failed", async () => {
-    const { orch, state } = setupIntegration({ completionStatus: "failure" });
+    const { orch, state, config } = setupIntegration({ completionStatus: "failure" });
+    config.pipeline.max_session_retries = 1;
+    config.pipeline.auto_escalate_on_max_retries = false;
 
     dropTaskFile(join(tmpDir, "tasks"), "agent-fail", "Do something impossible");
     orch.scanForTasks();

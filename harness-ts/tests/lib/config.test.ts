@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { loadConfig } from "../../src/lib/config.js";
+import { loadConfig, loadSystemPrompt } from "../../src/lib/config.js";
 
 const VALID_TOML = `
 [project]
@@ -150,5 +150,65 @@ escalation_channel = "e"
     expect(config.project.name).toBe("ozymandias-v3");
     expect(config.discord.agents.orchestrator.name).toBeTruthy();
     expect(config.pipeline.test_command).toContain("pytest");
+  });
+
+  it("parses Phase 2A optional pipeline fields", () => {
+    const toml = VALID_TOML + `
+max_session_retries = 5
+max_budget_usd = 2.50
+auto_escalate_on_max_retries = false
+max_tier1_escalations = 3
+`;
+    const path = writeTempToml(toml);
+    const config = loadConfig(path);
+
+    expect(config.pipeline.max_session_retries).toBe(5);
+    expect(config.pipeline.max_budget_usd).toBe(2.50);
+    expect(config.pipeline.auto_escalate_on_max_retries).toBe(false);
+    expect(config.pipeline.max_tier1_escalations).toBe(3);
+  });
+
+  it("leaves Phase 2A fields undefined when not in TOML", () => {
+    const path = writeTempToml(VALID_TOML);
+    const config = loadConfig(path);
+
+    expect(config.pipeline.max_session_retries).toBeUndefined();
+    expect(config.pipeline.max_budget_usd).toBeUndefined();
+    expect(config.pipeline.auto_escalate_on_max_retries).toBeUndefined();
+    expect(config.pipeline.max_tier1_escalations).toBeUndefined();
+  });
+});
+
+describe("loadSystemPrompt", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = join(tmpdir(), `harness-prompt-test-${Date.now()}`);
+    mkdirSync(tmpDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("loads prompt content from a file", () => {
+    const promptPath = join(tmpDir, "system-prompt.md");
+    writeFileSync(promptPath, "# Agent Protocol\nDo the thing.\n");
+    const content = loadSystemPrompt(promptPath);
+    expect(content).toContain("# Agent Protocol");
+    expect(content).toContain("Do the thing.");
+  });
+
+  it("returns empty string when file does not exist", () => {
+    const content = loadSystemPrompt(join(tmpDir, "nonexistent.md"));
+    expect(content).toBe("");
+  });
+
+  it("loads the real system-prompt.md", () => {
+    const realPath = join(process.cwd(), "..", "config", "harness", "system-prompt.md");
+    const content = loadSystemPrompt(realPath);
+    expect(content).toContain("Harness Agent Protocol");
+    expect(content).toContain("completion.json");
+    expect(content.length).toBeGreaterThan(100);
   });
 });

@@ -196,6 +196,72 @@ describe("SessionManager", () => {
       await mgr.spawnTask(task);
       expect(mgr.activeCount).toBe(0); // cleaned up after completion
     });
+
+    it("passes maxBudgetUsd from config to SDK session", async () => {
+      const queryFn: QueryFn = vi.fn().mockReturnValue(
+        mockQuery([makeResultSuccess()]),
+      );
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const config = makeConfig();
+      config.pipeline.max_budget_usd = 2.5;
+      const mgr = new SessionManager(sdk, state, config, mockGitOps());
+
+      const task = state.createTask("test prompt", "task-budget");
+      await mgr.spawnTask(task);
+
+      expect(queryFn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          options: expect.objectContaining({
+            maxBudgetUsd: 2.5,
+          }),
+        }),
+      );
+    });
+
+    it("omits maxBudgetUsd when not configured", async () => {
+      const queryFn: QueryFn = vi.fn().mockReturnValue(
+        mockQuery([makeResultSuccess()]),
+      );
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const config = makeConfig();
+      // no max_budget_usd set
+      const mgr = new SessionManager(sdk, state, config, mockGitOps());
+
+      const task = state.createTask("test prompt", "task-no-budget");
+      await mgr.spawnTask(task);
+
+      const callArgs = (queryFn as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(callArgs.options.maxBudgetUsd).toBeUndefined();
+    });
+
+    it("passes systemPrompt from config to SDK session", async () => {
+      const queryFn: QueryFn = vi.fn().mockReturnValue(
+        mockQuery([makeResultSuccess()]),
+      );
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const config = makeConfig();
+      config.systemPrompt = "You are a test agent.";
+      const mgr = new SessionManager(sdk, state, config, mockGitOps());
+
+      const task = state.createTask("test prompt", "task-sysprompt");
+      await mgr.spawnTask(task);
+
+      // queryFn was called with options that include systemPrompt
+      expect(queryFn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          options: expect.objectContaining({
+            systemPrompt: expect.objectContaining({
+              type: "preset",
+              preset: "claude_code",
+              append: "You are a test agent.",
+            }),
+          }),
+        }),
+      );
+    });
   });
 
   describe("completion signal", () => {
@@ -280,6 +346,149 @@ describe("SessionManager", () => {
 
       const { mgr } = makeManager();
       expect(mgr.readCompletion(dir)).toBeNull();
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("accepts completion with all enrichment fields", () => {
+      const dir = makeTmpDir();
+      mkdirSync(join(dir, ".harness"), { recursive: true });
+      writeFileSync(
+        join(dir, ".harness", "completion.json"),
+        JSON.stringify({
+          status: "success",
+          commitSha: "abc123",
+          summary: "Added auth module",
+          filesChanged: ["src/auth.ts"],
+          understanding: "Add JWT-based auth to the login endpoint",
+          assumptions: ["Using RS256 algorithm", "Token expires in 1h"],
+          nonGoals: ["OAuth2 support", "Session management"],
+          confidence: {
+            scopeClarity: "clear",
+            designCertainty: "obvious",
+            assumptions: [
+              { description: "RS256 key pair exists", impact: "high", reversible: false },
+            ],
+            openQuestions: [],
+            testCoverage: "verifiable",
+          },
+        }),
+      );
+
+      const { mgr } = makeManager();
+      const result = mgr.readCompletion(dir);
+      expect(result).not.toBeNull();
+      expect(result!.understanding).toBe("Add JWT-based auth to the login endpoint");
+      expect(result!.assumptions).toEqual(["Using RS256 algorithm", "Token expires in 1h"]);
+      expect(result!.nonGoals).toEqual(["OAuth2 support", "Session management"]);
+      expect(result!.confidence).toBeDefined();
+      expect(result!.confidence!.scopeClarity).toBe("clear");
+      expect(result!.confidence!.assumptions).toHaveLength(1);
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("accepts completion with partial enrichment", () => {
+      const dir = makeTmpDir();
+      mkdirSync(join(dir, ".harness"), { recursive: true });
+      writeFileSync(
+        join(dir, ".harness", "completion.json"),
+        JSON.stringify({
+          status: "success",
+          commitSha: "def456",
+          summary: "Quick fix",
+          filesChanged: ["src/fix.ts"],
+          understanding: "Fix null check",
+          // no assumptions, nonGoals, or confidence
+        }),
+      );
+
+      const { mgr } = makeManager();
+      const result = mgr.readCompletion(dir);
+      expect(result).not.toBeNull();
+      expect(result!.understanding).toBe("Fix null check");
+      expect(result!.assumptions).toBeUndefined();
+      expect(result!.nonGoals).toBeUndefined();
+      expect(result!.confidence).toBeUndefined();
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("strips malformed confidence but keeps rest of signal", () => {
+      const dir = makeTmpDir();
+      mkdirSync(join(dir, ".harness"), { recursive: true });
+      writeFileSync(
+        join(dir, ".harness", "completion.json"),
+        JSON.stringify({
+          status: "success",
+          commitSha: "ghi789",
+          summary: "Refactored module",
+          filesChanged: ["src/mod.ts"],
+          understanding: "Simplify module structure",
+          confidence: {
+            scopeClarity: "INVALID",
+            designCertainty: 42,
+          },
+        }),
+      );
+
+      const { mgr } = makeManager();
+      const result = mgr.readCompletion(dir);
+      expect(result).not.toBeNull();
+      expect(result!.understanding).toBe("Simplify module structure");
+      expect(result!.confidence).toBeUndefined(); // malformed, stripped
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("validates confidence assessment dimensions", () => {
+      const dir = makeTmpDir();
+      mkdirSync(join(dir, ".harness"), { recursive: true });
+      writeFileSync(
+        join(dir, ".harness", "completion.json"),
+        JSON.stringify({
+          status: "success",
+          commitSha: "jkl012",
+          summary: "Complex change",
+          filesChanged: ["src/complex.ts"],
+          confidence: {
+            scopeClarity: "partial",
+            designCertainty: "alternatives_exist",
+            assumptions: [
+              { description: "API stable", impact: "high", reversible: true },
+              { description: "Cache TTL ok", impact: "low", reversible: true },
+            ],
+            openQuestions: ["What about edge case X?"],
+            testCoverage: "partial",
+          },
+        }),
+      );
+
+      const { mgr } = makeManager();
+      const result = mgr.readCompletion(dir);
+      expect(result).not.toBeNull();
+      expect(result!.confidence!.scopeClarity).toBe("partial");
+      expect(result!.confidence!.designCertainty).toBe("alternatives_exist");
+      expect(result!.confidence!.testCoverage).toBe("partial");
+      expect(result!.confidence!.assumptions).toHaveLength(2);
+      expect(result!.confidence!.openQuestions).toEqual(["What about edge case X?"]);
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("strips non-string entries from assumptions array", () => {
+      const dir = makeTmpDir();
+      mkdirSync(join(dir, ".harness"), { recursive: true });
+      writeFileSync(
+        join(dir, ".harness", "completion.json"),
+        JSON.stringify({
+          status: "success",
+          commitSha: "mno345",
+          summary: "test",
+          filesChanged: [],
+          assumptions: ["valid string", 42, null, "another valid"],
+        }),
+      );
+
+      const { mgr } = makeManager();
+      const result = mgr.readCompletion(dir);
+      expect(result).not.toBeNull();
+      expect(result!.assumptions).toEqual(["valid string", "another valid"]);
       rmSync(dir, { recursive: true, force: true });
     });
   });

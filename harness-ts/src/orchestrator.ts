@@ -10,6 +10,9 @@ import { SessionManager } from "./session/manager.js";
 import { MergeGate, type MergeResult } from "./gates/merge.js";
 import { StateManager, type TaskRecord } from "./lib/state.js";
 import type { HarnessConfig } from "./lib/config.js";
+import { readEscalation, type EscalationSignal } from "./lib/escalation.js";
+import { readCheckpoints, type CheckpointSignal } from "./lib/checkpoint.js";
+import { evaluateResponseLevel, type ResponseLevel } from "./lib/response.js";
 
 // --- Task file schema ---
 
@@ -56,7 +59,14 @@ export type OrchestratorEvent =
   | { type: "task_failed"; taskId: string; reason: string }
   | { type: "task_done"; taskId: string }
   | { type: "poll_tick" }
-  | { type: "shutdown" };
+  | { type: "shutdown" }
+  // Phase 2A events
+  | { type: "escalation_needed"; taskId: string; escalation: EscalationSignal }
+  | { type: "checkpoint_detected"; taskId: string; checkpoints: CheckpointSignal[] }
+  | { type: "response_level"; taskId: string; level: ResponseLevel; name: string; reasons: string[] }
+  | { type: "completion_compliance"; taskId: string; hasConfidence: boolean; hasUnderstanding: boolean; hasAssumptions: boolean; hasNonGoals: boolean; complianceScore: number }
+  | { type: "retry_scheduled"; taskId: string; attempt: number; maxRetries: number }
+  | { type: "budget_exhausted"; taskId: string; totalCostUsd: number };
 
 export class Orchestrator {
   private readonly sessions: SessionManager;
@@ -194,7 +204,43 @@ export class Orchestrator {
         success: result.success,
       });
 
-      // Session failed without completion signal
+      // Check for checkpoints (informational — always emit if present)
+      const worktreePath = this.state.getTask(task.id)?.worktreePath;
+      if (worktreePath) {
+        const checkpoints = readCheckpoints(worktreePath);
+        if (checkpoints.length > 0) {
+          this.emit({ type: "checkpoint_detected", taskId: task.id, checkpoints });
+        }
+      }
+
+      // Completion compliance event (informational)
+      if (completion) {
+        this.emit({
+          type: "completion_compliance",
+          taskId: task.id,
+          hasConfidence: completion.confidence !== undefined,
+          hasUnderstanding: completion.understanding !== undefined,
+          hasAssumptions: completion.assumptions !== undefined,
+          hasNonGoals: completion.nonGoals !== undefined,
+          complianceScore:
+            (completion.confidence !== undefined ? 1 : 0) +
+            (completion.understanding !== undefined ? 1 : 0) +
+            (completion.assumptions !== undefined ? 1 : 0) +
+            (completion.nonGoals !== undefined ? 1 : 0),
+        });
+      }
+
+      // Check for escalation signal — takes priority over completion
+      if (worktreePath) {
+        const escalation = readEscalation(worktreePath);
+        if (escalation) {
+          this.state.transition(task.id, "escalation_wait");
+          this.emit({ type: "escalation_needed", taskId: task.id, escalation });
+          return;
+        }
+      }
+
+      // Session failed — route through retry/escalation logic
       if (!result.success || !completion || completion.status !== "success") {
         const reason = !result.success
           ? result.errors.join("; ")
@@ -202,11 +248,72 @@ export class Orchestrator {
             ? "No completion signal"
             : `Agent reported failure: ${completion.summary}`;
 
+        // Clean up worktree before any retry/escalation decision
+        this.sessions.cleanupWorktree(task.id);
+
+        // Budget exhaustion — permanent failure, never retry (would burn more money)
+        if (result.terminalReason === "error_max_budget_usd") {
+          this.state.transition(task.id, "failed");
+          this.state.updateTask(task.id, { lastError: `Budget exhausted ($${result.totalCostUsd.toFixed(2)})` });
+          this.emit({ type: "budget_exhausted", taskId: task.id, totalCostUsd: result.totalCostUsd });
+          this.emit({ type: "task_failed", taskId: task.id, reason: "Budget exhausted" });
+          return;
+        }
+
+        const retryCount = this.state.incrementRetry(task.id);
+        const maxSessionRetries = this.config.pipeline.max_session_retries ?? 3;
+
+        if (retryCount < maxSessionRetries) {
+          // Retry: active -> failed -> pending -> processTask
+          this.state.transition(task.id, "failed");
+          this.state.updateTask(task.id, { lastError: reason });
+          this.state.transition(task.id, "pending");
+          this.emit({ type: "retry_scheduled", taskId: task.id, attempt: retryCount + 1, maxRetries: maxSessionRetries });
+          const updated = this.state.getTask(task.id)!;
+          await this.processTask(updated);
+          return;
+        }
+
+        // Max retries exhausted — escalate or fail
+        const autoEscalate = this.config.pipeline.auto_escalate_on_max_retries ?? true;
+        const maxEscalations = this.config.pipeline.max_tier1_escalations ?? 2;
+        const current = this.state.getTask(task.id)!;
+
+        if (autoEscalate && current.tier1EscalationCount < maxEscalations) {
+          // Auto-escalate: active -> escalation_wait
+          this.state.transition(task.id, "escalation_wait");
+          this.state.updateTask(task.id, {
+            lastError: reason,
+            tier1EscalationCount: current.tier1EscalationCount + 1,
+          });
+          this.emit({
+            type: "escalation_needed",
+            taskId: task.id,
+            escalation: { type: "persistent_failure", question: `Task failed ${maxSessionRetries} times: ${reason}` },
+          });
+          return;
+        }
+
+        // Circuit breaker: permanent failure
         this.state.transition(task.id, "failed");
-        this.state.updateTask(task.id, { lastError: reason });
+        this.state.updateTask(task.id, {
+          lastError: autoEscalate
+            ? `Circuit breaker: exhausted ${maxSessionRetries} retries × ${maxEscalations} escalation cycles`
+            : reason,
+        });
         this.emit({ type: "task_failed", taskId: task.id, reason });
         return;
       }
+
+      // Graduated response routing (informational in Phase 2A — all levels proceed to merge)
+      const responseResult = evaluateResponseLevel(completion, result);
+      this.emit({
+        type: "response_level",
+        taskId: task.id,
+        level: responseResult.level,
+        name: responseResult.name,
+        reasons: responseResult.reasons,
+      });
 
       // Route to merge gate
       this.state.transition(task.id, "merging");
@@ -290,11 +397,17 @@ export class Orchestrator {
             taskId: task.id,
             reason: mergeResult.error,
           });
+          this.sessions.cleanupWorktree(task.id);
           break;
       }
     } catch (err) {
-      // Unexpected error — fail the task
+      // Unexpected error — fail the task and clean up worktree
       const reason = (err as Error).message;
+      try {
+        this.sessions.cleanupWorktree(task.id);
+      } catch {
+        // Cleanup may fail if worktree was never created
+      }
       try {
         this.state.transition(task.id, "failed");
         this.state.updateTask(task.id, { lastError: reason });
@@ -334,6 +447,10 @@ export class Orchestrator {
       // Shelved tasks get retried (worktree already cleaned on shelve path)
       if (task.state === "shelved") {
         this.scheduleRetry(task.id, this.config.pipeline.retry_delay_ms);
+      }
+      // Failed tasks with orphaned worktrees — clean up (safety net)
+      if (task.state === "failed" && task.worktreePath) {
+        this.sessions.cleanupWorktree(task.id);
       }
     }
   }

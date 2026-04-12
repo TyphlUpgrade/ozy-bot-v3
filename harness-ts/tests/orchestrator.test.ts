@@ -126,6 +126,7 @@ function setupHarness(opts?: {
   queryMessages?: SDKMessage[];
   withCompletion?: boolean;
   mergeGitOverrides?: Partial<MergeGitOps>;
+  freshQueryPerCall?: boolean;
 }): TestHarness {
   const config = makeConfig();
   mkdirSync(join(tmpDir, "tasks"), { recursive: true });
@@ -150,9 +151,9 @@ function setupHarness(opts?: {
     );
   }
 
-  const queryFn: QueryFn = vi.fn().mockReturnValue(
-    mockQuery(opts?.queryMessages ?? [makeResultSuccess()]),
-  );
+  const queryFn: QueryFn = opts?.freshQueryPerCall
+    ? vi.fn().mockImplementation(() => mockQuery(opts?.queryMessages ?? [makeResultSuccess()]))
+    : vi.fn().mockReturnValue(mockQuery(opts?.queryMessages ?? [makeResultSuccess()]));
   const sdk = new SDKClient(queryFn);
   const state = new StateManager(join(tmpDir, "state.json"));
   const sessionMgr = new SessionManager(sdk, state, config, gitOps);
@@ -287,7 +288,7 @@ describe("Orchestrator", () => {
       expect(events.some((e) => e.type === "task_done")).toBe(true);
     });
 
-    it("fails task when session returns error", async () => {
+    it("fails task when session returns error (after retries exhausted)", async () => {
       const errorResult: SDKMessage = {
         type: "result",
         subtype: "error_during_execution",
@@ -305,7 +306,9 @@ describe("Orchestrator", () => {
         session_id: "err-session",
       } as unknown as SDKMessage;
 
-      const { orch, state, events } = setupHarness({ queryMessages: [errorResult] });
+      const { orch, state, events, config } = setupHarness({ queryMessages: [errorResult], freshQueryPerCall: true });
+      config.pipeline.max_session_retries = 1;
+      config.pipeline.auto_escalate_on_max_retries = false;
       const task = state.createTask("test", "fail-1");
 
       await orch.processTask(task);
@@ -314,9 +317,10 @@ describe("Orchestrator", () => {
       expect(events.some((e) => e.type === "task_failed")).toBe(true);
     });
 
-    it("fails task when no completion signal", async () => {
-      // No completion.json written (default mock doesn't write it)
-      const { orch, state } = setupHarness({ withCompletion: false });
+    it("fails task when no completion signal (after retries exhausted)", async () => {
+      const { orch, state, config } = setupHarness({ withCompletion: false, freshQueryPerCall: true });
+      config.pipeline.max_session_retries = 1;
+      config.pipeline.auto_escalate_on_max_retries = false;
       const task = state.createTask("test", "no-signal");
 
       await orch.processTask(task);
@@ -449,6 +453,530 @@ describe("Orchestrator", () => {
       orch.start();
       expect(existsSync(join(tmpDir, "tasks"))).toBe(true);
       orch.shutdown();
+    });
+  });
+
+  describe("Phase 2A — escalation detection", () => {
+    it("escalation signal -> task transitions to escalation_wait", async () => {
+      const { orch, state, events, gitOps } = setupHarness({ withCompletion: true });
+      // Also write escalation.json (escalation takes priority)
+      (gitOps.createWorktree as ReturnType<typeof vi.fn>).mockImplementation(
+        (_base: string, _branch: string, wtPath: string) => {
+          mkdirSync(join(wtPath, ".harness"), { recursive: true });
+          writeFileSync(
+            join(wtPath, ".harness", "completion.json"),
+            JSON.stringify({ status: "success", commitSha: "abc", summary: "Done", filesChanged: [] }),
+          );
+          writeFileSync(
+            join(wtPath, ".harness", "escalation.json"),
+            JSON.stringify({ type: "design_decision", question: "REST or gRPC?" }),
+          );
+        },
+      );
+      const task = state.createTask("test", "esc-1");
+      await orch.processTask(task);
+
+      expect(state.getTask("esc-1")!.state).toBe("escalation_wait");
+      const escEvent = events.find((e) => e.type === "escalation_needed");
+      expect(escEvent).toBeTruthy();
+      if (escEvent && escEvent.type === "escalation_needed") {
+        expect(escEvent.escalation.type).toBe("design_decision");
+      }
+    });
+
+    it("escalation takes priority over successful completion", async () => {
+      const { orch, state, events, gitOps } = setupHarness();
+      (gitOps.createWorktree as ReturnType<typeof vi.fn>).mockImplementation(
+        (_base: string, _branch: string, wtPath: string) => {
+          mkdirSync(join(wtPath, ".harness"), { recursive: true });
+          writeFileSync(
+            join(wtPath, ".harness", "completion.json"),
+            JSON.stringify({ status: "success", commitSha: "abc", summary: "Done", filesChanged: ["a.ts"] }),
+          );
+          writeFileSync(
+            join(wtPath, ".harness", "escalation.json"),
+            JSON.stringify({ type: "scope_unclear", question: "Scope question" }),
+          );
+        },
+      );
+      const task = state.createTask("test", "esc-prio");
+      await orch.processTask(task);
+
+      // Should NOT proceed to merge
+      expect(state.getTask("esc-prio")!.state).toBe("escalation_wait");
+      expect(events.some((e) => e.type === "merge_result")).toBe(false);
+    });
+
+    it("no escalation -> normal flow unchanged", async () => {
+      const { orch, state, events } = setupHarness({ withCompletion: true });
+      const task = state.createTask("test", "no-esc");
+      await orch.processTask(task);
+
+      expect(state.getTask("no-esc")!.state).toBe("done");
+      expect(events.some((e) => e.type === "escalation_needed")).toBe(false);
+    });
+  });
+
+  describe("Phase 2A — checkpoint detection", () => {
+    it("checkpoint found -> event emitted", async () => {
+      const { orch, state, events, gitOps } = setupHarness();
+      (gitOps.createWorktree as ReturnType<typeof vi.fn>).mockImplementation(
+        (_base: string, _branch: string, wtPath: string) => {
+          mkdirSync(join(wtPath, ".harness"), { recursive: true });
+          writeFileSync(
+            join(wtPath, ".harness", "completion.json"),
+            JSON.stringify({ status: "success", commitSha: "abc", summary: "Done", filesChanged: [] }),
+          );
+          writeFileSync(
+            join(wtPath, ".harness", "checkpoint.json"),
+            JSON.stringify([
+              { timestamp: "2026-04-11T12:00:00Z", reason: "decision_point", description: "Chose REST" },
+            ]),
+          );
+        },
+      );
+      const task = state.createTask("test", "cp-1");
+      await orch.processTask(task);
+
+      const cpEvent = events.find((e) => e.type === "checkpoint_detected");
+      expect(cpEvent).toBeTruthy();
+      if (cpEvent && cpEvent.type === "checkpoint_detected") {
+        expect(cpEvent.checkpoints).toHaveLength(1);
+      }
+    });
+
+    it("no checkpoint file -> no event", async () => {
+      const { orch, state, events } = setupHarness({ withCompletion: true });
+      const task = state.createTask("test", "no-cp");
+      await orch.processTask(task);
+
+      expect(events.some((e) => e.type === "checkpoint_detected")).toBe(false);
+    });
+  });
+
+  describe("Phase 2A — response level", () => {
+    it("emits response_level on successful completion", async () => {
+      const { orch, state, events } = setupHarness({ withCompletion: true });
+      const task = state.createTask("test", "resp-1");
+      await orch.processTask(task);
+
+      const respEvent = events.find((e) => e.type === "response_level");
+      expect(respEvent).toBeTruthy();
+      if (respEvent && respEvent.type === "response_level") {
+        // Bare completion (no confidence) -> level 1
+        expect(respEvent.level).toBe(1);
+        expect(respEvent.name).toBe("enriched");
+      }
+    });
+
+    it("uses session cost in response evaluation", async () => {
+      const { orch, state, events, gitOps } = setupHarness();
+      (gitOps.createWorktree as ReturnType<typeof vi.fn>).mockImplementation(
+        (_base: string, _branch: string, wtPath: string) => {
+          mkdirSync(join(wtPath, ".harness"), { recursive: true });
+          writeFileSync(
+            join(wtPath, ".harness", "completion.json"),
+            JSON.stringify({
+              status: "success",
+              commitSha: "abc",
+              summary: "Done",
+              filesChanged: ["a.ts"],
+              confidence: {
+                scopeClarity: "clear",
+                designCertainty: "obvious",
+                assumptions: [],
+                openQuestions: [],
+                testCoverage: "verifiable",
+              },
+            }),
+          );
+        },
+      );
+      const task = state.createTask("test", "resp-cost");
+      await orch.processTask(task);
+
+      const respEvent = events.find((e) => e.type === "response_level");
+      expect(respEvent).toBeTruthy();
+      // Cost is $0.05 (from mock), below review threshold — level 0
+      if (respEvent && respEvent.type === "response_level") {
+        expect(respEvent.level).toBe(0);
+      }
+    });
+  });
+
+  describe("Phase 2A — failure retry + circuit breaker", () => {
+    it("session failure -> retry (attempt 1 of 3)", async () => {
+      // First call fails (no completion), second succeeds (with completion)
+      let callCount = 0;
+      const { orch, state, events, gitOps, config } = setupHarness({ freshQueryPerCall: true });
+      config.pipeline.max_session_retries = 3;
+      (gitOps.createWorktree as ReturnType<typeof vi.fn>).mockImplementation(
+        (_base: string, _branch: string, wtPath: string) => {
+          callCount++;
+          mkdirSync(join(wtPath, ".harness"), { recursive: true });
+          if (callCount >= 2) {
+            writeFileSync(
+              join(wtPath, ".harness", "completion.json"),
+              JSON.stringify({ status: "success", commitSha: "abc", summary: "Done", filesChanged: [] }),
+            );
+          }
+        },
+      );
+      const task = state.createTask("test", "retry-1");
+      await orch.processTask(task);
+
+      expect(events.some((e) => e.type === "retry_scheduled")).toBe(true);
+      expect(state.getTask("retry-1")!.state).toBe("done");
+    });
+
+    it("session failure -> retry -> success on attempt 2", async () => {
+      let callCount = 0;
+      const { orch, state, events, gitOps, config } = setupHarness({ freshQueryPerCall: true });
+      config.pipeline.max_session_retries = 3;
+      (gitOps.createWorktree as ReturnType<typeof vi.fn>).mockImplementation(
+        (_base: string, _branch: string, wtPath: string) => {
+          callCount++;
+          mkdirSync(join(wtPath, ".harness"), { recursive: true });
+          if (callCount === 2) {
+            writeFileSync(
+              join(wtPath, ".harness", "completion.json"),
+              JSON.stringify({ status: "success", commitSha: "abc", summary: "Done", filesChanged: [] }),
+            );
+          }
+        },
+      );
+      const task = state.createTask("test", "retry-success-2");
+      await orch.processTask(task);
+
+      const retryEvents = events.filter((e) => e.type === "retry_scheduled");
+      expect(retryEvents).toHaveLength(1); // only 1 retry needed
+      expect(state.getTask("retry-success-2")!.state).toBe("done");
+    });
+
+    it("max retries exhausted -> auto-escalate", async () => {
+      const { orch, state, events, config } = setupHarness({ withCompletion: false, freshQueryPerCall: true });
+      config.pipeline.max_session_retries = 2;
+      config.pipeline.auto_escalate_on_max_retries = true;
+      config.pipeline.max_tier1_escalations = 2;
+      const task = state.createTask("test", "retry-esc");
+
+      await orch.processTask(task);
+
+      expect(state.getTask("retry-esc")!.state).toBe("escalation_wait");
+      const escEvent = events.find((e) => e.type === "escalation_needed");
+      expect(escEvent).toBeTruthy();
+      if (escEvent && escEvent.type === "escalation_needed") {
+        expect(escEvent.escalation.type).toBe("persistent_failure");
+      }
+    });
+
+    it("auto_escalate_on_max_retries=false -> direct fail", async () => {
+      const { orch, state, events, config } = setupHarness({ withCompletion: false, freshQueryPerCall: true });
+      config.pipeline.max_session_retries = 1;
+      config.pipeline.auto_escalate_on_max_retries = false;
+      const task = state.createTask("test", "no-esc-fail");
+
+      await orch.processTask(task);
+
+      expect(state.getTask("no-esc-fail")!.state).toBe("failed");
+      expect(events.some((e) => e.type === "escalation_needed")).toBe(false);
+    });
+
+    it("circuit breaker -> permanent failure after max escalation cycles", async () => {
+      const { orch, state, events, config } = setupHarness({ withCompletion: false, freshQueryPerCall: true });
+      config.pipeline.max_session_retries = 1;
+      config.pipeline.auto_escalate_on_max_retries = true;
+      config.pipeline.max_tier1_escalations = 1;
+      // Pre-set escalation count to max
+      state.createTask("test", "circuit-break");
+      state.updateTask("circuit-break", { tier1EscalationCount: 1 });
+      const task = state.getTask("circuit-break")!;
+
+      await orch.processTask(task);
+
+      expect(state.getTask("circuit-break")!.state).toBe("failed");
+      expect(state.getTask("circuit-break")!.lastError).toContain("Circuit breaker");
+    });
+
+    it("tier1EscalationCount increments on each auto-escalation", async () => {
+      const { orch, state, config } = setupHarness({ withCompletion: false, freshQueryPerCall: true });
+      config.pipeline.max_session_retries = 1;
+      config.pipeline.auto_escalate_on_max_retries = true;
+      config.pipeline.max_tier1_escalations = 3;
+      const task = state.createTask("test", "esc-count");
+
+      await orch.processTask(task);
+
+      expect(state.getTask("esc-count")!.tier1EscalationCount).toBe(1);
+      expect(state.getTask("esc-count")!.state).toBe("escalation_wait");
+    });
+
+    it("retry_scheduled event includes correct attempt number", async () => {
+      let callCount = 0;
+      const { orch, state, events, gitOps, config } = setupHarness({ freshQueryPerCall: true });
+      config.pipeline.max_session_retries = 3;
+      (gitOps.createWorktree as ReturnType<typeof vi.fn>).mockImplementation(
+        (_base: string, _branch: string, wtPath: string) => {
+          callCount++;
+          mkdirSync(join(wtPath, ".harness"), { recursive: true });
+          if (callCount === 3) {
+            writeFileSync(
+              join(wtPath, ".harness", "completion.json"),
+              JSON.stringify({ status: "success", commitSha: "abc", summary: "Done", filesChanged: [] }),
+            );
+          }
+        },
+      );
+      const task = state.createTask("test", "retry-count");
+      await orch.processTask(task);
+
+      const retryEvents = events.filter((e) => e.type === "retry_scheduled");
+      expect(retryEvents).toHaveLength(2);
+      if (retryEvents[0].type === "retry_scheduled") {
+        expect(retryEvents[0].attempt).toBe(2); // attempt 2 (after 1st failure)
+      }
+      if (retryEvents[1].type === "retry_scheduled") {
+        expect(retryEvents[1].attempt).toBe(3); // attempt 3 (after 2nd failure)
+      }
+    });
+
+    it("retryCount persists across retry cycles", async () => {
+      const { orch, state, config } = setupHarness({ withCompletion: false, freshQueryPerCall: true });
+      config.pipeline.max_session_retries = 2;
+      config.pipeline.auto_escalate_on_max_retries = false;
+      const task = state.createTask("test", "retry-persist");
+
+      await orch.processTask(task);
+
+      expect(state.getTask("retry-persist")!.retryCount).toBe(2);
+    });
+  });
+
+  describe("budget exhaustion — no retry", () => {
+    it("budget exhaustion -> permanent failure, no retries", async () => {
+      const budgetResult: SDKMessage = {
+        type: "result",
+        subtype: "error_max_budget_usd",
+        duration_ms: 60000,
+        duration_api_ms: 55000,
+        is_error: true,
+        num_turns: 10,
+        stop_reason: null,
+        total_cost_usd: 2.50,
+        usage: { input_tokens: 50000, output_tokens: 25000 },
+        modelUsage: {},
+        permission_denials: [],
+        errors: ["Budget exceeded"],
+        uuid: "budget-uuid" as any,
+        session_id: "budget-session",
+        terminal_reason: "error_max_budget_usd",
+      } as unknown as SDKMessage;
+
+      const { orch, state, events, config } = setupHarness({ queryMessages: [budgetResult], freshQueryPerCall: true });
+      config.pipeline.max_session_retries = 3; // would normally allow retries
+      const task = state.createTask("expensive task", "budget-1");
+
+      await orch.processTask(task);
+
+      expect(state.getTask("budget-1")!.state).toBe("failed");
+      expect(state.getTask("budget-1")!.lastError).toContain("Budget exhausted");
+      // Should NOT retry — no retry_scheduled events
+      expect(events.some((e) => e.type === "retry_scheduled")).toBe(false);
+      // Should emit budget_exhausted event
+      expect(events.some((e) => e.type === "budget_exhausted")).toBe(true);
+      const budgetEvent = events.find((e) => e.type === "budget_exhausted");
+      if (budgetEvent && budgetEvent.type === "budget_exhausted") {
+        expect(budgetEvent.totalCostUsd).toBe(2.50);
+      }
+    });
+
+    it("budget exhaustion -> no auto-escalation even if configured", async () => {
+      const budgetResult: SDKMessage = {
+        type: "result",
+        subtype: "error_max_budget_usd",
+        duration_ms: 60000,
+        duration_api_ms: 55000,
+        is_error: true,
+        num_turns: 10,
+        stop_reason: null,
+        total_cost_usd: 5.00,
+        usage: { input_tokens: 100000, output_tokens: 50000 },
+        modelUsage: {},
+        permission_denials: [],
+        errors: ["Budget exceeded"],
+        uuid: "budget-uuid-2" as any,
+        session_id: "budget-session-2",
+        terminal_reason: "error_max_budget_usd",
+      } as unknown as SDKMessage;
+
+      const { orch, state, events, config } = setupHarness({ queryMessages: [budgetResult], freshQueryPerCall: true });
+      config.pipeline.max_session_retries = 1;
+      config.pipeline.auto_escalate_on_max_retries = true;
+      const task = state.createTask("expensive task", "budget-no-esc");
+
+      await orch.processTask(task);
+
+      // Should go straight to failed, not escalation_wait
+      expect(state.getTask("budget-no-esc")!.state).toBe("failed");
+      expect(events.some((e) => e.type === "escalation_needed")).toBe(false);
+    });
+  });
+
+  describe("crash cleanup — worktree orphaning", () => {
+    it("merge error path -> cleanupWorktree called", async () => {
+      const { orch, state, gitOps } = setupHarness({
+        withCompletion: true,
+        mergeGitOverrides: {
+          // Force the merge gate to return an error
+          rebase: vi.fn().mockImplementation(() => { throw new Error("merge gate internal error"); }),
+        },
+      });
+      // The rebase throwing will cause MergeGate.enqueue to return status: "error"
+      const task = state.createTask("test", "merge-err-cleanup");
+      await orch.processTask(task);
+
+      expect(state.getTask("merge-err-cleanup")!.state).toBe("failed");
+      // cleanupWorktree should have been called (removeWorktree is the indicator)
+      expect(gitOps.removeWorktree).toHaveBeenCalled();
+    });
+
+    it("unexpected exception -> cleanupWorktree called", async () => {
+      // Create a harness where spawnTask will throw
+      const config = makeConfig();
+      mkdirSync(join(tmpDir, "tasks"), { recursive: true });
+      const gitOps = mockGitOps();
+      // Make createWorktree throw to simulate unexpected error
+      (gitOps.createWorktree as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        throw new Error("disk full");
+      });
+
+      const queryFn: QueryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const sessionMgr = new SessionManager(sdk, state, config, gitOps);
+      const mergeGate = new MergeGate(config.pipeline, tmpDir, mockMergeGitOps());
+      const orch = new Orchestrator({ sessionManager: sessionMgr, mergeGate, stateManager: state, config });
+
+      const events: OrchestratorEvent[] = [];
+      orch.on((e) => events.push(e));
+
+      const task = state.createTask("test", "crash-cleanup");
+      await orch.processTask(task);
+
+      expect(state.getTask("crash-cleanup")!.state).toBe("failed");
+      // removeWorktree called in catch block cleanup (even though it'll no-op since worktree never created)
+      expect(gitOps.removeWorktree).toHaveBeenCalled();
+    });
+  });
+
+  describe("crash recovery — failed state worktree cleanup", () => {
+    it("recoverFromCrash cleans up worktrees for failed tasks", () => {
+      const { orch, state, gitOps } = setupHarness({ withCompletion: true });
+      // Manually create a failed task with a worktreePath (simulating orphaned worktree)
+      state.createTask("orphaned", "orphan-1");
+      state.transition("orphan-1", "active");
+      state.updateTask("orphan-1", { worktreePath: join(tmpDir, "worktrees", "task-orphan-1") });
+      state.transition("orphan-1", "failed");
+
+      // Start triggers recoverFromCrash
+      orch.start();
+
+      // Should have called cleanupWorktree for the failed task
+      expect(gitOps.removeWorktree).toHaveBeenCalled();
+
+      orch.shutdown();
+    });
+  });
+
+  describe("Phase 2A — completion compliance", () => {
+    it("fully enriched completion -> complianceScore 4", async () => {
+      const { orch, state, events, gitOps } = setupHarness();
+      (gitOps.createWorktree as ReturnType<typeof vi.fn>).mockImplementation(
+        (_base: string, _branch: string, wtPath: string) => {
+          mkdirSync(join(wtPath, ".harness"), { recursive: true });
+          writeFileSync(
+            join(wtPath, ".harness", "completion.json"),
+            JSON.stringify({
+              status: "success",
+              commitSha: "abc",
+              summary: "Done",
+              filesChanged: [],
+              understanding: "Task understood",
+              assumptions: ["A1"],
+              nonGoals: ["NG1"],
+              confidence: {
+                scopeClarity: "clear",
+                designCertainty: "obvious",
+                assumptions: [],
+                openQuestions: [],
+                testCoverage: "verifiable",
+              },
+            }),
+          );
+        },
+      );
+      const task = state.createTask("test", "comp-full");
+      await orch.processTask(task);
+
+      const compEvent = events.find((e) => e.type === "completion_compliance");
+      expect(compEvent).toBeTruthy();
+      if (compEvent && compEvent.type === "completion_compliance") {
+        expect(compEvent.hasConfidence).toBe(true);
+        expect(compEvent.hasUnderstanding).toBe(true);
+        expect(compEvent.hasAssumptions).toBe(true);
+        expect(compEvent.hasNonGoals).toBe(true);
+        expect(compEvent.complianceScore).toBe(4);
+      }
+    });
+
+    it("bare completion -> complianceScore 0", async () => {
+      const { orch, state, events } = setupHarness({ withCompletion: true });
+      const task = state.createTask("test", "comp-bare");
+      await orch.processTask(task);
+
+      const compEvent = events.find((e) => e.type === "completion_compliance");
+      expect(compEvent).toBeTruthy();
+      if (compEvent && compEvent.type === "completion_compliance") {
+        expect(compEvent.hasConfidence).toBe(false);
+        expect(compEvent.hasUnderstanding).toBe(false);
+        expect(compEvent.hasAssumptions).toBe(false);
+        expect(compEvent.hasNonGoals).toBe(false);
+        expect(compEvent.complianceScore).toBe(0);
+      }
+    });
+
+    it("partial enrichment -> correct score", async () => {
+      const { orch, state, events, gitOps } = setupHarness();
+      (gitOps.createWorktree as ReturnType<typeof vi.fn>).mockImplementation(
+        (_base: string, _branch: string, wtPath: string) => {
+          mkdirSync(join(wtPath, ".harness"), { recursive: true });
+          writeFileSync(
+            join(wtPath, ".harness", "completion.json"),
+            JSON.stringify({
+              status: "success",
+              commitSha: "abc",
+              summary: "Done",
+              filesChanged: [],
+              confidence: {
+                scopeClarity: "clear",
+                designCertainty: "obvious",
+                assumptions: [],
+                openQuestions: [],
+                testCoverage: "verifiable",
+              },
+            }),
+          );
+        },
+      );
+      const task = state.createTask("test", "comp-partial");
+      await orch.processTask(task);
+
+      const compEvent = events.find((e) => e.type === "completion_compliance");
+      expect(compEvent).toBeTruthy();
+      if (compEvent && compEvent.type === "completion_compliance") {
+        expect(compEvent.hasConfidence).toBe(true);
+        expect(compEvent.complianceScore).toBe(1);
+      }
     });
   });
 });
