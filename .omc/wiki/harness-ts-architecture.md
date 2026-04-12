@@ -165,7 +165,7 @@ See [[harness-ts-roadmap]] for phased plan.
 
 **Deliverables:** Config loader, 9-state machine, SDK wrapper, session manager, merge gate, orchestrator daemon. Business logic B1/B3/B5/B6/B7/O3/O4/O7/O8/O9 preserved.
 
-**Limitation:** All tests mock SDK and git. Real SDK behavior, `settingSources`, `resumeSession()`, and real git worktree operations are UNVERIFIED.
+**Limitation:** All tests mock SDK and git. Real git worktree operations verified in Phase 1.5. `settingSources` and `resumeSession()` verified against SDK v0.2.101 types (2026-04-12) — see Phase 1.5 resolution notes.
 
 ---
 
@@ -182,15 +182,15 @@ Verified Phase 0+1 foundation against reality. 90 new validation tests. Fixed 2 
 | **Agent completion protocol** | Real agent writes `.harness/completion.json` when systemPrompt instructs it | Manual: spawn session with completion instructions | Core pipeline protocol doesn't work |
 | **End-to-end manual test** | Full lifecycle: task file → agent → completion → merge → trunk | Drop real task, observe full pipeline | Everything |
 
-**If `settingSources` fails:** Fallback is to prepend project config to `systemPrompt` manually. Changes `spawnSession()` but not the rest of the architecture.
+**`settingSources` — RESOLVED (2026-04-12):** Verified in SDK v0.2.101. `settingSources: ["project"]` loads CLAUDE.md + `.claude/settings.json` + OMC hooks. Type: `SettingSource = 'user' | 'project' | 'local'`. Omitting = SDK isolation mode. No fallback needed.
 
-**If `resumeSession()` fails:** Dialogue agent uses two-session model (cheap dialogue session → implementation session) instead of single-session-with-pause. Changes Phase 3 design, not Phase 2.
+**`resumeSession()` — RESOLVED (2026-04-12):** Verified in SDK v0.2.101. Stable path: `query()` with `resume: sessionId` (full `Options` — keeps `settingSources`, `systemPrompt`, budget controls). Unstable V2 path (`unstable_v2_resumeSession`) exists but lacks `settingSources`/`systemPrompt` — not viable for OMC sessions. **Caveat:** `persistSession` must be `true` on original session or it can't be resumed. Fixed in `sdk.ts` (default changed from `false` to `true`).
 
 ---
 
-### Phase 2A: Pipeline Hardening — NOT STARTED
+### Phase 2A: Pipeline Hardening — COMPLETE (2026-04-11)
 
-Depends: Phase 1.5 validation complete.
+Depends: Phase 1.5 validation complete. **273 tests passing (71 new).**
 
 **Goal:** The agent can communicate structured information back to the orchestrator, and the orchestrator routes based on signals. Internal pipeline — no Discord dependency.
 
@@ -204,13 +204,60 @@ Depends: Phase 1.5 validation complete.
 | **Mid-task checkpoints** | system prompt + `src/orchestrator.ts` | ~30 lines | Agent writes `.harness/checkpoint.json` at decision points and budget thresholds. Orchestrator logs but doesn't pause (informational in Phase 2, gating in Phase 3). |
 | **Graduated response routing** | `src/orchestrator.ts` | ~40 lines | Evaluate completion signal assessment dimensions → select escalation level (0-4). Routes to merge directly (level 0-1), external review (level 2), or pause (level 3-4). |
 
-**Tests:** Unit tests for escalation detection, completion parsing with new fields, failure retry/circuit breaker, graduated routing logic. Extend existing mocked test infrastructure.
+**Tests:** 78 new tests across 4 new + 3 modified test files. All 280 passing.
+
+**Delivered (5 waves, 12 items):**
+- Wave 1: `config/harness/system-prompt.md` (agent protocol), `src/lib/budget.ts` (threshold tracker), config loader extensions
+- Wave 2: `src/lib/types.ts` (shared assessment types), enriched `CompletionSignal` with optional confidence/understanding/assumptions/nonGoals, B7-pattern validation
+- Wave 3: `src/lib/escalation.ts`, `src/lib/checkpoint.ts`, `src/lib/response.ts` (graduated routing levels 0-4), completion compliance event. 5 new `OrchestratorEvent` types wired into `processTask()`
+- Wave 4: Failure retry with `max_session_retries`, auto-escalation with `persistent_failure`, circuit breaker with `tier1EscalationCount` + `max_tier1_escalations`
+- Wave 5 (2026-04-12): SDK verification + critic/architect findings fixes:
+  - `settingSources: ["project"]` and `resumeSession()` verified against SDK v0.2.101 types
+  - `persistSession` default fixed `false` → `true` (was silently blocking session resumption)
+  - Hard budget kill: `config.pipeline.max_budget_usd` wired to SDK `maxBudgetUsd` in `spawnTask()`
+  - Budget exhaustion no-retry: `error_max_budget_usd` terminal reason short-circuits to permanent failure
+  - Crash cleanup: `cleanupWorktree()` added to `merge_result: "error"` and catch block paths
+  - Recovery gap: `recoverFromCrash()` now cleans up worktrees for tasks stuck in `failed` state
+  - New `budget_exhausted` orchestrator event type
+
+**Consensus plan:** `.omc/plans/ralplan-harness-ts-phase2a.md` (APPROVED, 2026-04-11)
+
+---
+
+### Post-2B Testing Options
+
+Items that can validate prompt strength and guardrail effectiveness once Discord integration is complete. Not blockers — informational testing to tune the agent protocol before adding hard gates in Phase 3.
+
+| # | Test Type | What | How | When |
+|---|-----------|------|-----|------|
+| 1 | **Live agent completion compliance** | Does a real agent produce `completion.json` with all enrichment fields (confidence, understanding, assumptions, nonGoals)? | Spawn real SDK session against `system-prompt.md` in a worktree with a simple task. Inspect output files. Measure compliance score (0-4). | Post-2B (can run without Discord via task file drop) |
+| 2 | **Adversarial ambiguity testing** | Does the agent escalate on deliberately ambiguous/impossible tasks instead of guessing? | Drop tasks with vague prompts ("fix the thing", "make it better"). Verify agent writes `escalation.json` with `scope_unclear` or `clarification_needed`. Check confidence dimensions aren't clustered. | Post-2B |
+| 3 | **Graduated response calibration** | Are the level 0-4 thresholds correctly tuned for real agent output? | Run N tasks of varying complexity. Collect `response_level` events. Histogram the distribution. If everything clusters at level 1, thresholds need adjustment. | Post-2B |
+| 4 | **Compliance regression tracking** | What % of sessions hit compliance score 4/4 over time? | Aggregate `completion_compliance` events. Track trend. Low scores = prompt engineering needs work. This is what Item 8 (compliance event) was designed for. | Ongoing post-2B |
+| 5 | **Checkpoint adoption testing** | Do agents actually write checkpoints at decision points? | Run complex multi-file tasks. Check for `checkpoint.json` in worktrees. If agents never write checkpoints, the prompt section needs strengthening before Phase 3 gating. | Post-2B |
+| 6 | **Circuit breaker stress test** | Does retry + auto-escalation + circuit breaker work under realistic failure conditions? | Drop tasks designed to fail (bad prompts, impossible constraints). Verify retry → escalation → circuit breaker sequence fires correctly. Check `tier1EscalationCount` increments and caps. | Post-2B |
+
+---
+
+### Phase 2B Pre-Requisites (from Critic/Architect Review, 2026-04-12)
+
+Items that must be resolved before or alongside Phase 2B Discord integration:
+
+| # | Severity | Finding | Status | Resolution |
+|---|----------|---------|--------|------------|
+| 1 | CRITICAL | `settingSources: ["project"]` doesn't load OMC plugins (user-level `enabledPlugins`) | **OPEN** | Option C recommended: use SDK `Options.settings` with inline `enabledPlugins: { "oh-my-claudecode@omc": true, "caveman@caveman": true }` at flag layer. Both plugins intentional — OMC for orchestration, caveman for cost control + accuracy. Option B fallback: register in project `.claude/settings.json`. Option A (`["user","project"]`) rejected — leaks `model: "opus"`, env vars, statusLine. |
+| 2 | CRITICAL | No hard budget kill | **FIXED** (Wave 5) | `max_budget_usd` wired to SDK `maxBudgetUsd`. Budget exhaustion (`error_max_budget_usd`) short-circuits to permanent failure, never retries. |
+| 3 | HIGH | Persistent-mode hook fights abortController | **MITIGATED** | Currently safe: `settingSources: ["project"]` excludes user settings → OMC plugin not loaded → hook never registers. Fragile if #1 is resolved by loading OMC. Fix when implementing #1: pass `hooks: {}` in SDK Options to prevent filesystem-discovered hooks, or selectively exclude `persistent-mode.cjs`. |
+| 4 | HIGH | Crash path doesn't clean up worktrees | **FIXED** (Wave 5) | `cleanupWorktree()` added to `merge_result: "error"` case and catch block. `recoverFromCrash()` now cleans up `failed`-state worktrees. |
+| 5 | MEDIUM | Cron/remote triggers escape lifecycle | **OPEN** | Block `CronCreate`, `CronDelete`, `CronList`, `RemoteTrigger`, `ScheduleWakeup` via `disallowedTools`. These create resources that outlive sessions with no cleanup path. |
+| 6 | MEDIUM | `/team` spawns tmux panes outside SDK lifecycle | **OPEN — by design** | User wants agents to use `/team`. Mitigation: add tmux cleanup to `cleanupWorktree()` (`tmux kill-session -t "*task-{id}*"`). Add cleanup sweep to `shutdown()`/`abortAll()`. |
+| 7 | LOW | No concurrent agent race conditions | **CONFIRMED OK** | Worktree isolation solid. Merge gate FIFO handles contention. `.omc/` exclusion prevents state leaking to trunk. |
 
 ---
 
 ### Phase 2B: Discord Integration — NOT STARTED
 
-Depends: Phase 2A escalation protocol.
+Depends: Phase 2A escalation protocol. Phase 2B pre-requisites #1, #3, #5, #6 should be resolved in Phase 2B Wave 1.
 
 **Goal:** Operator can submit tasks, see pipeline events, and respond to escalation — all via Discord.
 
@@ -240,6 +287,7 @@ Depends: Phase 2A (escalation protocol), Phase 1.5 (`resumeSession` verification
 | **Review trigger logic** | `src/orchestrator.ts` | ~30 lines | Fires review gate when: `totalCostUsd > threshold`, `filesChanged.length > threshold`, `confidence` assessment has partial/degraded dimensions, or task flag `mode: "reviewed"`. |
 | **Dialogue agent** | `src/session/dialogue.ts` (new) | ~80 lines | For build-from-scratch tasks. Agent writes `.harness/proposal.json` → orchestrator pauses → operator reviews → implementation proceeds. Single-session-with-pause if `resumeSession` works, two-session fallback otherwise. |
 | **Dialogue routing** | `src/orchestrator.ts` | ~20 lines | Auto-triggered when initial assessment has `unclear`/`guessing` dimensions, or operator sets `mode: "dialogue"` in task file. |
+| **Dialogue Discord channel** | `src/discord/dialogue-channel.ts` (new) | ~100 lines | Dedicated Discord channel linked to a persistent OmC instance for pre-pipeline design discussion. Operator hashes out broad implementation details (architecture, scope, constraints, trade-offs) conversationally before the task enters the pipeline. The channel is essentially a ralplan/deep-interview surface — once the operator and agent reach consensus on the approach, the refined task spec is submitted to the pipeline as a fully-scoped task. Prevents vague tasks from burning session retries. Separates "what should we build" (dialogue channel) from "build it" (pipeline). |
 | **Review verdict schema** | `src/gates/review.ts` | Part of gate | `{ verdict: "approve"|"reject"|"request_changes", risk_score: {...}, findings: [...] }`. Ported from Python reviewer verdict format. |
 
 **Tests:** Mocked review sessions (same pattern as existing SDK mocks). Integration test: task triggers review, review rejects, task fails. Task triggers review, review approves, merge proceeds.
