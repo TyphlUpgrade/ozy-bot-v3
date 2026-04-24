@@ -1615,6 +1615,54 @@ describe("Orchestrator — P1-B arbitration verdict routing", () => {
     expect(verdictEv && verdictEv.type === "arbitration_verdict" && verdictEv.verdict).toBe("plan_amendment");
   });
 
+  it("escalate_operator cascades to projectStore.failProject when no active phases remain", async () => {
+    const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 1 });
+    const architectManager = makeFakeArchitectManager({
+      reviewVerdict: { type: "escalate_operator", rationale: "unresolvable" },
+    });
+    const projectStore = new ProjectStore(join(tmpDir, "projects.json"), join(tmpDir, "wt"));
+    const proj = projectStore.createProject("p-single", "d", []);
+    projectStore.addPhase(proj.id, "only phase", "ph-only");
+    projectStore.attachTask(proj.id, "ph-only", "t-single");
+    const { orch, state, events } = setupWithReview({
+      reviewGate: gate, withCompletion: true, architectManager, projectStore,
+    });
+    state.createTask("x", "t-single");
+    state.updateTask("t-single", { projectId: proj.id, phaseId: "ph-only" });
+    await orch.processTask(state.getTask("t-single")!);
+
+    expect(projectStore.getProject(proj.id)!.state).toBe("failed");
+    const pf = events.find((e) => e.type === "project_failed");
+    expect(pf).toBeTruthy();
+    if (pf && pf.type === "project_failed") {
+      expect(pf.reason).toContain("unresolvable");
+    }
+  });
+
+  it("escalate_operator leaves project open when other phases are still active", async () => {
+    const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 1 });
+    const architectManager = makeFakeArchitectManager({
+      reviewVerdict: { type: "escalate_operator", rationale: "just this one" },
+    });
+    const projectStore = new ProjectStore(join(tmpDir, "projects.json"), join(tmpDir, "wt"));
+    const proj = projectStore.createProject("p-multi", "d", []);
+    projectStore.addPhase(proj.id, "failing phase", "ph-fail");
+    projectStore.addPhase(proj.id, "still pending phase", "ph-pending");
+    projectStore.attachTask(proj.id, "ph-fail", "t-multi-fail");
+    const { orch, state, events } = setupWithReview({
+      reviewGate: gate, withCompletion: true, architectManager, projectStore,
+    });
+    state.createTask("x", "t-multi-fail");
+    state.updateTask("t-multi-fail", { projectId: proj.id, phaseId: "ph-fail" });
+    await orch.processTask(state.getTask("t-multi-fail")!);
+
+    expect(projectStore.getProject(proj.id)!.state).toBe("decomposing");
+    expect(events.some((e) => e.type === "project_failed")).toBe(false);
+    // Phase itself marked failed.
+    const ph = projectStore.getProject(proj.id)!.phases.find((p) => p.id === "ph-fail");
+    expect(ph?.state).toBe("failed");
+  });
+
   it("escalate_operator: transitions failed, emits task_failed with architect rationale", async () => {
     const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 1 });
     const architectManager = makeFakeArchitectManager({

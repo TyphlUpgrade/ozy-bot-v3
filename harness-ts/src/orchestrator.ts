@@ -724,6 +724,20 @@ export class Orchestrator {
           reason: `architect escalation: ${verdict.rationale}`,
         });
         this.sessions.cleanupWorktree(task.id);
+        // Cascade to project: mark the phase failed; if it was the last active
+        // phase, fail the project so orchestrator loops terminate. Multi-phase
+        // projects with other active phases stay open.
+        if (task.projectId && task.phaseId && this.projectStore) {
+          this.projectStore.markPhaseFailed(task.projectId, task.phaseId, verdict.rationale);
+          if (!this.projectStore.hasActivePhases(task.projectId)) {
+            this.projectStore.failProject(task.projectId, `architect_escalate_operator: ${verdict.rationale}`);
+            this.emit({
+              type: "project_failed",
+              projectId: task.projectId,
+              reason: `architect escalation: ${verdict.rationale}`,
+            });
+          }
+        }
         break;
       }
     }
