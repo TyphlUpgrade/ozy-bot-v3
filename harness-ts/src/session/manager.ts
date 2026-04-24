@@ -196,9 +196,6 @@ export class SessionManager {
   private readonly gitOps: GitOps;
   private readonly tmuxOps: TmuxOps;
   private readonly activeSessions: Map<string, ActiveSession> = new Map();
-  // Wave C / U4 — monotonic cumulative counter of Executor spawns. Each spawn
-  // corresponds to a `persistSession: true` SDK record, so this doubles as an
-  // observability proxy for disk-accumulated session records.
   private cumulativeSessionSpawns = 0;
 
   constructor(
@@ -322,16 +319,13 @@ export class SessionManager {
       enabledPlugins,
       hooks: {}, // Wave 1 Item 2: explicit empty to prevent filesystem-discovered hooks
       ...(this.config.pipeline.max_budget_usd ? { maxBudgetUsd: this.config.pipeline.max_budget_usd } : {}),
-      // Wave C / U3: enrichment default. Operator override wins; otherwise Executor always
-      // receives the enriched completion-contract prompt (understanding/assumptions/nonGoals/confidence).
       systemPrompt: this.config.systemPrompt ?? DEFAULT_EXECUTOR_SYSTEM_PROMPT,
     };
 
     const { query, abortController } = this.sdk.spawnSession(sessionConfig);
 
-    // Wave C / U4 — persistent-session observability. Every spawn is a
-    // `persistSession: true` record; once cumulative spawns exceed the
-    // configured threshold we warn once per spawn-above-threshold.
+    // Every spawn allocates a persistSession:true SDK record; spawn count
+    // is therefore a direct proxy for disk-accumulated session records.
     this.cumulativeSessionSpawns += 1;
     const threshold =
       this.config.pipeline.persistent_session_warn_threshold
@@ -437,11 +431,7 @@ export class SessionManager {
     return this.activeSessions.size;
   }
 
-  /**
-   * Wave C / U4 — cumulative Executor spawn count since manager construction.
-   * Each spawn allocates a persistSession SDK record, so this doubles as an
-   * observability proxy for disk-accumulated session records.
-   */
+  /** Cumulative spawn count since construction. Proxy for persistSession records on disk. */
   get persistentSessionCount(): number {
     return this.cumulativeSessionSpawns;
   }

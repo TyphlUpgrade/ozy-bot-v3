@@ -286,14 +286,10 @@ function parseArchitect(raw: Record<string, unknown>): ArchitectFileConfig {
 // --- Executor system prompt default (Wave C / U3) ---
 
 /**
- * Wave C Executor system prompt default. Every Executor phase MUST write an
- * enriched completion.json with understanding / assumptions / nonGoals /
- * confidence blocks. Phase 2A graduated-response routing depends on these
- * fields; a base-fields-only completion silently lands at response_level 1.
- *
- * Kept identical to scripts/live-run.ts SYSTEM_PROMPT_ENRICHED (validated
- * 4/4 compliance in prior live runs). Operators may override via
- * HarnessConfig.systemPrompt; SessionManager falls through to this default.
+ * Phase 2A graduated-response routing requires `understanding`, `assumptions`,
+ * `nonGoals`, and `confidence` on every completion.json; a base-fields-only
+ * completion silently lands at response_level 1. Body kept identical to
+ * `scripts/live-run.ts` SYSTEM_PROMPT_ENRICHED (validated 4/4 compliance).
  */
 export const DEFAULT_EXECUTOR_SYSTEM_PROMPT = `You are working inside a harness-managed git worktree.
 

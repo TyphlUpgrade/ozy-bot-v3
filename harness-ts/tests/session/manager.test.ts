@@ -268,7 +268,6 @@ describe("SessionManager", () => {
       const sdk = new SDKClient(queryFn);
       const state = new StateManager(join(tmpDir, "state.json"));
       const config = makeConfig();
-      // Do NOT set config.systemPrompt — exercise the U3 default path.
       const mgr = new SessionManager(sdk, state, config, mockGitOps());
       const task = state.createTask("do the thing", "task-default-prompt");
       await mgr.spawnTask(task);
