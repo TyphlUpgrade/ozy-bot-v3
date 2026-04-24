@@ -42,10 +42,10 @@ describe("StateManager", () => {
     expect(task.id).toBe("custom-id-123");
   });
 
-  // --- 9 States ---
+  // --- 10 States (Phase 2A 9 + Wave 1.5b review_arbitration) ---
 
-  it("has exactly 9 states", () => {
-    expect(TASK_STATES).toHaveLength(9);
+  it("has exactly 10 states", () => {
+    expect(TASK_STATES).toHaveLength(10);
     expect(TASK_STATES).toContain("pending");
     expect(TASK_STATES).toContain("active");
     expect(TASK_STATES).toContain("reviewing");
@@ -55,6 +55,7 @@ describe("StateManager", () => {
     expect(TASK_STATES).toContain("shelved");
     expect(TASK_STATES).toContain("escalation_wait");
     expect(TASK_STATES).toContain("paused");
+    expect(TASK_STATES).toContain("review_arbitration");
   });
 
   // --- Valid Transitions ---
@@ -349,5 +350,104 @@ describe("StateManager", () => {
     expect(mgr.getTask(task.id)!.state).toBe("pending");
     mgr.reload();
     expect(mgr.getTask(task.id)!.state).toBe("active");
+  });
+
+  // --- Wave 1.5b: review_arbitration state + three-tier field round-trip ---
+
+  it("transitions reviewing -> review_arbitration", () => {
+    const mgr = freshManager();
+    const task = mgr.createTask("test");
+    mgr.transition(task.id, "active");
+    mgr.transition(task.id, "reviewing");
+    const updated = mgr.transition(task.id, "review_arbitration");
+    expect(updated.state).toBe("review_arbitration");
+  });
+
+  it("review_arbitration exits to active (retry_with_directive)", () => {
+    const mgr = freshManager();
+    const task = mgr.createTask("test");
+    mgr.transition(task.id, "active");
+    mgr.transition(task.id, "reviewing");
+    mgr.transition(task.id, "review_arbitration");
+    const updated = mgr.transition(task.id, "active");
+    expect(updated.state).toBe("active");
+  });
+
+  it("review_arbitration rejects illegal transition to done", () => {
+    const mgr = freshManager();
+    const task = mgr.createTask("test");
+    mgr.transition(task.id, "active");
+    mgr.transition(task.id, "reviewing");
+    mgr.transition(task.id, "review_arbitration");
+    expect(() => mgr.transition(task.id, "done")).toThrow(/Invalid transition/);
+  });
+
+  it("persists and reloads three-tier fields (projectId, phaseId, arbitrationCount, reviewerRejectionCount)", () => {
+    const mgr = freshManager();
+    const task = mgr.createTask("test");
+    mgr.updateTask(task.id, {
+      projectId: "proj-abc",
+      phaseId: "phase-1",
+      arbitrationCount: 2,
+      reviewerRejectionCount: 1,
+    });
+    const mgr2 = freshManager();
+    const reloaded = mgr2.getTask(task.id)!;
+    expect(reloaded.projectId).toBe("proj-abc");
+    expect(reloaded.phaseId).toBe("phase-1");
+    expect(reloaded.arbitrationCount).toBe(2);
+    expect(reloaded.reviewerRejectionCount).toBe(1);
+  });
+
+  it("persists and reloads dialogue + reviewResult fields", () => {
+    const mgr = freshManager();
+    const task = mgr.createTask("test");
+    mgr.updateTask(task.id, {
+      dialogueMessages: [
+        { role: "operator", content: "clarify scope", timestamp: "2026-04-24T00:00:00Z" },
+        { role: "agent", content: "scope: X", timestamp: "2026-04-24T00:00:05Z" },
+      ],
+      dialoguePendingConfirmation: true,
+      reviewResult: { verdict: "request_changes", weightedRisk: 0.42, findingCount: 3 },
+    });
+    const mgr2 = freshManager();
+    const reloaded = mgr2.getTask(task.id)!;
+    expect(reloaded.dialogueMessages).toHaveLength(2);
+    expect(reloaded.dialoguePendingConfirmation).toBe(true);
+    expect(reloaded.reviewResult?.verdict).toBe("request_changes");
+    expect(reloaded.reviewResult?.weightedRisk).toBeCloseTo(0.42);
+  });
+
+  it("B7 drops unknown keys on load but keeps Wave 1.5b known keys", () => {
+    // Hand-craft a state.json with both unknown and known-new keys
+    const now = new Date().toISOString();
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        tasks: {
+          t1: {
+            id: "t1",
+            state: "pending",
+            prompt: "x",
+            createdAt: now,
+            updatedAt: now,
+            totalCostUsd: 0,
+            retryCount: 0,
+            escalationTier: 1,
+            rebaseAttempts: 0,
+            tier1EscalationCount: 0,
+            projectId: "proj-1",
+            arbitrationCount: 5,
+            bogusKeyFromFuture: "drop-me", // unknown — must be dropped
+          },
+        },
+      }),
+    );
+    const mgr = freshManager();
+    const t = mgr.getTask("t1")!;
+    expect(t.projectId).toBe("proj-1");
+    expect(t.arbitrationCount).toBe(5);
+    expect((t as unknown as Record<string, unknown>).bogusKeyFromFuture).toBeUndefined();
   });
 });

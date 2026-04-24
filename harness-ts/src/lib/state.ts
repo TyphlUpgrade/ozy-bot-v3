@@ -20,6 +20,7 @@ export const TASK_STATES = [
   "shelved",
   "escalation_wait",
   "paused",
+  "review_arbitration", // Three-tier (Wave 1.5b) — Reviewer rejected, awaiting Architect arbitration
 ] as const;
 
 export type TaskState = (typeof TASK_STATES)[number];
@@ -28,16 +29,34 @@ export type TaskState = (typeof TASK_STATES)[number];
 const VALID_TRANSITIONS: Record<TaskState, readonly TaskState[]> = {
   pending: ["active", "failed"],
   active: ["reviewing", "merging", "done", "failed", "shelved", "escalation_wait", "paused"],
-  reviewing: ["active", "merging", "done", "failed", "escalation_wait"],
+  // Wave 1.5b: reviewing can route to review_arbitration on Reviewer reject (Wave A wires the state,
+  // Wave C wires the Architect listener that consumes it).
+  reviewing: ["active", "merging", "done", "failed", "escalation_wait", "review_arbitration"],
   merging: ["done", "failed", "shelved"],
   done: [],
   failed: ["pending"], // can retry
   shelved: ["pending", "active", "failed"],
   escalation_wait: ["active", "failed"],
   paused: ["active", "failed"],
+  // review_arbitration exit edges mirror reviewing's non-terminal destinations:
+  // back to active (retry_with_directive), merging (arbitration override — gated by C.3),
+  // failed (plan_amendment cancels current task), or escalation_wait (cap reached).
+  review_arbitration: ["active", "merging", "failed", "escalation_wait"],
 };
 
 // --- Task Record ---
+
+export interface DialogueMessage {
+  role: "operator" | "agent";
+  content: string;
+  timestamp: string;
+}
+
+export interface ReviewResult {
+  verdict: string;
+  weightedRisk: number;
+  findingCount: number;
+}
 
 export interface TaskRecord {
   id: string;
@@ -58,14 +77,28 @@ export interface TaskRecord {
   lastError?: string;
   summary?: string;
   filesChanged?: string[];
+  // Phase 2B-3 additions (dialogue + review)
+  dialogueMessages?: DialogueMessage[];
+  dialoguePendingConfirmation?: boolean;
+  reviewResult?: ReviewResult;
+  // Three-tier additions (Wave 1.5b)
+  projectId?: string;              // if present, task is a project phase
+  phaseId?: string;                // phase identifier within project; defaults to task.id
+  arbitrationCount?: number;       // per-task Architect arbitrations on THIS phase
+  reviewerRejectionCount?: number; // per-task Reviewer rejections on THIS phase
 }
 
-// Known keys for defensive deserialization (B7)
+// Known keys for defensive deserialization (B7). Unknown keys are silently dropped on load.
 const KNOWN_KEYS: ReadonlySet<string> = new Set([
+  // Phase 2A
   "id", "state", "prompt", "sessionId", "worktreePath", "branchName",
   "createdAt", "updatedAt", "completedAt", "totalCostUsd", "retryCount",
   "escalationTier", "shelvedAt", "rebaseAttempts", "tier1EscalationCount",
   "lastError", "summary", "filesChanged",
+  // Phase 2B-3
+  "dialogueMessages", "dialoguePendingConfirmation", "reviewResult",
+  // Three-tier (Wave 1.5b)
+  "projectId", "phaseId", "arbitrationCount", "reviewerRejectionCount",
 ]);
 
 // --- Event Log (O9: write-only) ---
