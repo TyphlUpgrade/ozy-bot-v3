@@ -157,13 +157,26 @@ function parseDiscordAgent(raw: Record<string, unknown>, agentName: string): Dis
   };
 }
 
+/**
+ * Config-free Discord agent identity defaults. Any agent key missing from
+ * `[discord.agents.*]` in project.toml resolves to these. Wave 2 establishes
+ * the three conventional keys; new agent tiers should add their default here.
+ */
+export const DISCORD_AGENT_DEFAULTS: Readonly<Record<string, DiscordAgentIdentity>> = {
+  orchestrator: { name: "Harness", avatar_url: "" },
+  architect: { name: "Architect", avatar_url: "" },
+  reviewer: { name: "Reviewer", avatar_url: "" },
+};
+
 function parseDiscord(raw: Record<string, unknown>): DiscordConfig {
   const section = "discord";
   const agentsRaw = (raw.agents ?? {}) as Record<string, Record<string, unknown>>;
-  const agents: Record<string, DiscordAgentIdentity> = {};
+  const parsed: Record<string, DiscordAgentIdentity> = {};
   for (const [name, agentData] of Object.entries(agentsRaw)) {
-    agents[name] = parseDiscordAgent(agentData, name);
+    parsed[name] = parseDiscordAgent(agentData, name);
   }
+  // Project config overrides defaults; unknown agent keys pass through.
+  const agents: Record<string, DiscordAgentIdentity> = { ...DISCORD_AGENT_DEFAULTS, ...parsed };
   return {
     bot_token_env: requireString(raw, "bot_token_env", section),
     dev_channel: requireString(raw, "dev_channel", section),

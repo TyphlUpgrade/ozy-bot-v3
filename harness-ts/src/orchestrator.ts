@@ -95,6 +95,10 @@ export interface OrchestratorDeps {
   config: HarnessConfig;
 }
 
+export type ArbitrationVerdict = "retry_with_directive" | "plan_amendment" | "escalate_operator";
+export type ArchitectRespawnReason = "compaction" | "crash_recovery";
+export type ArbitrationCause = "escalation" | "review_disagreement";
+
 export type OrchestratorEvent =
   | { type: "task_picked_up"; taskId: string; prompt: string }
   | { type: "session_complete"; taskId: string; success: boolean }
@@ -110,7 +114,21 @@ export type OrchestratorEvent =
   | { type: "response_level"; taskId: string; level: ResponseLevel; name: string; reasons: string[] }
   | { type: "completion_compliance"; taskId: string; hasConfidence: boolean; hasUnderstanding: boolean; hasAssumptions: boolean; hasNonGoals: boolean; complianceScore: number }
   | { type: "retry_scheduled"; taskId: string; attempt: number; maxRetries: number }
-  | { type: "budget_exhausted"; taskId: string; totalCostUsd: number };
+  | { type: "budget_exhausted"; taskId: string; totalCostUsd: number }
+  // Wave 2 three-tier events — all project-related events carry projectId (Critic item 10).
+  | { type: "project_declared"; projectId: string; name: string }
+  | { type: "project_decomposed"; projectId: string; phaseCount: number }
+  | { type: "project_completed"; projectId: string; phaseCount: number; totalCostUsd: number }
+  | { type: "project_failed"; projectId: string; reason: string }
+  | { type: "project_aborted"; projectId: string; operatorId: string }
+  | { type: "architect_spawned"; projectId: string; sessionId: string }
+  | { type: "architect_respawned"; projectId: string; sessionId: string; reason: ArchitectRespawnReason }
+  | { type: "architect_arbitration_fired"; taskId: string; projectId: string; cause: ArbitrationCause }
+  | { type: "arbitration_verdict"; taskId: string; projectId: string; verdict: ArbitrationVerdict; rationale: string }
+  | { type: "review_arbitration_entered"; taskId: string; projectId: string; reviewerRejectionCount: number }
+  | { type: "review_mandatory"; taskId: string; projectId: string }
+  | { type: "budget_ceiling_reached"; projectId: string; currentCostUsd: number; ceilingUsd: number }
+  | { type: "compaction_fired"; projectId: string; generation: number };
 
 export class Orchestrator {
   private readonly sessions: SessionManager;
