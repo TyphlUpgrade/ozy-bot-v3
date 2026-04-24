@@ -48,11 +48,20 @@ export interface DiscordConfig {
   agents: Record<string, DiscordAgentIdentity>;
 }
 
+export interface ReviewerConfig {
+  model?: string;                  // default claude-sonnet-4-6 (Reviewer tier, M.13.4 locked)
+  max_budget_usd?: number;         // per-review cap
+  reject_threshold?: number;       // weightedRisk above which default verdict is reject
+  timeout_ms?: number;
+  arbitration_threshold?: number;  // default 2 — transitions to review_arbitration on N-th project reject
+}
+
 export interface HarnessConfig {
   project: ProjectConfig;
   pipeline: PipelineConfig;
   discord: DiscordConfig;
-  systemPrompt?: string;  // loaded from prompt file at startup, cached
+  reviewer?: ReviewerConfig;       // optional — ReviewGate defaults apply when omitted
+  systemPrompt?: string;           // loaded from prompt file at startup, cached
 }
 
 // --- Defaults ---
@@ -218,11 +227,26 @@ export function loadConfig(configPath: string): HarnessConfig {
     throw new Error("Missing required [discord] section in config");
   }
 
-  return {
+  const reviewerRaw = parsed.reviewer;
+  const cfg: HarnessConfig = {
     project: parseProject(projectRaw as Record<string, unknown>),
     pipeline: parsePipeline(pipelineRaw as Record<string, unknown>),
     discord: parseDiscord(discordRaw as Record<string, unknown>),
   };
+  if (reviewerRaw && typeof reviewerRaw === "object") {
+    cfg.reviewer = parseReviewer(reviewerRaw as Record<string, unknown>);
+  }
+  return cfg;
+}
+
+function parseReviewer(raw: Record<string, unknown>): ReviewerConfig {
+  const out: ReviewerConfig = {};
+  if (typeof raw.model === "string") out.model = raw.model;
+  if (typeof raw.max_budget_usd === "number") out.max_budget_usd = raw.max_budget_usd;
+  if (typeof raw.reject_threshold === "number") out.reject_threshold = raw.reject_threshold;
+  if (typeof raw.timeout_ms === "number") out.timeout_ms = raw.timeout_ms;
+  if (typeof raw.arbitration_threshold === "number") out.arbitration_threshold = raw.arbitration_threshold;
+  return out;
 }
 
 // --- System Prompt Loader ---

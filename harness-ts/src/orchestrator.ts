@@ -15,6 +15,7 @@ import { readEscalation, type EscalationSignal } from "./lib/escalation.js";
 import { readCheckpoints, type CheckpointSignal } from "./lib/checkpoint.js";
 import { evaluateResponseLevel, type ResponseLevel } from "./lib/response.js";
 import { sanitizeTaskId } from "./lib/text.js";
+import type { ReviewGate, ReviewResult } from "./gates/review.js";
 
 // --- Task file schema ---
 
@@ -88,6 +89,9 @@ export interface OrchestratorDeps {
   mergeGate: MergeGate;
   stateManager: StateManager;
   config: HarnessConfig;
+  /** Wave A: optional ReviewGate. When present, project tasks always go through review;
+   *  standalone tasks go through review only when `shouldReview` returns true. */
+  reviewGate?: ReviewGate;
 }
 
 export type ArbitrationVerdict = "retry_with_directive" | "plan_amendment" | "escalate_operator";
@@ -130,15 +134,20 @@ export class Orchestrator {
   private readonly mergeGate: MergeGate;
   private readonly state: StateManager;
   private readonly config: HarnessConfig;
+  private readonly reviewGate?: ReviewGate;
   private running = false;
   private pollTimer?: ReturnType<typeof setTimeout>;
   private readonly eventListeners: ((event: OrchestratorEvent) => void)[] = [];
+  /** Tracks task ids that have already emitted the interim Wave A→C "listener not wired" warning,
+   *  so the log fires exactly once per task per Section C.6. */
+  private readonly arbitrationWarnedTasks: Set<string> = new Set();
 
   constructor(deps: OrchestratorDeps) {
     this.sessions = deps.sessionManager;
     this.mergeGate = deps.mergeGate;
     this.state = deps.stateManager;
     this.config = deps.config;
+    this.reviewGate = deps.reviewGate;
   }
 
   /** Register event listener */
@@ -448,24 +457,26 @@ export class Orchestrator {
   }
 
   /**
-   * Decide whether the review gate should fire for this task.
+   * Decide whether the review gate should fire for a standalone task.
    *
-   * Wave 1.5a stub — always returns false (Phase 2A path, no review gate).
-   * Wave A will wire real trigger logic based on:
-   *   - responseLevel >= 2 (reviewed / dialogue)
-   *   - TaskFile.mode === "reviewed"
-   *   - task.projectId !== undefined (project phases are always reviewed)
+   * Project tasks (`task.projectId !== undefined`) ALWAYS fire review — that
+   * decision is made upstream in `routeByResponseLevel` and this method is
+   * not consulted for them.
+   *
+   * Wave A returns `true` when response level ≥ 2 (reviewed / dialogue).
+   * TaskFile.mode === "reviewed" is a future extension (Wave A.1) once the
+   * ingest path plumbs it through to TaskRecord.
    */
   private shouldReview(
     _task: TaskRecord,
     _completion: CompletionSignal,
     _result: SessionResult,
-    _responseLevel: ResponseLevel,
+    responseLevel: ResponseLevel,
   ): boolean {
-    return false;
+    return responseLevel >= 2;
   }
 
-  /** Route task based on response level: today always merge, Wave A routes to review. */
+  /** Route task based on response level: review (when gate present + triggered) or direct merge. */
   private async routeByResponseLevel(
     task: TaskRecord,
     completion: CompletionSignal,
@@ -480,10 +491,18 @@ export class Orchestrator {
       reasons: responseResult.reasons,
     });
 
-    // Wave A hook: if (this.shouldReview(task, completion, result, responseResult.level))
-    //   route to Reviewer session. Until wired, always fall through to merge gate.
-    void this.shouldReview(task, completion, result, responseResult.level);
+    const projectTask = task.projectId !== undefined;
+    const standaloneTriggered = this.shouldReview(task, completion, result, responseResult.level);
+    if (this.reviewGate && (projectTask || standaloneTriggered)) {
+      await this.routeReview(task, completion);
+      return;
+    }
 
+    await this.routeDirectMerge(task, completion);
+  }
+
+  /** Direct merge path — no review gate. Extracted so routeReview can share it on approve. */
+  private async routeDirectMerge(task: TaskRecord, completion: CompletionSignal): Promise<void> {
     this.state.transition(task.id, "merging");
     const updatedTask = this.state.getTask(task.id)!;
     const mergeResult = await this.mergeGate.enqueue(
@@ -494,6 +513,96 @@ export class Orchestrator {
 
     this.emit({ type: "merge_result", taskId: task.id, result: mergeResult });
     this.handleMergeResult(task, mergeResult, completion);
+  }
+
+  /** Route through the Reviewer gate. On approve → merge; on reject → retry or review_arbitration. */
+  private async routeReview(task: TaskRecord, completion: CompletionSignal): Promise<void> {
+    if (!this.reviewGate) return; // defensive — routeByResponseLevel already gated
+
+    this.state.transition(task.id, "reviewing");
+    if (task.projectId) {
+      this.emit({ type: "review_mandatory", taskId: task.id, projectId: task.projectId });
+    }
+
+    const worktreePath = this.state.getTask(task.id)!.worktreePath!;
+    const review = await this.reviewGate.runReview(task, worktreePath, completion);
+
+    this.state.updateTask(task.id, {
+      reviewResult: {
+        verdict: review.verdict,
+        weightedRisk: review.riskScore.weighted,
+        findingCount: review.findings.length,
+      },
+    });
+
+    if (review.verdict === "approve") {
+      this.state.transition(task.id, "merging");
+      const updatedTask = this.state.getTask(task.id)!;
+      const mergeResult = await this.mergeGate.enqueue(
+        task.id,
+        updatedTask.worktreePath!,
+        updatedTask.branchName!,
+      );
+
+      this.emit({ type: "merge_result", taskId: task.id, result: mergeResult });
+      this.handleMergeResult(task, mergeResult, completion);
+      return;
+    }
+
+    await this.handleReviewReject(task, review);
+  }
+
+  /** Handle reject / request_changes verdict. Standalone → failed; project → retry or arbitration. */
+  private async handleReviewReject(task: TaskRecord, review: ReviewResult): Promise<void> {
+    if (!task.projectId) {
+      // Standalone reject → permanent failure for this wave.
+      this.state.transition(task.id, "failed");
+      this.state.updateTask(task.id, {
+        lastError: `Review ${review.verdict}: ${review.summary}`,
+      });
+      this.emit({
+        type: "task_failed",
+        taskId: task.id,
+        reason: `Review ${review.verdict}`,
+      });
+      this.sessions.cleanupWorktree(task.id);
+      return;
+    }
+
+    // Project path: increment rejection counter + check arbitration threshold.
+    const threshold = this.reviewGate!.arbitrationThreshold;
+    const current = this.state.getTask(task.id)!;
+    const newCount = (current.reviewerRejectionCount ?? 0) + 1;
+    this.state.updateTask(task.id, { reviewerRejectionCount: newCount });
+
+    if (newCount >= threshold) {
+      this.state.transition(task.id, "review_arbitration");
+      this.emit({
+        type: "review_arbitration_entered",
+        taskId: task.id,
+        projectId: task.projectId,
+        reviewerRejectionCount: newCount,
+      });
+      if (!this.arbitrationWarnedTasks.has(task.id)) {
+        // Section C.6 interim warning — removed in Wave C when the Architect listener wires in.
+        console.warn(
+          `WARN task=${task.id} in review_arbitration but architect listener not yet wired (Wave A/B/C window); merge blocked`,
+        );
+        this.arbitrationWarnedTasks.add(task.id);
+      }
+      // Merge blocked — no further action until Wave C.
+      return;
+    }
+
+    // Below threshold — retry: transition reviewing → active.
+    // Wave B wires the re-spawn-with-directive flow; Wave A only moves state.
+    this.state.transition(task.id, "active");
+    this.emit({
+      type: "retry_scheduled",
+      taskId: task.id,
+      attempt: newCount,
+      maxRetries: threshold,
+    });
   }
 
   /** Branch on merge gate result: merged / rebase_conflict / test_failed / test_timeout / error. */
@@ -588,6 +697,16 @@ export class Orchestrator {
         this.state.transition(task.id, "failed");
         this.state.transition(task.id, "pending");
         this.processTask(this.state.getTask(task.id)!);
+      }
+      // Section C.6: review_arbitration persists across restarts. The Architect
+      // listener (Wave C) consumes this state; preserve it + worktree so the
+      // listener has the diff to arbitrate over. Re-emit the interim warning
+      // so post-restart ops see the stuck task.
+      if (task.state === "review_arbitration") {
+        console.warn(
+          `WARN task=${task.id} in review_arbitration but architect listener not yet wired (Wave A/B/C window); merge blocked`,
+        );
+        this.arbitrationWarnedTasks.add(task.id);
       }
       // Shelved tasks get retried (worktree already cleaned on shelve path)
       if (task.state === "shelved") {

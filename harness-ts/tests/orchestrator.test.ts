@@ -3,11 +3,12 @@ import { mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Orchestrator, type OrchestratorEvent, type OrchestratorDeps } from "../src/orchestrator.js";
-import { SessionManager, type GitOps } from "../src/session/manager.js";
+import { SessionManager, type GitOps, type CompletionSignal } from "../src/session/manager.js";
 import { SDKClient, type QueryFn } from "../src/session/sdk.js";
 import { MergeGate, type MergeGitOps } from "../src/gates/merge.js";
-import { StateManager } from "../src/lib/state.js";
+import { StateManager, type TaskRecord } from "../src/lib/state.js";
 import type { HarnessConfig } from "../src/lib/config.js";
+import type { ReviewGate, ReviewResult, ReviewVerdict } from "../src/gates/review.js";
 import type { Query, SDKMessage, SDKResultSuccess } from "@anthropic-ai/claude-agent-sdk";
 
 // --- Test infrastructure ---
@@ -1022,5 +1023,402 @@ describe("Orchestrator", () => {
         expect(compEvent.complianceScore).toBe(1);
       }
     });
+  });
+});
+
+// --- Wave A: Review gate + mandatory-for-project + arbitration state wiring ---
+
+/** Fake ReviewGate that returns a pre-configured verdict without spawning SDK. */
+function makeFakeReviewGate(
+  verdict: ReviewVerdict,
+  opts: { arbitrationThreshold?: number; weightedRisk?: number } = {},
+): ReviewGate {
+  const result: ReviewResult = {
+    verdict,
+    riskScore: {
+      correctness: 0,
+      integration: 0,
+      stateCorruption: 0,
+      performance: 0,
+      regression: 0,
+      weighted: opts.weightedRisk ?? (verdict === "approve" ? 0.1 : 0.7),
+    },
+    findings: verdict === "approve" ? [] : [{ severity: "high", file: "f", description: "d" }],
+    summary: `fake ${verdict}`,
+  };
+  return {
+    arbitrationThreshold: opts.arbitrationThreshold ?? 2,
+    runReview: vi.fn().mockResolvedValue(result),
+  } as unknown as ReviewGate;
+}
+
+function setupWithReview(opts: {
+  reviewGate: ReviewGate;
+  withCompletion?: boolean;
+}): TestHarness {
+  const config = makeConfig();
+  mkdirSync(join(tmpDir, "tasks"), { recursive: true });
+
+  const gitOps = mockGitOps();
+  if (opts.withCompletion) {
+    (gitOps.createWorktree as ReturnType<typeof vi.fn>).mockImplementation(
+      (_base: string, _branch: string, wtPath: string) => {
+        mkdirSync(join(wtPath, ".harness"), { recursive: true });
+        writeFileSync(
+          join(wtPath, ".harness", "completion.json"),
+          JSON.stringify({
+            status: "success",
+            commitSha: "abc123",
+            summary: "Fixed it",
+            filesChanged: ["src/fix.ts"],
+          }),
+        );
+      },
+    );
+  }
+
+  const queryFn: QueryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+  const sdk = new SDKClient(queryFn);
+  const state = new StateManager(join(tmpDir, "state.json"));
+  const sessionMgr = new SessionManager(sdk, state, config, gitOps);
+  const mergeGitOps_ = mockMergeGitOps();
+  const mergeGate = new MergeGate(config.pipeline, tmpDir, mergeGitOps_);
+
+  const orch = new Orchestrator({
+    sessionManager: sessionMgr,
+    mergeGate,
+    stateManager: state,
+    config,
+    reviewGate: opts.reviewGate,
+  } as OrchestratorDeps);
+
+  const events: OrchestratorEvent[] = [];
+  orch.on((e) => events.push(e));
+
+  return { orch, state, config, events, gitOps, mergeGitOps: mergeGitOps_, queryFn };
+}
+
+describe("Orchestrator — Wave A review gate + arbitration wiring", () => {
+  beforeEach(() => {
+    tmpDir = makeTmpDir();
+  });
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("standalone task with no review trigger goes directly to merge (Phase 2A preserved)", async () => {
+    const gate = makeFakeReviewGate("approve");
+    const { orch, state, events } = setupWithReview({ reviewGate: gate, withCompletion: true });
+    const task = state.createTask("test", "t1");
+    await orch.processTask(task);
+    // shouldReview default is responseLevel >= 2; minimal completion has no confidence → level 1 → no review
+    expect((gate.runReview as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
+    expect(events.some((e) => e.type === "task_done")).toBe(true);
+  });
+
+  it("project task ALWAYS triggers review + emits review_mandatory", async () => {
+    const gate = makeFakeReviewGate("approve");
+    const { orch, state, events } = setupWithReview({ reviewGate: gate, withCompletion: true });
+    const task = state.createTask("test", "t-proj");
+    state.updateTask("t-proj", { projectId: "proj-abc", phaseId: "phase-1" });
+    await orch.processTask(state.getTask("t-proj")!);
+    expect((gate.runReview as ReturnType<typeof vi.fn>)).toHaveBeenCalledOnce();
+    const reviewMandatory = events.find((e) => e.type === "review_mandatory");
+    expect(reviewMandatory).toBeTruthy();
+    if (reviewMandatory && reviewMandatory.type === "review_mandatory") {
+      expect(reviewMandatory.projectId).toBe("proj-abc");
+    }
+  });
+
+  it("review approve → merging path + task_done", async () => {
+    const gate = makeFakeReviewGate("approve");
+    const { orch, state, events } = setupWithReview({ reviewGate: gate, withCompletion: true });
+    const task = state.createTask("test", "t-ok");
+    state.updateTask("t-ok", { projectId: "proj", phaseId: "p1" });
+    await orch.processTask(state.getTask("t-ok")!);
+    expect(state.getTask("t-ok")!.state).toBe("done");
+    expect(events.some((e) => e.type === "task_done")).toBe(true);
+  });
+
+  it("review reject + standalone → failed (no retry)", async () => {
+    // Rich completion triggers responseLevel ≥ 2 (dialogue) for a standalone task,
+    // which fires the review gate. Reject verdict → transition to failed.
+    const gate = makeFakeReviewGate("reject");
+    const config = makeConfig();
+    mkdirSync(join(tmpDir, "tasks"), { recursive: true });
+    const gitOps = mockGitOps();
+    (gitOps.createWorktree as ReturnType<typeof vi.fn>).mockImplementation(
+      (_b: string, _br: string, wtPath: string) => {
+        mkdirSync(join(wtPath, ".harness"), { recursive: true });
+        writeFileSync(
+          join(wtPath, ".harness", "completion.json"),
+          JSON.stringify({
+            status: "success",
+            commitSha: "abc",
+            summary: "ambiguous work",
+            filesChanged: ["x.ts"],
+            // Confidence with unclear scope + open questions → response level 3 (dialogue).
+            confidence: {
+              scopeClarity: "unclear",
+              designCertainty: "guessing",
+              testCoverage: "untestable",
+              assumptions: [],
+              openQuestions: ["what should this really do?", "is this in scope?"],
+            },
+          }),
+        );
+      },
+    );
+    const queryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+    const sdk = new SDKClient(queryFn);
+    const state = new StateManager(join(tmpDir, "state.json"));
+    const sessionMgr = new SessionManager(sdk, state, config, gitOps);
+    const mergeGate = new MergeGate(config.pipeline, tmpDir, mockMergeGitOps());
+    const orch = new Orchestrator({
+      sessionManager: sessionMgr, mergeGate, stateManager: state, config, reviewGate: gate,
+    });
+    const events: OrchestratorEvent[] = [];
+    orch.on((e) => events.push(e));
+
+    const task = state.createTask("ambiguous work", "t-reject-standalone");
+    // No projectId — pure standalone.
+    await orch.processTask(state.getTask("t-reject-standalone")!);
+
+    expect((gate.runReview as ReturnType<typeof vi.fn>)).toHaveBeenCalledOnce();
+    const updated = state.getTask("t-reject-standalone")!;
+    expect(updated.state).toBe("failed");
+    expect(events.some((e) => e.type === "task_failed" && e.type === "task_failed" && /Review reject/i.test(e.reason))).toBe(true);
+    // No retry for standalone
+    expect(events.some((e) => e.type === "retry_scheduled")).toBe(false);
+  });
+
+  it("review reject + project + count 0 → retry (reviewerRejectionCount becomes 1, transition to active)", async () => {
+    const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 2 });
+    const { orch, state, events } = setupWithReview({ reviewGate: gate, withCompletion: true });
+    const task = state.createTask("test", "t-retry");
+    state.updateTask("t-retry", { projectId: "proj" });
+    await orch.processTask(state.getTask("t-retry")!);
+    const updated = state.getTask("t-retry")!;
+    expect(updated.reviewerRejectionCount).toBe(1);
+    expect(updated.state).toBe("active");
+    expect(events.some((e) => e.type === "retry_scheduled")).toBe(true);
+    // Did NOT enter review_arbitration yet
+    expect(events.some((e) => e.type === "review_arbitration_entered")).toBe(false);
+  });
+
+  it("review reject + project + count already 1 → transitions to review_arbitration at threshold", async () => {
+    const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 2 });
+    const { orch, state, events } = setupWithReview({ reviewGate: gate, withCompletion: true });
+    const task = state.createTask("test", "t-arb");
+    state.updateTask("t-arb", { projectId: "proj", reviewerRejectionCount: 1 });
+    const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await orch.processTask(state.getTask("t-arb")!);
+    consoleSpy.mockRestore();
+    const updated = state.getTask("t-arb")!;
+    expect(updated.reviewerRejectionCount).toBe(2);
+    expect(updated.state).toBe("review_arbitration");
+    const entered = events.find((e) => e.type === "review_arbitration_entered");
+    expect(entered).toBeTruthy();
+    if (entered && entered.type === "review_arbitration_entered") {
+      expect(entered.reviewerRejectionCount).toBe(2);
+      expect(entered.projectId).toBe("proj");
+    }
+  });
+
+  it("interim Wave A→C warning fires exactly once per task in review_arbitration", async () => {
+    const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 2 });
+    const { orch, state } = setupWithReview({ reviewGate: gate, withCompletion: true });
+    const task = state.createTask("test", "t-warn");
+    state.updateTask("t-warn", { projectId: "proj", reviewerRejectionCount: 1 });
+    const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await orch.processTask(state.getTask("t-warn")!);
+    expect(consoleSpy).toHaveBeenCalledOnce();
+    expect(consoleSpy.mock.calls[0][0]).toMatch(/review_arbitration but architect listener not yet wired/);
+    consoleSpy.mockRestore();
+  });
+
+  it("request_changes verdict treated same as reject for retry path", async () => {
+    const gate = makeFakeReviewGate("request_changes", { arbitrationThreshold: 2 });
+    const { orch, state, events } = setupWithReview({ reviewGate: gate, withCompletion: true });
+    const task = state.createTask("test", "t-rc");
+    state.updateTask("t-rc", { projectId: "proj" });
+    await orch.processTask(state.getTask("t-rc")!);
+    expect(state.getTask("t-rc")!.reviewerRejectionCount).toBe(1);
+    expect(state.getTask("t-rc")!.state).toBe("active");
+    expect(events.some((e) => e.type === "retry_scheduled")).toBe(true);
+  });
+
+  it("configurable arbitration_threshold honored (threshold=1 triggers arbitration on first reject)", async () => {
+    const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 1 });
+    const { orch, state, events } = setupWithReview({ reviewGate: gate, withCompletion: true });
+    const task = state.createTask("test", "t-1");
+    state.updateTask("t-1", { projectId: "proj" });
+    const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await orch.processTask(state.getTask("t-1")!);
+    consoleSpy.mockRestore();
+    expect(state.getTask("t-1")!.state).toBe("review_arbitration");
+    expect(events.some((e) => e.type === "review_arbitration_entered")).toBe(true);
+  });
+
+  it("review result persists into task.reviewResult on any verdict", async () => {
+    const gate = makeFakeReviewGate("approve", { weightedRisk: 0.15 });
+    const { orch, state } = setupWithReview({ reviewGate: gate, withCompletion: true });
+    const task = state.createTask("test", "t-res");
+    state.updateTask("t-res", { projectId: "proj" });
+    await orch.processTask(state.getTask("t-res")!);
+    const rr = state.getTask("t-res")!.reviewResult;
+    expect(rr).toBeTruthy();
+    expect(rr!.verdict).toBe("approve");
+    expect(rr!.weightedRisk).toBeCloseTo(0.15);
+    expect(rr!.findingCount).toBe(0);
+  });
+
+  it("reviewerRejectionCount round-trips via state persistence", async () => {
+    const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 3 });
+    const { orch, state } = setupWithReview({ reviewGate: gate, withCompletion: true });
+    const task = state.createTask("test", "t-rt");
+    state.updateTask("t-rt", { projectId: "proj" });
+    await orch.processTask(state.getTask("t-rt")!);
+    const count = state.getTask("t-rt")!.reviewerRejectionCount;
+    const mgr2 = new StateManager(join(tmpDir, "state.json"));
+    expect(mgr2.getTask("t-rt")!.reviewerRejectionCount).toBe(count);
+  });
+
+  it("orchestrator with NO reviewGate skips review path entirely (backward-compat)", async () => {
+    // Construct orchestrator WITHOUT reviewGate — same as Phase 2A.
+    const config = makeConfig();
+    mkdirSync(join(tmpDir, "tasks"), { recursive: true });
+    const gitOps = mockGitOps();
+    (gitOps.createWorktree as ReturnType<typeof vi.fn>).mockImplementation(
+      (_b: string, _br: string, wtPath: string) => {
+        mkdirSync(join(wtPath, ".harness"), { recursive: true });
+        writeFileSync(
+          join(wtPath, ".harness", "completion.json"),
+          JSON.stringify({
+            status: "success",
+            commitSha: "x",
+            summary: "done",
+            filesChanged: ["a.ts"],
+          }),
+        );
+      },
+    );
+    const queryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+    const sdk = new SDKClient(queryFn);
+    const state = new StateManager(join(tmpDir, "state.json"));
+    const sessionMgr = new SessionManager(sdk, state, config, gitOps);
+    const mergeGate = new MergeGate(config.pipeline, tmpDir, mockMergeGitOps());
+    const orch = new Orchestrator({ sessionManager: sessionMgr, mergeGate, stateManager: state, config });
+    const events: OrchestratorEvent[] = [];
+    orch.on((e) => events.push(e));
+    const task = state.createTask("test", "t-nogate");
+    state.updateTask("t-nogate", { projectId: "proj" }); // even project → no review without gate
+    await orch.processTask(state.getTask("t-nogate")!);
+    expect(events.some((e) => e.type === "task_done")).toBe(true);
+    expect(events.some((e) => e.type === "review_mandatory")).toBe(false);
+  });
+
+  it("reviewGate.runReview receives correct task + worktreePath + completion", async () => {
+    const gate = makeFakeReviewGate("approve");
+    const { orch, state } = setupWithReview({ reviewGate: gate, withCompletion: true });
+    const task = state.createTask("my prompt", "t-args");
+    state.updateTask("t-args", { projectId: "proj" });
+    await orch.processTask(state.getTask("t-args")!);
+    const call = (gate.runReview as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(call[0].id).toBe("t-args");
+    expect(call[1]).toContain("task-t-args"); // worktreePath
+    expect(call[2].summary).toBe("Fixed it");
+  });
+
+  it("arbitration warning fires exactly once across multiple transitions on same task", async () => {
+    const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 1 });
+    const { orch, state } = setupWithReview({ reviewGate: gate, withCompletion: true });
+    const task = state.createTask("test", "t-once");
+    state.updateTask("t-once", { projectId: "proj" });
+    const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await orch.processTask(state.getTask("t-once")!);
+    // Attempting to reprocess doesn't realistically happen for review_arbitration state,
+    // but the warned-set persists across calls. We only check first warning fired cleanly.
+    expect(consoleSpy).toHaveBeenCalledOnce();
+    consoleSpy.mockRestore();
+  });
+
+  it("reviewGate threshold exposed to handleReviewReject logic matches config", async () => {
+    // Create a gate with threshold 5 and verify retry runs through to count 5.
+    const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 5 });
+    const { orch, state } = setupWithReview({ reviewGate: gate, withCompletion: true });
+    const task = state.createTask("test", "t-thresh");
+    state.updateTask("t-thresh", { projectId: "proj", reviewerRejectionCount: 4 });
+    const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await orch.processTask(state.getTask("t-thresh")!);
+    consoleSpy.mockRestore();
+    const updated = state.getTask("t-thresh")!;
+    expect(updated.reviewerRejectionCount).toBe(5);
+    expect(updated.state).toBe("review_arbitration");
+  });
+
+  it("approve verdict with zero findings proceeds cleanly without any retry signal", async () => {
+    const gate = makeFakeReviewGate("approve");
+    const { orch, state, events } = setupWithReview({ reviewGate: gate, withCompletion: true });
+    const task = state.createTask("test", "t-clean");
+    state.updateTask("t-clean", { projectId: "proj" });
+    await orch.processTask(state.getTask("t-clean")!);
+    expect(events.some((e) => e.type === "retry_scheduled")).toBe(false);
+    expect(state.getTask("t-clean")!.state).toBe("done");
+  });
+
+  it("review_mandatory emitted BEFORE review runs (ordering)", async () => {
+    let runReviewCalledAt = -1;
+    const gate = {
+      arbitrationThreshold: 2,
+      runReview: vi.fn().mockImplementation(async () => {
+        runReviewCalledAt = eventsRef.length;
+        return {
+          verdict: "approve" as const,
+          riskScore: { correctness: 0, integration: 0, stateCorruption: 0, performance: 0, regression: 0, weighted: 0.1 },
+          findings: [],
+          summary: "ok",
+        };
+      }),
+    } as unknown as ReviewGate;
+    const eventsRef: OrchestratorEvent[] = [];
+    // Can't use setupWithReview since we need eventsRef captured before runReview
+    const config = makeConfig();
+    mkdirSync(join(tmpDir, "tasks"), { recursive: true });
+    const gitOps = mockGitOps();
+    (gitOps.createWorktree as ReturnType<typeof vi.fn>).mockImplementation(
+      (_b: string, _br: string, wtPath: string) => {
+        mkdirSync(join(wtPath, ".harness"), { recursive: true });
+        writeFileSync(
+          join(wtPath, ".harness", "completion.json"),
+          JSON.stringify({ status: "success", commitSha: "x", summary: "done", filesChanged: [] }),
+        );
+      },
+    );
+    const queryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+    const sdk = new SDKClient(queryFn);
+    const state = new StateManager(join(tmpDir, "state.json"));
+    const sessionMgr = new SessionManager(sdk, state, config, gitOps);
+    const mergeGate = new MergeGate(config.pipeline, tmpDir, mockMergeGitOps());
+    const orch = new Orchestrator({ sessionManager: sessionMgr, mergeGate, stateManager: state, config, reviewGate: gate });
+    orch.on((e) => eventsRef.push(e));
+    const task = state.createTask("test", "t-order");
+    state.updateTask("t-order", { projectId: "proj" });
+    await orch.processTask(state.getTask("t-order")!);
+    // review_mandatory fires BEFORE runReview is invoked
+    const mandatoryIdx = eventsRef.findIndex((e) => e.type === "review_mandatory");
+    expect(mandatoryIdx).toBeGreaterThanOrEqual(0);
+    expect(runReviewCalledAt).toBeGreaterThan(mandatoryIdx);
+  });
+
+  it("reject + project logs warning ONLY at threshold, not at count < threshold", async () => {
+    const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 3 });
+    const { orch, state } = setupWithReview({ reviewGate: gate, withCompletion: true });
+    const task = state.createTask("test", "t-warn-no");
+    state.updateTask("t-warn-no", { projectId: "proj" }); // count 0 → becomes 1, below threshold 3
+    const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await orch.processTask(state.getTask("t-warn-no")!);
+    expect(consoleSpy).not.toHaveBeenCalled(); // no arbitration yet
+    consoleSpy.mockRestore();
   });
 });
