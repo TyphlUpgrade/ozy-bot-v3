@@ -22,6 +22,78 @@ import type { GitOps } from "./manager.js";
 import type { EscalationSignal } from "../lib/escalation.js";
 import type { ReviewResult } from "../gates/review.js";
 
+// --- Constants ---
+
+/**
+ * Tools blocked for the Architect session. Network reach (WebFetch/WebSearch),
+ * cron primitives, and team lifecycle operations exceed the Architect's
+ * retry-only authority. `Task` is NOT blocked — OMC subagent delegation is
+ * validated (plan M.12) and a core decomposition pattern.
+ */
+export const ARCHITECT_DISALLOWED_TOOLS: readonly string[] = [
+  "WebFetch",
+  "WebSearch",
+  "CronCreate",
+  "CronDelete",
+  "CronList",
+  "TeamCreate",
+  "TeamDelete",
+];
+
+/**
+ * Full schema check for `architect-summary.json` written by the Architect at
+ * compaction time. Rejects the file if any top-level field shape is wrong,
+ * forcing the fallback projectStore-derived summary (which preserves verbatim
+ * invariants). Wave B only validated nonGoals — SEC M1 extends coverage to
+ * every field.
+ */
+export function validateArchitectCompactionSummary(
+  v: unknown,
+): v is ArchitectCompactionSummary {
+  if (!v || typeof v !== "object") return false;
+  const s = v as Record<string, unknown>;
+  if (typeof s.projectId !== "string" || s.projectId.length === 0) return false;
+  if (typeof s.name !== "string") return false;
+  if (typeof s.description !== "string") return false;
+  if (!Array.isArray(s.nonGoals) || !s.nonGoals.every((g) => typeof g === "string")) return false;
+  if (typeof s.compactedAt !== "string") return false;
+  if (typeof s.compactionGeneration !== "number" || !Number.isFinite(s.compactionGeneration)) return false;
+
+  if (!Array.isArray(s.priorVerdicts)) return false;
+  const verdictTypes = new Set(["retry_with_directive", "plan_amendment", "escalate_operator"]);
+  for (const pv of s.priorVerdicts) {
+    if (!pv || typeof pv !== "object") return false;
+    const e = pv as Record<string, unknown>;
+    if (typeof e.phaseId !== "string") return false;
+    if (typeof e.verdict !== "string" || !verdictTypes.has(e.verdict)) return false;
+    if (typeof e.rationale !== "string") return false;
+    if (typeof e.timestamp !== "string") return false;
+  }
+
+  if (!Array.isArray(s.completedPhases)) return false;
+  const phaseStates = new Set(["done", "failed"]);
+  for (const cp of s.completedPhases) {
+    if (!cp || typeof cp !== "object") return false;
+    const e = cp as Record<string, unknown>;
+    if (typeof e.phaseId !== "string") return false;
+    if (typeof e.taskId !== "string") return false;
+    if (typeof e.state !== "string" || !phaseStates.has(e.state)) return false;
+    if (typeof e.finalCostUsd !== "number" || !Number.isFinite(e.finalCostUsd)) return false;
+    if (e.finalVerdict !== undefined && typeof e.finalVerdict !== "string") return false;
+  }
+
+  if (!s.currentPhaseContext || typeof s.currentPhaseContext !== "object") return false;
+  const cpc = s.currentPhaseContext as Record<string, unknown>;
+  if (typeof cpc.phaseId !== "string") return false;
+  if (typeof cpc.taskId !== "string") return false;
+  if (typeof cpc.state !== "string") return false;
+  if (typeof cpc.reviewerRejectionCount !== "number") return false;
+  if (typeof cpc.arbitrationCount !== "number") return false;
+  if (cpc.lastDirective !== undefined && typeof cpc.lastDirective !== "string") return false;
+
+  return true;
+}
+
 // --- Types ---
 
 export type ArchitectVerdict =
@@ -459,12 +531,15 @@ export class ArchitectManager {
       priorVerdicts: [],
       completedPhases: project.phases
         .filter((p) => p.state === "done" || p.state === "failed")
-        .map((p) => ({
-          phaseId: p.id,
-          taskId: p.taskId ?? "",
-          state: p.state as "done" | "failed",
-          finalCostUsd: 0,
-        })),
+        .map((p) => {
+          const taskRecord = p.taskId ? this.state.getTask(p.taskId) : undefined;
+          return {
+            phaseId: p.id,
+            taskId: p.taskId ?? "",
+            state: p.state as "done" | "failed",
+            finalCostUsd: taskRecord?.totalCostUsd ?? 0,
+          };
+        }),
       currentPhaseContext: {
         phaseId: project.phases.find((p) => p.state === "active")?.id ?? "",
         taskId: project.phases.find((p) => p.state === "active")?.taskId ?? "",
@@ -497,11 +572,19 @@ export class ArchitectManager {
   private readArchitectSummaryFile(worktreePath: string): ArchitectCompactionSummary | null {
     const path = join(worktreePath, ".harness", "architect-summary.json");
     if (!existsSync(path)) return null;
+    let parsed: unknown;
     try {
-      return JSON.parse(readFileSync(path, "utf-8")) as ArchitectCompactionSummary;
+      parsed = JSON.parse(readFileSync(path, "utf-8"));
     } catch {
       return null;
     }
+    if (!validateArchitectCompactionSummary(parsed)) {
+      console.warn(
+        `WARN architect-summary.json at ${path} failed schema validation; falling back to projectStore-derived summary`,
+      );
+      return null;
+    }
+    return parsed;
   }
 
   // --- Liveness / crash recovery ---
@@ -557,6 +640,7 @@ export class ArchitectManager {
       settingSources: ["project"],
       enabledPlugins: this.architect.plugins,
       hooks: {},
+      disallowedTools: [...ARCHITECT_DISALLOWED_TOOLS],
       abortController: ac,
     };
 

@@ -12,6 +12,7 @@ import {
   type ArchitectConfig,
   writePhaseFile,
   cleanupPhaseFiles,
+  validateArchitectCompactionSummary,
 } from "../../src/session/architect.js";
 import { SDKClient, type QueryFn } from "../../src/session/sdk.js";
 import type { GitOps } from "../../src/session/manager.js";
@@ -224,6 +225,20 @@ describe("ArchitectManager", () => {
     const opts = h.capturedOptions[0] as Options & { settings?: { enabledPlugins?: Record<string, boolean> } };
     expect(opts.settings?.enabledPlugins?.["oh-my-claudecode@omc"]).toBe(true);
     expect(opts.settings?.enabledPlugins?.["caveman@caveman"]).toBe(true);
+  });
+
+  it("spawn options: disallows network + cron + team-lifecycle tools (SEC M2)", async () => {
+    const h = setupManager();
+    const p = h.projectStore.createProject("proj-sec-m2", "d", []);
+    await h.manager.spawn(p.id, p.name, p.description, p.nonGoals);
+    const opts = h.capturedOptions[0];
+    expect(opts.disallowedTools).toEqual(expect.arrayContaining([
+      "WebFetch", "WebSearch",
+      "CronCreate", "CronDelete", "CronList",
+      "TeamCreate", "TeamDelete",
+    ]));
+    // `Task` MUST remain available — OMC subagent delegation is core to decomposition.
+    expect(opts.disallowedTools).not.toContain("Task");
   });
 
   // --- Decomposition ---
@@ -446,6 +461,99 @@ describe("ArchitectManager", () => {
     const summary = await h.manager.requestSummary(p.id);
     consoleSpy.mockRestore();
     expect(summary.nonGoals).toEqual(["ng-1", "ng-2"]);
+  });
+
+  // --- SEC M1: full schema validation for architect-summary.json ---
+
+  it("validateArchitectCompactionSummary accepts a well-formed summary", () => {
+    const ok = {
+      projectId: "p1",
+      name: "n",
+      description: "d",
+      nonGoals: ["a", "b"],
+      priorVerdicts: [{ phaseId: "ph1", verdict: "retry_with_directive", rationale: "r", timestamp: "t" }],
+      completedPhases: [{ phaseId: "ph0", taskId: "t0", state: "done", finalCostUsd: 0.5 }],
+      currentPhaseContext: { phaseId: "ph1", taskId: "t1", state: "running", reviewerRejectionCount: 0, arbitrationCount: 0 },
+      compactedAt: "2026-04-24T00:00:00Z",
+      compactionGeneration: 1,
+    };
+    expect(validateArchitectCompactionSummary(ok)).toBe(true);
+  });
+
+  it("validateArchitectCompactionSummary rejects invalid verdict enum", () => {
+    const bad = {
+      projectId: "p1", name: "n", description: "d", nonGoals: [],
+      priorVerdicts: [{ phaseId: "x", verdict: "executor_correct", rationale: "", timestamp: "" }],
+      completedPhases: [],
+      currentPhaseContext: { phaseId: "", taskId: "", state: "", reviewerRejectionCount: 0, arbitrationCount: 0 },
+      compactedAt: "", compactionGeneration: 0,
+    };
+    expect(validateArchitectCompactionSummary(bad)).toBe(false);
+  });
+
+  it("validateArchitectCompactionSummary rejects non-array nonGoals", () => {
+    const bad = {
+      projectId: "p1", name: "n", description: "d", nonGoals: "not-an-array",
+      priorVerdicts: [], completedPhases: [],
+      currentPhaseContext: { phaseId: "", taskId: "", state: "", reviewerRejectionCount: 0, arbitrationCount: 0 },
+      compactedAt: "", compactionGeneration: 0,
+    };
+    expect(validateArchitectCompactionSummary(bad)).toBe(false);
+  });
+
+  it("validateArchitectCompactionSummary rejects missing currentPhaseContext counters", () => {
+    const bad = {
+      projectId: "p1", name: "n", description: "d", nonGoals: [],
+      priorVerdicts: [], completedPhases: [],
+      currentPhaseContext: { phaseId: "", taskId: "", state: "" }, // missing counters
+      compactedAt: "", compactionGeneration: 0,
+    };
+    expect(validateArchitectCompactionSummary(bad)).toBe(false);
+  });
+
+  it("validateArchitectCompactionSummary rejects non-numeric finalCostUsd", () => {
+    const bad = {
+      projectId: "p1", name: "n", description: "d", nonGoals: [],
+      priorVerdicts: [],
+      completedPhases: [{ phaseId: "ph0", taskId: "t0", state: "done", finalCostUsd: "not-a-number" }],
+      currentPhaseContext: { phaseId: "", taskId: "", state: "", reviewerRejectionCount: 0, arbitrationCount: 0 },
+      compactedAt: "", compactionGeneration: 0,
+    };
+    expect(validateArchitectCompactionSummary(bad)).toBe(false);
+  });
+
+  it("requestSummary synthesized completedPhases pull finalCostUsd from StateManager (CR M2)", async () => {
+    const h = setupManager();
+    const p = h.projectStore.createProject("proj-cost", "d", []);
+    h.projectStore.addPhase(p.id, "phase 1", "ph-1");
+    h.projectStore.attachTask(p.id, "ph-1", "t-ph1");
+    const task = h.state.createTask("phase 1", "t-ph1");
+    h.state.updateTask(task.id, { projectId: p.id, phaseId: "ph-1", totalCostUsd: 0.42 });
+    h.projectStore.markPhaseDone(p.id, "ph-1");
+    await h.manager.spawn(p.id, p.name, p.description, p.nonGoals);
+    // No architect-summary.json on disk → fallback path synthesizes summary.
+    const summary = await h.manager.requestSummary(p.id);
+    const ph1 = summary.completedPhases.find((cp) => cp.phaseId === "ph-1");
+    expect(ph1?.finalCostUsd).toBe(0.42);
+  });
+
+  it("requestSummary falls back to projectStore when summary file fails schema", async () => {
+    const h = setupManager();
+    const p = h.projectStore.createProject("proj-badschema", "desc-x", ["ng-a"]);
+    await h.manager.spawn(p.id, p.name, p.description, p.nonGoals);
+    const session = h.manager.getSession(p.id)!;
+    mkdirSync(join(session.worktreePath, ".harness"), { recursive: true });
+    // Write schema-invalid summary (missing priorVerdicts, wrong type)
+    writeFileSync(
+      join(session.worktreePath, ".harness", "architect-summary.json"),
+      JSON.stringify({ projectId: p.id, name: "garbage", nonGoals: "not-array" }),
+    );
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const summary = await h.manager.requestSummary(p.id);
+    warnSpy.mockRestore();
+    // Fallback uses verbatim projectStore values
+    expect(summary.nonGoals).toEqual(["ng-a"]);
+    expect(summary.description).toBe("desc-x");
   });
 
   // --- Architect authority / no-merge-override ---
