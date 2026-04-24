@@ -125,10 +125,11 @@ export const realMergeGitOps: MergeGitOps = {
   },
 
   getTrunkBranch(trunkCwd: string): string {
-    // Try to determine the main branch
+    // Prefer origin/HEAD (remote-tracking repo), then local HEAD (local-only repo),
+    // then master as last-resort default.
     try {
       const ref = execSync(
-        "git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null || echo refs/heads/master",
+        "git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null || git symbolic-ref HEAD 2>/dev/null || echo refs/heads/master",
         { ...execOpts(trunkCwd), shell: "/bin/bash" },
       ) as unknown as string;
       return ref.trim().replace("refs/remotes/origin/", "").replace("refs/heads/", "");

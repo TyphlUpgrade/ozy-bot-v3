@@ -297,13 +297,28 @@ describe("realMergeGitOps — validation against real git", () => {
   // -------------------------------------------------------------------------
 
   describe("getTrunkBranch", () => {
-    it("returns the current branch name for a local-only repo", () => {
-      initRepo(tmpDir);
-      // No remote configured — falls back to detecting the default branch name
-      const branch = realMergeGitOps.getTrunkBranch(tmpDir);
-      // Should be a non-empty string (typically 'master' or 'main')
-      expect(typeof branch).toBe("string");
-      expect(branch.length).toBeGreaterThan(0);
+    it("returns 'main' for a local-only repo initialized with -b main", () => {
+      const opts = { cwd: tmpDir, stdio: "pipe" as const };
+      execSync("git init -b main", opts);
+      execSync("git config user.email 'test@harness.local'", opts);
+      execSync("git config user.name 'Harness Test'", opts);
+      execSync("git config commit.gpgsign false", opts);
+      writeFileSync(join(tmpDir, "README.md"), "initial\n");
+      execSync("git add README.md", opts);
+      execSync("git commit -m 'initial commit'", opts);
+      expect(realMergeGitOps.getTrunkBranch(tmpDir)).toBe("main");
+    });
+
+    it("returns 'master' for a local-only repo initialized with -b master", () => {
+      const opts = { cwd: tmpDir, stdio: "pipe" as const };
+      execSync("git init -b master", opts);
+      execSync("git config user.email 'test@harness.local'", opts);
+      execSync("git config user.name 'Harness Test'", opts);
+      execSync("git config commit.gpgsign false", opts);
+      writeFileSync(join(tmpDir, "README.md"), "initial\n");
+      execSync("git add README.md", opts);
+      execSync("git commit -m 'initial commit'", opts);
+      expect(realMergeGitOps.getTrunkBranch(tmpDir)).toBe("master");
     });
   });
 });
