@@ -269,6 +269,50 @@ describe("Orchestrator", () => {
       // Should still be the original task
       expect(state.getTask("task-dup")!.prompt).toBe("existing");
     });
+
+    // --- Wave 1.5b: TaskFile three-tier + mode extensions ---
+
+    it("ingests task file with projectId and phaseId", () => {
+      const { orch, state } = setupHarness({ withCompletion: true });
+      writeFileSync(
+        join(tmpDir, "tasks", "proj-task.json"),
+        JSON.stringify({
+          id: "proj-task",
+          prompt: "phase 1: add logger",
+          projectId: "proj-abc",
+          phaseId: "phase-1",
+        }),
+      );
+
+      orch.scanForTasks();
+
+      const task = state.getTask("proj-task");
+      expect(task).toBeTruthy();
+      // TaskFile fields parsed but not yet persisted to TaskRecord (routeByProject
+      // in Wave 1.5a + project attachment in Wave B wires the projectId into state).
+      // The smoke check here is that the file was accepted, not rejected.
+      expect(task!.prompt).toBe("phase 1: add logger");
+    });
+
+    it("rejects task file with projectId + mode:dialogue (Section C.2)", () => {
+      const { orch, state } = setupHarness({ withCompletion: true });
+      const badPath = join(tmpDir, "tasks", "conflict.json");
+      writeFileSync(
+        badPath,
+        JSON.stringify({
+          id: "conflict",
+          prompt: "ambiguous",
+          projectId: "proj-xyz",
+          mode: "dialogue",
+        }),
+      );
+
+      orch.scanForTasks();
+
+      // No task created; file removed.
+      expect(state.getAllTasks()).toHaveLength(0);
+      expect(existsSync(badPath)).toBe(false);
+    });
   });
 
   describe("processTask — full lifecycle", () => {

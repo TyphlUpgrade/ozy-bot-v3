@@ -16,10 +16,23 @@ import { evaluateResponseLevel, type ResponseLevel } from "./lib/response.js";
 
 // --- Task file schema ---
 
+export type TaskFileMode = "dialogue" | "reviewed";
+
 export interface TaskFile {
   id?: string;
   prompt: string;
   priority?: number;
+  mode?: TaskFileMode;    // Phase 2B-3: "dialogue" (pre-pipeline) or "reviewed" (force review gate)
+  projectId?: string;     // Three-tier (Wave 1.5b): if present, task is a project phase
+  phaseId?: string;       // Three-tier (Wave 1.5b): phase identifier within project; defaults to task.id
+}
+
+/** Thrown by parseTaskFile on business-rule validation (e.g. projectId+mode:dialogue). */
+export class TaskFileValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TaskFileValidationError";
+  }
 }
 
 // O4: Path traversal validation on task IDs (untrusted Discord/file input)
@@ -31,15 +44,45 @@ function sanitizeTaskId(raw: string): string | null {
   return raw;
 }
 
+/**
+ * Parse a task file from disk.
+ *
+ * Returns `null` for malformed JSON or structural failure (missing prompt,
+ * wrong types on required fields) — these are "just ignore the file" cases.
+ *
+ * Throws `TaskFileValidationError` for business-rule violations that the
+ * operator needs to see. Currently the only business rule is the Section C.2
+ * mutual-exclusion: `projectId` and `mode: "dialogue"` cannot coexist —
+ * project-scoped dialogue happens through the Architect, not the standalone
+ * dialogue session (Wave 6-split).
+ */
 function parseTaskFile(path: string): TaskFile | null {
+  let raw: unknown;
   try {
-    const raw = JSON.parse(readFileSync(path, "utf-8"));
-    if (typeof raw !== "object" || !raw) return null;
-    if (typeof raw.prompt !== "string" || raw.prompt.length === 0) return null;
-    return raw as TaskFile;
+    raw = JSON.parse(readFileSync(path, "utf-8"));
   } catch {
     return null;
   }
+  if (typeof raw !== "object" || !raw) return null;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.prompt !== "string" || obj.prompt.length === 0) return null;
+
+  // Optional field type checks — silently drop malformed optional fields (B7 pattern)
+  const result: TaskFile = { prompt: obj.prompt };
+  if (typeof obj.id === "string") result.id = obj.id;
+  if (typeof obj.priority === "number") result.priority = obj.priority;
+  if (obj.mode === "dialogue" || obj.mode === "reviewed") result.mode = obj.mode;
+  if (typeof obj.projectId === "string") result.projectId = obj.projectId;
+  if (typeof obj.phaseId === "string") result.phaseId = obj.phaseId;
+
+  // Section C.2 routing conflict: projectId + mode:"dialogue" is rejected at ingest.
+  if (result.projectId && result.mode === "dialogue") {
+    throw new TaskFileValidationError(
+      "projectId and mode:dialogue are mutually exclusive (project dialogue routes through the Architect)",
+    );
+  }
+
+  return result;
 }
 
 // --- Orchestrator ---
@@ -158,9 +201,19 @@ export class Orchestrator {
 
     for (const file of files) {
       const filePath = join(taskDir, file);
-      const taskFile = parseTaskFile(filePath);
+      let taskFile: TaskFile | null;
+      try {
+        taskFile = parseTaskFile(filePath);
+      } catch (err) {
+        if (err instanceof TaskFileValidationError) {
+          // Business-rule rejection — log for operator visibility, drop the file.
+          console.warn(`[orchestrator] task file rejected at ingest (${file}): ${err.message}`);
+        }
+        try { unlinkSync(filePath); } catch { /* ignore */ }
+        continue;
+      }
       if (!taskFile) {
-        // Invalid file — remove it
+        // Malformed JSON / structural failure — remove silently.
         try { unlinkSync(filePath); } catch { /* ignore */ }
         continue;
       }
