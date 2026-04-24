@@ -17,7 +17,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import type { HarnessConfig } from "../../src/lib/config.js";
 
 export const DEFAULT_POLL_INTERVAL_SEC = 3;
@@ -56,18 +56,24 @@ export function initScratchRepo(opts: InitScratchRepoOpts): string {
       );
     }
   }
-  execSync("git init -b main", { cwd: root, stdio: "ignore" });
-  execSync(`git config user.email ${opts.gitEmail ?? "live@harness.test"}`, {
+  // argv form (no shell) — safe even when callers thread untrusted text into
+  // gitEmail/gitName. Each git call is its own execFileSync.
+  execFileSync("git", ["init", "-b", "main"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", opts.gitEmail ?? "live@harness.test"], {
     cwd: root,
     stdio: "ignore",
   });
-  execSync(`git config user.name ${opts.gitName ?? "live"}`, { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", opts.gitName ?? "live"], {
+    cwd: root,
+    stdio: "ignore",
+  });
   writeFileSync(join(root, "README.md"), `# scratch ${opts.prefix}\n`);
   writeFileSync(
     join(root, ".gitignore"),
     "tasks/\nworktrees/\nsessions/\nstate.json\nprojects.json\nstate.log.jsonl\n",
   );
-  execSync("git add -A && git commit -m init", { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["add", "-A"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "init"], { cwd: root, stdio: "ignore" });
   return root;
 }
 

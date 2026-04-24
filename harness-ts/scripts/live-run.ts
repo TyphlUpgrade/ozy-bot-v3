@@ -14,10 +14,8 @@
  *  - Task file ingest → session spawn → completion detect → merge queue → trunk
  */
 
-import { mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { writeFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { execSync } from "node:child_process";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { Orchestrator, type OrchestratorEvent } from "../src/orchestrator.js";
 import { SessionManager } from "../src/session/manager.js";
@@ -25,22 +23,7 @@ import { SDKClient } from "../src/session/sdk.js";
 import { MergeGate } from "../src/gates/merge.js";
 import { StateManager } from "../src/lib/state.js";
 import type { HarnessConfig } from "../src/lib/config.js";
-
-// ---------- Scratch repo bootstrap ----------
-
-function initScratchRepo(): string {
-  const root = join(tmpdir(), `harness-live-${Date.now()}`);
-  mkdirSync(root, { recursive: true });
-  mkdirSync(join(root, "tasks"), { recursive: true });
-  mkdirSync(join(root, "worktrees"), { recursive: true });
-  mkdirSync(join(root, "sessions"), { recursive: true });
-  execSync("git init -b main", { cwd: root, stdio: "ignore" });
-  execSync("git config user.email live-run@harness.test", { cwd: root, stdio: "ignore" });
-  execSync("git config user.name live-run", { cwd: root, stdio: "ignore" });
-  writeFileSync(join(root, "README.md"), "# scratch\n");
-  execSync("git add -A && git commit -m init", { cwd: root, stdio: "ignore" });
-  return root;
-}
+import { initScratchRepo } from "./lib/scratch-repo.js";
 
 function buildConfig(root: string): HarnessConfig {
   return {
@@ -183,7 +166,11 @@ const TASK_PROMPT =
 // ---------- Runner ----------
 
 async function main(): Promise<void> {
-  const root = initScratchRepo();
+  const root = initScratchRepo({
+    prefix: "harness-live",
+    gitEmail: "live-run@harness.test",
+    gitName: "live-run",
+  });
   console.log(`[live-run] mode: ${MODE}`);
   console.log(`[live-run] scratch root: ${root}`);
 

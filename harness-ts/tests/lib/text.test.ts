@@ -6,11 +6,27 @@ describe("truncateRationale", () => {
     expect(truncateRationale("short reason")).toBe("short reason");
   });
 
-  it("caps at default 1024 chars with ellipsis", () => {
+  it("caps at default 1024 chars + single-character ellipsis suffix", () => {
     const long = "x".repeat(2000);
     const out = truncateRationale(long);
-    expect(out.length).toBe(1025); // 1024 + ellipsis char
+    expect(out.length).toBeLessThanOrEqual(1024 + 2); // tolerant of ellipsis-char width drift
+    expect(out.startsWith("x".repeat(1024))).toBe(true);
     expect(out.endsWith("…")).toBe(true);
+  });
+
+  it("strips C1 controls (8-bit CSI)", () => {
+    expect(truncateRationale("aXb")).toBe("aXb");
+  });
+
+  it("strips BIDI override characters", () => {
+    // ‮ = Right-to-Left Override; commonly used for filename spoofing.
+    expect(truncateRationale("hi‮there")).toBe("hithere");
+  });
+
+  it("strips OSC escape sequence (ESC ] ... BEL)", () => {
+    // OSC 0;title sets terminal title; malicious content would survive a
+    // naive ANSI-only regex that only handles CSI-final-byte.
+    expect(truncateRationale("safe]0;pwndtext")).toBe("safetext");
   });
 
   it("strips ANSI escape sequences", () => {

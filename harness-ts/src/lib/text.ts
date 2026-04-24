@@ -40,17 +40,22 @@ export function redactSecrets(raw: string): string {
  */
 export function sanitize(raw: string, maxLen: number = MAX_FIELD_LEN): string {
   const stripped = raw
-    .replace(/@(everyone|here)/g, "@​$1") // zero-width joiner neutralizes mention
-    .replace(/`/g, "\\`");                 // don't escape the surrounding code span
+    .replace(/@(everyone|here)/g, "@\u200B$1") // ZWSP neutralizes mention
+    .replace(/`/g, "\\`");
   if (stripped.length <= maxLen) return stripped;
   return `${stripped.slice(0, maxLen)}…`;
 }
 
 const RATIONALE_MAX_LEN = 1024;
-// ESC + CSI / OSC + control chars we never want embedded in operator-facing
-// reasons. Keeps \n and \t — those are legitimately useful in multi-line text.
+// Stripped on ingestion from operator-facing rationale:
+//   - ESC + CSI/OSC/DCS sequences (7-bit form)
+//   - C0 controls, keeps \n and \t
+//   - C1 controls (\x80-\x9f)
+//   - Invisible / BIDI formatters (U+200B-200F, U+2028-2029, U+202A-202E,
+//     U+2066-2069, U+FEFF)
 // eslint-disable-next-line no-control-regex
-const CONTROL_RE = /\x1b\[[0-9;]*[A-Za-z]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
+const CONTROL_RE =
+  /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?]*[A-Za-z]|\x1bP[^\x07\x1b]*(?:\x07|\x1b\\)|\x1bO.|\x1b[^\[\]PO]?|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u200B-\u200F\u2028-\u2029\u202A-\u202E\u2066-\u2069\uFEFF]/g;
 
 /**
  * Cap + strip hostile characters from an Architect-supplied rationale before

@@ -15,11 +15,11 @@
  *   - no state-write contention (final state.json contains BOTH tasks in "done")
  */
 
-import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { execSync } from "node:child_process";
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import { initScratchRepo } from "./lib/scratch-repo.js";
 import { Orchestrator, type OrchestratorEvent } from "../src/orchestrator.js";
 import { SessionManager } from "../src/session/manager.js";
 import { SDKClient } from "../src/session/sdk.js";
@@ -37,20 +37,6 @@ When you finish your task, commit your change and write .harness/completion.json
   "filesChanged": ["<paths>"]
 }
 `;
-
-function initScratchRepo(): string {
-  const root = join(tmpdir(), `harness-concurrent-${Date.now()}`);
-  mkdirSync(root, { recursive: true });
-  mkdirSync(join(root, "tasks"), { recursive: true });
-  mkdirSync(join(root, "worktrees"), { recursive: true });
-  mkdirSync(join(root, "sessions"), { recursive: true });
-  execSync("git init -b main", { cwd: root, stdio: "ignore" });
-  execSync("git config user.email concurrent@harness.test", { cwd: root, stdio: "ignore" });
-  execSync("git config user.name concurrent", { cwd: root, stdio: "ignore" });
-  writeFileSync(join(root, "README.md"), "# scratch\n");
-  execSync("git add -A && git commit -m init", { cwd: root, stdio: "ignore" });
-  return root;
-}
 
 function buildConfig(root: string): HarnessConfig {
   return {
@@ -100,7 +86,11 @@ Commit with message "add beta". Write .harness/completion.json per system prompt
 filesChanged: ["beta.ts"], summary: "Added beta module".`;
 
 async function main(): Promise<void> {
-  const root = initScratchRepo();
+  const root = initScratchRepo({
+    prefix: "harness-concurrent",
+    gitEmail: "concurrent@harness.test",
+    gitName: "concurrent",
+  });
   console.log(`[concurrent] scratch root: ${root}`);
 
   const config = buildConfig(root);
