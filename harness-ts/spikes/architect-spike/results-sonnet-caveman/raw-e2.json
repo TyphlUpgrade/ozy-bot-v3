@@ -1,0 +1,30 @@
+{
+  "escalationId": "e2",
+  "shape": "executor_escalation",
+  "type": "design_decision",
+  "verdict": "retry_with_directive",
+  "directive": "Implement Strategy B: add an idempotency_key column (VARCHAR, NOT NULL) to the orders table with a partial unique index on (idempotency_key) WHERE idempotency_key IS NOT NULL. On consumer INSERT, supply the message's deduplication ID as idempotency_key; catch unique-constraint violations and treat them as successful no-ops (already processed). Do not use Redis for idempotency. Idempotency window is implicit (row persists as long as the order record exists, satisfying ≥24h).",
+  "amendedSpec": null,
+  "escalationReason": null,
+  "rationale": "The phase acceptance criterion requires 'exactly one order record' — a hard correctness guarantee. Strategy A (Redis SETNX) cannot satisfy this: any Redis eviction policy (allkeys-lru, volatile-lru) may silently drop idempotency keys before the 24h TTL expires, allowing duplicates through during memory pressure. That is an unacceptable risk against a correctness guarantee. Strategy B (orders table column + partial unique index) provides a durable, eviction-proof guarantee enforced by the database's own uniqueness constraint. The Executor's non-goal concern is a misread: 'do not introduce new external service dependencies beyond the existing Redis instance' prohibits adding new external services (a separate lock manager, a new cache tier), not schema changes to an existing table. Adding an idempotency_key column is an internal schema change, not a new service dependency. All three non-goals are preserved by Strategy B.",
+  "nonGoalsPreserved": true,
+  "category": "design_decision",
+  "fullArbitration": {
+    "verdict": "retry_with_directive",
+    "rationale": "The phase acceptance criterion requires 'exactly one order record' — a hard correctness guarantee. Strategy A (Redis SETNX) cannot satisfy this: any Redis eviction policy (allkeys-lru, volatile-lru) may silently drop idempotency keys before the 24h TTL expires, allowing duplicates through during memory pressure. That is an unacceptable risk against a correctness guarantee. Strategy B (orders table column + partial unique index) provides a durable, eviction-proof guarantee enforced by the database's own uniqueness constraint. The Executor's non-goal concern is a misread: 'do not introduce new external service dependencies beyond the existing Redis instance' prohibits adding new external services (a separate lock manager, a new cache tier), not schema changes to an existing table. Adding an idempotency_key column is an internal schema change, not a new service dependency. All three non-goals are preserved by Strategy B.",
+    "directive": "Implement Strategy B: add an idempotency_key column (VARCHAR, NOT NULL) to the orders table with a partial unique index on (idempotency_key) WHERE idempotency_key IS NOT NULL. On consumer INSERT, supply the message's deduplication ID as idempotency_key; catch unique-constraint violations and treat them as successful no-ops (already processed). Do not use Redis for idempotency. Idempotency window is implicit (row persists as long as the order record exists, satisfying ≥24h).",
+    "amendedSpec": null,
+    "escalationReason": null,
+    "nonGoalsPreserved": true,
+    "category": "design_decision"
+  },
+  "parseError": null,
+  "costUsd": 0.09443145,
+  "latencyMs": 29324,
+  "numTurns": 2,
+  "inputTokens": 4,
+  "outputTokens": 1469,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

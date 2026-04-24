@@ -1,0 +1,364 @@
+{
+  "project": {
+    "name": "alerts-migration-v2",
+    "description": "Migrate internal alerting from the custom rule DSL + home-grown dispatcher to PagerDuty's API. The existing system routes alerts to Slack and email via internal webhooks; PagerDuty replaces the dispatcher entirely but must accept the same DSL input unchanged.",
+    "nonGoals": [
+      "Do not modify the existing alert rule DSL syntax (backward compatibility guaranteed to rule authors)",
+      "Do not lose historical alert records — must backfill at least 90 days into PagerDuty incident history",
+      "Do not introduce new secrets beyond PAGERDUTY_API_KEY; reuse existing Slack/email integration credentials only where strictly required",
+      "Do not deploy a separate new service — the dispatcher lives inline in the existing alerting service"
+    ]
+  },
+  "phases": [
+    {
+      "id": "p1",
+      "shape": "executor_escalation",
+      "type": "scope_unclear",
+      "phaseSpec": {
+        "phaseId": "p1",
+        "title": "Select PagerDuty client library",
+        "description": "Pick a Node.js client for PagerDuty Events API v2 and add it to package.json. Wire up an authenticated smoke test that creates a test incident and resolves it.",
+        "acceptanceCriteria": [
+          "Chosen client supports Events API v2",
+          "Smoke test creates and resolves a test incident without manual steps",
+          "Client initialization reads PAGERDUTY_API_KEY from env"
+        ]
+      },
+      "escalation": {
+        "type": "scope_unclear",
+        "question": "Three library options identified. Which fits the project non-goals and existing patterns?",
+        "context": "Option A: official `@pagerduty/pdjs` SDK — maintained, well-typed, but ~40KB bundle size and forces axios. Option B: community `node-pagerduty` — smaller, no hard axios dep, last published 14 months ago. Option C: direct HTTP via existing internal `httpClient` utility — zero new deps, but we'd hand-roll retry + rate-limit logic. Project already uses axios elsewhere so Option A's dep cost is minimal.",
+        "options": [
+          "Option A: @pagerduty/pdjs (official SDK)",
+          "Option B: node-pagerduty (community)",
+          "Option C: direct HTTP via internal httpClient"
+        ],
+        "assessment": {
+          "scopeClarity": "partial",
+          "designCertainty": "alternatives_exist",
+          "assumptions": [],
+          "openQuestions": ["library choice"],
+          "testCoverage": "verifiable"
+        }
+      }
+    },
+    {
+      "id": "p2",
+      "shape": "executor_escalation",
+      "type": "design_decision",
+      "phaseSpec": {
+        "phaseId": "p2",
+        "title": "Alert-rule → PagerDuty incident mapping layer",
+        "description": "Implement transformation: parsed DSL alert rule → PagerDuty Events API v2 payload. Must preserve all rule fields (severity, source, dedup_key, labels). Maps to src/alerts/pagerduty/mapper.ts.",
+        "acceptanceCriteria": [
+          "Every DSL field is represented in the PD payload (lossless)",
+          "Unknown DSL fields emitted in `custom_details`",
+          "Unit tests cover each severity tier"
+        ]
+      },
+      "escalation": {
+        "type": "design_decision",
+        "question": "Mapping layer granularity: per-alert-rule transformation (stateless, called N times per batch) vs bulk batch transformation (one call, returns array)?",
+        "context": "Per-alert-rule is simpler to test and matches existing dispatcher patterns. Bulk is required by PagerDuty's bulk events endpoint for throughput (up to 100 events per call). The existing dispatcher submits one alert at a time, but phase 4 (backfill) will need bulk throughput.",
+        "options": [
+          "Per-alert-rule (matches existing; adapter wraps for bulk later)",
+          "Bulk batch (designed for PD's bulk endpoint; future-proof for backfill)"
+        ],
+        "assessment": {
+          "scopeClarity": "clear",
+          "designCertainty": "alternatives_exist",
+          "assumptions": [],
+          "openQuestions": [],
+          "testCoverage": "verifiable"
+        }
+      }
+    },
+    {
+      "id": "p3",
+      "shape": "executor_escalation",
+      "type": "blocked",
+      "phaseSpec": {
+        "phaseId": "p3",
+        "title": "Dev environment credential setup",
+        "description": "Wire PAGERDUTY_API_KEY into dev + staging. Verify Events API v2 authentication in staging.",
+        "acceptanceCriteria": [
+          "PAGERDUTY_API_KEY present in dev and staging environments",
+          "Authentication verified via a live (but no-op) PagerDuty call in staging",
+          "Key rotation runbook documented in docs/ops/pagerduty.md"
+        ]
+      },
+      "escalation": {
+        "type": "blocked",
+        "question": "Cannot verify authentication — PAGERDUTY_API_KEY is missing from both dev and staging .env files, and the PagerDuty admin console is gated to the on-call team.",
+        "context": "Existing secrets (SLACK_WEBHOOK, SMTP_USER) are in 1Password 'platform-secrets' vault. No PagerDuty entry exists. IAM console access requires a ticket through #it-access which takes 2-3 days.",
+        "options": [],
+        "assessment": {
+          "scopeClarity": "clear",
+          "designCertainty": "obvious",
+          "assumptions": [],
+          "openQuestions": ["Where to obtain/request PAGERDUTY_API_KEY"],
+          "testCoverage": "partial"
+        }
+      }
+    },
+    {
+      "id": "p4",
+      "shape": "review_arbitration",
+      "phaseSpec": {
+        "phaseId": "p4",
+        "title": "Backfill historical alerts into PD incident history",
+        "description": "Write a one-time script to ingest the last 90 days of alerts from the old system's PostgreSQL archive into PagerDuty as historical incidents. Incidents imported in this phase are marked resolved immediately (we only need the history).",
+        "acceptanceCriteria": [
+          "At least 90 days of alerts present in PD incident history post-run",
+          "Script is idempotent — re-running does not duplicate",
+          "Completes in under 60 minutes against production archive volume"
+        ]
+      },
+      "executorCompletion": {
+        "status": "success",
+        "summary": "Implemented backfillPdIncidents.ts using bulk INSERT against PD's events-api-v2 bulk endpoint with 100-event batches. Idempotent via dedup_key = `legacy-{uuid}`.",
+        "understanding": "Ingest 90 days of archived alerts as resolved PD incidents. Idempotent and bounded runtime.",
+        "assumptions": ["Dedup keys using a legacy- prefix won't collide with live alerts post-cutover"],
+        "nonGoals": ["Did not modify DSL syntax; script consumes archive rows directly"],
+        "confidence": {
+          "scopeClarity": "clear",
+          "designCertainty": "obvious",
+          "testCoverage": "verifiable",
+          "assumptions": [],
+          "openQuestions": []
+        },
+        "filesChanged": ["scripts/backfillPdIncidents.ts", "tests/scripts/backfillPdIncidents.test.ts"]
+      },
+      "diffSummary": "scripts/backfillPdIncidents.ts (~220 lines) paginates through the archive.alerts table in batches of 100, transforms via mapAlert(), and posts to PD bulk endpoint. 12 unit tests cover batching, dedup, and resolved-state marking. Runtime benchmarked at 38 min against 90d staging archive (~280k rows).",
+      "reviewerVerdicts": [
+        {
+          "round": 1,
+          "verdict": "reject",
+          "feedback": "Backfill runs `SELECT * FROM archive.alerts ORDER BY created_at LIMIT 100 OFFSET n` for paging. OFFSET-based pagination is O(n²) against 280k rows — PostgreSQL re-scans on every offset. Switch to keyset pagination on created_at. Also: the dedup_key prefix 'legacy-' could collide with user-chosen dedup_keys in the live alert pipeline post-cutover. Prefix with something more clearly internal, e.g., '__backfill_legacy_' or similar.",
+          "severity": "critical"
+        },
+        {
+          "round": 2,
+          "verdict": "reject",
+          "feedback": "Keyset pagination fix is correct, but the new implementation holds an open transaction across the full backfill to ensure snapshot consistency. A 38-minute transaction will block routine VACUUM on the archive.alerts table, starving autovacuum and causing bloat. Either (a) drop the transaction entirely and accept the snapshot-inconsistency risk (new archive rows during the backfill get missed), or (b) take a `pg_dump` snapshot separately and feed the script from the snapshot file. The dedup_key rename to '__backfill_legacy_' is good; keep that.",
+          "severity": "critical"
+        }
+      ]
+    },
+    {
+      "id": "p5",
+      "shape": "executor_escalation",
+      "type": "design_decision",
+      "phaseSpec": {
+        "phaseId": "p5",
+        "title": "Retry strategy for mapping layer",
+        "description": "Implement retry logic for transient PagerDuty API failures (5xx, 429). Retries must preserve alert ordering where possible and not accidentally duplicate incidents.",
+        "acceptanceCriteria": [
+          "5xx and 429 retried with exponential backoff (3 attempts)",
+          "4xx other than 429 fail-fast (no retry)",
+          "Duplicate-incident prevention via dedup_key"
+        ]
+      },
+      "escalation": {
+        "type": "design_decision",
+        "question": "Retry logic per-alert or bulk-batch? This is the same granularity question as phase 2 but for a different layer. Does the phase-2 decision constrain us here?",
+        "context": "In phase 2 we settled on one approach for the mapping layer (per-alert vs bulk). Retry logic either inherits that shape (per-alert retry state, N retries in flight simultaneously) or diverges (batch retry with one retry state per batch). Batch retry is simpler operationally; per-alert retry is more robust if only a few alerts in a batch fail.",
+        "options": [
+          "Inherit phase-2 shape (whatever that was)",
+          "Per-alert retry (regardless of phase 2)",
+          "Bulk-batch retry (regardless of phase 2)"
+        ],
+        "assessment": {
+          "scopeClarity": "clear",
+          "designCertainty": "alternatives_exist",
+          "assumptions": [],
+          "openQuestions": ["whether phase-2 decision constrains this phase"],
+          "testCoverage": "verifiable"
+        }
+      }
+    },
+    {
+      "id": "p6",
+      "shape": "executor_escalation",
+      "type": "scope_unclear",
+      "phaseSpec": {
+        "phaseId": "p6",
+        "title": "Cutover mechanism",
+        "description": "Implement the switch from old dispatcher to PagerDuty. Must support rollback if PagerDuty integration fails in production.",
+        "acceptanceCriteria": [
+          "Rollback possible within 5 minutes without data loss",
+          "Zero double-dispatch (no alert hits both old and new systems simultaneously for real routing)",
+          "Cutover state visible in observability dashboard"
+        ]
+      },
+      "escalation": {
+        "type": "scope_unclear",
+        "question": "Three cutover mechanisms are plausible. Which fits the project's non-goals and operational envelope?",
+        "context": "Option A: dual-write period where both old and new systems dispatch for N hours, with monitoring to compare outputs, then old is disabled. Option B: feature-flag per-rule gradual cutover (move rules to PD in batches). Option C: blue-green full cutover at a scheduled maintenance window with a pre-rehearsed rollback script. Non-goal mentions 'Do not deploy a separate new service' — dual-write needs a comparator service; is that a non-goal violation?",
+        "options": [
+          "Dual-write with comparator",
+          "Feature-flag per-rule gradual",
+          "Blue-green scheduled cutover"
+        ],
+        "assessment": {
+          "scopeClarity": "partial",
+          "designCertainty": "alternatives_exist",
+          "assumptions": [
+            {"description": "Comparator service would count as a 'separate new service'", "impact": "high", "reversible": false}
+          ],
+          "openQuestions": ["cutover strategy", "whether comparator violates non-goals"],
+          "testCoverage": "verifiable"
+        }
+      }
+    },
+    {
+      "id": "p7",
+      "shape": "review_arbitration",
+      "phaseSpec": {
+        "phaseId": "p7",
+        "title": "Backfill test performance",
+        "description": "Tests for the backfill script from phase 4 need to exercise the pagination + transaction behavior decided there. Currently integration tests use a 10k-row synthetic archive; we want confidence they'll behave under production's 280k volume.",
+        "acceptanceCriteria": [
+          "Integration tests cover keyset pagination boundary conditions",
+          "Transaction semantics (whatever phase 4 chose) validated end-to-end",
+          "Test suite runtime stays under 5 minutes on CI"
+        ]
+      },
+      "executorCompletion": {
+        "status": "success",
+        "summary": "Added integration tests for backfill: keyset boundary cases (empty archive, single page, exactly-N-rows), idempotency on re-run, and snapshot-consistency semantics per phase 4 decision.",
+        "understanding": "Validate backfill behavior at boundary conditions. Use phase 4's chosen transaction/snapshot mechanism.",
+        "assumptions": ["Phase 4's transaction decision was final and governs this phase's test setup"],
+        "nonGoals": ["Did not modify backfill implementation; tests only"],
+        "confidence": {
+          "scopeClarity": "clear",
+          "designCertainty": "obvious",
+          "testCoverage": "verifiable",
+          "assumptions": [],
+          "openQuestions": []
+        },
+        "filesChanged": ["tests/scripts/backfillPdIncidents.integration.test.ts"]
+      },
+      "diffSummary": "Added ~180 lines of integration tests across 14 cases. Uses docker-compose to spin up a Postgres fixture with 50k synthetic rows. Test runtime is 4.2 min locally, ~6.8 min on CI (exceeds 5 min acceptance criterion).",
+      "reviewerVerdicts": [
+        {
+          "round": 1,
+          "verdict": "reject",
+          "feedback": "Integration tests exceed the 5-minute CI budget (6.8 min observed). Either reduce the synthetic row count from 50k to 10k (still enough to exercise keyset pagination with 3+ pages at 100/page) or move these tests out of the standard CI run into a nightly suite.",
+          "severity": "warning"
+        },
+        {
+          "round": 2,
+          "verdict": "reject",
+          "feedback": "Tests reduced to 10k rows and pass in 4.1 min. However, the snapshot-consistency test assumes phase 4 took a pg_dump snapshot (option b from that phase's arbitration). If phase 4 actually chose option a (drop the transaction, accept snapshot risk), this test is testing a behavior that doesn't exist and will false-pass. Confirm the phase 4 decision is reflected correctly in these tests. Also: the docker-compose fixture is not torn down on test failure, leaving orphan containers.",
+          "severity": "critical"
+        }
+      ]
+    },
+    {
+      "id": "p8",
+      "shape": "executor_escalation",
+      "type": "design_decision",
+      "phaseSpec": {
+        "phaseId": "p8",
+        "title": "Dead-letter queue for failed PagerDuty pushes",
+        "description": "Alerts that fail to reach PagerDuty after retry exhaustion must be captured somewhere rather than silently dropped. Design and implement the dead-letter path.",
+        "acceptanceCriteria": [
+          "Dead-lettered alerts are persisted with original payload + failure reason",
+          "Ops dashboard surfaces dead-letter queue depth",
+          "Dead-lettered alerts can be manually replayed via a CLI"
+        ]
+      },
+      "escalation": {
+        "type": "design_decision",
+        "question": "Dead-letter storage: reuse the existing archive.alerts Postgres table with a new status column, or add a new table (archive.pd_deadletter)?",
+        "context": "archive.alerts is already write-heavy (the backfill source). Adding a new status column + write path for dead letters would increase write load and risk index bloat. A dedicated archive.pd_deadletter table isolates the write pattern. But 'do not deploy a separate new service' in non-goals leans toward minimizing new surface area.",
+        "options": [
+          "Reuse archive.alerts with new status column",
+          "New archive.pd_deadletter table"
+        ],
+        "assessment": {
+          "scopeClarity": "clear",
+          "designCertainty": "alternatives_exist",
+          "assumptions": [
+            {"description": "A new table does not count as a 'separate service'", "impact": "low", "reversible": true}
+          ],
+          "openQuestions": [],
+          "testCoverage": "verifiable"
+        }
+      }
+    },
+    {
+      "id": "p9",
+      "shape": "executor_escalation",
+      "type": "design_decision",
+      "phaseSpec": {
+        "phaseId": "p9",
+        "title": "In-flight alert handling during cutover",
+        "description": "If phase 6 chose a staged cutover mechanism, alerts arriving mid-cutover need a defined disposition. Implement that disposition.",
+        "acceptanceCriteria": [
+          "No alert is lost during cutover transition",
+          "No alert is dispatched twice to the real downstream",
+          "Disposition behavior matches phase 6's cutover design"
+        ]
+      },
+      "escalation": {
+        "type": "design_decision",
+        "question": "Per phase 6's cutover choice, how do we handle alerts arriving in the transition window?",
+        "context": "This depends entirely on what phase 6 chose: dual-write handles in-flight naturally (both systems see them). Feature-flag per-rule means rules are migrated atomically — in-flight alerts for a rule either go to old or new based on the flag state at dispatch time, which is fine. Blue-green at a maintenance window means alerts arriving during the 5-minute switch either queue (if we have buffering) or get dropped. What did we decide in phase 6 and what does it imply for this phase?",
+        "options": [],
+        "assessment": {
+          "scopeClarity": "partial",
+          "designCertainty": "alternatives_exist",
+          "assumptions": [],
+          "openQuestions": ["what did phase 6 decide"],
+          "testCoverage": "partial"
+        }
+      }
+    },
+    {
+      "id": "p10",
+      "shape": "review_arbitration",
+      "phaseSpec": {
+        "phaseId": "p10",
+        "title": "Final integration tests",
+        "description": "End-to-end integration test covering rule parsing → mapping → dispatch → PD incident creation. Uses the library chosen in phase 1 and exercises the retry behavior from phase 5.",
+        "acceptanceCriteria": [
+          "E2E test creates a real PD incident in staging and resolves it",
+          "Retry behavior validated with injected transient failures",
+          "All severity tiers produce correct PD payloads"
+        ]
+      },
+      "executorCompletion": {
+        "status": "success",
+        "summary": "Added e2e integration test using the phase-1 library, exercising retry behavior from phase 5 and full mapping from phase 2.",
+        "understanding": "Cover the full pipeline end-to-end with a real staging PD incident.",
+        "assumptions": ["PAGERDUTY_STAGING_API_KEY is available to CI (set up in phase 3)"],
+        "nonGoals": ["Did not touch production credentials"],
+        "confidence": {
+          "scopeClarity": "clear",
+          "designCertainty": "obvious",
+          "testCoverage": "verifiable",
+          "assumptions": [],
+          "openQuestions": []
+        },
+        "filesChanged": ["tests/integration/pagerduty-e2e.test.ts"]
+      },
+      "diffSummary": "~120-line e2e test tightly coupled to the library API chosen in phase 1. Creates PD incident with severity=critical, injects two 429 responses to validate phase-5 retry logic, then resolves incident.",
+      "reviewerVerdicts": [
+        {
+          "round": 1,
+          "verdict": "reject",
+          "feedback": "The e2e test is tightly coupled to the phase-1 library's API surface. If we ever swap libraries (which this project explicitly DOES not do, but future projects might), these tests break. Abstract the test behind a framework-agnostic driver interface so the test logic survives library migration.",
+          "severity": "warning"
+        },
+        {
+          "round": 2,
+          "verdict": "reject",
+          "feedback": "Driver abstraction added, but the abstraction mimics the phase-1 library's specific shape rather than a neutral domain interface. It's framework-agnostic on paper but not in practice — any library swap would still require rewriting the driver. Either go all the way (neutral domain interface: createIncident, resolveIncident, injectFailure) or drop the abstraction entirely and own the coupling explicitly in a code comment.",
+          "severity": "warning"
+        }
+      ]
+    }
+  ]
+}

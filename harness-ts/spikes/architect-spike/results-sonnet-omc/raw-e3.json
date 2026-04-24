@@ -1,0 +1,30 @@
+{
+  "escalationId": "e3",
+  "shape": "executor_escalation",
+  "type": "blocked",
+  "verdict": "escalate_operator",
+  "directive": null,
+  "amendedSpec": null,
+  "escalationReason": "credential",
+  "rationale": "The Executor's escalation is type 'blocked' due to a missing credential: STRIPE_WEBHOOK_SECRET is absent from .env.test and has no entry in the 1Password 'shared-eng' vault (where Braintree equivalents live). This is an external credential that was never provisioned for this development environment — it cannot be resolved by the Architect through a directive or plan amendment. The code and unit tests (with mocked signature) are complete; only the end-to-end integration test is blocked. Resolution requires a human operator to either provision the test-mode webhook secret from Stripe Dashboard > Developers > Webhooks or confirm that mocked unit test coverage satisfies the acceptance criteria.",
+  "nonGoalsPreserved": true,
+  "category": "blocked",
+  "fullArbitration": {
+    "verdict": "escalate_operator",
+    "rationale": "The Executor's escalation is type 'blocked' due to a missing credential: STRIPE_WEBHOOK_SECRET is absent from .env.test and has no entry in the 1Password 'shared-eng' vault (where Braintree equivalents live). This is an external credential that was never provisioned for this development environment — it cannot be resolved by the Architect through a directive or plan amendment. The code and unit tests (with mocked signature) are complete; only the end-to-end integration test is blocked. Resolution requires a human operator to either provision the test-mode webhook secret from Stripe Dashboard > Developers > Webhooks or confirm that mocked unit test coverage satisfies the acceptance criteria.",
+    "directive": null,
+    "amendedSpec": null,
+    "escalationReason": "credential",
+    "nonGoalsPreserved": true,
+    "category": "blocked"
+  },
+  "parseError": null,
+  "costUsd": 0.11473409999999999,
+  "latencyMs": 19255,
+  "numTurns": 2,
+  "inputTokens": 6,
+  "outputTokens": 621,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

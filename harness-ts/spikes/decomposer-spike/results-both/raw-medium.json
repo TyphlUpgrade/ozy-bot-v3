@@ -1,0 +1,203 @@
+{
+  "projectId": "medium",
+  "projectName": "redis-job-queue-migration",
+  "complexity": "medium",
+  "expectedPhaseRange": "6-12",
+  "actualPhaseCount": 6,
+  "nonGoalsPreservedCount": 5,
+  "nonGoalsOperatorCount": 5,
+  "nonGoalsAddedCount": 0,
+  "criticalPathLength": 5,
+  "allDependenciesValid": true,
+  "hasDecompositionRationale": true,
+  "subagentInvocations": [],
+  "subagentInvocationCount": 0,
+  "fullPlan": {
+    "projectId": "redis-job-queue-migration",
+    "projectDescription": "Replace the current in-memory job queue (src/queue/memory.ts, shared Map<jobId, Job>) with a Redis-backed queue supporting at-least-once delivery, dead-letter handling, and configurable retry. Producer/consumer API contract must be preserved so existing callers compile and function without modification. Goals: durability + horizontal scale (queue survives process restart, multiple consumer instances). Feature flag keeps in-memory impl available for rollback.",
+    "nonGoals": [
+      "Do not change the producer/consumer API — existing callers must compile without modification",
+      "Do not introduce new authentication or credentials beyond the existing REDIS_URL environment variable",
+      "Do not remove the in-memory implementation — keep behind a feature flag for rollback",
+      "Do not support exactly-once delivery — at-least-once with idempotency_key is sufficient",
+      "Do not implement priority queues, scheduled (delayed) jobs, or cron-like features in this project"
+    ],
+    "phases": [
+      {
+        "phaseId": "p1",
+        "title": "Queue interface abstraction + feature flag factory",
+        "description": "Extract an IQueue interface from the behavioral contract of memory.ts, create a factory function gated on a QUEUE_BACKEND env var (values: 'memory' | 'redis'), and update all existing callers to import from the factory rather than memory.ts directly. Memory implementation is unchanged. This phase makes the rest of the migration non-breaking.",
+        "dependencies": [],
+        "acceptanceCriteria": [
+          "IQueue interface defined; MemoryQueue implements it; existing tests pass unchanged",
+          "Factory function exported from src/queue/index.ts; accepts no arguments; reads QUEUE_BACKEND env var",
+          "All callers that previously imported from src/queue/memory.ts now import from src/queue/index.ts and typecheck clean",
+          "QUEUE_BACKEND unset or set to 'memory' returns MemoryQueue instance",
+          "Unit test: factory returns correct implementation class for each QUEUE_BACKEND value"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "IQueue method names (must match existing memory.ts API exactly)",
+            "Internal factory file layout within src/queue/",
+            "Whether to use a generic or concrete Job type in the interface"
+          ],
+          "escalateToOperator": [
+            "Any caller that cannot adopt the factory without API changes",
+            "Discovery that memory.ts exposes additional public API not coverable by IQueue"
+          ]
+        },
+        "estimatedComplexity": "small"
+      },
+      {
+        "phaseId": "p2",
+        "title": "RedisQueue core — enqueue, dequeue, acknowledgment",
+        "description": "Implement RedisQueue satisfying IQueue using ioredis. Enqueue pushes serialized jobs via RPUSH. Dequeue uses LMOVE (main → processing list) for at-least-once semantics. Explicit ack removes from processing list; nack returns job to main list. Connection constructed from REDIS_URL.",
+        "dependencies": [
+          "p1"
+        ],
+        "acceptanceCriteria": [
+          "RedisQueue class in src/queue/redis.ts implements IQueue; factory returns it when QUEUE_BACKEND='redis'",
+          "enqueue(job): job serialized as JSON and RPUSH'd to queue:{name} list; returns jobId",
+          "dequeue(): uses LMOVE queue:{name} queue:{name}:processing RIGHT LEFT; returns deserialized Job or null on empty",
+          "ack(jobId): LREM queue:{name}:processing 1 <job>; job removed from processing list",
+          "nack(jobId): LREM from processing, RPUSH back to main list",
+          "Unit tests with ioredis mock cover all four operations and null-dequeue case"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Redis key naming scheme for queue and processing lists",
+            "JSON serialization format for Job objects",
+            "ioredis client instantiation (singleton vs per-instance)",
+            "Blocking vs non-blocking dequeue (BLMOVE vs LMOVE + polling)"
+          ],
+          "escalateToOperator": [
+            "IQueue contract requires a streaming/subscription API incompatible with poll-based dequeue",
+            "LMOVE not available on target Redis version (requires Redis 6.2+)"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p3",
+        "title": "Retry logic + dead-letter queue",
+        "description": "Extend RedisQueue with configurable retry: track attempt count per job in a Redis hash, increment on nack, move to DLQ after max retries exceeded. DLQ keys set with 14-day EXPIRE. Max retry count is configurable via constructor option.",
+        "dependencies": [
+          "p2"
+        ],
+        "acceptanceCriteria": [
+          "Attempt count tracked in queue:{name}:attempts hash (HINCRBY on each nack)",
+          "nack() checks attempt count; if >= maxRetries, RPUSH to queue:{name}:dlq and HDEL from attempts hash instead of requeueing",
+          "DLQ entries have EXPIRE set to 1209600 seconds (14 days) applied on each RPUSH to DLQ key",
+          "maxRetries is a constructor option with a documented default (executor chooses default, must be >=1)",
+          "Unit tests: job reaches DLQ after exactly maxRetries nacks; job before limit is requeued",
+          "Unit test: DLQ EXPIRE is set on DLQ job entry"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Default maxRetries value",
+            "Whether backoff delay between retries is implemented (not required by spec; may add if trivial)",
+            "DLQ key expiry applied per-entry or per-list (per-entry is correct for 14-day retention per job)"
+          ],
+          "escalateToOperator": [
+            "Operator wants per-job configurable retry counts (not in spec — escalate before adding)"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p4",
+        "title": "Integration test suite + docker-compose fixture",
+        "description": "Add docker-compose.test.yml with a Redis service and an integration test suite that exercises RedisQueue against a real Redis instance. Tests cover the full lifecycle: enqueue→dequeue→ack, retry path, DLQ promotion, feature flag switch, and multi-consumer dequeue ordering.",
+        "dependencies": [
+          "p3"
+        ],
+        "acceptanceCriteria": [
+          "docker-compose.test.yml starts a Redis container on an ephemeral port; integration tests read REDIS_URL from env",
+          "Integration test: enqueue N jobs, dequeue all, ack all — queue and processing list empty after",
+          "Integration test: nack job maxRetries times — job appears in DLQ list, not in main or processing list",
+          "Integration test: two concurrent consumer instances (two RedisQueue instances, same queue name) dequeue disjoint job sets (no double-dequeue)",
+          "Integration test: QUEUE_BACKEND='redis' factory returns RedisQueue; QUEUE_BACKEND='memory' returns MemoryQueue — both satisfy IQueue at runtime",
+          "npm script (e.g., npm run test:integration) documented; all integration tests pass in CI against docker-compose Redis"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Test framework (vitest is already present; use it)",
+            "docker-compose Redis image version (use official redis:7-alpine or later)",
+            "Whether integration tests run in a separate file tree from unit tests"
+          ],
+          "escalateToOperator": [
+            "CI environment does not support docker-compose — alternative Redis fixture needed"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p5",
+        "title": "Latency validation + ioredis connection tuning",
+        "description": "Benchmark p99 enqueue latency against a staging Redis instance and tune ioredis connection options (keepAlive, connection pool, pipelining) until p99 stays under 10ms. Produce a repeatable benchmark script.",
+        "dependencies": [
+          "p2"
+        ],
+        "acceptanceCriteria": [
+          "Benchmark script at scripts/bench-enqueue.ts: enqueues 10,000 jobs, reports p50/p95/p99 latency",
+          "Script accepts REDIS_URL from env; outputs results to stdout as JSON",
+          "p99 enqueue latency ≤10ms when run against staging Redis under representative load",
+          "Any ioredis options changed from defaults are documented with rationale in a comment in src/queue/redis.ts"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "ioredis options to tune (keepAlive, enableReadyCheck, lazyConnect, etc.)",
+            "Benchmark sample size and warm-up round count",
+            "Whether to use ioredis pipeline for batch-enqueue (only if needed to hit latency target)"
+          ],
+          "escalateToOperator": [
+            "p99 ≤10ms is not achievable without architectural change (e.g., local Redis sidecar vs remote) — operator decides acceptable remediation"
+          ]
+        },
+        "estimatedComplexity": "small"
+      },
+      {
+        "phaseId": "p6",
+        "title": "Cutover runbook + rollback validation",
+        "description": "Document the feature flag cutover procedure and write an automated test that validates no job loss during a flag flip while jobs are in-flight. Confirms the 5-minute reversibility constraint is operationally true.",
+        "dependencies": [
+          "p4",
+          "p5"
+        ],
+        "acceptanceCriteria": [
+          "docs/queue-cutover-runbook.md documents: pre-cutover checklist, flag flip steps, rollback steps, verification queries",
+          "Rollback test: enqueue 100 jobs to Redis queue, flip QUEUE_BACKEND to 'memory', verify the 100 Redis-enqueued jobs are acknowledged as in-flight and not silently dropped (test documents expected operator action for in-flight jobs at cutover boundary)",
+          "Integration test: process restart with QUEUE_BACKEND='redis' — jobs enqueued before restart are dequeue-able after restart (durability assertion)",
+          "Runbook includes Redis key inspection commands to verify queue depth before/after cutover"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Runbook format and section structure",
+            "How the rollback test simulates process restart (e.g., new ioredis client instance)"
+          ],
+          "escalateToOperator": [
+            "In-flight jobs at cutover boundary require active migration logic (draining Redis before flip) — operator decides policy"
+          ]
+        },
+        "estimatedComplexity": "small"
+      }
+    ],
+    "criticalPath": [
+      "p1",
+      "p2",
+      "p3",
+      "p4",
+      "p6"
+    ],
+    "decompositionRationale": "Six phases align with the six distinct deliverables: interface contract (p1), core Redis mechanics (p2), reliability layer (p3), integration evidence (p4), latency validation (p5), and operational cutover (p6). p5 depends only on p2 and runs in parallel with p3+p4, shaving wall-clock time. Phases are kept separate rather than merged because p2 and p3 have distinct acceptance criteria and failure modes — a broken retry implementation should not block validating the core enqueue/dequeue path. The count lands at the low end of the 6-12 range because the project has a clear linear core (abstract → implement → harden → test → validate → cutover) with minimal branching; adding more phases would over-decompose what are genuinely sequential concerns."
+  },
+  "parseError": null,
+  "costUsd": 0.3401524,
+  "latencyMs": 138297,
+  "numTurns": 3,
+  "inputTokens": 9,
+  "outputTokens": 4819,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

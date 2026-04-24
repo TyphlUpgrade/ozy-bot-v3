@@ -1,0 +1,30 @@
+{
+  "escalationId": "e3",
+  "shape": "executor_escalation",
+  "type": "blocked",
+  "verdict": "escalate_operator",
+  "directive": null,
+  "amendedSpec": null,
+  "escalationReason": "credential",
+  "rationale": "Escalation type is 'blocked' on a missing credential — STRIPE_WEBHOOK_SECRET for the test-mode webhook secret. This is an external fact (Stripe Dashboard > Developers > Webhooks) that requires operator action to provision. Braintree equivalents exist in 1Password 'shared-eng' vault but no Stripe entry was ever created. The Executor has confirmed signature verification code is written and unit tests pass with mocked signature; the only gap is the real test-mode secret. This is outside arbitration authority — no directive or plan amendment can substitute for the credential itself.",
+  "nonGoalsPreserved": true,
+  "category": "blocked",
+  "fullArbitration": {
+    "verdict": "escalate_operator",
+    "rationale": "Escalation type is 'blocked' on a missing credential — STRIPE_WEBHOOK_SECRET for the test-mode webhook secret. This is an external fact (Stripe Dashboard > Developers > Webhooks) that requires operator action to provision. Braintree equivalents exist in 1Password 'shared-eng' vault but no Stripe entry was ever created. The Executor has confirmed signature verification code is written and unit tests pass with mocked signature; the only gap is the real test-mode secret. This is outside arbitration authority — no directive or plan amendment can substitute for the credential itself.",
+    "directive": null,
+    "amendedSpec": null,
+    "escalationReason": "credential",
+    "nonGoalsPreserved": true,
+    "category": "blocked"
+  },
+  "parseError": null,
+  "costUsd": 0.07536,
+  "latencyMs": 18204,
+  "numTurns": 2,
+  "inputTokens": 4,
+  "outputTokens": 467,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

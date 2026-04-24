@@ -1,0 +1,30 @@
+{
+  "escalationId": "e4",
+  "shape": "review_arbitration",
+  "type": "review_arbitration",
+  "verdict": "retry_with_directive",
+  "directive": "In diffInventory.ts aliasMatch(), for each unmatched warehouse SKU, collect all db records mapped via the reverse-alias index, sum their dbQty values, then compare the single sum to warehouseQty. Update the corresponding test to assert that warehouse SKU-W=10 aliased to SKU-A(dbQty=7)+SKU-B(dbQty=3) produces no discrepancy (sum 10 == 10), and add a case where the sum mismatches (e.g. SKU-W=10, SKU-A=7+SKU-B=2, delta=-1).",
+  "amendedSpec": null,
+  "escalationReason": null,
+  "rationale": "Round 2 rejection identifies a concrete logic bug: aliasMatch() compares warehouseQty to each mapped dbQty individually rather than summing dbQty across all aliases before comparing. The spec explicitly states 'one warehouse SKU maps to multiple database SKUs', which requires aggregation semantics. The Reviewer's correction (sum dbQty across aliases first, then compare to warehouseQty) is the only correct reading of the spec. This is a quality/logic fix within the existing implementation scope — no new files, no new dependencies, no non-goal violations.",
+  "nonGoalsPreserved": true,
+  "category": "design_decision",
+  "fullArbitration": {
+    "verdict": "retry_with_directive",
+    "rationale": "Round 2 rejection identifies a concrete logic bug: aliasMatch() compares warehouseQty to each mapped dbQty individually rather than summing dbQty across all aliases before comparing. The spec explicitly states 'one warehouse SKU maps to multiple database SKUs', which requires aggregation semantics. The Reviewer's correction (sum dbQty across aliases first, then compare to warehouseQty) is the only correct reading of the spec. This is a quality/logic fix within the existing implementation scope — no new files, no new dependencies, no non-goal violations.",
+    "directive": "In diffInventory.ts aliasMatch(), for each unmatched warehouse SKU, collect all db records mapped via the reverse-alias index, sum their dbQty values, then compare the single sum to warehouseQty. Update the corresponding test to assert that warehouse SKU-W=10 aliased to SKU-A(dbQty=7)+SKU-B(dbQty=3) produces no discrepancy (sum 10 == 10), and add a case where the sum mismatches (e.g. SKU-W=10, SKU-A=7+SKU-B=2, delta=-1).",
+    "amendedSpec": null,
+    "escalationReason": null,
+    "nonGoalsPreserved": true,
+    "category": "design_decision"
+  },
+  "parseError": null,
+  "costUsd": 0.0846924,
+  "latencyMs": 22745,
+  "numTurns": 2,
+  "inputTokens": 4,
+  "outputTokens": 866,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

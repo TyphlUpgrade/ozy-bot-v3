@@ -1,0 +1,229 @@
+[
+  {
+    "id": "e1",
+    "shape": "executor_escalation",
+    "type": "scope_unclear",
+    "projectContext": {
+      "name": "auth-hardening",
+      "description": "Add rate limiting and lockout to the login endpoint to resist credential stuffing attacks.",
+      "nonGoals": [
+        "Do not refactor the existing session token logic",
+        "Do not add new database tables",
+        "Do not change the public API contract of /api/auth/login"
+      ]
+    },
+    "phaseSpec": {
+      "phaseId": "p2",
+      "title": "Rate limiting on login endpoint",
+      "description": "Add rate limiting to the POST /api/auth/login endpoint to cap attempts per identifier. Integrate with existing rate-limit middleware in src/middleware/ratelimit.ts.",
+      "acceptanceCriteria": [
+        "Login endpoint returns 429 after threshold exceeded",
+        "Threshold is configurable via config/auth.yml",
+        "Legitimate retries after cooldown window succeed"
+      ]
+    },
+    "escalation": {
+      "type": "scope_unclear",
+      "question": "Should rate limiting key be per-IP address or per-username?",
+      "context": "Existing ratelimit.ts middleware supports both modes via a `keyFn` parameter. Project plan says 'rate limit the login endpoint' without specifying granularity. Per-IP is simpler and matches existing patterns for /api/signup. Per-username catches credential stuffing where attacker rotates IPs but targets the same account, but requires reading the request body before rate limit check (inversion of current middleware order).",
+      "options": [
+        "per-IP using x-forwarded-for header (matches existing /api/signup pattern)",
+        "per-username reading body.username (stronger for credential stuffing, requires middleware reorder)",
+        "composite: both keys, rate-limit if either exceeds (safest, 2x state)"
+      ],
+      "assessment": {
+        "scopeClarity": "partial",
+        "designCertainty": "alternatives_exist",
+        "assumptions": [],
+        "openQuestions": ["per-IP vs per-username granularity"],
+        "testCoverage": "verifiable"
+      }
+    }
+  },
+  {
+    "id": "e2",
+    "shape": "executor_escalation",
+    "type": "design_decision",
+    "projectContext": {
+      "name": "order-pipeline-v2",
+      "description": "Replace synchronous order processing with an async queue-backed pipeline.",
+      "nonGoals": [
+        "Do not change the external Order API response format",
+        "Do not introduce new external service dependencies beyond the existing Redis instance",
+        "Do not remove the synchronous path (gate behind feature flag)"
+      ]
+    },
+    "phaseSpec": {
+      "phaseId": "p4",
+      "title": "Queue consumer idempotency",
+      "description": "Implement idempotency guarantees for the async order consumer so retried messages do not double-process.",
+      "acceptanceCriteria": [
+        "Duplicate message delivery produces exactly one order record",
+        "Idempotency window is at least 24 hours",
+        "Idempotency check adds < 5ms p99 latency"
+      ]
+    },
+    "escalation": {
+      "type": "design_decision",
+      "question": "Two valid idempotency strategies surfaced during implementation. Which fits the project's non-goals and existing patterns?",
+      "context": "Strategy A: use Redis SETNX with order_id as key, 24h TTL. Matches existing Redis usage in the codebase. Adds ~1ms per write. Risks: Redis eviction under memory pressure could allow duplicates. Strategy B: add an idempotency_key column to the orders table with a partial unique index, check on INSERT. More durable than Redis. Risks: adds a column, which the non-goals list may or may not forbid depending on interpretation — the non-goal 'do not introduce new external service dependencies beyond the existing Redis instance' speaks to services, not schema changes.",
+      "options": [
+        "Strategy A (Redis SETNX)",
+        "Strategy B (orders table column + partial unique index)"
+      ],
+      "assessment": {
+        "scopeClarity": "clear",
+        "designCertainty": "alternatives_exist",
+        "assumptions": [
+          {"description": "Schema changes to existing tables are permitted under non-goals", "impact": "high", "reversible": false}
+        ],
+        "openQuestions": [],
+        "testCoverage": "verifiable"
+      }
+    }
+  },
+  {
+    "id": "e3",
+    "shape": "executor_escalation",
+    "type": "blocked",
+    "projectContext": {
+      "name": "stripe-integration",
+      "description": "Integrate Stripe as a secondary payment processor alongside existing Braintree.",
+      "nonGoals": [
+        "Do not remove Braintree integration",
+        "Do not change the checkout UI",
+        "Do not process real payments during development — use test mode only"
+      ]
+    },
+    "phaseSpec": {
+      "phaseId": "p3",
+      "title": "Stripe webhook handler",
+      "description": "Implement the /webhooks/stripe endpoint to handle payment_intent.succeeded and payment_intent.failed events, verify signatures, and update order state.",
+      "acceptanceCriteria": [
+        "Handler verifies Stripe-Signature header per stripe-node docs",
+        "Successful events mark order as paid",
+        "Failed events mark order as payment_failed and emit retry event"
+      ]
+    },
+    "escalation": {
+      "type": "blocked",
+      "question": "Cannot test webhook signature verification end-to-end — STRIPE_WEBHOOK_SECRET environment variable is missing from .env.test and is not in the password manager.",
+      "context": "Signature verification code is written and unit tests pass with mocked signature. Full integration test requires the test-mode webhook secret from Stripe Dashboard > Developers > Webhooks. This appears to be a credential that was never provisioned for this development environment. Braintree equivalents live in 1Password 'shared-eng' vault but no Stripe entry exists there.",
+      "options": [],
+      "assessment": {
+        "scopeClarity": "clear",
+        "designCertainty": "obvious",
+        "assumptions": [],
+        "openQuestions": ["Where to obtain STRIPE_WEBHOOK_SECRET for test-mode"],
+        "testCoverage": "partial"
+      }
+    }
+  },
+  {
+    "id": "e4",
+    "shape": "review_arbitration",
+    "projectContext": {
+      "name": "inventory-reconciliation",
+      "description": "Build nightly reconciliation job that compares warehouse inventory snapshots against the database and flags discrepancies.",
+      "nonGoals": [
+        "Do not auto-correct discrepancies (read-only flagging only)",
+        "Do not alter the warehouse snapshot ingestion path",
+        "Do not block on slow warehouse systems — use 60s timeout"
+      ]
+    },
+    "phaseSpec": {
+      "phaseId": "p2",
+      "title": "Discrepancy detection algorithm",
+      "description": "Implement algorithm that diffs warehouse snapshot against inventory table and produces a list of mismatches. Must handle partial snapshots (some SKUs missing) and SKU aliases (one warehouse SKU maps to multiple database SKUs).",
+      "acceptanceCriteria": [
+        "Diff produces list of {sku, warehouseQty, dbQty, delta} records",
+        "Partial snapshots flagged separately, not treated as zero-qty",
+        "SKU alias map consulted when direct match fails"
+      ]
+    },
+    "executorCompletion": {
+      "status": "success",
+      "summary": "Implemented diffInventory() with three-phase matching: direct SKU match, alias map match, partial-snapshot flagging.",
+      "understanding": "Goal is detecting inventory discrepancies without attempting correction. Alias handling and partial-snapshot detection are required.",
+      "assumptions": ["Alias map is loaded from config/sku-aliases.yml at job start"],
+      "nonGoals": ["Did not modify warehouse snapshot ingestion", "Did not auto-correct discrepancies"],
+      "confidence": {
+        "scopeClarity": "clear",
+        "designCertainty": "obvious",
+        "testCoverage": "verifiable",
+        "assumptions": [],
+        "openQuestions": []
+      },
+      "filesChanged": ["src/jobs/reconciliation/diffInventory.ts", "tests/jobs/reconciliation/diffInventory.test.ts"]
+    },
+    "diffSummary": "Added src/jobs/reconciliation/diffInventory.ts (~180 lines) with exported diffInventory(warehouse, db, aliases) function. Three internal helpers: directMatch, aliasMatch, partialSnapshotFlag. 12 unit tests cover direct/alias/partial/empty/null cases. Uses Map<string, Item> for O(1) lookups.",
+    "reviewerVerdicts": [
+      {
+        "round": 1,
+        "verdict": "reject",
+        "feedback": "diffInventory() is O(n+m) as claimed but the aliases lookup in aliasMatch() is O(n) per unmatched SKU because it iterates the aliases Map. Worst case with many unmatched SKUs this is O(n²). Refactor to build a reverse-alias index at function entry (O(m)) then lookup O(1) per SKU. Also: test coverage does not include the 'same SKU aliased to multiple DB SKUs' case — the spec says this is possible.",
+        "severity": "warning"
+      },
+      {
+        "round": 2,
+        "verdict": "reject",
+        "feedback": "Reverse-alias index added but the test for 'one warehouse SKU → multiple DB SKUs' now asserts quantity equality across all mapped DB SKUs, which is wrong: if warehouse reports 10 units of SKU-W and it aliases to SKU-A (dbQty 7) and SKU-B (dbQty 3), the sum matches (10 = 7+3) and should NOT be flagged. Current implementation flags it as a discrepancy because it compares warehouseQty to each dbQty individually. Fix the aggregation logic: for multi-aliased SKUs, sum dbQty across aliases before comparing.",
+        "severity": "critical"
+      }
+    ]
+  },
+  {
+    "id": "e5",
+    "shape": "review_arbitration",
+    "projectContext": {
+      "name": "metrics-export",
+      "description": "Export application metrics to Prometheus for operational dashboards.",
+      "nonGoals": [
+        "Do not add any new metric labels beyond those already documented",
+        "Do not change the metrics registry pattern used by existing services",
+        "Do not export sensitive data (PII, tokens, keys) in metric values or labels"
+      ]
+    },
+    "phaseSpec": {
+      "phaseId": "p3",
+      "title": "Request latency histogram",
+      "description": "Add a histogram metric 'http_request_duration_seconds' to capture request latency with labels {method, route, status_class}. Bucket boundaries per Prometheus best practices for web request latency.",
+      "acceptanceCriteria": [
+        "Histogram registered at service startup",
+        "Middleware records duration for every HTTP request",
+        "Buckets cover 10ms to 10s range with reasonable granularity",
+        "status_class label is '2xx' | '3xx' | '4xx' | '5xx'"
+      ]
+    },
+    "executorCompletion": {
+      "status": "success",
+      "summary": "Added http_request_duration_seconds histogram with {method, route, status_class} labels via middleware.",
+      "understanding": "Capture latency per-request, categorize by status code class, expose via existing /metrics endpoint.",
+      "assumptions": ["Route label uses registered route pattern (/users/:id), not full URL path"],
+      "nonGoals": ["Did not add new label keys beyond the three specified"],
+      "confidence": {
+        "scopeClarity": "clear",
+        "designCertainty": "obvious",
+        "testCoverage": "verifiable",
+        "assumptions": [],
+        "openQuestions": []
+      },
+      "filesChanged": ["src/middleware/metrics.ts", "src/metrics/registry.ts", "tests/middleware/metrics.test.ts"]
+    },
+    "diffSummary": "Added histogram registration in src/metrics/registry.ts, middleware in src/middleware/metrics.ts. Buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]. Labels populated from req.method, req.route?.path ?? req.path, and Math.floor(res.statusCode / 100) + 'xx'. 8 unit tests.",
+    "reviewerVerdicts": [
+      {
+        "round": 1,
+        "verdict": "reject",
+        "feedback": "The fallback `req.route?.path ?? req.path` is a high-cardinality label hazard. When no route matches (404 path, typo'd URLs), req.path is the raw URL which can be unbounded — attackers hitting /foo?x=1, /foo?x=2, ... each create new time series. This is Prometheus's classic 'cardinality explosion' anti-pattern. For unmatched routes, use 'unknown' or the static string 'unmatched'.",
+        "severity": "critical"
+      },
+      {
+        "round": 2,
+        "verdict": "reject",
+        "feedback": "Fallback changed to 'unknown', good. But now matched routes with path parameters still include raw parameter values in some frameworks where req.route.path isn't normalized. The test suite still uses Express which does normalize, but the middleware is advertised as framework-agnostic in the phase description. Either (a) scope to Express only and document the limitation, or (b) add a route normalizer that strips numeric IDs. Also: the phase spec says 'bucket boundaries per Prometheus best practices for web request latency' but the buckets chosen differ from Prometheus's recommended defaults (no 2.5 in default, etc). Either match Prometheus defaults or cite a best-practice source.",
+        "severity": "warning"
+      }
+    ]
+  }
+]

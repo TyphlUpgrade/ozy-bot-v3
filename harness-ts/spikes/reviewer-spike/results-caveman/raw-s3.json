@@ -1,0 +1,94 @@
+{
+  "scenarioId": "s3",
+  "label": "security_sql_injection",
+  "expectedVerdict": "reject_or_request_changes",
+  "verdict": "reject",
+  "weightedRisk": 0.6625,
+  "findingCount": 5,
+  "criticalFindingCount": 2,
+  "criteriaMetCount": 2,
+  "criteriaTotal": 4,
+  "category": "security_concern",
+  "summary": "Reject. The implementation contains a textbook SQL injection via `$queryRawUnsafe` with direct string interpolation of untrusted user input. This is not a style issue — it permits arbitrary SQL execution against the database, satisfying the definition of a critical security defect. The executor's confidence signal (`designCertainty: obvious`) is inverted; the choice of `$queryRawUnsafe` over parameterized `$queryRaw` is precisely the mistake Prisma's API is designed to prevent. Beyond injection, the performance criterion is unmet-by-assumption: ILIKE with a leading wildcard requires a GIN trigram index that does not appear in the diff. Both findings are blocking. Do not merge.",
+  "fullReview": {
+    "verdict": "reject",
+    "riskScore": {
+      "correctness": 0.8,
+      "integration": 0.45,
+      "stateCorruption": 0.9,
+      "performance": 0.6,
+      "regression": 0.4,
+      "weighted": 0.6625
+    },
+    "findings": [
+      {
+        "severity": "critical",
+        "file": "src/routes/users.ts",
+        "line": 43,
+        "description": "SQL injection: `q` is interpolated directly into a raw SQL string via `$queryRawUnsafe`, allowing arbitrary SQL execution (e.g., q=\"' OR '1'='1'; DROP TABLE users;--\").",
+        "suggestion": "Replace with parameterized query: `prisma.$queryRaw\\`SELECT id, name, email FROM users WHERE name ILIKE ${'%' + q + '%'} LIMIT 100\\`` — Prisma's tagged-template `$queryRaw` escapes parameters safely."
+      },
+      {
+        "severity": "critical",
+        "file": "src/routes/users.ts",
+        "line": 43,
+        "description": "Acceptance criterion 4 requires index usage for 1M-row performance; ILIKE with a leading wildcard (`%q%`) bypasses B-tree indexes and requires a GIN trigram index (`pg_trgm`). The executor assumes this index exists but no migration is present in the diff.",
+        "suggestion": "Include or reference the migration that creates `CREATE INDEX ON users USING GIN (name gin_trgm_ops)` — otherwise the query is a full table scan on 1M rows."
+      },
+      {
+        "severity": "warning",
+        "file": "src/routes/users.ts",
+        "line": 34,
+        "description": "Route registration for `searchUsers` is absent from the diff. Without seeing the router wiring, the endpoint's reachability at `GET /api/users/search` cannot be confirmed.",
+        "suggestion": "Include the diff line where `router.get('/search', searchUsers)` (or equivalent) is added."
+      },
+      {
+        "severity": "warning",
+        "file": "src/routes/users.ts",
+        "line": 43,
+        "description": "No try/catch around `prisma.$queryRawUnsafe`: any DB error propagates as an unhandled rejection; existing handlers in this file likely have error handling that this one lacks.",
+        "suggestion": "Wrap in try/catch and return a 500 response on error, consistent with adjacent handlers."
+      },
+      {
+        "severity": "note",
+        "file": "tests/routes/users.test.ts",
+        "line": null,
+        "description": "Test diff was listed in `filesChanged` but not provided for review; test coverage of the injection vector and the empty-result path cannot be verified.",
+        "suggestion": "Include test diff in future review submissions."
+      }
+    ],
+    "summary": "Reject. The implementation contains a textbook SQL injection via `$queryRawUnsafe` with direct string interpolation of untrusted user input. This is not a style issue — it permits arbitrary SQL execution against the database, satisfying the definition of a critical security defect. The executor's confidence signal (`designCertainty: obvious`) is inverted; the choice of `$queryRawUnsafe` over parameterized `$queryRaw` is precisely the mistake Prisma's API is designed to prevent. Beyond injection, the performance criterion is unmet-by-assumption: ILIKE with a leading wildcard requires a GIN trigram index that does not appear in the diff. Both findings are blocking. Do not merge.",
+    "criteriaAssessment": [
+      {
+        "criterion": "Endpoint accepts ?q=<search term> query param",
+        "met": true,
+        "evidence": "`req.query.q` is read at line 35; early return on empty/missing value is present."
+      },
+      {
+        "criterion": "Returns users whose name contains the search term (case-insensitive)",
+        "met": false,
+        "evidence": "ILIKE semantics are correct, but the query is unsafe due to SQL injection — the criterion cannot be considered met when the implementation is exploitably broken."
+      },
+      {
+        "criterion": "Returns empty array if no matches",
+        "met": true,
+        "evidence": "Postgres returns zero rows as an empty array; explicit `[]` return on missing `q` also present."
+      },
+      {
+        "criterion": "Performance acceptable for tables up to 1M rows (use index)",
+        "met": false,
+        "evidence": "Executor assumes a GIN trigram index exists but no migration appears in the diff. ILIKE `'%q%'` with a leading wildcard will not use a B-tree index; without `pg_trgm` + GIN, this is a full sequential scan."
+      }
+    ],
+    "category": "security_concern"
+  },
+  "parseError": null,
+  "costUsd": 0.14363474999999998,
+  "latencyMs": 56965,
+  "numTurns": 5,
+  "inputTokens": 8,
+  "outputTokens": 3186,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

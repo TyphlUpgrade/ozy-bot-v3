@@ -1,0 +1,66 @@
+{
+  "runAt": "2026-04-23T22:22:26.192Z",
+  "model": "claude-sonnet-4-6",
+  "totalEscalations": 5,
+  "resolvedCount": 4,
+  "escalatedCount": 1,
+  "errorCount": 0,
+  "resolutionRate": 0.8,
+  "totalCostUsd": 0.74310075,
+  "avgCostUsd": 0.14862015,
+  "avgLatencyMs": 44773.4,
+  "p99LatencyMs": 55153,
+  "killCriteriaHit": [],
+  "proceedCriteriaMet": [
+    "resolution_rate_at_least_60pct (80%)",
+    "avg_cost_within_budget",
+    "avg_latency_within_budget"
+  ],
+  "perEscalation": [
+    {
+      "id": "e1",
+      "shape": "executor_escalation",
+      "verdict": "retry_with_directive",
+      "category": "design_decision",
+      "costUsd": 0.13521285,
+      "latencyMs": 38696,
+      "terminalReason": "completed"
+    },
+    {
+      "id": "e2",
+      "shape": "executor_escalation",
+      "verdict": "retry_with_directive",
+      "category": "design_decision",
+      "costUsd": 0.16834575000000002,
+      "latencyMs": 66142,
+      "terminalReason": "completed"
+    },
+    {
+      "id": "e3",
+      "shape": "executor_escalation",
+      "verdict": "escalate_operator",
+      "category": "blocked",
+      "costUsd": 0.11473409999999999,
+      "latencyMs": 19255,
+      "terminalReason": "completed"
+    },
+    {
+      "id": "e4",
+      "shape": "review_arbitration",
+      "verdict": "retry_with_directive",
+      "category": "design_decision",
+      "costUsd": 0.1603191,
+      "latencyMs": 44621,
+      "terminalReason": "completed"
+    },
+    {
+      "id": "e5",
+      "shape": "review_arbitration",
+      "verdict": "retry_with_directive",
+      "category": "review_arbitration",
+      "costUsd": 0.16448894999999997,
+      "latencyMs": 55153,
+      "terminalReason": "completed"
+    }
+  ]
+}

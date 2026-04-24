@@ -1,0 +1,606 @@
+{
+  "projectId": "large",
+  "projectName": "postgres-to-cockroach-migration",
+  "complexity": "large",
+  "expectedPhaseRange": "18-28",
+  "actualPhaseCount": 21,
+  "nonGoalsPreservedCount": 7,
+  "nonGoalsOperatorCount": 7,
+  "nonGoalsAddedCount": 1,
+  "criticalPathLength": 15,
+  "allDependenciesValid": true,
+  "hasDecompositionRationale": true,
+  "subagentInvocations": [
+    {
+      "tool": "Agent",
+      "subagent_type": "oh-my-claudecode:architect"
+    },
+    {
+      "tool": "Agent",
+      "subagent_type": "oh-my-claudecode:critic"
+    }
+  ],
+  "subagentInvocationCount": 2,
+  "fullPlan": {
+    "projectId": "postgres-to-cockroach-migration",
+    "projectDescription": "Migrate production application database from PostgreSQL 14 to CockroachDB (cloud-hosted) with zero downtime and zero data loss during cutover. The application uses Prisma ORM across ~40 tables totaling ~2TB, peak 5k writes/sec. Critical paths: user authentication, billing transactions, audit log append. 6-week deadline. Cutover executed during a 2-hour scheduled maintenance window. Rollback to PostgreSQL must remain possible for 30 days post-cutover, maintained by CockroachDB→Postgres reverse-sync to keep Postgres current throughout the window.",
+    "nonGoals": [
+      "Do not change the Prisma schema semantics — client-side code must compile and pass tests unchanged",
+      "Do not remove PostgreSQL until 30-day post-cutover stability window passes",
+      "Do not migrate denormalized read-replica data or analytics pipelines — those are a separate post-cutover project",
+      "Do not introduce multi-region writes — single-region CockroachDB only (multi-region is future scope)",
+      "Do not disable any existing monitoring, alerting, or logging paths during migration",
+      "Do not increase p99 application latency by more than 15% vs PostgreSQL baseline measured over the migration week",
+      "Do not modify business logic or application behavior — this is a pure storage-layer migration",
+      "Do not change integer primary key ID types to UUID without explicit operator approval — a silent sequential→UUID change affects API contracts, pagination cursors, and external system FK references (surfaced during decomposition as a risk to non-goal #1)"
+    ],
+    "phases": [
+      {
+        "phaseId": "p1",
+        "title": "Compatibility Audit + Production Postgres Baseline Capture",
+        "description": "Survey the codebase for CockroachDB incompatibilities and capture the current production Postgres p99 performance baseline. Establishes the incompatibility inventory driving p2/p3 and the latency reference defining the 15% budget for all subsequent phases.",
+        "dependencies": [],
+        "acceptanceCriteria": [
+          "Inventory lists all Prisma schema constructs incompatible with CockroachDB: data types, index types, constraints, sequences, JSON operators, array types, custom types",
+          "All $queryRaw/$executeRaw call sites catalogued with PostgreSQL-specific syntax flagged (::casts, pg_advisory_lock, Postgres-only functions, RETURNING edge cases)",
+          "Transaction semantic differences documented: serializable isolation behavior, FOR UPDATE semantics, advisory lock usage, error code mapping (23505→40001 etc.)",
+          "ID type strategy risk assessment documents whether CockroachDB migration requires sequential→UUID changes and the blast radius: API contracts, pagination cursors, external system FK references",
+          "Production Postgres p99/p95/p50 latency captured for auth, billing, and audit log critical paths under peak load and recorded as the reference baseline for non-goal #6"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Tooling for baseline capture (pg_stat_statements, custom instrumentation, APM)",
+            "Format and structure of incompatibility inventory document",
+            "Specific endpoints sampled for latency baseline"
+          ],
+          "escalateToOperator": [
+            "If ID type changes are required and whether that violates non-goal #1 (Prisma client unchanged)",
+            "Any discovered dependency on PostgreSQL extensions (pg_trgm, pg_crypto, postgis, etc.) with no CockroachDB equivalent"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p2",
+        "title": "CockroachDB-Compatible Schema Adaptation",
+        "description": "Produce a CockroachDB-compatible Prisma schema and DDL migration scripts that leave the Prisma client API semantically unchanged. Includes gated ID type strategy decision and FK-ordered DDL for the 12-table audit log chain.",
+        "dependencies": [
+          "p1"
+        ],
+        "acceptanceCriteria": [
+          "Prisma client compiles and all existing tests pass unchanged after schema adaptation (tsc --noEmit confirms identical TypeScript types)",
+          "DDL migration scripts apply in correct FK-dependency order to an empty CockroachDB instance with zero errors (audit log table last in its FK chain)",
+          "ID type strategy documented and resolved: if sequential IDs are retained, CockroachDB hot-spot write risk acknowledged with mitigation (e.g., hash sharding); if UUID migration required, operator sign-off obtained per added non-goal #8",
+          "All incompatible constructs from p1 inventory resolved: unsupported index types adapted, JSON operators replaced, array type handling confirmed",
+          "Schema adaptation does not change any Prisma-generated client method signatures or return types"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Index syntax adaptations (STORING clauses, covering indexes)",
+            "Migration tooling approach (prisma migrate vs raw DDL scripts)",
+            "Hash sharding configuration if sequential IDs retained"
+          ],
+          "escalateToOperator": [
+            "UUID vs sequential ID decision if ID type change is required",
+            "Any adaptation that changes Prisma-generated client method signatures or return types",
+            "Any discovered PostgreSQL extension dependency with no CockroachDB equivalent requiring architectural change"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p3",
+        "title": "Application Transaction Hardening",
+        "description": "Identify and remediate all application code paths that assume PostgreSQL-specific transaction behavior. CockroachDB's default serializable isolation generates 40001 retryable errors under write-write conflicts that PostgreSQL (read-committed default) silently resolves.",
+        "dependencies": [
+          "p1"
+        ],
+        "acceptanceCriteria": [
+          "All transaction blocks on auth, billing, and audit log paths audited for serializable conflict exposure",
+          "Retry logic implemented for CockroachDB 40001 errors on all affected transaction paths; tested with injected 40001 errors confirming retry and eventual success",
+          "Automated scan confirms zero PostgreSQL-specific syntax remaining in all $queryRaw/$executeRaw call sites (::casts, pg_advisory_lock, Postgres-only functions)",
+          "Advisory lock usage (if any) replaced with CockroachDB-compatible alternatives",
+          "Full application test suite passes with retry logic active"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Retry backoff strategy (exponential, jitter, fixed)",
+            "Retry wrapper pattern (decorator, middleware, explicit loop)",
+            "Maximum retry count per transaction path"
+          ],
+          "escalateToOperator": [
+            "Any transaction path where retry is semantically unsafe due to non-idempotent side effects within the transaction (external API calls, email sends)"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p4",
+        "title": "Dual-Write Infrastructure + FK Write Ordering + Metrics Instrumentation",
+        "description": "Build the dual-write middleware that fans writes to both Postgres (primary) and CockroachDB, with FK-aware write ordering for the audit log dependency chain, a DLQ for failed CockroachDB writes, and metrics instrumentation that underpins all subsequent observability.",
+        "dependencies": [
+          "p2",
+          "p3"
+        ],
+        "acceptanceCriteria": [
+          "All application writes fan out to Postgres (primary) and CockroachDB; read path remains exclusively on Postgres",
+          "CockroachDB write failure does not surface as application error: failure triggers log entry, alert, and DLQ capture within 5 seconds; write latency penalty under CockroachDB outage does not exceed a configured timeout ceiling (default 200ms)",
+          "Write ordering respects FK constraints: parent table writes confirmed in CockroachDB before child table writes in the same fan-out, verified against the audit log 12-table FK chain",
+          "DLQ replay correctness validated: simulated 5-minute CockroachDB outage followed by DLQ replay produces zero row-level divergence from Postgres",
+          "Metrics exported: dual-write latency overhead, DLQ depth, DLQ replay lag, CockroachDB write error rate, per-table write counts (these metrics are consumed by p14 for dashboard and alert configuration)"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "DLQ storage backend (Redis, database table, managed queue), consistent with existing infrastructure",
+            "Dual-write implementation layer (Prisma middleware, application service layer, sidecar proxy)",
+            "Metric export format consistent with existing monitoring stack"
+          ],
+          "escalateToOperator": [
+            "DLQ replay conflict resolution policy when a replayed write conflicts with a Postgres row that has since changed",
+            "Any dual-write design that requires changes to the Prisma schema or generated client API"
+          ]
+        },
+        "estimatedComplexity": "large"
+      },
+      {
+        "phaseId": "p5",
+        "title": "Bulk Migration Pipeline",
+        "description": "Build and benchmark the one-shot bulk data pipeline for the initial ~2TB Postgres→CockroachDB copy. Must demonstrate throughput sufficient for the 2-hour production maintenance window.",
+        "dependencies": [
+          "p2"
+        ],
+        "acceptanceCriteria": [
+          "Pipeline migrates tables in FK-dependency order respecting all 40-table constraint chain",
+          "Sustained throughput ≥1TB/hr on a representative dataset (formally benchmarked in p9)",
+          "Row counts and checksums match Postgres source for all migrated tables",
+          "Pipeline is resumable: an interrupted run can restart per-table without full reload",
+          "PII tables (users, payments) migrated with additional integrity assertions (row counts plus field-level spot checks)"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Migration tooling choice (custom ETL, COPY protocol, pg_dump streaming, third-party tool)",
+            "Table-level parallelism strategy",
+            "Checksum algorithm"
+          ],
+          "escalateToOperator": [
+            "Any tooling requiring a paid third-party service not in the existing infrastructure budget"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p6",
+        "title": "Delta-Sync Replication Pipeline",
+        "description": "Build the continuous streaming replication component that keeps CockroachDB current with Postgres during the dual-write period. Distinct from the bulk pipeline: must handle 5k writes/sec ongoing with low latency and survive gaps without data loss.",
+        "dependencies": [
+          "p2"
+        ],
+        "acceptanceCriteria": [
+          "Replication lag <30 seconds under sustained 5k writes/sec load (benchmarked in staging)",
+          "FK ordering respected: parent row changes replicate before dependent child row changes",
+          "No data loss after a 10-minute replication gap followed by reconnect (verified in staging p10)",
+          "Correctly handles INSERT, UPDATE, DELETE, and upsert patterns",
+          "Delta-sync lag metric exported and alertable (consumed by p14)"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Replication mechanism (logical replication, CDC via WAL, change-polling)",
+            "Conflict resolution for rows modified on both sides during a gap"
+          ],
+          "escalateToOperator": [
+            "Any mechanism requiring PostgreSQL superuser privileges or WAL configuration changes affecting production stability",
+            "If the chosen approach cannot meet the 30s lag SLO under 5k writes/sec in benchmark"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p7",
+        "title": "Staging Environment Setup",
+        "description": "Provision CockroachDB Cloud Serverless staging and deploy the adapted schema. Gate for all staging validation phases (p8–p15).",
+        "dependencies": [
+          "p2"
+        ],
+        "acceptanceCriteria": [
+          "CockroachDB Serverless staging instance provisioned and accessible",
+          "Schema applied in FK-dependency order with zero DDL errors",
+          "Prisma client connects and executes representative reads and writes without error",
+          "Encryption-at-rest confirmed enabled on staging instance per CockroachDB Cloud documentation"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Staging instance sizing within Serverless tier constraints",
+            "Connection string and credentials management approach"
+          ],
+          "escalateToOperator": [
+            "Staging data residency or network isolation requirements beyond CockroachDB Cloud defaults"
+          ]
+        },
+        "estimatedComplexity": "small"
+      },
+      {
+        "phaseId": "p8",
+        "title": "PII & Encryption Validation Framework",
+        "description": "Build the automated comparison harness for PII tables and verify encryption-at-rest compliance. This framework runs in p9 (staging load validation) and p19 (pre-cutover production validation), so it must be built before data loads begin.",
+        "dependencies": [
+          "p7"
+        ],
+        "acceptanceCriteria": [
+          "Harness executes row-count and checksum comparison for users and payments tables between Postgres and CockroachDB",
+          "PII field-level spot checks: harness samples N random rows and verifies field-by-field equality for all PII columns",
+          "Encryption-at-rest on staging confirmed against the existing Postgres encryption standard; any gap reported as a blocking finding",
+          "Harness produces structured pass/fail report with per-table results and any divergent row IDs"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Sample size N for spot checks",
+            "Report format (JSON, HTML, structured log)"
+          ],
+          "escalateToOperator": [
+            "Any encryption-at-rest configuration difference between current Postgres standard and what CockroachDB Cloud provides (compliance team decision)"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p9",
+        "title": "Staging Data Load & Integrity Validation",
+        "description": "Execute the bulk migration to staging, validate integrity across all tables, and benchmark the pipeline to confirm the 2-hour production window is achievable.",
+        "dependencies": [
+          "p5",
+          "p7",
+          "p8"
+        ],
+        "acceptanceCriteria": [
+          "All ~40 tables migrated to staging; row counts match Postgres source per table",
+          "FK integrity validated: no orphaned child rows in CockroachDB staging",
+          "Billing tables validated: total debits and credits match Postgres to the cent",
+          "PII validation harness (p8) passes for users and payments tables",
+          "Pipeline benchmark on staging dataset extrapolates to ≥1TB/hr, confirming 2TB is feasible within 2 hours"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Whether staging uses full production data copy or a representative subset"
+          ],
+          "escalateToOperator": [
+            "If benchmark result indicates 2TB cannot be completed in 2 hours — requires cutover window rescheduling or scope decision"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p10",
+        "title": "Staging Dual-Write + DLQ Validation",
+        "description": "Deploy dual-write and delta-sync to staging, run automated Postgres-vs-CockroachDB read comparison for all critical paths, and validate DLQ replay correctness under simulated CockroachDB outage.",
+        "dependencies": [
+          "p4",
+          "p6",
+          "p9"
+        ],
+        "acceptanceCriteria": [
+          "Dual-write active in staging; delta-sync lag <30s under representative load",
+          "Automated comparison runs continuously: Postgres vs CockroachDB reads for auth, billing, and audit log paths",
+          "Zero billing table divergence at quiescence (defined quiet period with no in-flight writes) over a 48-hour staging run",
+          "DLQ validation: simulate 5-minute CockroachDB outage; all missed writes captured in DLQ; DLQ replay produces zero row-level divergence from Postgres",
+          "Dual-write latency overhead (p99 delta vs single-write baseline) measured and recorded for p14 alert threshold calibration"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Quiet period duration for divergence comparison (to exclude in-flight write noise)",
+            "DLQ replay ordering strategy for FK-dependent rows"
+          ],
+          "escalateToOperator": [
+            "Any billing divergence detected during 48-hour run — financial data requires investigation before proceeding"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p11",
+        "title": "Staging Performance Baseline",
+        "description": "Measure p99 latency for auth, billing, and audit log paths under dual-write in staging. Tune any queries breaching the 15% threshold. Produces empirical thresholds for p14 alert configuration.",
+        "dependencies": [
+          "p10"
+        ],
+        "acceptanceCriteria": [
+          "p99 latency measured for auth, billing, and audit log paths under dual-write with CockroachDB active at peak-equivalent load",
+          "All three critical paths confirmed within 15% of the Postgres production baseline from p1",
+          "Any query exceeding the threshold identified, tuned (index additions or query restructuring within Prisma), and re-measured below threshold",
+          "Connection pooling validated under peak load: no pool exhaustion or timeout errors at 5k writes/sec",
+          "Note any Serverless throttling artifacts that may not represent Dedicated production behavior"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Index tuning approach (STORING clause, covering indexes, composite reordering)",
+            "Connection pool size adjustments"
+          ],
+          "escalateToOperator": [
+            "If 15% threshold cannot be met without application-level changes that alter business logic or Prisma schema semantics",
+            "If Serverless throttling makes staging results non-representative and a Dedicated staging instance is needed"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p12",
+        "title": "Serializable Contention & Retry Stress Test",
+        "description": "Stress-test CockroachDB serializable isolation under realistic hot-row contention at production write volumes. Validates that retry overhead stays within the 15% p99 budget and that no retry storm emerges — a failure mode with no PostgreSQL analogue.",
+        "dependencies": [
+          "p11"
+        ],
+        "acceptanceCriteria": [
+          "Load test runs at 5k writes/sec targeting hot rows: concurrent billing ledger updates, concurrent auth session writes, concurrent audit log appends with FK constraint checks",
+          "Transaction abort rate (40001 before successful retry) measured at <5% under sustained peak load",
+          "p99 latency including retry overhead remains within 15% of Postgres baseline",
+          "No retry storm: retry rate does not grow unboundedly under sustained contention; backoff/circuit-breaker prevents cascading",
+          "Serializable correctness verified: concurrent billing transactions produce consistent final totals with zero phantom reads or lost updates"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Load test tooling (k6, custom harness, etc.)",
+            "Contention pattern modeling based on billing and auth schema audit"
+          ],
+          "escalateToOperator": [
+            "If abort rate >5% or p99 exceeds 15% threshold under contention — requires schema-level redesign (row-level locking strategy) or operator decision on acceptable contention rate"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p13",
+        "title": "Rollback Procedure Build & Staging Test",
+        "description": "Build and end-to-end test the rollback procedure for the dual-write period: disable CockroachDB writes, switch reads back to Postgres. Produces a runbook with explicit, measurable go/no-go criteria.",
+        "dependencies": [
+          "p10"
+        ],
+        "acceptanceCriteria": [
+          "Rollback runbook complete with enumerated go/no-go trigger criteria: delta-sync lag threshold, billing divergence tolerance (zero), error rate ceiling, p99 breach threshold, maximum allowed rollback time",
+          "Full rollback executed in staging after 48-hour dual-write run: CockroachDB writes disabled and reads switched to Postgres in <15 minutes",
+          "Postgres confirmed consistent and current post-rollback: row counts and billing totals match pre-rollback snapshot",
+          "Rollback is reversible: re-enabling dual-write after rollback produces no data loss or duplication"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Rollback automation (manual runbook, scripted, feature flag)",
+            "Specific threshold values for trigger criteria based on p11/p12 measurements"
+          ],
+          "escalateToOperator": [
+            "If rollback from dual-write produces any Postgres state inconsistency that cannot be automatically resolved"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p14",
+        "title": "Monitoring & Observability Build",
+        "description": "Build CockroachDB-specific dashboards and alert rules using empirical thresholds from p11/p12. Built before production deployment so monitoring is operational when production dual-write goes live.",
+        "dependencies": [
+          "p11"
+        ],
+        "acceptanceCriteria": [
+          "Dashboards display: CockroachDB p99 vs Postgres baseline, dual-write latency overhead, DLQ depth, DLQ replay lag, delta-sync lag, transaction abort rate, consistency error count",
+          "Alert rules configured and validated in staging: PII validation failure, billing divergence (any nonzero amount), p99 breach >15%, DLQ depth above threshold, delta-sync lag >30s — all fire within 60 seconds of condition",
+          "No existing monitoring alert rule modified, disabled, or muted",
+          "All CockroachDB alert thresholds derived from p11/p12 empirical measurements, not assumed values"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Dashboard tooling consistent with existing monitoring stack",
+            "Alert notification channels consistent with existing on-call setup"
+          ],
+          "escalateToOperator": [
+            "Any existing alert rule that fires falsely during CockroachDB dual-write and cannot be namespace-filtered without modifying the rule"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p15",
+        "title": "Staging Cutover Rehearsal",
+        "description": "Execute the full cutover procedure in staging: connection draining, final delta-sync catch-up, read path switch, full integration test suite against CockroachDB-only, and emergency rollback test. Finalizes the production runbook with measured timings.",
+        "dependencies": [
+          "p12",
+          "p13"
+        ],
+        "acceptanceCriteria": [
+          "Full cutover procedure executed in staging end-to-end within 90 minutes (buffer within the 2-hour production window)",
+          "Connection draining tested: all in-flight transactions complete or time out before the read switch; no transaction spans the cutover boundary",
+          "Full application test suite passes with CockroachDB as the sole backend (Postgres disconnected) confirming non-goal #7 (no business logic change)",
+          "Emergency rollback executed mid-cutover (after read switch, before completion): Postgres restored as primary in <15 minutes with zero data loss",
+          "Production cutover runbook finalized with measured per-step timings and explicit abort criteria"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "In-flight transaction drain timeout value",
+            "Smoke test and integration test scope for post-switch validation"
+          ],
+          "escalateToOperator": [
+            "Any application behavior difference observed under CockroachDB-only that indicates a non-goal #7 violation (business logic change)"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p16",
+        "title": "Production Infrastructure Provisioning",
+        "description": "Provision CockroachDB Dedicated (production) and deploy the schema. Staging must be fully validated (p15) before any production CockroachDB infrastructure is created.",
+        "dependencies": [
+          "p15"
+        ],
+        "acceptanceCriteria": [
+          "CockroachDB Dedicated production instance provisioned with sizing appropriate for 5k writes/sec peak (based on p11/p12 benchmarks)",
+          "Schema deployed in FK-dependency order with zero DDL errors",
+          "Encryption-at-rest confirmed enabled and meeting the same compliance standard as production Postgres",
+          "Prisma client connects and executes smoke reads and writes against production CockroachDB",
+          "Network access controls and connection limits verified for production traffic"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Instance sizing (node count, hardware tier) based on benchmarks and CockroachDB sizing documentation"
+          ],
+          "escalateToOperator": [
+            "Production network topology decisions (VPC peering, private endpoints, firewall rules)",
+            "Backup and PITR configuration policy for production CockroachDB"
+          ]
+        },
+        "estimatedComplexity": "small"
+      },
+      {
+        "phaseId": "p17",
+        "title": "Production Initial Data Load",
+        "description": "Execute the ~2TB bulk migration from production Postgres to CockroachDB production, validate full data integrity, and establish the ongoing delta-sync.",
+        "dependencies": [
+          "p5",
+          "p16"
+        ],
+        "acceptanceCriteria": [
+          "All ~40 tables migrated; row counts match production Postgres per table at load completion",
+          "FK integrity validated: no orphaned rows in CockroachDB production",
+          "Billing tables validated: total debits and credits match Postgres to the cent",
+          "PII validation harness (p8) passes for users and payments tables against production CockroachDB",
+          "Delta-sync established and stable: lag <30s under live production write volume within 30 minutes of activation"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Bulk load timing (off-peak hours to minimize delta-sync catch-up lag)"
+          ],
+          "escalateToOperator": [
+            "If bulk load exceeds the 2-hour benchmark threshold — requires cutover window rescheduling",
+            "Any billing total discrepancy however small (financial zero data loss requirement)"
+          ]
+        },
+        "estimatedComplexity": "large"
+      },
+      {
+        "phaseId": "p18",
+        "title": "Production Dual-Write Deployment",
+        "description": "Deploy dual-write, delta-sync, and monitoring dashboards to production. Reads remain on Postgres. Begin accumulating production consistency signal before scheduling the cutover window.",
+        "dependencies": [
+          "p4",
+          "p13",
+          "p14",
+          "p17"
+        ],
+        "acceptanceCriteria": [
+          "Dual-write active in production: all writes reach both Postgres and CockroachDB; delta-sync lag <30s",
+          "Production monitoring dashboards show live CockroachDB metrics",
+          "Application error rate shows no increase vs pre-dual-write baseline",
+          "Consistency alerts validated: test billing divergence injection fires alert within 60 seconds",
+          "DLQ operational in production: captures and replays test-injected write failures correctly"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Dual-write rollout strategy (feature flag, canary, full deploy)"
+          ],
+          "escalateToOperator": [
+            "Any production application error rate increase >0.1% attributable to dual-write overhead"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p19",
+        "title": "Pre-Cutover Production Validation",
+        "description": "Final gate before scheduling the maintenance window. Full data comparison across all 40 tables, billing zero-loss audit, p99 confirmation under live production load, and go/no-go sign-off.",
+        "dependencies": [
+          "p18"
+        ],
+        "acceptanceCriteria": [
+          "All 40 tables compared between Postgres and CockroachDB at quiescence: row counts and checksums match",
+          "Billing zero-loss audit: cumulative debit and credit totals match to the cent between Postgres and CockroachDB across all billing records",
+          "p99 latency confirmed within 15% of Postgres baseline under live production peak load",
+          "PII validation harness passes for users and payments tables against production CockroachDB",
+          "Go/no-go checklist signed off by designated authority, covering: delta-sync lag <30s, zero billing divergence, p99 within threshold, DLQ empty or replay current, no open P0/P1 incidents"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Timing of comparison scans (low-traffic window to minimize in-flight write noise)"
+          ],
+          "escalateToOperator": [
+            "Any go/no-go criterion that fails — cutover cannot proceed without operator decision",
+            "Any billing divergence however small"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p20",
+        "title": "Production Cutover Execution + Reverse-Sync Activation",
+        "description": "Execute the 2-hour maintenance window: connection drain, final delta-sync catch-up, switch reads to CockroachDB, disable Postgres write path, and activate CockroachDB→Postgres reverse-sync to keep Postgres current for the 30-day rollback window.",
+        "dependencies": [
+          "p19"
+        ],
+        "acceptanceCriteria": [
+          "Full cutover completes within 2-hour maintenance window: connection drain, delta-sync catch-up, read switch, Postgres write disable all completed",
+          "Post-switch smoke tests pass for auth, billing, and audit log critical paths",
+          "CockroachDB→Postgres reverse-sync active within 5 minutes of cutover completion: Postgres receives all new CockroachDB writes within 30 seconds of write",
+          "Rollback trigger criteria from runbook (p15) being actively monitored in real-time during and immediately after cutover",
+          "Postgres confirmed receiving reverse-sync writes and staying current within the 30-second SLO"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Abort timing heuristics within the window (e.g., abort if delta-sync not complete by minute 90)"
+          ],
+          "escalateToOperator": [
+            "Any decision to proceed past a defined abort criterion rather than rolling back",
+            "Any post-switch smoke test failure"
+          ]
+        },
+        "estimatedComplexity": "large"
+      },
+      {
+        "phaseId": "p21",
+        "title": "Post-Cutover Stability & 30-Day Rollback Window",
+        "description": "Maintain CockroachDB→Postgres reverse-sync and rollback readiness for 30 days, with automated daily validation and a day-7 rollback readiness test that confirms the rollback guarantee is technically real, not nominal.",
+        "dependencies": [
+          "p20"
+        ],
+        "acceptanceCriteria": [
+          "Postgres remains current within 30 seconds of CockroachDB throughout the 30-day window, verified by automated daily sync lag check",
+          "Day-7 rollback readiness test executed: connection drain, switch reads to Postgres, verify Postgres current and consistent (row counts + billing totals match CockroachDB), complete re-cutover back to CockroachDB without data loss",
+          "Automated daily validation job runs: CockroachDB↔Postgres row count reconciliation, billing total reconciliation, sync lag check — alerts on any divergence",
+          "No p99 regression >15% vs Postgres baseline observed at 30-day measurement point",
+          "At 30-day mark, Postgres decommission plan presented to operator (decommission is out of scope per non-goal #2)"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Daily validation job scheduling and alerting channels consistent with existing on-call"
+          ],
+          "escalateToOperator": [
+            "Any data divergence detected during the 30-day window",
+            "Any decision to execute an actual rollback if stability issues emerge",
+            "Postgres decommission approval at 30-day mark"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      }
+    ],
+    "criticalPath": [
+      "p1",
+      "p2",
+      "p7",
+      "p8",
+      "p9",
+      "p10",
+      "p11",
+      "p12",
+      "p15",
+      "p16",
+      "p17",
+      "p18",
+      "p19",
+      "p20",
+      "p21"
+    ],
+    "decompositionRationale": "21 phases reflect two parallel tracks converging at p10 (staging dual-write): a data-load track (p5, p6, p7, p8, p9) and an infrastructure track (p3, p4), followed by a staging validation spine (p10–p15) that must complete before any production data is touched. The critical path runs through the data-load track (p7→p8→p9→p10) rather than the infrastructure track (p3→p4→p10) because the former has more sequential hops, though p4 (large) is the parallel risk phase and may be the practical bottleneck depending on team capacity. Two blocking findings from mandatory architect and critic subagent review added phases not in the initial draft: (1) the 30-day rollback window requires active CockroachDB→Postgres reverse-sync post-cutover — without it, Postgres stays alive but goes stale the moment writes switch to CockroachDB, making 'rollback on day 15' equivalent to accepting 15 days of data loss; reverse-sync was added to p20 (activation) and p21 (maintenance), and a day-7 rollback test was added to p21 to confirm the guarantee is real; (2) serializable contention stress testing (p12) was separated from performance baseline (p11) because p11 measures p99 latency under normal dual-write load while p12 specifically exercises CockroachDB 40001 retry behavior under hot-row contention at 5k writes/sec — a failure mode with no PostgreSQL analogue at read-committed that could cause retry storms blowing the 15% p99 budget. Additional integrations from subagent review: Postgres production baseline capture folded into p1 (read-only survey, no new phase needed); ID type strategy added as a gated decision to p2 with a new non-goal preventing silent sequential→UUID changes; monitoring (p14) placed before production provisioning (p16) so dashboards and alerts exist before production dual-write goes live; in-flight transaction connection draining added to p15 and p20; DLQ replay correctness test with outage simulation added to p10; full application integration test against CockroachDB-only added to p15. Two advisory findings were rejected: merging p8 (PII framework) into p9 (data load) was rejected because p8 includes encryption-at-rest verification which is configuration-level and meaningful before any data exists; splitting p5 into bulk+delta sub-phases was rejected in favor of separate p5 (bulk) and p6 (delta-sync) phases, which achieves the same parallelism benefit more cleanly."
+  },
+  "parseError": null,
+  "costUsd": 1.3589378000000003,
+  "latencyMs": 763686,
+  "numTurns": 7,
+  "inputTokens": 15,
+  "outputTokens": 39051,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

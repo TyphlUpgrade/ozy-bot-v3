@@ -1,0 +1,33 @@
+{
+  "escalationId": "p9",
+  "shape": "executor_escalation",
+  "type": "design_decision",
+  "verdict": "retry_with_directive",
+  "directive": "Phase 6 chose feature-flag per-rule gradual cutover. In-flight handling is already fully resolved by that design — no buffering or queuing mechanism is needed. P9 scope is: (1) assert that the per-rule flag read is synchronous and occurs before any dispatch I/O begins (close the TOCTOU window — read flag, then open connection, not the reverse); (2) add tests covering the flag-flip boundary: alerts whose flag was read before the flip complete to the old target; alerts whose flag is read after the flip route to the new target; no alert appears in both systems. Do not implement a separate buffering layer or queuing mechanism — the flag-read-before-dispatch guarantee is sufficient to meet all three acceptance criteria.",
+  "amendedSpec": null,
+  "escalationReason": null,
+  "rationale": "The Executor's open question is answered by the p6 arbitration decision: phase 6 chose feature-flag per-rule gradual cutover. Each alert reads the per-rule flag state at the moment dispatch begins and routes to exactly one system — there is no transition window in which an alert can hit both old and new systems. A flag flip between two successive alerts for the same rule is handled naturally: the in-flight alert completes to whichever target the flag named when it was read; the next alert reads the updated flag. This is the design's inherent property, not something p9 needs to add. P9's scope is therefore narrow: assert the flag read is synchronous and occurs before dispatch begins (no TOCTOU gap), and test the flag-flip boundary. The acceptance criteria (no loss, no double-dispatch, matches p6 design) are already satisfied by p6's design; p9 verifies and hardens it.",
+  "nonGoalsPreserved": true,
+  "category": "assumption_confirmation",
+  "fullArbitration": {
+    "verdict": "retry_with_directive",
+    "rationale": "The Executor's open question is answered by the p6 arbitration decision: phase 6 chose feature-flag per-rule gradual cutover. Each alert reads the per-rule flag state at the moment dispatch begins and routes to exactly one system — there is no transition window in which an alert can hit both old and new systems. A flag flip between two successive alerts for the same rule is handled naturally: the in-flight alert completes to whichever target the flag named when it was read; the next alert reads the updated flag. This is the design's inherent property, not something p9 needs to add. P9's scope is therefore narrow: assert the flag read is synchronous and occurs before dispatch begins (no TOCTOU gap), and test the flag-flip boundary. The acceptance criteria (no loss, no double-dispatch, matches p6 design) are already satisfied by p6's design; p9 verifies and hardens it.",
+    "directive": "Phase 6 chose feature-flag per-rule gradual cutover. In-flight handling is already fully resolved by that design — no buffering or queuing mechanism is needed. P9 scope is: (1) assert that the per-rule flag read is synchronous and occurs before any dispatch I/O begins (close the TOCTOU window — read flag, then open connection, not the reverse); (2) add tests covering the flag-flip boundary: alerts whose flag was read before the flip complete to the old target; alerts whose flag is read after the flip route to the new target; no alert appears in both systems. Do not implement a separate buffering layer or queuing mechanism — the flag-read-before-dispatch guarantee is sufficient to meet all three acceptance criteria.",
+    "amendedSpec": null,
+    "escalationReason": null,
+    "nonGoalsPreserved": true,
+    "category": "assumption_confirmation"
+  },
+  "parseError": null,
+  "costUsd": 0.055438799999999996,
+  "latencyMs": 35829,
+  "numTurns": 2,
+  "inputTokens": 4,
+  "outputTokens": 1535,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": [],
+  "callIndex": 9,
+  "cumulativeCostUsd": 0.51323025,
+  "cumulativeTurns": 18
+}

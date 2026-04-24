@@ -1,0 +1,30 @@
+{
+  "escalationId": "e4",
+  "shape": "review_arbitration",
+  "type": "review_arbitration",
+  "verdict": "retry_with_directive",
+  "directive": "In diffInventory.ts, fix the multi-alias aggregation: when a warehouse SKU resolves to more than one DB SKU via the alias map, sum their dbQty values into a single total before comparing against warehouseQty. The delta for that row should be warehouseQty minus the summed dbQty, and the record is only flagged if that delta is non-zero. Update the multi-alias test to assert no discrepancy when warehouseQty equals the sum of aliased dbQtys, and add a second case where the sum differs to confirm a flag is produced.",
+  "amendedSpec": null,
+  "escalationReason": null,
+  "rationale": "The Round 2 rejection is a concrete, correct logic bug: the current implementation compares warehouseQty against each aliased dbQty individually instead of summing them first. The Reviewer's example is unambiguous — warehouse 10, aliases sum to 7+3=10, should not flag. The fix is fully within the existing phase scope (the spec requires alias handling and the diff contract is already defined). The Reviewer is not citing the phase spec as the root cause; this is an implementation error in aliasMatch aggregation. No non-goals are implicated.",
+  "nonGoalsPreserved": true,
+  "category": "design_decision",
+  "fullArbitration": {
+    "verdict": "retry_with_directive",
+    "rationale": "The Round 2 rejection is a concrete, correct logic bug: the current implementation compares warehouseQty against each aliased dbQty individually instead of summing them first. The Reviewer's example is unambiguous — warehouse 10, aliases sum to 7+3=10, should not flag. The fix is fully within the existing phase scope (the spec requires alias handling and the diff contract is already defined). The Reviewer is not citing the phase spec as the root cause; this is an implementation error in aliasMatch aggregation. No non-goals are implicated.",
+    "directive": "In diffInventory.ts, fix the multi-alias aggregation: when a warehouse SKU resolves to more than one DB SKU via the alias map, sum their dbQty values into a single total before comparing against warehouseQty. The delta for that row should be warehouseQty minus the summed dbQty, and the record is only flagged if that delta is non-zero. Update the multi-alias test to assert no discrepancy when warehouseQty equals the sum of aliased dbQtys, and add a second case where the sum differs to confirm a flag is produced.",
+    "amendedSpec": null,
+    "escalationReason": null,
+    "nonGoalsPreserved": true,
+    "category": "design_decision"
+  },
+  "parseError": null,
+  "costUsd": 0.08232104999999999,
+  "latencyMs": 21781,
+  "numTurns": 2,
+  "inputTokens": 4,
+  "outputTokens": 938,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

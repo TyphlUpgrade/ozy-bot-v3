@@ -1,0 +1,75 @@
+{
+  "scenarioId": "s1",
+  "label": "clean_trivial_pr",
+  "expectedVerdict": "approve",
+  "verdict": "request_changes",
+  "weightedRisk": 0.255,
+  "findingCount": 3,
+  "criticalFindingCount": 1,
+  "criteriaMetCount": 2,
+  "criteriaTotal": 3,
+  "category": "correctness_bug",
+  "summary": "The diff is a single-line documentation addition with correct formatting that would satisfy all three acceptance criteria on its face — except for a false prerequisite. The Executor listed 'package.json already defines the lint:fix script' as an assumption and did not verify it. Inspection of package.json confirms no lint:fix script exists. Merging this README entry would document a command that immediately fails when a developer tries to run it. The fix is straightforward: implement the script (and its underlying tool) in package.json first, then land the README entry. The ordering of the new bullet (between npm test and npm run build rather than at the end after npm run lint) is a minor style concern but not blocking.",
+  "fullReview": {
+    "verdict": "request_changes",
+    "riskScore": {
+      "correctness": 0.7,
+      "integration": 0.1,
+      "stateCorruption": 0,
+      "performance": 0,
+      "regression": 0.2,
+      "weighted": 0.255
+    },
+    "findings": [
+      {
+        "severity": "critical",
+        "file": "README.md",
+        "line": 17,
+        "description": "`npm run lint:fix` does not exist in package.json — the scripts section defines only build, start, test, test:watch, test:e2e, and lint; running the documented command will fail with 'Missing script: lint:fix'.",
+        "suggestion": "Either add a lint:fix script to package.json (e.g., integrating ESLint with --fix) before merging this README entry, or remove the entry until the script is implemented."
+      },
+      {
+        "severity": "warning",
+        "file": "README.md",
+        "line": 17,
+        "description": "The description 'fix lint errors automatically' implies an auto-fixing linter, but the project has no ESLint or equivalent in package.json devDependencies — tsc (the current lint script) cannot auto-fix.",
+        "suggestion": "If lint:fix is added, ensure the underlying tool (e.g., eslint --fix) is also added as a devDependency and configured."
+      },
+      {
+        "severity": "note",
+        "file": "harness-ts/CLAUDE.md",
+        "line": null,
+        "description": "CLAUDE.md's Commands section lists three scripts (npm test, npm run build, npm run lint) and does not include lint:fix — the README and CLAUDE.md would be inconsistent after this merge.",
+        "suggestion": "If the script is added, update CLAUDE.md's Commands section to match."
+      }
+    ],
+    "summary": "The diff is a single-line documentation addition with correct formatting that would satisfy all three acceptance criteria on its face — except for a false prerequisite. The Executor listed 'package.json already defines the lint:fix script' as an assumption and did not verify it. Inspection of package.json confirms no lint:fix script exists. Merging this README entry would document a command that immediately fails when a developer tries to run it. The fix is straightforward: implement the script (and its underlying tool) in package.json first, then land the README entry. The ordering of the new bullet (between npm test and npm run build rather than at the end after npm run lint) is a minor style concern but not blocking.",
+    "criteriaAssessment": [
+      {
+        "criterion": "README.md contains the new `npm run lint:fix` command under the Commands section",
+        "met": false,
+        "evidence": "The diff adds the entry to the correct section with correct formatting, but the command it documents does not exist in package.json — the README entry is misleading until the script is defined."
+      },
+      {
+        "criterion": "Existing commands remain unchanged",
+        "met": true,
+        "evidence": "The diff context shows npm test, npm run build, and npm run lint entries are untouched; only a new line is inserted."
+      },
+      {
+        "criterion": "Spelling and formatting match existing command entries",
+        "met": true,
+        "evidence": "The new entry uses the same pattern as existing entries: backtick-wrapped command, em dash separator, lowercase description with no trailing period."
+      }
+    ],
+    "category": "correctness_bug"
+  },
+  "parseError": null,
+  "costUsd": 0.17931750000000002,
+  "latencyMs": 88135,
+  "numTurns": 8,
+  "inputTokens": 7,
+  "outputTokens": 4063,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

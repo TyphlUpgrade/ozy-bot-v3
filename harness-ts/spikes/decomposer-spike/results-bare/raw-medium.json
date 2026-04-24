@@ -1,0 +1,240 @@
+{
+  "projectId": "medium",
+  "projectName": "redis-job-queue-migration",
+  "complexity": "medium",
+  "expectedPhaseRange": "6-12",
+  "actualPhaseCount": 7,
+  "nonGoalsPreservedCount": 5,
+  "nonGoalsOperatorCount": 5,
+  "nonGoalsAddedCount": 1,
+  "criticalPathLength": 6,
+  "allDependenciesValid": true,
+  "hasDecompositionRationale": true,
+  "subagentInvocations": [],
+  "subagentInvocationCount": 0,
+  "fullPlan": {
+    "projectId": "redis-job-queue-migration",
+    "projectDescription": "Replace the current in-memory job queue (Map<jobId, Job> in src/queue/memory.ts) with a Redis-backed queue supporting at-least-once delivery, dead-letter handling, and configurable retry. Migration must preserve the producer/consumer API contract so existing callers continue to compile and function without modification. Goals: durability + horizontal scale (queue survives process restart, multiple consumer instances can share a single queue).",
+    "nonGoals": [
+      "Do not change the producer/consumer API — existing callers must compile without modification",
+      "Do not introduce new authentication or credentials beyond the existing REDIS_URL environment variable",
+      "Do not remove the in-memory implementation — keep behind a feature flag for rollback",
+      "Do not support exactly-once delivery — at-least-once with idempotency_key is sufficient",
+      "Do not implement priority queues, scheduled (delayed) jobs, or cron-like features in this project",
+      "Do not implement a DLQ replay or requeue API — retention is passive TTL only"
+    ],
+    "phases": [
+      {
+        "phaseId": "p1",
+        "title": "Queue interface contract + in-memory alignment",
+        "description": "Define the canonical QueueInterface<T> type contract and align MemoryQueue to implement it. Locks the API surface that all subsequent phases and all existing callers depend on.",
+        "dependencies": [],
+        "acceptanceCriteria": [
+          "QueueInterface<T> exported from src/queue/types.ts with enqueue, dequeue, ack, nack, and size method signatures",
+          "MemoryQueue<T> in src/queue/memory.ts implements QueueInterface<T> without changing its external behavior",
+          "src/queue/index.ts re-exports QueueInterface and MemoryQueue; existing import paths continue to resolve",
+          "TypeScript build passes with zero errors (tsc --noEmit)",
+          "Unit tests cover MemoryQueue: enqueue, dequeue, ack, nack, and empty-queue dequeue returns null"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Generic type parameter name (T, TJob, etc.)",
+            "Whether dequeue returns T | null or Promise<T | null>",
+            "Internal MemoryQueue data structures beyond the Map constraint",
+            "Test file location (co-located vs __tests__ subdirectory)"
+          ],
+          "escalateToOperator": [
+            "Any method added to QueueInterface beyond enqueue/dequeue/ack/nack/size",
+            "Breaking change to existing caller import paths"
+          ]
+        },
+        "estimatedComplexity": "small"
+      },
+      {
+        "phaseId": "p2",
+        "title": "Feature flag + queue factory adapter",
+        "description": "Build the createQueue factory and QUEUE_BACKEND env-var routing that selects MemoryQueue or RedisQueue at startup. Provides the 5-minute rollback mechanism required by the reversibility constraint.",
+        "dependencies": [
+          "p1"
+        ],
+        "acceptanceCriteria": [
+          "createQueue<T>(config) factory exported from src/queue/index.ts returns a QueueInterface<T>",
+          "QUEUE_BACKEND=memory routes to MemoryQueue; QUEUE_BACKEND=redis routes to RedisQueue (stub accepted in this phase)",
+          "Invalid QUEUE_BACKEND value throws at startup with a descriptive message, not at first enqueue",
+          "Changing QUEUE_BACKEND and restarting the process switches backends without any code changes",
+          "Unit tests cover factory routing for both valid backend values and the invalid-value throw path"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Config object shape passed to createQueue (env-read inside factory vs caller-supplied object)",
+            "How to stub RedisQueue for this phase (interface-conforming throw-on-use class)",
+            "Whether QUEUE_BACKEND defaults to 'memory' or is required"
+          ],
+          "escalateToOperator": [
+            "Additional flag mechanism beyond QUEUE_BACKEND env var",
+            "Runtime flag switching without process restart"
+          ]
+        },
+        "estimatedComplexity": "small"
+      },
+      {
+        "phaseId": "p3",
+        "title": "Redis connection wrapper + docker-compose fixture",
+        "description": "Build the ioredis connection lifecycle wrapper and the docker-compose fixture used by integration tests in p7. Can proceed in parallel with p2 after p1 lands.",
+        "dependencies": [
+          "p1"
+        ],
+        "acceptanceCriteria": [
+          "RedisConnection class wraps ioredis, exposes connect(), disconnect(), and client getter",
+          "connect() reads REDIS_URL from environment; throws a clear error if REDIS_URL is unset when QUEUE_BACKEND=redis",
+          "healthCheck() returns true when Redis is reachable, false on connection error (never throws)",
+          "docker-compose.yml starts a Redis instance on a deterministic port usable by integration tests",
+          "Unit tests cover connection lifecycle using a mock ioredis client (no real Redis required)"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "ioredis reconnect strategy and timeout values",
+            "Whether RedisConnection is a class or a factory function",
+            "docker-compose Redis image version (latest stable)"
+          ],
+          "escalateToOperator": [
+            "TLS or auth config beyond REDIS_URL",
+            "Redis cluster or sentinel support"
+          ]
+        },
+        "estimatedComplexity": "small"
+      },
+      {
+        "phaseId": "p4",
+        "title": "RedisQueue core — enqueue and dequeue",
+        "description": "Implement the core Redis data model and the enqueue/dequeue operations. Dequeue atomically moves a job from the pending list to an inflight sorted set (by timestamp), establishing the foundation for at-least-once semantics in p5.",
+        "dependencies": [
+          "p2",
+          "p3"
+        ],
+        "acceptanceCriteria": [
+          "RedisQueue<T> implements QueueInterface<T>; ack/nack may be no-op stubs in this phase",
+          "enqueue(job) serializes job to JSON, appends to Redis list QUEUE:{name}:pending, and returns a job ID",
+          "dequeue() atomically moves the next job from the pending list to QUEUE:{name}:inflight sorted set with a timestamp score",
+          "size() returns LLEN of QUEUE:{name}:pending",
+          "Two concurrent RedisQueue instances sharing the same Redis keyspace cannot both dequeue the same job (mutual exclusion via atomic command)",
+          "Unit tests with a mock ioredis client cover enqueue, dequeue, size, and empty-queue dequeue returns null"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Redis key naming scheme (namespace, separator characters)",
+            "Job ID generation strategy (uuid, nanoid, timestamp+random)",
+            "Lua script vs LMOVE for the atomic pending→inflight transition",
+            "JSON serialization approach for job payload"
+          ],
+          "escalateToOperator": [
+            "Switching the data model from list+sorted-set to Redis Streams",
+            "Storing job metadata in a separate hash rather than inline in the payload"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p5",
+        "title": "At-least-once delivery — ack, nack, and visibility timeout",
+        "description": "Complete the at-least-once delivery contract: ack removes a job from inflight, nack returns it to pending immediately, and a background daemon re-queues jobs whose consumers crashed without acking.",
+        "dependencies": [
+          "p4"
+        ],
+        "acceptanceCriteria": [
+          "ack(jobId) removes the job from QUEUE:{name}:inflight; calling ack on an unknown ID is a no-op (not an error)",
+          "nack(jobId) moves the job from inflight back to the pending list without incrementing retry count",
+          "Visibility timeout daemon polls the inflight sorted set and re-queues any job whose score is older than visibilityTimeoutMs",
+          "visibilityTimeoutMs is configurable per RedisQueue instance, not hardcoded",
+          "Unit tests cover: ack removes job from inflight; nack returns job to pending; daemon re-queues an overdue job; daemon ignores a job still within the timeout window"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Daemon polling interval (reasonable default, e.g. visibilityTimeoutMs / 2)",
+            "setInterval vs recursive setTimeout for the daemon",
+            "Whether nack prepends (LPUSH) or appends (RPUSH) back to the pending list"
+          ],
+          "escalateToOperator": [
+            "Replacing daemon polling with Redis keyspace notifications or Streams consumer groups",
+            "Per-job visibility timeout overrides"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p6",
+        "title": "Retry logic and dead-letter queue",
+        "description": "Wire retry counting into nack and implement DLQ promotion. Jobs that exhaust retries are moved to a DLQ key with a 14-day TTL. All retry parameters are configuration-driven.",
+        "dependencies": [
+          "p5"
+        ],
+        "acceptanceCriteria": [
+          "nack(jobId) increments the job's retry count in Redis; if retryCount < maxRetries, re-queues with exponential backoff delay; if retryCount >= maxRetries, promotes job to QUEUE:{name}:dlq",
+          "maxRetries and backoff parameters (base delay, multiplier) are configurable per RedisQueue instance",
+          "Each DLQ entry has a Redis TTL of exactly 1209600 seconds (14 days) set at promotion time",
+          "deadLetterSize() returns the count of entries in QUEUE:{name}:dlq",
+          "Unit tests cover: first nack re-queues with base delay; subsequent nack uses longer delay; max-retry exceeded promotes to DLQ; DLQ TTL is set to 1209600 on the promoted entry"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Where retry count is stored (hash field, inline in serialized payload, or separate key)",
+            "Backoff strategy detail (pure exponential vs exponential with jitter)",
+            "DLQ data structure (list vs sorted set keyed by failure timestamp)"
+          ],
+          "escalateToOperator": [
+            "DLQ replay or requeue API (explicitly out of scope)",
+            "Per-job configurable TTL beyond the 14-day minimum",
+            "Alerting or notification on DLQ promotion"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p7",
+        "title": "Integration test suite and latency validation",
+        "description": "End-to-end integration tests against a real Redis instance using the docker-compose fixture from p3, covering all delivery guarantees. Includes a p99 enqueue latency benchmark enforcing the 10ms constraint.",
+        "dependencies": [
+          "p6"
+        ],
+        "acceptanceCriteria": [
+          "Integration test suite starts and stops the docker-compose Redis fixture automatically (globalSetup/globalTeardown or equivalent vitest mechanism)",
+          "Full enqueue→dequeue→ack cycle passes against real Redis with no mocks",
+          "nack→retry cycle test: job is re-queued N-1 times then promoted to DLQ on the Nth nack",
+          "Visibility timeout recovery test: a job left unacked is re-queued by the daemon within 2× visibilityTimeoutMs",
+          "Feature flag test: QUEUE_BACKEND=memory creates a MemoryQueue; QUEUE_BACKEND=redis creates a RedisQueue",
+          "Latency benchmark: p99 of 1000 sequential enqueue calls against the docker-compose Redis instance is ≤ 10ms (test fails and reports the actual p99 if exceeded)"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "docker-compose integration strategy (vitest globalSetup shell-out vs testcontainers library)",
+            "Latency percentile calculation (manual sort vs a stats helper)",
+            "Whether integration tests run in the same vitest suite or a separate npm script"
+          ],
+          "escalateToOperator": [
+            "CI pipeline changes required to provision Redis in the test environment",
+            "Latency target adjustment if the docker-compose Redis cannot meet 10ms p99 on the target hardware"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      }
+    ],
+    "criticalPath": [
+      "p1",
+      "p2",
+      "p4",
+      "p5",
+      "p6",
+      "p7"
+    ],
+    "decompositionRationale": "Seven phases reflect the natural dependency layers of the migration. p1 locks the interface contract that all phases and existing callers share — nothing can start without it. p2 (feature flag adapter) and p3 (Redis connection + docker-compose) both depend only on p1 and can run in parallel; p4 needs both to land before RedisQueue can be fully wired. p4–p6 stack vertically: core data model, then delivery semantics (ack/nack/visibility), then failure path (retry/DLQ) — each phase is a coherent slice of the Redis implementation that builds directly on the previous one's data structures. p7 closes with end-to-end validation against real Redis, which requires all delivery guarantees to be in place. The critical path runs through p2 rather than p3 because p4 depends on the adapter to slot RedisQueue in; p3 proceeds in parallel. Phase count of 7 sits comfortably in the 6–12 target: p1/p2/p3 are small (types and wiring), p4–p7 are medium (non-trivial Redis ops, integration harness, benchmark). Splitting p5 (consumer-side contract) from p6 (failure-path contract) avoids a single unwieldy phase covering all delivery guarantees while keeping each phase's scope coherent and independently merge-ready."
+  },
+  "parseError": null,
+  "costUsd": 0.3355173,
+  "latencyMs": 196413,
+  "numTurns": 3,
+  "inputTokens": 7,
+  "outputTokens": 10365,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

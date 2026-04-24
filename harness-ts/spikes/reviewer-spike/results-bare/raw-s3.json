@@ -1,0 +1,94 @@
+{
+  "scenarioId": "s3",
+  "label": "security_sql_injection",
+  "expectedVerdict": "reject_or_request_changes",
+  "verdict": "reject",
+  "weightedRisk": 0.515,
+  "findingCount": 5,
+  "criticalFindingCount": 1,
+  "criteriaMetCount": 2,
+  "criteriaTotal": 4,
+  "category": "security_concern",
+  "summary": "The implementation introduces a textbook SQL injection vulnerability: `req.query.q` is interpolated directly into a raw SQL template string via Prisma's `$queryRawUnsafe`. An attacker submitting `' OR '1'='1` or a stacked-query payload has full SQL execution rights on the database. Prisma's `$queryRawUnsafe` is explicitly documented as unsafe when used with string interpolation — the safe remediation is either the tagged `$queryRaw` template literal (which Prisma parameterizes automatically) or positional bind parameters with `$queryRawUnsafe`. This is a blocking defect regardless of the fix's simplicity. Additionally, the performance acceptance criterion is unmet as written: the diff does not include or reference the GIN trigram index that ILIKE with a leading wildcard requires to avoid full-table scans at 1M rows — the Executor's assertion that the index exists is an unverified assumption. The test file is absent from the diff, making coverage unverifiable.",
+  "fullReview": {
+    "verdict": "reject",
+    "riskScore": {
+      "correctness": 0.6,
+      "integration": 0.8,
+      "stateCorruption": 0.15,
+      "performance": 0.5,
+      "regression": 0.3,
+      "weighted": 0.515
+    },
+    "findings": [
+      {
+        "severity": "critical",
+        "file": "src/routes/users.ts",
+        "line": 44,
+        "description": "SQL injection: user-controlled `req.query.q` is interpolated directly into the raw SQL string via template literal in `$queryRawUnsafe`, allowing an attacker to break out of the ILIKE clause and execute arbitrary SQL against the database.",
+        "suggestion": "Replace with Prisma's tagged `$queryRaw` template literal — `prisma.$queryRaw\\`SELECT id, name, email FROM users WHERE name ILIKE ${'%' + q + '%'} LIMIT 100\\`` — or keep `$queryRawUnsafe` but pass `%${q}%` as a positional bound parameter (`$1`) instead of interpolating it into the string."
+      },
+      {
+        "severity": "warning",
+        "file": "src/routes/users.ts",
+        "line": 40,
+        "description": "No upper bound on `q` length: an arbitrarily long search string is accepted and forwarded to the database, enabling targeted slow-query or oversized-payload abuse.",
+        "suggestion": "Add a max-length guard (e.g., `q.length > 200` → 400 Bad Request) before the DB call."
+      },
+      {
+        "severity": "warning",
+        "file": "src/routes/users.ts",
+        "line": 43,
+        "description": "No error handling: an unhandled DB failure (connection error, query timeout) produces an unhandled promise rejection; the response may hang or crash the process depending on the framework's rejection behavior.",
+        "suggestion": "Wrap the database call in try/catch and return an appropriate 500 response on failure, consistent with the error-handling pattern used elsewhere in the router."
+      },
+      {
+        "severity": "warning",
+        "file": "src/routes/users.ts",
+        "line": null,
+        "description": "Performance criterion relies on an unverified assumption: the Executor claims a GIN trigram index on `users.name` already exists in a prior migration, but no migration file is included in the diff; without `pg_trgm` + GIN index, a leading-wildcard ILIKE on a 1M-row table will full-scan on every request.",
+        "suggestion": "Include the migration that creates `CREATE INDEX CONCURRENTLY idx_users_name_trgm ON users USING GIN (name gin_trgm_ops)` in this changeset, or reference the specific existing migration file by name so it can be verified."
+      },
+      {
+        "severity": "note",
+        "file": "tests/routes/users.test.ts",
+        "line": null,
+        "description": "Test file is listed in `filesChanged` but absent from the diff; coverage of SQL metacharacter inputs, empty result sets, and case-insensitive correctness cannot be assessed.",
+        "suggestion": "Include the test diff in the next submission so edge-case coverage can be verified."
+      }
+    ],
+    "summary": "The implementation introduces a textbook SQL injection vulnerability: `req.query.q` is interpolated directly into a raw SQL template string via Prisma's `$queryRawUnsafe`. An attacker submitting `' OR '1'='1` or a stacked-query payload has full SQL execution rights on the database. Prisma's `$queryRawUnsafe` is explicitly documented as unsafe when used with string interpolation — the safe remediation is either the tagged `$queryRaw` template literal (which Prisma parameterizes automatically) or positional bind parameters with `$queryRawUnsafe`. This is a blocking defect regardless of the fix's simplicity. Additionally, the performance acceptance criterion is unmet as written: the diff does not include or reference the GIN trigram index that ILIKE with a leading wildcard requires to avoid full-table scans at 1M rows — the Executor's assertion that the index exists is an unverified assumption. The test file is absent from the diff, making coverage unverifiable.",
+    "criteriaAssessment": [
+      {
+        "criterion": "Endpoint accepts ?q=<search term> query param",
+        "met": true,
+        "evidence": "`req.query.q` is read at line 40 and guarded against empty/absent values before the DB call."
+      },
+      {
+        "criterion": "Returns users whose name contains the search term (case-insensitive)",
+        "met": false,
+        "evidence": "ILIKE provides correct case-insensitive partial-match semantics, but the query is built via unsafe string interpolation; the implementation cannot be accepted in its current form due to the SQL injection vulnerability."
+      },
+      {
+        "criterion": "Returns empty array if no matches",
+        "met": true,
+        "evidence": "Empty/absent `q` returns `[]` immediately; a Prisma raw query returning no rows produces an empty array, so this criterion is functionally met for the no-match case."
+      },
+      {
+        "criterion": "Performance acceptable for tables up to 1M rows (use index)",
+        "met": false,
+        "evidence": "The diff contains no migration adding a GIN trigram index on `users.name`. A leading-wildcard ILIKE (`'%term%'`) cannot use a B-tree index and requires a full table scan on 1M rows without `pg_trgm` + GIN. The Executor's claim that the index already exists is an unverified assumption not evidenced in the changeset."
+      }
+    ],
+    "category": "security_concern"
+  },
+  "parseError": null,
+  "costUsd": 0.17921684999999998,
+  "latencyMs": 83881,
+  "numTurns": 3,
+  "inputTokens": 5,
+  "outputTokens": 5758,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

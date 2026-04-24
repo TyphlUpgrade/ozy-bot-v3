@@ -1,0 +1,68 @@
+{
+  "scenarioId": "s1",
+  "label": "clean_trivial_pr",
+  "expectedVerdict": "approve",
+  "verdict": "request_changes",
+  "weightedRisk": 0.19,
+  "findingCount": 2,
+  "criticalFindingCount": 1,
+  "criteriaMetCount": 3,
+  "criteriaTotal": 3,
+  "category": "correctness_bug",
+  "summary": "The diff is correctly formatted and all three acceptance criteria are satisfied on the surface — the entry is present, existing commands are untouched, and formatting matches. However, the Executor's load-bearing assumption ('package.json already defines the lint:fix script') is verifiably false: package.json at the harness-ts root defines six scripts and lint:fix is not among them. The README now documents a command that will fail at runtime. Merging documentation for a non-existent script is a correctness defect: developers will read the README, run the command, and get an npm error. The fix is straightforward — add the script to package.json — but that work was not done. Additionally, no project-level README.md was found at the harness-ts root outside of node_modules, raising a secondary concern that the target file may have been newly created rather than modified; the diff context (hunk at line 14) implies prior content exists, but this could not be verified from the filesystem.",
+  "fullReview": {
+    "verdict": "request_changes",
+    "riskScore": {
+      "correctness": 0.55,
+      "integration": 0.05,
+      "stateCorruption": 0,
+      "performance": 0,
+      "regression": 0.05,
+      "weighted": 0.19
+    },
+    "findings": [
+      {
+        "severity": "critical",
+        "file": "package.json",
+        "line": null,
+        "description": "The `lint:fix` script does not exist in package.json — the `scripts` section defines only `build`, `start`, `test`, `test:watch`, `test:e2e`, and `lint`; running `npm run lint:fix` will fail with 'Missing script: lint:fix'.",
+        "suggestion": "Add a `lint:fix` script to package.json (e.g. `\"lint:fix\": \"tsc --noEmit\"` if a formatter like prettier or eslint --fix is intended) before or alongside this README entry, or remove the README entry until the script is defined."
+      },
+      {
+        "severity": "note",
+        "file": "README.md",
+        "line": null,
+        "description": "The new `lint:fix` entry is inserted between `npm test` and `npm run build` rather than adjacent to the existing `npm run lint` entry; grouping lint-related commands together would improve scannability.",
+        "suggestion": "Move the `lint:fix` line to follow `npm run lint` so the two lint commands are consecutive."
+      }
+    ],
+    "summary": "The diff is correctly formatted and all three acceptance criteria are satisfied on the surface — the entry is present, existing commands are untouched, and formatting matches. However, the Executor's load-bearing assumption ('package.json already defines the lint:fix script') is verifiably false: package.json at the harness-ts root defines six scripts and lint:fix is not among them. The README now documents a command that will fail at runtime. Merging documentation for a non-existent script is a correctness defect: developers will read the README, run the command, and get an npm error. The fix is straightforward — add the script to package.json — but that work was not done. Additionally, no project-level README.md was found at the harness-ts root outside of node_modules, raising a secondary concern that the target file may have been newly created rather than modified; the diff context (hunk at line 14) implies prior content exists, but this could not be verified from the filesystem.",
+    "criteriaAssessment": [
+      {
+        "criterion": "README.md contains the new `npm run lint:fix` command under the Commands section",
+        "met": true,
+        "evidence": "The diff adds `- \\`npm run lint:fix\\` — fix lint errors automatically` within the Commands section between the `npm test` and `npm run build` entries."
+      },
+      {
+        "criterion": "Existing commands remain unchanged",
+        "met": true,
+        "evidence": "The diff is a pure insertion (+1 line); the three existing command lines (`npm test`, `npm run build`, `npm run lint`) appear as context lines with no modification."
+      },
+      {
+        "criterion": "Spelling and formatting match existing command entries",
+        "met": true,
+        "evidence": "The new entry follows the identical pattern of existing entries: `- \\`npm run <command>\\` — <description>` with an em dash separator and lowercase description."
+      }
+    ],
+    "category": "correctness_bug"
+  },
+  "parseError": null,
+  "costUsd": 0.26646000000000003,
+  "latencyMs": 127757,
+  "numTurns": 7,
+  "inputTokens": 15,
+  "outputTokens": 6456,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

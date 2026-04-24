@@ -1,0 +1,33 @@
+{
+  "escalationId": "p6",
+  "shape": "executor_escalation",
+  "type": "scope_unclear",
+  "verdict": "retry_with_directive",
+  "directive": "Implement cutover as a feature-flag per-rule mechanism, inline in the existing alerting service. A per-rule flag (e.g., a config or DB field) determines whether that rule's alert routes to the old dispatcher or PagerDuty — never both simultaneously. Roll forward in batches: flip rules to PD, validate, continue. Rollback for any rule: flip its flag back to the old dispatcher. Expose the current routing state of each rule (old vs PD) in the observability dashboard. Do not implement a comparator service or any dual-write period.",
+  "amendedSpec": null,
+  "escalationReason": null,
+  "rationale": "Option A is disqualified by two independent constraints: (1) a comparator service is a separate new service, violating the project non-goal 'do not deploy a separate new service'; (2) dual-write routes real alerts through both systems simultaneously, directly contradicting the p6 acceptance criterion 'zero double-dispatch.' Between B and C, Option B (feature-flag per-rule) is the correct fit. Each rule routes to exactly one system at any given moment, satisfying zero-double-dispatch. Rollback is a flag flip — trivially within 5 minutes. No maintenance window is required, no new deployment artifact, and flag state is naturally exposed to the observability dashboard. Option C (blue-green) requires scheduling a maintenance window and pre-rehearsing a rollback script — a heavier operational lift than the non-goal ('dispatcher lives inline in the existing alerting service') and the acceptance criteria require. The phase spec is ambiguous on mechanism only; the acceptance criteria are sufficient as written. No plan amendment needed.",
+  "nonGoalsPreserved": true,
+  "category": "scope_unclear",
+  "fullArbitration": {
+    "verdict": "retry_with_directive",
+    "rationale": "Option A is disqualified by two independent constraints: (1) a comparator service is a separate new service, violating the project non-goal 'do not deploy a separate new service'; (2) dual-write routes real alerts through both systems simultaneously, directly contradicting the p6 acceptance criterion 'zero double-dispatch.' Between B and C, Option B (feature-flag per-rule) is the correct fit. Each rule routes to exactly one system at any given moment, satisfying zero-double-dispatch. Rollback is a flag flip — trivially within 5 minutes. No maintenance window is required, no new deployment artifact, and flag state is naturally exposed to the observability dashboard. Option C (blue-green) requires scheduling a maintenance window and pre-rehearsing a rollback script — a heavier operational lift than the non-goal ('dispatcher lives inline in the existing alerting service') and the acceptance criteria require. The phase spec is ambiguous on mechanism only; the acceptance criteria are sufficient as written. No plan amendment needed.",
+    "directive": "Implement cutover as a feature-flag per-rule mechanism, inline in the existing alerting service. A per-rule flag (e.g., a config or DB field) determines whether that rule's alert routes to the old dispatcher or PagerDuty — never both simultaneously. Roll forward in batches: flip rules to PD, validate, continue. Rollback for any rule: flip its flag back to the old dispatcher. Expose the current routing state of each rule (old vs PD) in the observability dashboard. Do not implement a comparator service or any dual-write period.",
+    "amendedSpec": null,
+    "escalationReason": null,
+    "nonGoalsPreserved": true,
+    "category": "scope_unclear"
+  },
+  "parseError": null,
+  "costUsd": 0.06710550000000001,
+  "latencyMs": 48888,
+  "numTurns": 2,
+  "inputTokens": 4,
+  "outputTokens": 2385,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": [],
+  "callIndex": 6,
+  "cumulativeCostUsd": 0.34885815,
+  "cumulativeTurns": 12
+}

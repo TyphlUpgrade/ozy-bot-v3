@@ -1,0 +1,33 @@
+{
+  "escalationId": "p2",
+  "shape": "executor_escalation",
+  "type": "design_decision",
+  "verdict": "retry_with_directive",
+  "directive": "Implement mapper.ts as a stateless per-alert-rule function with signature mapRule(rule: AlertRule): PDEventPayload. Batching is a caller concern — p4 (backfill) will collect mapped payloads into arrays before calling the bulk endpoint; that is not mapper scope. All DSL fields must be represented losslessly; unknown fields go into custom_details. Unit tests cover each severity tier with one input/one output assertions.",
+  "amendedSpec": null,
+  "escalationReason": null,
+  "rationale": "This is a design_decision where bulk batching is being considered at the wrong abstraction layer. The mapper's responsibility is transformation (DSL rule → PD payload), not transport batching. A per-alert stateless function composes into bulk trivially via rules.map(mapRule), making it fully compatible with p4's backfill throughput requirement — the backfill caller batches already-mapped payloads before hitting the bulk endpoint. The inverse is not true: a bulk mapper cannot be cleanly decomposed for the existing single-alert dispatch path without introducing the same wrapper complexity being deferred. Per-alert also matches the existing dispatcher patterns the Executor cited, avoids forcing an unnecessary interface change on p3, and keeps unit tests simple (one input, one output per case). Non-goals are preserved: no DSL changes, no new service, no new secrets.",
+  "nonGoalsPreserved": true,
+  "category": "design_decision",
+  "fullArbitration": {
+    "verdict": "retry_with_directive",
+    "rationale": "This is a design_decision where bulk batching is being considered at the wrong abstraction layer. The mapper's responsibility is transformation (DSL rule → PD payload), not transport batching. A per-alert stateless function composes into bulk trivially via rules.map(mapRule), making it fully compatible with p4's backfill throughput requirement — the backfill caller batches already-mapped payloads before hitting the bulk endpoint. The inverse is not true: a bulk mapper cannot be cleanly decomposed for the existing single-alert dispatch path without introducing the same wrapper complexity being deferred. Per-alert also matches the existing dispatcher patterns the Executor cited, avoids forcing an unnecessary interface change on p3, and keeps unit tests simple (one input, one output per case). Non-goals are preserved: no DSL changes, no new service, no new secrets.",
+    "directive": "Implement mapper.ts as a stateless per-alert-rule function with signature mapRule(rule: AlertRule): PDEventPayload. Batching is a caller concern — p4 (backfill) will collect mapped payloads into arrays before calling the bulk endpoint; that is not mapper scope. All DSL fields must be represented losslessly; unknown fields go into custom_details. Unit tests cover each severity tier with one input/one output assertions.",
+    "amendedSpec": null,
+    "escalationReason": null,
+    "nonGoalsPreserved": true,
+    "category": "design_decision"
+  },
+  "parseError": null,
+  "costUsd": 0.04627515,
+  "latencyMs": 34601,
+  "numTurns": 2,
+  "inputTokens": 4,
+  "outputTokens": 1577,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": [],
+  "callIndex": 2,
+  "cumulativeCostUsd": 0.1357437,
+  "cumulativeTurns": 4
+}

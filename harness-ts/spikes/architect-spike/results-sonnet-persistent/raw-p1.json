@@ -1,0 +1,33 @@
+{
+  "escalationId": "p1",
+  "shape": "executor_escalation",
+  "type": "scope_unclear",
+  "verdict": "retry_with_directive",
+  "directive": "Use @pagerduty/pdjs. Add it to package.json. Initialize the client by reading PAGERDUTY_API_KEY from env (process.env.PAGERDUTY_API_KEY). Wire the smoke test to create a test incident via Events API v2 and resolve it. Do not hand-roll retry or rate-limit logic — rely on the SDK's built-in behavior.",
+  "amendedSpec": null,
+  "escalationReason": null,
+  "rationale": "This is a design_decision escalation between three valid approaches. Option A (@pagerduty/pdjs) is the correct choice: it is the official, actively maintained SDK with strong typing, and the project already uses axios so Option A's dep cost is negligible. Option B is disqualified by its 14-month publication staleness — a live PagerDuty integration needs a library that tracks API changes. Option C would require hand-rolling retry and rate-limit logic, which is scope expansion beyond p1's budget ('pick a client and wire a smoke test'); introducing that implementation complexity here would also create a maintenance surface that contradicts the project's principle of keeping the dispatcher inline and minimal. Non-goals are fully preserved: Option A requires no new secrets, no new service, and does not touch the DSL.",
+  "nonGoalsPreserved": true,
+  "category": "design_decision",
+  "fullArbitration": {
+    "verdict": "retry_with_directive",
+    "rationale": "This is a design_decision escalation between three valid approaches. Option A (@pagerduty/pdjs) is the correct choice: it is the official, actively maintained SDK with strong typing, and the project already uses axios so Option A's dep cost is negligible. Option B is disqualified by its 14-month publication staleness — a live PagerDuty integration needs a library that tracks API changes. Option C would require hand-rolling retry and rate-limit logic, which is scope expansion beyond p1's budget ('pick a client and wire a smoke test'); introducing that implementation complexity here would also create a maintenance surface that contradicts the project's principle of keeping the dispatcher inline and minimal. Non-goals are fully preserved: Option A requires no new secrets, no new service, and does not touch the DSL.",
+    "directive": "Use @pagerduty/pdjs. Add it to package.json. Initialize the client by reading PAGERDUTY_API_KEY from env (process.env.PAGERDUTY_API_KEY). Wire the smoke test to create a test incident via Events API v2 and resolve it. Do not hand-roll retry or rate-limit logic — rely on the SDK's built-in behavior.",
+    "amendedSpec": null,
+    "escalationReason": null,
+    "nonGoalsPreserved": true,
+    "category": "design_decision"
+  },
+  "parseError": null,
+  "costUsd": 0.08946855,
+  "latencyMs": 29758,
+  "numTurns": 2,
+  "inputTokens": 4,
+  "outputTokens": 1372,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": [],
+  "callIndex": 1,
+  "cumulativeCostUsd": 0.08946855,
+  "cumulativeTurns": 2
+}

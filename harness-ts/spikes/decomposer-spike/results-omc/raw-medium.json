@@ -1,0 +1,210 @@
+{
+  "projectId": "medium",
+  "projectName": "redis-job-queue-migration",
+  "complexity": "medium",
+  "expectedPhaseRange": "6-12",
+  "actualPhaseCount": 6,
+  "nonGoalsPreservedCount": 5,
+  "nonGoalsOperatorCount": 5,
+  "nonGoalsAddedCount": 1,
+  "criticalPathLength": 5,
+  "allDependenciesValid": true,
+  "hasDecompositionRationale": true,
+  "subagentInvocations": [],
+  "subagentInvocationCount": 0,
+  "fullPlan": {
+    "projectId": "redis-job-queue-migration",
+    "projectDescription": "Replace the current in-memory job queue (Map<jobId, Job> in src/queue/memory.ts) with a Redis-backed queue supporting at-least-once delivery, dead-letter handling, and configurable retry. The producer/consumer API contract must be preserved so existing callers continue to compile and function without modification. The in-memory implementation is retained behind a feature flag for rollback. The migration targets durability and horizontal scale: the queue survives process restart and supports multiple concurrent consumer instances.",
+    "nonGoals": [
+      "Do not change the producer/consumer API — existing callers must compile without modification",
+      "Do not introduce new authentication or credentials beyond the existing REDIS_URL environment variable",
+      "Do not remove the in-memory implementation — keep behind a feature flag for rollback",
+      "Do not support exactly-once delivery — at-least-once with idempotency_key is sufficient",
+      "Do not implement priority queues, scheduled (delayed) jobs, or cron-like features in this project — those are out of scope",
+      "Do not introduce Redis Streams (XADD/XREAD) — Redis list-based queue is sufficient given the delivery requirements"
+    ],
+    "phases": [
+      {
+        "phaseId": "p1",
+        "title": "Interface extraction + in-memory adapter",
+        "description": "Extract the producer/consumer contract from memory.ts into a formal TypeScript interface. Refactor MemoryQueue to implement it. This establishes the type-safe boundary that both implementations must satisfy and is the prerequisite for every subsequent phase.",
+        "dependencies": [],
+        "acceptanceCriteria": [
+          "QueueProvider<T> interface exists in src/queue/types.ts with at minimum enqueue, dequeue, ack, and nack method signatures",
+          "MemoryQueue<T> in src/queue/memory.ts explicitly implements QueueProvider<T> — TypeScript verifies this without casts",
+          "All existing unit tests for MemoryQueue pass without source modification",
+          "npm run lint reports zero type errors",
+          "No existing caller of the queue module requires source changes to continue compiling"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Exact method signatures beyond the four named, as long as all current callers still compile",
+            "Whether Job<T> wrapper type lives in types.ts or a separate file",
+            "Generic constraints on T (e.g., T extends object vs unconstrained)"
+          ],
+          "escalateToOperator": [
+            "Any caller that cannot be made to compile without modifying the call site",
+            "Discovery that the existing API surface includes batch operations, event emitters, or cursors not captured by enqueue/dequeue/ack/nack"
+          ]
+        },
+        "estimatedComplexity": "small"
+      },
+      {
+        "phaseId": "p2",
+        "title": "Redis client + integration test infrastructure",
+        "description": "Establish the ioredis connection module and the docker-compose fixture that integration tests will run against. Produces no queue logic — only the connection layer and test harness that p3 and p4 depend on.",
+        "dependencies": [],
+        "acceptanceCriteria": [
+          "docker-compose.yml at repo root starts a Redis 7.x container on port 6379 with a named volume",
+          "src/queue/redis-client.ts exports a factory returning a connected ioredis Redis instance initialized from REDIS_URL",
+          "Client throws a typed, catchable error (not an unhandled crash) when REDIS_URL is absent or malformed",
+          "Integration test bootstrap connects to redis://localhost:6379 and calls FLUSHDB before each test suite",
+          "npm test with REDIS_URL=redis://localhost:6379 and docker-compose running exits 0 (no failures due to missing infra)"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Singleton vs factory-per-caller client design",
+            "Connection pool size and ioredis reconnect strategy settings",
+            "Test helper file location (e.g., tests/helpers/redis.ts vs vitest setup file)"
+          ],
+          "escalateToOperator": [
+            "Discovery that ioredis version in package.json is incompatible with Redis 7.x commands needed in p3",
+            "Need for Redis ACL or AUTH configuration beyond what REDIS_URL encodes"
+          ]
+        },
+        "estimatedComplexity": "small"
+      },
+      {
+        "phaseId": "p3",
+        "title": "Core Redis queue — enqueue, dequeue, visibility timeout",
+        "description": "Implement RedisQueue<T> satisfying QueueProvider<T>. Enqueue pushes serialized jobs via LPUSH; dequeue atomically moves a job to an in-flight list via LMOVE with a configurable visibility timeout so crashed consumers cannot orphan jobs permanently. Retry and DLQ logic are excluded — added in p4.",
+        "dependencies": [
+          "p1",
+          "p2"
+        ],
+        "acceptanceCriteria": [
+          "RedisQueue<T> in src/queue/redis.ts implements QueueProvider<T> — TypeScript verifies this without casts",
+          "enqueue(job) returns a stable string jobId and the job is retrievable from Redis immediately after return",
+          "dequeue() uses an atomic LMOVE (or equivalent) to move the job to a <queue>:inflight list and returns the Job<T>",
+          "A visibility timeout (configurable, default 30s) causes un-acked inflight jobs to be re-enqueued by a background reaper",
+          "Integration test: two concurrent consumers each dequeue exactly one of two enqueued jobs within the visibility window (no duplication)",
+          "Integration test: enqueue a job, force-close and reconnect the Redis client, dequeue still returns the job (durability across restart)"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Redis key naming scheme (e.g., queue:<name>:pending, queue:<name>:inflight)",
+            "Job serialization format (JSON.stringify is acceptable)",
+            "Reaper implementation strategy (polling interval vs Lua script)",
+            "LMOVE vs BRPOPLPUSH (LMOVE preferred for Redis 6.2+)"
+          ],
+          "escalateToOperator": [
+            "Discovery that the docker-compose Redis version does not support LMOVE",
+            "Requirement for message ordering guarantees beyond FIFO within a single queue"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p4",
+        "title": "Retry logic + dead-letter queue",
+        "description": "Add ack/nack semantics and the retry state machine on top of the inflight list from p3. nack increments a per-job retry counter; after maxRetries exhaustion the job moves to the dead-letter queue with a 14-day TTL enforced atomically at insertion.",
+        "dependencies": [
+          "p3"
+        ],
+        "acceptanceCriteria": [
+          "ack(jobId) removes the job from the inflight list; calling ack on an unknown jobId is a no-op (idempotent)",
+          "nack(jobId) increments the job's retry counter and re-enqueues to the pending list if retries remain",
+          "After nack is called maxRetries times (configurable per queue, default 3), the job is atomically moved to <queue>:dlq",
+          "DLQ entries have a Redis TTL of at least 1209600 seconds (14 days) set at insertion time",
+          "Integration test: job nacked maxRetries times appears in DLQ and does not reappear in pending or inflight lists",
+          "Integration test: DLQ entry TTL is ≥ 1209600 seconds immediately after insertion",
+          "Integration test: job nacked fewer than maxRetries times is re-enqueued and returned by a subsequent dequeue call"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Whether retry counter is stored in the job payload or a separate Redis hash",
+            "Re-enqueue strategy on nack (immediate re-enqueue is acceptable; exponential backoff is out of scope per non-goals)",
+            "DLQ key naming convention"
+          ],
+          "escalateToOperator": [
+            "Request to add a DLQ inspection or replay API to QueueProvider<T> — this would change the interface contract",
+            "Discovery that 14-day TTL on DLQ conflicts with Redis maxmemory-policy in the staging environment"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p5",
+        "title": "Feature flag factory + rollback procedure",
+        "description": "Wire up a createQueue factory that routes to MemoryQueue or RedisQueue based on the QUEUE_BACKEND env var. This is the complete cutover and rollback mechanism — changing the env var and restarting is the entire rollback path.",
+        "dependencies": [
+          "p1",
+          "p4"
+        ],
+        "acceptanceCriteria": [
+          "createQueue<T>(config: QueueConfig) exported from src/queue/index.ts returns MemoryQueue when QUEUE_BACKEND=memory or the var is unset",
+          "createQueue returns RedisQueue when QUEUE_BACKEND=redis",
+          "Both return types satisfy QueueProvider<T> — TypeScript verifies assignability without casts",
+          "Unit test: factory returns MemoryQueue for QUEUE_BACKEND=memory and RedisQueue for QUEUE_BACKEND=redis",
+          "QUEUE_ROLLBACK.md documents the exact rollback procedure: set QUEUE_BACKEND=memory, rolling-restart consumers, verify no pending Redis jobs are lost"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Whether QueueConfig is a discriminated union or a flat object with an optional redisUrl field",
+            "Whether the factory throws on unknown QUEUE_BACKEND values or silently falls back to memory"
+          ],
+          "escalateToOperator": [
+            "Discovery that callers construct QueueProvider directly rather than via a factory — would require caller changes, violating non-goal 1",
+            "Request to support hot-swap without process restart"
+          ]
+        },
+        "estimatedComplexity": "small"
+      },
+      {
+        "phaseId": "p6",
+        "title": "Performance validation + end-to-end test coverage",
+        "description": "Verify the p99 enqueue latency SLA and close integration test coverage gaps across both the happy path and failure path. Produces no new features — confirms all prior phases meet their operational requirements under load.",
+        "dependencies": [
+          "p4",
+          "p5"
+        ],
+        "acceptanceCriteria": [
+          "scripts/bench-enqueue.ts measures p99 enqueue latency over 1000 sequential samples against docker-compose Redis and prints the result",
+          "Measured p99 is ≤ 10ms; if it exceeds 10ms, an optimization is applied and the benchmark re-run before the phase closes",
+          "Integration test: full happy-path lifecycle — enqueue → dequeue → ack, queue is empty after ack",
+          "Integration test: full failure-path lifecycle — enqueue → dequeue → nack × maxRetries → job in DLQ, pending list is empty",
+          "npm test with QUEUE_BACKEND=redis and docker-compose Redis running exits 0",
+          "npm test with QUEUE_BACKEND=memory exits 0 (in-memory path unbroken by all prior changes)"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Benchmark tooling (custom script vs a lightweight bench library)",
+            "Whether CI runs the benchmark as a test assertion or as a separate npm script step"
+          ],
+          "escalateToOperator": [
+            "p99 latency exceeds 10ms after applying pipeline optimizations — may require infrastructure change outside Executor scope",
+            "Any test failure that can only be fixed by changing the QueueProvider<T> interface"
+          ]
+        },
+        "estimatedComplexity": "small"
+      }
+    ],
+    "criticalPath": [
+      "p1",
+      "p3",
+      "p4",
+      "p5",
+      "p6"
+    ],
+    "decompositionRationale": "The migration splits into six natural work units: contract establishment (p1), test infrastructure (p2), core queue mechanics (p3), failure-path mechanics (p4), cutover wiring (p5), and validation (p6). Phases p1 and p2 are independent and can run in parallel — both are prerequisites for p3, which has the deepest implementation work. Retry and DLQ logic in p4 is separated from the core dequeue path in p3 because ack/nack semantics require the inflight list to exist first and the state machine is complex enough to warrant isolated review. The feature flag factory (p5) is deferred until both implementations exist and are complete so assignability can be verified by the compiler. Performance validation is last because the latency SLA can only be confirmed once all optimistic-path code is stable. Six phases lands at the lower bound of the expected range, which is correct: p3 and p4 are genuinely medium-complexity, the rest are small, and splitting further would introduce artificial boundaries without reducing Executor session risk."
+  },
+  "parseError": null,
+  "costUsd": 0.3325083,
+  "latencyMs": 166733,
+  "numTurns": 5,
+  "inputTokens": 12,
+  "outputTokens": 11406,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

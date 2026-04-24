@@ -1,0 +1,33 @@
+{
+  "escalationId": "p5",
+  "shape": "executor_escalation",
+  "type": "design_decision",
+  "verdict": "retry_with_directive",
+  "directive": "Implement retry logic at the per-alert level, matching the existing per-alert dispatch shape. On 5xx or 429: exponential backoff, 3 attempts. On 4xx (except 429): fail-fast, no retry. Dedup_key on each payload prevents duplicate incidents if a retry fires after a silent partial success. Do not introduce batch-level retry state — the live dispatch path is not batched and p4 (backfill) already handles its own retry shape independently.",
+  "amendedSpec": null,
+  "escalationReason": null,
+  "rationale": "The p2 decision (per-alert mapper) does not formally constrain p5 — these are different layers — but the same reasoning applies independently. The live dispatch path is per-alert (existing dispatcher, p2 mapper); retry logic at the transport layer should match. Per-alert retry means only the failing alert retries, not all 99 others that may have succeeded in a co-batch. Bulk-batch retry forces re-sending already-accepted events on any partial failure, increasing unnecessary API traffic and accelerating rate-limit consumption — the opposite of the goal. Dedup_key satisfies the duplicate-prevention acceptance criterion either way, but per-alert retry trivially satisfies 'preserve alert ordering where possible' without any partial-batch state tracking. Bulk batching is a backfill concern (p4, already done); the live dispatch path does not batch.",
+  "nonGoalsPreserved": true,
+  "category": "design_decision",
+  "fullArbitration": {
+    "verdict": "retry_with_directive",
+    "rationale": "The p2 decision (per-alert mapper) does not formally constrain p5 — these are different layers — but the same reasoning applies independently. The live dispatch path is per-alert (existing dispatcher, p2 mapper); retry logic at the transport layer should match. Per-alert retry means only the failing alert retries, not all 99 others that may have succeeded in a co-batch. Bulk-batch retry forces re-sending already-accepted events on any partial failure, increasing unnecessary API traffic and accelerating rate-limit consumption — the opposite of the goal. Dedup_key satisfies the duplicate-prevention acceptance criterion either way, but per-alert retry trivially satisfies 'preserve alert ordering where possible' without any partial-batch state tracking. Bulk batching is a backfill concern (p4, already done); the live dispatch path does not batch.",
+    "directive": "Implement retry logic at the per-alert level, matching the existing per-alert dispatch shape. On 5xx or 429: exponential backoff, 3 attempts. On 4xx (except 429): fail-fast, no retry. Dedup_key on each payload prevents duplicate incidents if a retry fires after a silent partial success. Do not introduce batch-level retry state — the live dispatch path is not batched and p4 (backfill) already handles its own retry shape independently.",
+    "amendedSpec": null,
+    "escalationReason": null,
+    "nonGoalsPreserved": true,
+    "category": "design_decision"
+  },
+  "parseError": null,
+  "costUsd": 0.05758574999999999,
+  "latencyMs": 42594,
+  "numTurns": 2,
+  "inputTokens": 4,
+  "outputTokens": 1966,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": [],
+  "callIndex": 5,
+  "cumulativeCostUsd": 0.28175265,
+  "cumulativeTurns": 10
+}

@@ -1,0 +1,61 @@
+{
+  "scenarioId": "s1",
+  "label": "clean_trivial_pr",
+  "expectedVerdict": "approve",
+  "verdict": "request_changes",
+  "weightedRisk": 0.2425,
+  "findingCount": 1,
+  "criticalFindingCount": 1,
+  "criteriaMetCount": 3,
+  "criteriaTotal": 3,
+  "category": "correctness_bug",
+  "summary": "The diff satisfies all three acceptance criteria as written — the line is present, formatting matches, and existing entries are untouched. However, the Executor's stated assumption ('package.json already defines the lint:fix script') is false: package.json scripts are build, start, test, test:watch, test:e2e, and lint only. No lint:fix exists. The README now documents a command that produces a hard error when run, making this a correctness defect. Weighted risk score is 0.2425 (just under threshold), but the critical finding forces request_changes regardless. Fix: add the script to package.json before or alongside the README entry.",
+  "fullReview": {
+    "verdict": "request_changes",
+    "riskScore": {
+      "correctness": 0.75,
+      "integration": 0.05,
+      "stateCorruption": 0,
+      "performance": 0,
+      "regression": 0.05,
+      "weighted": 0.2425
+    },
+    "findings": [
+      {
+        "severity": "critical",
+        "file": "README.md",
+        "line": 17,
+        "description": "Documents `npm run lint:fix` but package.json contains no such script — running this command fails with 'Missing script: lint:fix'.",
+        "suggestion": "Either add a lint:fix script to package.json (e.g. eslint --fix or tsc equivalent) before merging, or remove this README entry until the script is implemented."
+      }
+    ],
+    "summary": "The diff satisfies all three acceptance criteria as written — the line is present, formatting matches, and existing entries are untouched. However, the Executor's stated assumption ('package.json already defines the lint:fix script') is false: package.json scripts are build, start, test, test:watch, test:e2e, and lint only. No lint:fix exists. The README now documents a command that produces a hard error when run, making this a correctness defect. Weighted risk score is 0.2425 (just under threshold), but the critical finding forces request_changes regardless. Fix: add the script to package.json before or alongside the README entry.",
+    "criteriaAssessment": [
+      {
+        "criterion": "README.md contains the new `npm run lint:fix` command under the Commands section",
+        "met": true,
+        "evidence": "Line added at diff +17: `- \\`npm run lint:fix\\` — fix lint errors automatically` appears under ## Commands."
+      },
+      {
+        "criterion": "Existing commands remain unchanged",
+        "met": true,
+        "evidence": "npm test, npm run build, and npm run lint lines are all present and unmodified in the diff context."
+      },
+      {
+        "criterion": "Spelling and formatting match existing command entries",
+        "met": true,
+        "evidence": "Entry uses identical format: backtick-wrapped command, em dash, lowercase description — matches all three existing entries."
+      }
+    ],
+    "category": "correctness_bug"
+  },
+  "parseError": null,
+  "costUsd": 0.22972845000000003,
+  "latencyMs": 73757,
+  "numTurns": 7,
+  "inputTokens": 15,
+  "outputTokens": 3296,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

@@ -1,0 +1,573 @@
+{
+  "projectId": "large",
+  "projectName": "postgres-to-cockroach-migration",
+  "complexity": "large",
+  "expectedPhaseRange": "18-28",
+  "actualPhaseCount": 19,
+  "nonGoalsPreservedCount": 7,
+  "nonGoalsOperatorCount": 7,
+  "nonGoalsAddedCount": 2,
+  "criticalPathLength": 16,
+  "allDependenciesValid": true,
+  "hasDecompositionRationale": true,
+  "subagentInvocations": [],
+  "subagentInvocationCount": 0,
+  "fullPlan": {
+    "projectId": "postgres-to-cockroach-migration",
+    "projectDescription": "Migrate the production application database from PostgreSQL 14 to CockroachDB (cloud-hosted) with zero downtime and zero data loss during the cutover. The application uses Prisma ORM across ~40 tables totaling ~2TB, with moderate write throughput (peak 5k writes/sec during business hours). Critical paths include user authentication, billing transactions, and audit log append. Business requirement: complete migration within 6 weeks of project start, with live cutover executed during a 2-hour scheduled maintenance window. Rollback must be possible for 30 days post-cutover. No raw SQL — all queries through Prisma client. Staging uses CockroachDB Cloud Serverless; production uses Dedicated tier.",
+    "nonGoals": [
+      "Do not change the Prisma schema semantics — client-side code must compile and pass tests unchanged",
+      "Do not remove PostgreSQL until 30-day post-cutover stability window passes",
+      "Do not migrate denormalized read-replica data or analytics pipelines — those are a separate post-cutover project",
+      "Do not introduce multi-region writes — single-region CockroachDB only (multi-region is future scope)",
+      "Do not disable any existing monitoring, alerting, or logging paths during migration",
+      "Do not increase p99 application latency by more than 15% vs PostgreSQL baseline measured over the migration week",
+      "Do not modify business logic or application behavior — this is a pure storage-layer migration",
+      "Do not execute Postgres decommission — that happens after the 30-day stability window, which is outside this project's scope",
+      "Do not treat read-replica or analytics data as in scope for consistency validation"
+    ],
+    "phases": [
+      {
+        "phaseId": "p1",
+        "title": "Schema Compatibility Audit",
+        "description": "Audit all 40 tables for CockroachDB incompatibilities and produce a migration checklist. This phase gates every schema and application change that follows — nothing can be scoped without knowing what needs adapting.",
+        "dependencies": [],
+        "acceptanceCriteria": [
+          "All 40 tables catalogued with any CockroachDB-incompatible types flagged (SERIAL, sequences, arrays, PostGIS, pg-specific extensions)",
+          "FK dependency graph documented with audit log's 12 FK dependencies explicitly ordered for safe schema migration",
+          "PII-containing tables (users, payments and any others) enumerated with encryption-at-rest requirements noted",
+          "CockroachDB-incompatible DDL constructs listed with required substitution for each",
+          "Migration checklist artifact committed, covering schema changes and known behavioral differences"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Format of the migration checklist artifact",
+            "Which secondary audit tooling to use (pganalyze, manual inspection, CockroachDB schema import dry-run)"
+          ],
+          "escalateToOperator": [
+            "Any table using a Postgres feature with no CockroachDB equivalent that would require application behavior changes",
+            "Any PII table with ambiguous data classification requiring compliance review"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p2",
+        "title": "Staging Environment Setup + PostgreSQL Baseline Capture",
+        "description": "Provision CockroachDB Cloud Serverless for staging and capture PostgreSQL p99 latency and throughput baselines. Both outputs are hard dependencies for later phases — the staging instance for all validation work, the baseline for the ≤15% latency non-goal.",
+        "dependencies": [],
+        "acceptanceCriteria": [
+          "CockroachDB Cloud Serverless staging cluster provisioned with credentials and network access configured",
+          "Application can establish a Prisma connection to CockroachDB staging from the test environment",
+          "PostgreSQL p99 latency baseline captured for auth, billing, and audit log critical paths under representative load",
+          "PostgreSQL write throughput baseline captured at or above peak 5k writes/sec",
+          "Baseline metrics artifact committed for reference in P10"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Benchmarking tool choice (k6, pgbench, custom script)",
+            "Staging cluster sizing within Serverless tier",
+            "Secrets management approach for staging credentials"
+          ],
+          "escalateToOperator": [
+            "Network peering or VPC requirements that need infra team involvement",
+            "Compliance requirements on staging data (whether production PII can be used)"
+          ]
+        },
+        "estimatedComplexity": "small"
+      },
+      {
+        "phaseId": "p3",
+        "title": "Prisma Schema Adaptation for CockroachDB",
+        "description": "Adapt prisma.schema to target CockroachDB while preserving the generated client API exactly. This is the most likely source of non-goal-1 violations and must be validated by running the existing test suite unchanged.",
+        "dependencies": [
+          "p1"
+        ],
+        "acceptanceCriteria": [
+          "prisma.schema uses cockroachdb provider and resolves all incompatibilities identified in p1 (SERIAL → UUID/cuid, sequences, etc.)",
+          "prisma generate succeeds without errors or warnings against the adapted schema",
+          "All existing application test files compile without modification",
+          "Existing test suite passes against the adapted schema on a local CockroachDB-compatible target",
+          "Audit log table and its 12 FK-referenced tables represented correctly in adapted schema"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "UUID generation strategy (cuid, uuid, nanoid) for tables that used SERIAL PKs",
+            "Whether to use prisma migrate or prisma db push for staging deployment",
+            "Schema file organization (single file vs. multi-file if supported)"
+          ],
+          "escalateToOperator": [
+            "Any schema change that would alter the generated Prisma client types exposed to application code",
+            "Any PK strategy change that would break existing FK references or application-layer ID assumptions"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p4",
+        "title": "Transaction Semantics Audit + Application Compatibility Fixes",
+        "description": "Identify and fix all application code paths affected by CockroachDB's serializable-by-default isolation and behavioral differences from PostgreSQL. Unaddressed serialization conflicts will surface as silent data errors or panics in production.",
+        "dependencies": [
+          "p1",
+          "p3"
+        ],
+        "acceptanceCriteria": [
+          "All code paths using advisory locks identified; each either ported to an application-level alternative or confirmed unsupported and escalated",
+          "All Prisma transaction blocks audited for serialization conflict exposure; retry logic (handling error code 40001) added where required",
+          "All Postgres-specific error code references in application error handlers updated or aliased for CockroachDB equivalents",
+          "Deferred constraint usage (if any) identified and resolved — CockroachDB does not support deferred FK constraints",
+          "Retry layer unit-tested: confirms retries occur on 40001, does not retry on other error classes"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Retry backoff strategy (exponential, fixed, jitter)",
+            "Maximum retry count and timeout per transaction class",
+            "Whether to implement retry at Prisma middleware layer or per-call site"
+          ],
+          "escalateToOperator": [
+            "Any advisory lock usage that cannot be replaced without changing application behavior",
+            "Any deferred constraint that enforces a business rule — removal may require product sign-off"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p5",
+        "title": "Data Migration Tooling Setup + Throughput Validation",
+        "description": "Select, configure, and validate tooling for the bulk initial data load and ongoing consistency checking. The 2TB/2-hour cutover requirement is a hard constraint — tooling that can't hit that throughput invalidates the cutover plan.",
+        "dependencies": [
+          "p2"
+        ],
+        "acceptanceCriteria": [
+          "Bulk load tooling selected and configured (IMPORT INTO via pg_dump export, or equivalent) against staging CockroachDB",
+          "Throughput benchmark confirms 2TB load completes within 120 minutes under staging conditions, or bottleneck is documented and escalated",
+          "Reconciliation tooling operational: row-count and checksum comparison between Postgres and CockroachDB for any table",
+          "Dual-write consistency checker operational: samples a configurable percentage of write pairs and compares resulting reads from both DBs",
+          "PII table data validation script operational: validates row counts, field presence, and encryption-at-rest flag for users and payments tables"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Bulk load tool selection (IMPORT INTO, COPY, custom chunked upsert)",
+            "Reconciliation sampling rate and comparison granularity",
+            "Checksum algorithm choice"
+          ],
+          "escalateToOperator": [
+            "If 2TB/2hr throughput cannot be achieved — may require window extension or phased table cutover instead of atomic",
+            "If encryption-at-rest verification requires CockroachDB Cloud console access not yet provisioned"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p6",
+        "title": "Staging Schema Deployment",
+        "description": "Apply the validated Prisma schema to CockroachDB staging in FK-dependency order. This is the first end-to-end proof that the adapted schema is deployable — a failing migration here blocks all data work.",
+        "dependencies": [
+          "p3",
+          "p4",
+          "p5"
+        ],
+        "acceptanceCriteria": [
+          "Prisma migrations execute successfully against CockroachDB staging with no manual SQL intervention",
+          "All 40 tables present with correct column types, constraints, and indexes",
+          "Audit log FK constraints satisfied: all 12 referenced tables exist and have PKs at migration time",
+          "Migration is idempotent: re-running does not error or duplicate data",
+          "Schema diff between Postgres production and CockroachDB staging documented — all differences intentional and explained"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Migration execution order for FK-constrained tables",
+            "Whether to use a single migration file or ordered set"
+          ],
+          "escalateToOperator": [
+            "Any schema difference that is not a known CockroachDB adaptation and cannot be explained by p1 findings"
+          ]
+        },
+        "estimatedComplexity": "small"
+      },
+      {
+        "phaseId": "p7",
+        "title": "Staging Data Load + PII and Integrity Validation",
+        "description": "Load a production data snapshot into CockroachDB staging and validate correctness. This is the first real test that the tooling from p5 works against actual production data shape and volume.",
+        "dependencies": [
+          "p6"
+        ],
+        "acceptanceCriteria": [
+          "Production data snapshot loaded into all 40 CockroachDB staging tables",
+          "Row counts match between Postgres source snapshot and CockroachDB staging for all tables",
+          "FK integrity validated: no orphaned FK references across all 40 tables post-load",
+          "PII validation passed for users and payments tables: row counts match, all required fields present, encryption-at-rest verified active",
+          "Billing transactions table validated: transaction count and total sum match source snapshot exactly"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Whether to use a full production snapshot or a time-bounded subset for staging",
+            "Checksum comparison granularity (table-level vs. row-level sampling)"
+          ],
+          "escalateToOperator": [
+            "Any row count mismatch not explained by snapshot timing",
+            "Any PII validation failure — must not proceed to p8 until resolved",
+            "Any billing sum mismatch, however small"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p8",
+        "title": "Dual-Write Infrastructure",
+        "description": "Build the dual-write layer that fans application writes to both Postgres and CockroachDB simultaneously. This is the technical foundation for zero-downtime cutover — Postgres remains primary until cutover, CockroachDB receives shadow writes.",
+        "dependencies": [
+          "p4",
+          "p6"
+        ],
+        "acceptanceCriteria": [
+          "Dual-write middleware intercepts all Prisma write operations and executes them against both Postgres and CockroachDB",
+          "Feature flag enables/disables dual-write without application redeploy",
+          "Billing transaction writes are atomic across both DBs: if CockroachDB write fails, the overall transaction is failed (not silently skipped)",
+          "Dual-write failures surface to existing monitoring and alerting paths — no silent failure mode",
+          "Consistency checker from p5 is wired to run continuously against dual-write output and emit alerts on detected drift"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Whether dual-write is implemented as Prisma middleware, a service layer wrapper, or a proxy",
+            "Failure handling strategy for non-billing tables (fail-open vs. fail-closed)",
+            "Feature flag mechanism (env var, config service, or database-backed flag)"
+          ],
+          "escalateToOperator": [
+            "Any dual-write architecture that would require modifying business logic code paths (violates non-goal 7)",
+            "Decision to make non-billing dual-write failures fail-open — requires explicit operator risk acceptance"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p9",
+        "title": "Staging Dual-Write Validation Under Load",
+        "description": "Enable dual-write in staging and validate correctness and consistency under peak load. This is the primary integration test of the entire migration stack before any production work begins.",
+        "dependencies": [
+          "p7",
+          "p8"
+        ],
+        "acceptanceCriteria": [
+          "Dual-write runs continuously in staging under sustained 5k writes/sec load with zero consistency checker alerts over a 4-hour test window",
+          "Billing transactions: zero data loss confirmed — every write to Postgres confirmed present in CockroachDB post-test",
+          "Audit log append ordering consistent between Postgres and CockroachDB under concurrent write load",
+          "Retry layer exercises correctly: serialization conflicts resolved by retry, not surfaced as application errors",
+          "Dual-write adds no more than 30% latency overhead to write operations (absolute increase, not the 15% non-goal which applies to post-cutover reads)"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Load test tool and traffic shape",
+            "Consistency check sampling rate during load test",
+            "Whether to run auth, billing, and audit as separate load test scenarios or combined"
+          ],
+          "escalateToOperator": [
+            "Any consistency drift detected during load test — must not proceed to p10 until root cause identified and fixed",
+            "Any billing data loss, however small",
+            "Dual-write write latency overhead exceeding 30% — may require architectural reconsideration"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p10",
+        "title": "Performance Benchmarking Against ≤15% Latency Target",
+        "description": "Measure CockroachDB p99 latency on read-path critical operations against the PostgreSQL baseline from p2 and validate the ≤15% non-goal. This must pass before production provisioning is approved — a latency violation here requires tuning, not workarounds.",
+        "dependencies": [
+          "p9"
+        ],
+        "acceptanceCriteria": [
+          "p99 read latency on auth critical path ≤ 115% of Postgres baseline under production-like load",
+          "p99 read latency on billing critical path ≤ 115% of Postgres baseline",
+          "p99 read latency on audit log read path ≤ 115% of Postgres baseline",
+          "Any index or connection pool tuning applied to hit latency targets is documented with before/after measurements",
+          "Benchmark results artifact committed for operator review before p12 begins"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Index additions to CockroachDB that are not in Postgres schema (query-plan-driven tuning)",
+            "Connection pool size adjustments",
+            "Query hint usage if CockroachDB query planner diverges from Postgres"
+          ],
+          "escalateToOperator": [
+            "Any latency target breach that cannot be resolved by index or connection pool tuning — may require scope review or window extension",
+            "Any tuning that would require schema changes affecting Prisma client types"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p11",
+        "title": "Rollback Procedure Development + End-to-End Drill",
+        "description": "Write the complete rollback runbook and execute it end-to-end in staging. A rollback plan that has never been executed is not a rollback plan — the 30-day post-cutover rollback requirement demands demonstrated capability.",
+        "dependencies": [
+          "p9",
+          "p10"
+        ],
+        "acceptanceCriteria": [
+          "Rollback runbook covers two scenarios: cutover abort (never switched) and post-cutover rollback (switched, then rolled back within 30 days)",
+          "Rollback trigger criteria defined: specific error rate thresholds, data drift thresholds, and latency breach values that mandate rollback",
+          "End-to-end rollback drill executed in staging: CockroachDB activated as primary, rollback trigger simulated, Postgres restored as primary, data consistency verified",
+          "Postgres data consistency after rollback drill confirmed: no writes lost that occurred after CockroachDB was made primary during the drill",
+          "Runbook timing validated: rollback completes within a defined time bound documented in the runbook"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Specific error rate thresholds for rollback triggers (within reasonable bounds)",
+            "Runbook format and tooling (manual steps vs. scripted automation)"
+          ],
+          "escalateToOperator": [
+            "Rollback trigger thresholds that could cause false positives under normal traffic fluctuation — operator must accept final values",
+            "Any rollback scenario that cannot be executed within the maintenance window"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p12",
+        "title": "Production CockroachDB Provisioning",
+        "description": "Provision the CockroachDB Dedicated production cluster with security and network configuration. This is the only phase that touches production infrastructure before the data load — it must be gated on staging validation passing.",
+        "dependencies": [
+          "p10",
+          "p11"
+        ],
+        "acceptanceCriteria": [
+          "CockroachDB Dedicated tier production cluster provisioned in correct cloud region",
+          "Encryption-at-rest enabled and verified on the production cluster",
+          "Network peering or private connectivity from production application to CockroachDB Dedicated established",
+          "Prisma connection string for production CockroachDB validated: application can connect and execute a DDL smoke test",
+          "IAM and credential access controls documented and match security requirements for PII data"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Cluster sizing (node count, CPU/RAM) within Dedicated tier based on p10 benchmarks",
+            "Backup schedule configuration on the CockroachDB Dedicated cluster"
+          ],
+          "escalateToOperator": [
+            "Any networking topology that requires changes to production firewall rules or VPC peering agreements",
+            "Cluster sizing decisions that significantly exceed budget — operator must approve spend"
+          ]
+        },
+        "estimatedComplexity": "small"
+      },
+      {
+        "phaseId": "p13",
+        "title": "Production Schema Deployment",
+        "description": "Apply the staging-validated schema to production CockroachDB in FK-dependency order. Uses the identical migration artifacts from p6, not a re-derivation — this is a promotion, not a re-run.",
+        "dependencies": [
+          "p12",
+          "p6"
+        ],
+        "acceptanceCriteria": [
+          "Prisma migration artifacts from p6 applied to production CockroachDB without modification",
+          "All 40 tables present in production CockroachDB with correct types, constraints, and indexes",
+          "Audit log FK constraints satisfied in production schema",
+          "Migration idempotency confirmed: re-run does not error",
+          "Schema diff between production Postgres and production CockroachDB matches the diff documented in p6"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Whether to run migration via CI pipeline or direct CLI invocation"
+          ],
+          "escalateToOperator": [
+            "Any migration failure in production — must not proceed to p14 until fully resolved and root cause understood"
+          ]
+        },
+        "estimatedComplexity": "small"
+      },
+      {
+        "phaseId": "p14",
+        "title": "Production Initial Data Load + PII and Integrity Validation",
+        "description": "Load a production Postgres snapshot into CockroachDB production and run the full validation suite. This is the highest-stakes data operation in the project — billing zero-loss and PII validation are hard gates.",
+        "dependencies": [
+          "p13"
+        ],
+        "acceptanceCriteria": [
+          "Full production data snapshot loaded into all 40 CockroachDB production tables within the throughput window validated in p5",
+          "Row counts match between Postgres snapshot and CockroachDB production for all 40 tables",
+          "FK integrity validated: no orphaned references across all tables",
+          "PII validation passed: users and payments tables row counts match, encryption-at-rest confirmed active on production cluster",
+          "Billing transactions sum and count match source snapshot exactly — zero tolerance for discrepancy"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Snapshot timing relative to business hours to minimize data age at load start",
+            "Whether to pause and re-snapshot if load duration would make data more than N hours stale"
+          ],
+          "escalateToOperator": [
+            "Any row count mismatch — must not proceed to p15",
+            "Any PII validation failure",
+            "Any billing discrepancy, however small",
+            "Load throughput falling below the validated rate, risking the 2-hour cutover window"
+          ]
+        },
+        "estimatedComplexity": "large"
+      },
+      {
+        "phaseId": "p15",
+        "title": "Production Dual-Write Activation",
+        "description": "Enable the dual-write feature flag in production with Postgres remaining the read/write primary. This begins the period where CockroachDB receives every production write — the first real production validation.",
+        "dependencies": [
+          "p14",
+          "p8"
+        ],
+        "acceptanceCriteria": [
+          "Dual-write feature flag enabled in production without application redeploy",
+          "All production write paths confirmed reaching CockroachDB via dual-write layer monitoring",
+          "No increase in application error rate above baseline during first 30 minutes post-activation",
+          "p99 write latency within 30% of Postgres-only baseline during first 30 minutes (dual-write overhead acceptable per p9)",
+          "Consistency checker running against production dual-write output with alerts wired to existing monitoring"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Ramp-up strategy (immediate full enable vs. gradual percentage rollout via feature flag)",
+            "Monitoring window duration before declaring activation stable"
+          ],
+          "escalateToOperator": [
+            "Any error rate increase during activation — must roll back flag immediately",
+            "Any consistency alert within first hour of activation"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p16",
+        "title": "Production Dual-Write Validation Period",
+        "description": "Run dual-write in production for a minimum validation period before cutover rehearsal. This is the sustained evidence baseline — cutover cannot proceed until consistency and latency targets are met over real production load.",
+        "dependencies": [
+          "p15"
+        ],
+        "acceptanceCriteria": [
+          "Dual-write runs for minimum 5 business days under full production load with zero consistency alerts",
+          "Daily reconciliation reports show zero row count drift across all 40 tables",
+          "Billing transaction counts and sums match between Postgres and CockroachDB at each daily reconciliation",
+          "p99 read latency on Postgres (current primary) shows no regression vs. baseline — dual-write adds no read overhead",
+          "Validation period summary report produced and committed for operator review before p17 is authorized"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Reconciliation check scheduling (time of day, frequency)",
+            "Report format for the validation summary"
+          ],
+          "escalateToOperator": [
+            "Any consistency drift detected during validation period — must resolve before advancing",
+            "Decision to shorten validation period below 5 business days — operator must explicitly accept reduced evidence",
+            "Any billing discrepancy at any reconciliation"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p17",
+        "title": "Cutover Rehearsal in Staging",
+        "description": "Execute a full 2-hour cutover rehearsal in staging using the production runbook verbatim. This validates the runbook timing, smoke test completeness, and rollback capability within a single window before production execution.",
+        "dependencies": [
+          "p11",
+          "p16"
+        ],
+        "acceptanceCriteria": [
+          "Full cutover executed in staging within 120 minutes using the production runbook with no ad-hoc steps",
+          "All runbook steps timed individually — total time and critical-path time documented",
+          "Post-cutover smoke tests (auth login, billing transaction, audit log write/read) pass within the window",
+          "Rollback drill executed in same window: CockroachDB made primary, then rolled back to Postgres, data integrity confirmed",
+          "Any runbook gaps found during rehearsal resolved and runbook updated before p18"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Specific smoke test queries used to validate post-cutover state",
+            "Staging data freshness requirements for the rehearsal"
+          ],
+          "escalateToOperator": [
+            "Any rehearsal step that cannot be completed within the 120-minute window — requires window extension or step elimination decision",
+            "Any rollback failure during the drill"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p18",
+        "title": "Production Cutover",
+        "description": "Execute the 2-hour scheduled maintenance window: drain dual-write, complete final sync, switch all reads and writes to CockroachDB, and verify. PostgreSQL transitions to read-only standby for the rollback window.",
+        "dependencies": [
+          "p17",
+          "p16"
+        ],
+        "acceptanceCriteria": [
+          "Final Postgres-to-CockroachDB sync completes with zero row count drift before read switch",
+          "All application reads and writes routed to CockroachDB within the 120-minute window",
+          "Post-cutover smoke tests pass: auth, billing transaction write+read, audit log append+query",
+          "CockroachDB p99 latency within 15% of Postgres baseline during first 30 minutes post-switch",
+          "PostgreSQL placed in read-only mode and confirmed receiving zero application writes post-cutover",
+          "Rollback runbook on standby with operator and on-call team briefed on trigger criteria"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Exact step ordering within the runbook (already validated in p17)",
+            "Smoke test retry count before declaring failure"
+          ],
+          "escalateToOperator": [
+            "Any smoke test failure post-switch — operator decides rollback vs. investigate",
+            "Any latency breach above 15% in first 30 minutes — operator decides rollback vs. monitor",
+            "Window overrun: if cutover cannot complete within 120 minutes, operator must decide extend or abort"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p19",
+        "title": "Post-Cutover Stability Monitoring + Rollback Readiness",
+        "description": "Monitor production CockroachDB for the 30-day stability window while maintaining Postgres as a verified rollback target. This phase ends at the 30-day mark with a stability report and Postgres decommission criteria documented for the follow-on project.",
+        "dependencies": [
+          "p18"
+        ],
+        "acceptanceCriteria": [
+          "CockroachDB production monitored continuously for 30 days with no sustained latency breach (p99 > 115% of baseline for more than 1 hour)",
+          "Weekly Postgres consistency spot-checks confirm Postgres data snapshot remains consistent and accessible for rollback",
+          "Rollback capability tested by read-only validation query against Postgres weekly — Postgres confirmed rollback-ready throughout window",
+          "Any rollback trigger event during the 30-day window documented with root cause and resolution",
+          "End-of-window stability report produced documenting: incident count, latency trend, data drift events, and recommended Postgres decommission criteria for the follow-on project"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Monitoring dashboard layout and alert grouping",
+            "Spot-check query selection for Postgres rollback validation",
+            "Stability report format"
+          ],
+          "escalateToOperator": [
+            "Any rollback trigger event — operator decides whether to roll back or accept the risk",
+            "Any sustained Postgres data drift detected during spot-checks (would indicate dual-write inconsistency that persisted through cutover)"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      }
+    ],
+    "criticalPath": [
+      "p1",
+      "p3",
+      "p4",
+      "p6",
+      "p7",
+      "p9",
+      "p10",
+      "p11",
+      "p12",
+      "p13",
+      "p14",
+      "p15",
+      "p16",
+      "p17",
+      "p18",
+      "p19"
+    ],
+    "decompositionRationale": "The project decomposes along four structural seams: (1) staging-first validation — every risky operation is proven in staging before touching production, which forces a staging-then-production doubling of schema, data load, and dual-write phases; (2) the dual-write period as the central safety mechanism — it is its own infrastructure phase (p8) rather than bundled into cutover, because it must run long enough to generate the consistency evidence that authorizes cutover; (3) hard gates between phases — p10 latency benchmarks gate production provisioning, p11 rollback drill gates production dual-write, p16 validation report gates rehearsal, and p17 rehearsal gates the live cutover; and (4) the 30-day rollback window as a first-class phase (p19) rather than an epilogue, because it requires active operational discipline and produces the decommission criteria for the follow-on project. The 19-phase count sits at the low end of the expected 18-28 range because several natural phase boundaries were intentionally merged: PII validation was kept inside its respective data-load phases (p7, p14) rather than extracted as a separate phase, since it executes at the same time and against the same data; staging and production schema deployments are separate phases because they have genuinely different gates and accept different risk levels, but they share artifacts rather than re-deriving them. The 6-week timeline is achievable because p1, p2 are fully parallel; p3, p4, p5 run largely in parallel after p1/p2; and the production phases (p12 onwards) can begin as soon as staging validation clears, overlapping with the tail of p11."
+  },
+  "parseError": null,
+  "costUsd": 0.41864505,
+  "latencyMs": 250908,
+  "numTurns": 5,
+  "inputTokens": 12,
+  "outputTokens": 15668,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

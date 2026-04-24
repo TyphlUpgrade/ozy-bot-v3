@@ -1,0 +1,33 @@
+{
+  "escalationId": "e1",
+  "shape": "executor_escalation",
+  "type": "scope_unclear",
+  "verdict": "retry_with_directive",
+  "directive": "Use per-username keying: configure the ratelimit middleware with a keyFn that reads body.username (normalized to lowercase), and reorder the middleware so the body is parsed before the rate-limit check on POST /api/auth/login only. Keep threshold and cooldown configurable via config/auth.yml as specified. Do not change /api/signup or other endpoints, and do not add per-IP keying in this phase.",
+  "amendedSpec": null,
+  "escalationReason": null,
+  "rationale": "The project description explicitly targets credential stuffing, which by definition involves attackers rotating IPs against a single account — per-IP keying does not address the stated threat. Per-username keying directly matches the project goal. The required change (reading body.username before the ratelimit check) is a local reorder within existing middleware and introduces no new files, tables, or API contract changes, so all non-goals are preserved. Composite keying is stronger but adds complexity beyond what the phase spec requires; the operator can expand later if desired. This is a design_decision resolvable from project context, not a plan defect.",
+  "nonGoalsPreserved": true,
+  "category": "design_decision",
+  "fullArbitration": {
+    "verdict": "retry_with_directive",
+    "rationale": "The project description explicitly targets credential stuffing, which by definition involves attackers rotating IPs against a single account — per-IP keying does not address the stated threat. Per-username keying directly matches the project goal. The required change (reading body.username before the ratelimit check) is a local reorder within existing middleware and introduces no new files, tables, or API contract changes, so all non-goals are preserved. Composite keying is stronger but adds complexity beyond what the phase spec requires; the operator can expand later if desired. This is a design_decision resolvable from project context, not a plan defect.",
+    "directive": "Use per-username keying: configure the ratelimit middleware with a keyFn that reads body.username (normalized to lowercase), and reorder the middleware so the body is parsed before the rate-limit check on POST /api/auth/login only. Keep threshold and cooldown configurable via config/auth.yml as specified. Do not change /api/signup or other endpoints, and do not add per-IP keying in this phase.",
+    "amendedSpec": null,
+    "escalationReason": null,
+    "nonGoalsPreserved": true,
+    "category": "design_decision"
+  },
+  "parseError": null,
+  "costUsd": 0.68838375,
+  "latencyMs": 23556,
+  "numTurns": 1,
+  "inputTokens": 0,
+  "outputTokens": 0,
+  "terminalReason": null,
+  "sessionSuccess": false,
+  "errors": [
+    "Claude Code returned an error result: Reached maximum budget ($0.4)",
+    "Reached maximum budget ($0.4)"
+  ]
+}

@@ -1,0 +1,536 @@
+{
+  "projectId": "large",
+  "projectName": "postgres-to-cockroach-migration",
+  "complexity": "large",
+  "expectedPhaseRange": "18-28",
+  "actualPhaseCount": 18,
+  "nonGoalsPreservedCount": 6,
+  "nonGoalsOperatorCount": 7,
+  "nonGoalsAddedCount": 3,
+  "criticalPathLength": 12,
+  "allDependenciesValid": true,
+  "hasDecompositionRationale": true,
+  "subagentInvocations": [],
+  "subagentInvocationCount": 0,
+  "fullPlan": {
+    "projectId": "postgres-to-cockroach-migration",
+    "projectDescription": "Migrate the production application database from PostgreSQL 14 to CockroachDB (cloud-hosted) with zero downtime and zero data loss during the cutover. The application uses Prisma ORM across ~40 tables totaling ~2TB, with moderate write throughput (peak 5k writes/sec during business hours). Critical paths include user authentication, billing transactions, and audit log append. Business requirement: complete migration within 6 weeks of project start, with live cutover executed during a 2-hour scheduled maintenance window. Rollback must be possible for 30 days post-cutover. CockroachDB Cloud Serverless tier for staging, Dedicated tier for production. Prisma schema datasource block will change provider from postgresql to cockroachdb; generated client API must remain identical.",
+    "nonGoals": [
+      "Do not change Prisma schema semantics — client-side code must compile and pass tests unchanged",
+      "Do not remove PostgreSQL until 30-day post-cutover stability window passes",
+      "Do not migrate denormalized read-replica data or analytics pipelines — those are a separate post-cutover project",
+      "Do not introduce multi-region writes — single-region CockroachDB only (multi-region is future scope)",
+      "Do not disable any existing monitoring, alerting, or logging paths during migration",
+      "Do not increase p99 application latency by more than 15% vs PostgreSQL baseline measured over the migration week",
+      "Do not modify business logic or application behavior — this is a pure storage-layer migration",
+      "Do not execute production cutover before rollback procedure is validated end-to-end in staging",
+      "Do not run application writes against CockroachDB in production before dual-write is confirmed clean for at least 72 hours"
+    ],
+    "phases": [
+      {
+        "phaseId": "p1",
+        "title": "CockroachDB Compatibility Audit",
+        "description": "Audit all 40 Prisma models and the application codebase for CockroachDB incompatibilities. Covers schema-level issues (partial indexes, ENUM handling, sequence behavior, generated columns, ON CONFLICT semantics, JSONB vs JSON), transaction isolation assumptions (application code written against read-committed; CRDB defaults to serializable), and the FK dependency graph for the audit log table. Produces the compatibility report and remediation checklist that gates all subsequent phases.",
+        "dependencies": [],
+        "acceptanceCriteria": [
+          "Every Prisma model annotated with CRDB-compatible, needs-adaptation, or blocked status",
+          "Complete FK dependency graph for the audit log table's 12 referenced tables documented",
+          "All code paths with implicit read-committed isolation assumptions identified and catalogued",
+          "Serialization-retry candidates (long transactions, high-contention paths) listed with owning files",
+          "Compatibility report artifact committed to repo as docs/migration/crdb-audit.md"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Audit report format and section ordering",
+            "Tooling used to grep and enumerate transaction patterns",
+            "Which Prisma field types map cleanly vs require @db annotation changes"
+          ],
+          "escalateToOperator": [
+            "Any schema incompatibility that cannot be resolved without changing Prisma model semantics",
+            "Any application behavior that cannot be preserved under serializable isolation without logic changes",
+            "Discovery of table types (e.g., TimescaleDB, partitioned tables) not accounted for in project description"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p2",
+        "title": "Environment & Tooling Setup",
+        "description": "Provision CockroachDB Cloud Serverless for staging and configure all migration tooling. Includes Prisma datasource configuration for CRDB, connection pooling validation (pgBouncer session mode or direct connections — CRDB has restrictions on transaction-mode pgBouncer), data sync tool selection and initial configuration, and CI pipeline additions to run tests against CRDB.",
+        "dependencies": [],
+        "acceptanceCriteria": [
+          "CockroachDB Cloud Serverless staging cluster provisioned and accessible via connection string",
+          "Prisma client successfully generates against CRDB datasource without client API changes",
+          "Connection pooling configured and confirmed compatible with CRDB (no transaction-mode pgBouncer issues)",
+          "Chosen bulk data sync tool (e.g., IMPORT INTO, COPY, or custom ETL) runs a 1GB test dataset load without errors",
+          "npm test (or equivalent) executes against CRDB staging cluster and all existing tests pass or are explicitly tagged pending-remediation"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Specific connection pool configuration parameters",
+            "Bulk sync tool selection from operator-approved options",
+            "CI environment variable naming conventions"
+          ],
+          "escalateToOperator": [
+            "Serverless tier quota limits that would block 2TB sync throughput requirements",
+            "Licensing or cost concerns from chosen sync tooling",
+            "Decision to use CRDB-native IMPORT vs third-party CDC tooling"
+          ]
+        },
+        "estimatedComplexity": "small"
+      },
+      {
+        "phaseId": "p3",
+        "title": "PostgreSQL Baseline Performance Capture",
+        "description": "Instrument and record p99 latency baselines for all critical application paths against production PostgreSQL. Baselines must be captured over a representative business-hours window to account for peak 5k writes/sec load. Output is a signed-off baseline document used as the comparison target in staging and post-cutover validation.",
+        "dependencies": [],
+        "acceptanceCriteria": [
+          "p99 latency captured for auth (login, session validation, token refresh), billing (transaction create, query), and audit log (append, query by FK) critical paths",
+          "Baselines captured during a business-hours peak period (minimum 30-minute window at or near 5k writes/sec)",
+          "p95 and p99 values recorded per endpoint, not just averages",
+          "Baseline document committed as docs/migration/pg-baseline.md with methodology and timestamp",
+          "15% degradation threshold calculated and documented per endpoint (absolute ms values)"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Instrumentation method (APM sampling, query log analysis, or synthetic test harness)",
+            "Number of sample endpoints beyond the three named critical paths"
+          ],
+          "escalateToOperator": [
+            "Production instrumentation that would require application changes or restarts",
+            "Baseline window scheduling (requires operator coordination with business hours)"
+          ]
+        },
+        "estimatedComplexity": "small"
+      },
+      {
+        "phaseId": "p4",
+        "title": "Schema Translation & Migration Scripts",
+        "description": "Adapt schema.prisma for the CockroachDB provider and generate ordered migration SQL. Handles FK dependency ordering for the audit log table (12 FKs require parent tables migrated before audit log), CRDB-specific type annotations (@db directives for types that differ), and any schema incompatibilities identified in p1. The generated Prisma client API must remain identical to the PostgreSQL version.",
+        "dependencies": [
+          "p1",
+          "p2"
+        ],
+        "acceptanceCriteria": [
+          "schema.prisma compiles with provider = cockroachdb and generates a Prisma client with identical TypeScript API surface as the PostgreSQL version",
+          "prisma migrate diff between PG and CRDB schemas shows zero model-level changes (only datasource and @db annotation changes permitted)",
+          "Migration SQL scripts execute against CRDB staging in correct FK dependency order without errors",
+          "Audit log table and all 12 FK-referenced parent tables migrate successfully with constraints intact",
+          "All 40 tables present and schema-valid in CRDB staging after migration scripts run"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Order of table creation beyond FK-required ordering",
+            "@db type annotation choices where multiple CRDB-compatible options exist",
+            "Whether to use prisma migrate or raw SQL scripts for CRDB migration"
+          ],
+          "escalateToOperator": [
+            "Any model field that cannot be translated without changing the Prisma client TypeScript API",
+            "CRDB schema features required that Prisma does not yet support natively"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p5",
+        "title": "Transaction Semantics Audit & Remediation",
+        "description": "CockroachDB uses serializable isolation by default; the application was written against PostgreSQL read-committed. This phase identifies all code paths that implicitly relied on weaker isolation (dirty reads, non-repeatable reads, phantom read tolerance) and adds Prisma middleware for automatic serialization error retry. Critical paths (billing, auth) get explicit coverage.",
+        "dependencies": [
+          "p1"
+        ],
+        "acceptanceCriteria": [
+          "Every transaction in the application codebase classified as safe-under-serializable or requires-retry-logic",
+          "Prisma middleware implemented that catches CRDB serialization errors (SQLSTATE 40001) and retries with exponential backoff",
+          "Retry middleware tested under simulated contention for billing and auth transaction paths",
+          "Maximum retry count and backoff parameters are config-driven, not hardcoded",
+          "No application behavior changes introduced — retry is transparent to callers"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Retry backoff algorithm (linear vs exponential) and default parameters",
+            "Whether to use Prisma middleware or a wrapper function for retry logic",
+            "Test contention simulation approach (concurrent test runners vs mock)"
+          ],
+          "escalateToOperator": [
+            "Any transaction that cannot be made serialization-safe without changing business logic",
+            "Performance impact of retry middleware exceeds 15% p99 threshold in isolation testing"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p6",
+        "title": "Dual-Write Infrastructure",
+        "description": "Build the dual-write layer that fans all Prisma writes to both PostgreSQL (source of truth) and CockroachDB simultaneously during the validation period. PostgreSQL remains the read source. Write failures on the CRDB side are logged and alerted but do not fail the application request. Divergence between databases is tracked via a diff-detection job.",
+        "dependencies": [
+          "p5"
+        ],
+        "acceptanceCriteria": [
+          "Prisma middleware or wrapper intercepts all create, update, upsert, and delete operations and fans them to both databases",
+          "CRDB write failures emit structured log events and increment a metrics counter but do not propagate to the caller",
+          "Dual-write can be toggled per-database via a feature flag without application restart",
+          "Divergence detection job runs on a configurable interval and emits alerts when PG and CRDB row counts diverge beyond threshold",
+          "Unit tests cover: successful dual-write, CRDB-only failure (PG succeeds), PG failure (both fail), and feature flag disable"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Metrics counter implementation (existing APM vs new counter)",
+            "Divergence detection query strategy (row count only vs checksum sampling)",
+            "Feature flag mechanism (env var, config file, or operator-provided flag service)"
+          ],
+          "escalateToOperator": [
+            "Decision to fan reads to CRDB for shadow validation — that is a separate phase (p15)",
+            "Any dual-write implementation that requires schema changes beyond the datasource layer"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p7",
+        "title": "Bulk Data Sync Tooling",
+        "description": "Build or configure the tooling that loads 2TB of historical data from PostgreSQL into CockroachDB. Must support: initial bulk export, incremental catch-up for writes that occur during bulk load, and idempotent re-run. Throughput must be validated against the 2-hour maintenance window target (~278 MB/s sustained). Tested against a representative dataset in staging.",
+        "dependencies": [
+          "p2"
+        ],
+        "acceptanceCriteria": [
+          "Bulk load tool successfully loads a 50GB representative staging dataset without data loss or schema errors",
+          "Measured staging throughput extrapolates to completing 2TB within 90 minutes (leaving 30-minute buffer in the maintenance window)",
+          "Incremental sync correctly applies writes made to PG during bulk load (no rows lost, no duplicates)",
+          "Sync is idempotent — re-running from a checkpoint does not create duplicate rows",
+          "Sync tool respects FK ordering from p4 (parent tables loaded before child tables)"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Checkpoint strategy for resumable sync",
+            "Parallelism configuration for bulk load",
+            "Table ordering beyond FK constraints (e.g., largest tables first)"
+          ],
+          "escalateToOperator": [
+            "Measured throughput cannot reach 2TB/2hr even with maximum parallelism — may require maintenance window extension",
+            "Sync tool requires PG logical replication slots — evaluate availability and operational impact"
+          ]
+        },
+        "estimatedComplexity": "large"
+      },
+      {
+        "phaseId": "p8",
+        "title": "PII & Financial Data Validation Suite",
+        "description": "Build the validation suite that verifies data integrity and compliance for PII-containing tables (users, payments) and billing transactions. Covers row-count parity, field-level checksum sampling, encryption-at-rest verification on CRDB, and zero-loss reconciliation for every billing transaction ID. This suite is reused in staging (p9) and production (p14).",
+        "dependencies": [
+          "p4"
+        ],
+        "acceptanceCriteria": [
+          "Validation script compares row counts across all 40 tables between PG and CRDB and reports discrepancies",
+          "Checksum sampling covers 100% of billing transaction rows (every transaction_id reconciled, not sampled)",
+          "Checksum sampling covers statistically significant sample (≥5%) of user and payment rows with configurable depth",
+          "CRDB encryption-at-rest confirmed enabled and verified for users and payments tables via CRDB cluster settings query",
+          "Validation script exits non-zero and emits structured failure report on any discrepancy — never silently passes"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Checksum algorithm (MD5, SHA-256, row hash via SQL expression)",
+            "Sampling strategy for non-financial PII tables",
+            "Output format (JSON, structured log, or HTML report)"
+          ],
+          "escalateToOperator": [
+            "Encryption-at-rest cannot be verified via available CRDB credentials — may require cloud console access",
+            "Full billing reconciliation exceeds available time budget — discuss sampling vs full reconciliation trade-off"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p9",
+        "title": "Staging Migration Dry Run",
+        "description": "Execute the full end-to-end migration sequence in staging: schema migration (p4 scripts), bulk data load (p7 tooling), dual-write enable (p6 middleware), and data validation (p8 suite). This is the first complete rehearsal of the production migration sequence. All failures here are expected to be found and fixed before production.",
+        "dependencies": [
+          "p4",
+          "p6",
+          "p7",
+          "p8"
+        ],
+        "acceptanceCriteria": [
+          "Schema migration scripts execute to completion in staging without manual intervention",
+          "Bulk data load completes for the full staging dataset within the projected time window",
+          "Dual-write enabled in staging application — all write operations fan to both databases for a minimum 24-hour period",
+          "Validation suite (p8) passes against staging CRDB with zero row-count discrepancies and zero billing reconciliation failures",
+          "All issues found during dry run documented with root-cause and fix applied before p10"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Staging dataset size (full staging DB vs representative subset)",
+            "24-hour dual-write period start time",
+            "Issue tracking format for dry run findings"
+          ],
+          "escalateToOperator": [
+            "Dry run failures that require changes to the migration sequence or tooling beyond parameter tuning",
+            "Staging environment resource constraints that prevent representative load testing"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p10",
+        "title": "Staging Critical Path & Performance Validation",
+        "description": "Validate that all critical application paths (auth, billing, audit log) function correctly against CRDB staging, and that p99 latency is within the 15% threshold vs the PostgreSQL baseline from p3. Includes load testing at simulated peak (5k writes/sec equivalent) to surface contention and retry-storm behavior under the serializable isolation model.",
+        "dependencies": [
+          "p9",
+          "p3"
+        ],
+        "acceptanceCriteria": [
+          "Auth critical path (login, session validation, token refresh) passes functional tests against CRDB staging",
+          "Billing transaction create and query pass functional tests with zero data loss across 1000 synthetic transactions",
+          "Audit log append correctly enforces FK constraints and passes functional tests against CRDB staging",
+          "p99 latency for all three critical paths is within 15% of the PostgreSQL baseline values from p3 under representative load",
+          "Retry middleware does not cause latency spike (retry storm) under simulated 5k writes/sec peak load"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Load test tooling selection (k6, Artillery, custom script)",
+            "Synthetic transaction volume for billing validation",
+            "Acceptable retry rate threshold under peak load"
+          ],
+          "escalateToOperator": [
+            "p99 latency exceeds 15% threshold and no configuration changes bring it within bounds",
+            "Retry storm behavior under peak load that cannot be resolved without query restructuring"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p11",
+        "title": "Rollback Procedure Build & Test",
+        "description": "Document, script, and end-to-end test the rollback procedure that restores PostgreSQL as the sole database. Rollback must be executable within the 30-day post-cutover window and must be tested in staging by cutting over to CRDB, then rolling back to PostgreSQL, and verifying data consistency. Produces the rollback runbook used in production.",
+        "dependencies": [
+          "p10"
+        ],
+        "acceptanceCriteria": [
+          "Rollback script disables CRDB as write target, re-enables PostgreSQL as sole writer, and switches reads back to PostgreSQL",
+          "Rollback tested in staging: full cutover to CRDB executed, then rollback invoked, then PG confirmed as source of truth with no data loss",
+          "Data written to CRDB during the post-rollback-trigger window is captured and reconciled back to PG (no write-during-rollback loss)",
+          "Rollback execution time measured and documented (target: completable in under 30 minutes)",
+          "Rollback runbook committed as docs/migration/rollback-runbook.md with step-by-step operator instructions"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Rollback trigger mechanism (manual script vs feature flag flip)",
+            "Write-during-rollback reconciliation strategy (replay from CRDB WAL vs dual-write lag flush)"
+          ],
+          "escalateToOperator": [
+            "Rollback execution time exceeds 30 minutes — may require maintenance window for rollback",
+            "Any scenario where rollback cannot guarantee zero data loss (requires operator risk acceptance)"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p12",
+        "title": "Production Dual-Write Enablement",
+        "description": "Deploy the dual-write middleware (p6) to production. PostgreSQL remains the read source and source of truth; CockroachDB receives shadow writes. Requires 72 hours of clean dual-write operation (zero CRDB write failures, zero divergence alerts) before proceeding to bulk sync. This phase is a go/no-go gate — any sustained CRDB write failures halt progress.",
+        "dependencies": [
+          "p11"
+        ],
+        "acceptanceCriteria": [
+          "Dual-write middleware deployed to production with feature flag enabled",
+          "CRDB write error rate is zero for 72 consecutive hours under production traffic",
+          "Divergence detection job runs every 15 minutes and reports zero discrepancies for 72 hours",
+          "Production p99 latency remains within 15% of baseline during dual-write period (dual-write adds a second write path)",
+          "Dual-write metrics dashboard visible in existing monitoring stack (no new monitoring systems)"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Divergence detection polling interval (defaulting to 15 minutes)",
+            "Alerting threshold for CRDB write error rate before halting"
+          ],
+          "escalateToOperator": [
+            "Any CRDB write failures during the 72-hour window — operator decides whether to restart the clock or investigate",
+            "Latency degradation from dual-write that approaches the 15% threshold"
+          ]
+        },
+        "estimatedComplexity": "small"
+      },
+      {
+        "phaseId": "p13",
+        "title": "Production Bulk Data Sync",
+        "description": "Execute the 2TB historical data load from PostgreSQL into CockroachDB production using the tooling validated in p7. Dual-write handles new writes during this period; bulk sync catches up all historical data. Incremental sync runs after bulk load to close the gap. Phase completes when CRDB production is within acceptable lag of PostgreSQL for cutover.",
+        "dependencies": [
+          "p12"
+        ],
+        "acceptanceCriteria": [
+          "All 40 tables loaded into CockroachDB production with row counts matching PostgreSQL at sync-start",
+          "Incremental sync applied — CRDB production lag behind PostgreSQL is under 60 seconds before validation begins",
+          "Bulk sync does not increase production PostgreSQL load beyond 20% above baseline (monitored throughout)",
+          "Sync completes without errors — any errors are logged, investigated, and resolved before validation",
+          "Sync completion documented with row counts per table for audit trail"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Sync parallelism level based on observed PG load impact",
+            "Acceptable lag threshold for starting validation (defaulting to 60 seconds)"
+          ],
+          "escalateToOperator": [
+            "Bulk sync throughput falls below 2TB/2hr projection — impacts maintenance window feasibility",
+            "PG production load exceeds 20% above baseline during sync — operator decides to throttle or pause"
+          ]
+        },
+        "estimatedComplexity": "large"
+      },
+      {
+        "phaseId": "p14",
+        "title": "Production Data Validation",
+        "description": "Run the full validation suite (p8) against production CockroachDB. This is the pre-cutover data integrity gate. Every billing transaction must reconcile. PII table checksums and encryption-at-rest must pass. Any validation failure blocks cutover.",
+        "dependencies": [
+          "p13",
+          "p8"
+        ],
+        "acceptanceCriteria": [
+          "Row counts match across all 40 tables between PG and CRDB production (within incremental-lag tolerance)",
+          "100% of billing transaction IDs reconcile between PG and CRDB with no missing or duplicate rows",
+          "PII checksum sampling (≥5% of user and payment rows) shows zero field-level discrepancies",
+          "CRDB encryption-at-rest confirmed active for users and payments tables in the production cluster",
+          "Validation suite exits zero — any non-zero exit blocks cutover and triggers investigation"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Timing of validation run relative to incremental sync completion",
+            "Whether to run validation during off-peak hours to reduce moving-target lag"
+          ],
+          "escalateToOperator": [
+            "Any billing reconciliation failure — zero tolerance, operator must approve resolution before cutover",
+            "PII checksum discrepancies — operator and compliance review required before cutover"
+          ]
+        },
+        "estimatedComplexity": "small"
+      },
+      {
+        "phaseId": "p15",
+        "title": "Production Shadow Read Validation",
+        "description": "Route a configurable percentage of production reads to CockroachDB alongside PostgreSQL reads, compare results, and surface any behavioral differences. Start at 1% and increase to 100% over several days. Shadow reads are strictly observational — PG remains the authoritative response source. Confirms CRDB query results match PG under real production query patterns.",
+        "dependencies": [
+          "p14"
+        ],
+        "acceptanceCriteria": [
+          "Shadow read middleware deployed — reads issued to both PG (authoritative) and CRDB (shadow) with results compared",
+          "Shadow read percentage configurable via feature flag without application restart",
+          "Result divergences between PG and CRDB are logged with query, expected result, and actual result",
+          "Zero divergences observed at 100% shadow read rate over a 24-hour business-hours window",
+          "Shadow read latency overhead does not cause p99 to exceed the 15% baseline threshold (shadow reads are async/non-blocking)"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Ramp schedule from 1% to 100% (defaulting to 1%→10%→50%→100% over 3 days)",
+            "Divergence log sampling rate if volume is high",
+            "Async implementation strategy for non-blocking shadow reads"
+          ],
+          "escalateToOperator": [
+            "Any divergences at 100% shadow read rate — must be root-caused and resolved before cutover",
+            "Shadow read overhead that pushes p99 toward the 15% threshold"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p16",
+        "title": "Production Cutover (Maintenance Window)",
+        "description": "Execute live cutover during the 2-hour scheduled maintenance window. Sequence: quiesce application writes → final incremental sync → validate parity → flip Prisma datasource to CRDB → smoke test all critical paths → confirm or rollback. If any smoke test fails within the window, rollback runbook (p11) is executed. No writes to PostgreSQL after the flip.",
+        "dependencies": [
+          "p15",
+          "p11"
+        ],
+        "acceptanceCriteria": [
+          "Application writes quiesced cleanly with no in-flight transactions left pending",
+          "Final incremental sync completes and validation confirms zero row-count or billing discrepancies",
+          "Prisma datasource switched to CockroachDB Dedicated production cluster",
+          "Auth, billing, and audit log critical path smoke tests pass against CRDB within 20 minutes of flip",
+          "Cutover completes (or rollback executes) within the 2-hour maintenance window"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Application quiesce mechanism (load balancer drain vs feature flag vs maintenance page)",
+            "Smoke test script implementation and success criteria thresholds"
+          ],
+          "escalateToOperator": [
+            "Any smoke test failure — operator decides rollback vs investigate-and-retry within window",
+            "Final sync completes but validation shows discrepancies — operator accepts risk or rolls back"
+          ]
+        },
+        "estimatedComplexity": "medium"
+      },
+      {
+        "phaseId": "p17",
+        "title": "Post-Cutover Monitoring & Rollback Standby",
+        "description": "30-day monitoring period with PostgreSQL kept on standby as a read-only replica of its last state. Daily automated validation confirms CRDB data integrity. Latency monitored against baseline continuously. Rollback procedure remains ready to execute. Dual-write is disabled (CRDB is now sole writer) but rollback infrastructure remains live.",
+        "dependencies": [
+          "p16"
+        ],
+        "acceptanceCriteria": [
+          "Daily automated validation (row counts, billing reconciliation for prior day's transactions) runs without failures for 30 days",
+          "p99 latency monitored continuously — any breach of the 15% threshold triggers alert within 5 minutes",
+          "Rollback runbook remains tested and executable throughout the 30-day window",
+          "PostgreSQL instance remains live in read-only mode for the full 30-day window",
+          "30-day monitoring summary report produced at window close documenting stability, latency, and any incidents"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Daily validation run schedule (defaulting to off-peak hours)",
+            "Latency alerting integration method (existing APM vs new webhook)"
+          ],
+          "escalateToOperator": [
+            "Any latency breach or data validation failure during the 30-day window — operator decides rollback or remediate",
+            "Any incident requiring PostgreSQL data access (triggers rollback evaluation)"
+          ]
+        },
+        "estimatedComplexity": "small"
+      },
+      {
+        "phaseId": "p18",
+        "title": "Rollback Window Close & Migration Completion",
+        "description": "Formally close the 30-day rollback window after stability confirmation. Disable dual-write infrastructure permanently, archive migration tooling, and produce the PostgreSQL decommission checklist. Per non-goal #2, PostgreSQL is not removed — decommission is a separate future decision. Migration is declared complete.",
+        "dependencies": [
+          "p17"
+        ],
+        "acceptanceCriteria": [
+          "30-day monitoring summary reviewed and signed off — no outstanding incidents or open data discrepancies",
+          "Dual-write middleware feature flag disabled and infrastructure removed or disabled",
+          "Shadow read infrastructure removed or disabled",
+          "PostgreSQL decommission checklist produced as docs/migration/pg-decommission-checklist.md (not executed)",
+          "Migration completion documented in changelog/runbook with cutover date, data volumes, and stability metrics"
+        ],
+        "decisionBoundaries": {
+          "executorDecides": [
+            "Archive location for migration tooling and scripts",
+            "Decommission checklist format and depth"
+          ],
+          "escalateToOperator": [
+            "Any outstanding incident that has not been resolved before rollback window close — operator decides whether to extend the window"
+          ]
+        },
+        "estimatedComplexity": "small"
+      }
+    ],
+    "criticalPath": [
+      "p1",
+      "p4",
+      "p9",
+      "p10",
+      "p11",
+      "p12",
+      "p13",
+      "p14",
+      "p15",
+      "p16",
+      "p17",
+      "p18"
+    ],
+    "decompositionRationale": "18 phases reflecting four natural layers: audit & environment (p1-p3, parallelizable), infrastructure build (p4-p8, partially parallelizable), staging validation (p9-p11, sequential rehearsal), and production execution (p12-p18, sequential with hard gates). The critical path runs through schema translation (p4) because dual-write and the staging dry run both block on it. Transaction semantics (p5) and sync tooling (p7) run in parallel with p4 since they only require the audit (p1) and environment (p2) respectively. Phase count is 18 rather than the upper range because several concerns that could be split (PII validation, financial validation) share the same tooling and execution context — splitting them would create artificial hand-offs. The dual-write period (p12) is deliberately a standalone phase because the 72-hour clean-operation gate is a true hold point, not a sub-task of bulk sync. The 6-week timeline is feasible only if p1-p3 complete in week 1 and p4-p8 complete in parallel through week 2, leaving weeks 3-4 for staging and weeks 4-6 for production execution — any slip in the audit or schema translation phases compresses the production validation window."
+  },
+  "parseError": null,
+  "costUsd": 0.40494465,
+  "latencyMs": 276423,
+  "numTurns": 5,
+  "inputTokens": 12,
+  "outputTokens": 14645,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

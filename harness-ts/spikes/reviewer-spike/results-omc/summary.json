@@ -1,0 +1,77 @@
+{
+  "runAt": "2026-04-23T23:43:35.956Z",
+  "model": "claude-sonnet-4-6",
+  "plugins": [
+    "omc"
+  ],
+  "variant": "claude-sonnet-4-6+omc",
+  "totalScenarios": 5,
+  "verdictAccuracy": 0.8,
+  "verdictMatches": 4,
+  "errorCount": 0,
+  "totalCostUsd": 1.10652255,
+  "avgCostUsd": 0.22130451,
+  "avgLatencyMs": 99420,
+  "perScenario": [
+    {
+      "id": "s1",
+      "label": "clean_trivial_pr",
+      "expected": "approve",
+      "actual": "request_changes",
+      "match": false,
+      "weightedRisk": 0.19,
+      "critical": 1,
+      "criteriaMet": "3/3",
+      "cost": 0.26646000000000003,
+      "latencyMs": 127757
+    },
+    {
+      "id": "s2",
+      "label": "correctness_bug_off_by_one",
+      "expected": "reject_or_request_changes",
+      "actual": "request_changes",
+      "match": true,
+      "weightedRisk": 0.46,
+      "critical": 1,
+      "criteriaMet": "4/5",
+      "cost": 0.17511165,
+      "latencyMs": 62710
+    },
+    {
+      "id": "s3",
+      "label": "security_sql_injection",
+      "expected": "reject_or_request_changes",
+      "actual": "reject",
+      "match": true,
+      "weightedRisk": 0.645,
+      "critical": 1,
+      "criteriaMet": "1/4",
+      "cost": 0.1781631,
+      "latencyMs": 71098
+    },
+    {
+      "id": "s4",
+      "label": "performance_quadratic",
+      "expected": "request_changes",
+      "actual": "request_changes",
+      "match": true,
+      "weightedRisk": 0.2,
+      "critical": 1,
+      "criteriaMet": "4/5",
+      "cost": 0.1993665,
+      "latencyMs": 71228
+    },
+    {
+      "id": "s5",
+      "label": "test_coverage_gap",
+      "expected": "request_changes",
+      "actual": "request_changes",
+      "match": true,
+      "weightedRisk": 0.43,
+      "critical": 2,
+      "criteriaMet": "4/6",
+      "cost": 0.2874213,
+      "latencyMs": 164307
+    }
+  ]
+}

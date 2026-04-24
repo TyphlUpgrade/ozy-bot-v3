@@ -1,0 +1,33 @@
+{
+  "escalationId": "p8",
+  "shape": "executor_escalation",
+  "type": "design_decision",
+  "verdict": "retry_with_directive",
+  "directive": "Use a new archive.pd_deadletter table (not a modification to archive.alerts). Schema must include at minimum: original PD payload (jsonb), failure reason (text), exhausted retry count (int), and created_at (timestamptz). Do not add any status column to archive.alerts. Wire the CLI replay command to SELECT from archive.pd_deadletter and re-submit via the existing per-alert retry path (p5). Surface queue depth (COUNT(*) where replayed_at IS NULL) to the ops dashboard.",
+  "amendedSpec": null,
+  "escalationReason": null,
+  "rationale": "The Executor's assumption is correct: a database table is not a service; the non-goal 'do not deploy a separate new service' targets runtime processes and does not apply to schema additions. On the merits, a dedicated archive.pd_deadletter table is the right choice. Dead-letter records carry a distinct schema (original PD payload + failure reason + timestamp) that does not map cleanly onto archive.alerts columns — forcing them in requires awkward nullable additions to a table not designed for them. More importantly, the p4 backfill reads from archive.alerts via keyset pagination; adding a dead-letter write path to the same table introduces unintended coupling — p4's read pattern would need to explicitly filter the status column or risk mishandling dead-letter rows during backfill runs. A separate table eliminates that coupling entirely and also isolates the dead-letter write pattern from the already write-heavy archive source, reducing contention and index pressure. Non-goals are fully preserved.",
+  "nonGoalsPreserved": true,
+  "category": "design_decision",
+  "fullArbitration": {
+    "verdict": "retry_with_directive",
+    "rationale": "The Executor's assumption is correct: a database table is not a service; the non-goal 'do not deploy a separate new service' targets runtime processes and does not apply to schema additions. On the merits, a dedicated archive.pd_deadletter table is the right choice. Dead-letter records carry a distinct schema (original PD payload + failure reason + timestamp) that does not map cleanly onto archive.alerts columns — forcing them in requires awkward nullable additions to a table not designed for them. More importantly, the p4 backfill reads from archive.alerts via keyset pagination; adding a dead-letter write path to the same table introduces unintended coupling — p4's read pattern would need to explicitly filter the status column or risk mishandling dead-letter rows during backfill runs. A separate table eliminates that coupling entirely and also isolates the dead-letter write pattern from the already write-heavy archive source, reducing contention and index pressure. Non-goals are fully preserved.",
+    "directive": "Use a new archive.pd_deadletter table (not a modification to archive.alerts). Schema must include at minimum: original PD payload (jsonb), failure reason (text), exhausted retry count (int), and created_at (timestamptz). Do not add any status column to archive.alerts. Wire the CLI replay command to SELECT from archive.pd_deadletter and re-submit via the existing per-alert retry path (p5). Surface queue depth (COUNT(*) where replayed_at IS NULL) to the ops dashboard.",
+    "amendedSpec": null,
+    "escalationReason": null,
+    "nonGoalsPreserved": true,
+    "category": "design_decision"
+  },
+  "parseError": null,
+  "costUsd": 0.057435749999999994,
+  "latencyMs": 37306,
+  "numTurns": 2,
+  "inputTokens": 4,
+  "outputTokens": 1684,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": [],
+  "callIndex": 8,
+  "cumulativeCostUsd": 0.45779145,
+  "cumulativeTurns": 16
+}

@@ -1,0 +1,46 @@
+{
+  "runAt": "2026-04-24T00:39:00.574Z",
+  "model": "claude-sonnet-4-6",
+  "plugins": [],
+  "variant": "claude-sonnet-4-6-bare",
+  "totalProjects": 2,
+  "parseErrorCount": 0,
+  "totalSubagentInvocations": 0,
+  "totalCostUsd": 0.6706593000000001,
+  "avgCostUsd": 0.33532965000000003,
+  "avgLatencyMs": 223184.5,
+  "perProject": [
+    {
+      "id": "medium",
+      "complexity": "medium",
+      "phases": 7,
+      "expected": "6-12",
+      "nonGoalsPreserved": "5/5",
+      "nonGoalsAdded": 1,
+      "criticalPathLen": 6,
+      "depsValid": true,
+      "hasRationale": true,
+      "subagents": 0,
+      "cost": 0.3355173,
+      "latencyMs": 196413,
+      "turns": 3,
+      "parseError": null
+    },
+    {
+      "id": "large",
+      "complexity": "large",
+      "phases": 18,
+      "expected": "18-28",
+      "nonGoalsPreserved": "7/7",
+      "nonGoalsAdded": 2,
+      "criticalPathLen": 13,
+      "depsValid": true,
+      "hasRationale": true,
+      "subagents": 0,
+      "cost": 0.33514200000000005,
+      "latencyMs": 249956,
+      "turns": 3,
+      "parseError": null
+    }
+  ]
+}

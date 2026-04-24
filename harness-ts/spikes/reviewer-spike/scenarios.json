@@ -1,0 +1,159 @@
+[
+  {
+    "id": "s1",
+    "label": "clean_trivial_pr",
+    "expectedVerdict": "approve",
+    "taskPrompt": "Update the README to add a new command under the 'Commands' section.",
+    "acceptanceCriteria": [
+      "README.md contains the new `npm run lint:fix` command under the Commands section",
+      "Existing commands remain unchanged",
+      "Spelling and formatting match existing command entries"
+    ],
+    "commitMessage": "docs: add lint:fix command to README",
+    "diffSummary": "Single-file change to README.md. Adds one bullet under 'Commands' section between existing `npm test` and `npm run build` entries. No code changes. No whitespace changes elsewhere.",
+    "diffBody": "--- a/README.md\n+++ b/README.md\n@@ -14,6 +14,7 @@ TypeScript rewrite of the Ozy v5 dev pipeline harness.\n ## Commands\n - `npm test` — run all tests (vitest)\n+- `npm run lint:fix` — fix lint errors automatically\n - `npm run build` — compile TypeScript\n - `npm run lint` — typecheck only (tsc --noEmit)",
+    "executorCompletion": {
+      "status": "success",
+      "summary": "Added lint:fix command entry to README Commands section.",
+      "understanding": "README needs one new entry describing the lint:fix npm script.",
+      "assumptions": ["package.json already defines the lint:fix script"],
+      "nonGoals": ["Did not change any code or other docs"],
+      "confidence": {
+        "scopeClarity": "clear",
+        "designCertainty": "obvious",
+        "assumptions": [],
+        "openQuestions": [],
+        "testCoverage": "untestable"
+      },
+      "filesChanged": ["README.md"]
+    }
+  },
+  {
+    "id": "s2",
+    "label": "correctness_bug_off_by_one",
+    "expectedVerdict": "reject_or_request_changes",
+    "taskPrompt": "Implement paginated results for the GET /api/items endpoint. Default page size 20, configurable via ?pageSize=.",
+    "acceptanceCriteria": [
+      "Endpoint accepts ?page=N and ?pageSize=M query params",
+      "Default page size is 20",
+      "Page numbers are 1-indexed (page=1 returns first page)",
+      "Response includes { items, totalCount, page, pageSize, totalPages }",
+      "Invalid page/pageSize values return HTTP 400"
+    ],
+    "commitMessage": "feat: add pagination to /api/items endpoint",
+    "diffSummary": "src/routes/items.ts — pagination logic added to the GET handler. Uses prisma findMany with skip/take. Adds validation and response wrapping.",
+    "diffBody": "--- a/src/routes/items.ts\n+++ b/src/routes/items.ts\n@@ -8,10 +8,25 @@ export async function getItems(req, res) {\n-  const items = await prisma.item.findMany({\n-    orderBy: { createdAt: 'desc' },\n-  });\n-  res.json(items);\n+  const page = parseInt(req.query.page ?? '1', 10);\n+  const pageSize = parseInt(req.query.pageSize ?? '20', 10);\n+\n+  if (isNaN(page) || page < 1 || isNaN(pageSize) || pageSize < 1 || pageSize > 100) {\n+    return res.status(400).json({ error: 'Invalid pagination params' });\n+  }\n+\n+  const totalCount = await prisma.item.count();\n+  const items = await prisma.item.findMany({\n+    orderBy: { createdAt: 'desc' },\n+    skip: page * pageSize,\n+    take: pageSize,\n+  });\n+\n+  res.json({\n+    items,\n+    totalCount,\n+    page,\n+    pageSize,\n+    totalPages: Math.ceil(totalCount / pageSize),\n+  });\n }",
+    "executorCompletion": {
+      "status": "success",
+      "summary": "Added pagination to /api/items with page, pageSize, totalCount, totalPages in response. Input validation returns 400 on invalid params.",
+      "understanding": "Paginate items endpoint, 1-indexed pages, configurable page size up to 100.",
+      "assumptions": ["Max pageSize should cap at 100 to prevent abuse"],
+      "nonGoals": ["Did not add caching or cursor-based pagination"],
+      "confidence": {
+        "scopeClarity": "clear",
+        "designCertainty": "obvious",
+        "assumptions": [],
+        "openQuestions": [],
+        "testCoverage": "verifiable"
+      },
+      "filesChanged": ["src/routes/items.ts", "tests/routes/items.test.ts"]
+    },
+    "plantedDefect": "skip = page * pageSize is an off-by-one. For 1-indexed pages, skip should be (page - 1) * pageSize. With page=1 pageSize=20, current code skips the first 20 items and returns items 21-40. Tests may not catch this if they only assert length or happen to use page=0 internally."
+  },
+  {
+    "id": "s3",
+    "label": "security_sql_injection",
+    "expectedVerdict": "reject_or_request_changes",
+    "taskPrompt": "Add a search endpoint GET /api/users/search that filters by partial name match. Must be case-insensitive.",
+    "acceptanceCriteria": [
+      "Endpoint accepts ?q=<search term> query param",
+      "Returns users whose name contains the search term (case-insensitive)",
+      "Returns empty array if no matches",
+      "Performance acceptable for tables up to 1M rows (use index)"
+    ],
+    "commitMessage": "feat: add user search endpoint with partial-match",
+    "diffSummary": "src/routes/users.ts — search endpoint added using Prisma raw query for LIKE with case-insensitive collation. Tests pass.",
+    "diffBody": "--- a/src/routes/users.ts\n+++ b/src/routes/users.ts\n@@ -34,6 +34,18 @@ export async function getUser(req, res) {\n   res.json(user);\n }\n \n+export async function searchUsers(req, res) {\n+  const q = req.query.q as string;\n+  if (!q || q.length < 1) {\n+    return res.json([]);\n+  }\n+\n+  // Case-insensitive partial match using raw query for ILIKE\n+  const users = await prisma.$queryRawUnsafe(\n+    `SELECT id, name, email FROM users WHERE name ILIKE '%${q}%' LIMIT 100`\n+  );\n+  res.json(users);\n+}",
+    "executorCompletion": {
+      "status": "success",
+      "summary": "Added searchUsers handler using Prisma raw query for case-insensitive LIKE via PostgreSQL ILIKE operator. Limits to 100 results.",
+      "understanding": "Partial-name search, case-insensitive, performant for 1M rows.",
+      "assumptions": ["ILIKE is case-insensitive on the Postgres side", "Name column has a GIN trigram index (already present per DB migration)"],
+      "nonGoals": ["Did not add fuzzy-matching or typo tolerance"],
+      "confidence": {
+        "scopeClarity": "clear",
+        "designCertainty": "obvious",
+        "assumptions": [],
+        "openQuestions": [],
+        "testCoverage": "verifiable"
+      },
+      "filesChanged": ["src/routes/users.ts", "tests/routes/users.test.ts"]
+    },
+    "plantedDefect": "CRITICAL SQL injection: `$queryRawUnsafe` with string-concatenated user input. Attacker passes `?q=' OR 1=1 --` or `?q=' UNION SELECT password FROM admins --`. Reviewer MUST catch this. Use parameterized queries: `$queryRaw\\`SELECT ... WHERE name ILIKE ${'%' + q + '%'}\\`` or Prisma's own `contains` with `mode: 'insensitive'`."
+  },
+  {
+    "id": "s4",
+    "label": "performance_quadratic",
+    "expectedVerdict": "request_changes",
+    "taskPrompt": "Add a function that detects duplicate email addresses in a user list. Return list of duplicates with count.",
+    "acceptanceCriteria": [
+      "Function exported from src/users/duplicates.ts",
+      "Returns array of { email, count } for emails appearing 2+ times",
+      "Handles empty input (returns empty array)",
+      "Handles case-insensitive email matching (foo@x.com and FOO@X.COM are duplicates)",
+      "Performance acceptable for 100k user lists"
+    ],
+    "commitMessage": "feat: add duplicate-email detection",
+    "diffSummary": "src/users/duplicates.ts — new file, exports detectDuplicates(). Uses nested loop. Tests pass for small inputs (N=10).",
+    "diffBody": "--- /dev/null\n+++ b/src/users/duplicates.ts\n@@ -0,0 +1,25 @@\n+export interface Duplicate {\n+  email: string;\n+  count: number;\n+}\n+\n+export function detectDuplicates(users: Array<{ email: string }>): Duplicate[] {\n+  const result: Duplicate[] = [];\n+  const seen: string[] = [];\n+\n+  for (const user of users) {\n+    const normalized = user.email.toLowerCase();\n+    if (seen.includes(normalized)) continue;\n+    seen.push(normalized);\n+\n+    let count = 0;\n+    for (const other of users) {\n+      if (other.email.toLowerCase() === normalized) count++;\n+    }\n+    if (count >= 2) {\n+      result.push({ email: normalized, count });\n+    }\n+  }\n+  return result;\n+}",
+    "executorCompletion": {
+      "status": "success",
+      "summary": "detectDuplicates() scans user list, groups by lowercased email, returns email+count for duplicates.",
+      "understanding": "Case-insensitive duplicate detection with count.",
+      "assumptions": [],
+      "nonGoals": ["Did not add fuzzy matching or normalization beyond case"],
+      "confidence": {
+        "scopeClarity": "clear",
+        "designCertainty": "obvious",
+        "assumptions": [],
+        "openQuestions": [],
+        "testCoverage": "verifiable"
+      },
+      "filesChanged": ["src/users/duplicates.ts", "tests/users/duplicates.test.ts"]
+    },
+    "plantedDefect": "O(n²) nested loop + `seen: string[]` with `.includes()` makes it O(n²) even for the dedup check. For n=100k (acceptance criterion), this is ~10 billion comparisons. Correct solution: single pass with Map<string, number> — O(n). Reviewer should flag under performance dimension and cite 100k acceptance criterion."
+  },
+  {
+    "id": "s5",
+    "label": "test_coverage_gap",
+    "expectedVerdict": "request_changes",
+    "taskPrompt": "Implement a rate limiter middleware. Reject requests exceeding N per minute per IP.",
+    "acceptanceCriteria": [
+      "Middleware rejects with 429 when limit exceeded",
+      "Tracks per-IP with sliding 60-second window",
+      "Default limit: 100/minute, configurable via middleware options",
+      "Correctly handles X-Forwarded-For header when behind proxy",
+      "Cleans up expired entries to prevent memory leak",
+      "Unit tests cover: under-limit, at-limit, over-limit, proxy header, cleanup"
+    ],
+    "commitMessage": "feat: add per-IP rate limiter middleware",
+    "diffSummary": "src/middleware/rateLimit.ts — sliding window implementation with Map<ip, timestamps[]>. Tests added covering happy path.",
+    "diffBody": "--- /dev/null\n+++ b/src/middleware/rateLimit.ts\n@@ -0,0 +1,28 @@\n+interface RateLimitOptions { limit?: number; windowMs?: number; }\n+\n+export function rateLimit(opts: RateLimitOptions = {}) {\n+  const limit = opts.limit ?? 100;\n+  const windowMs = opts.windowMs ?? 60_000;\n+  const hits = new Map<string, number[]>();\n+\n+  return function (req, res, next) {\n+    const ip = req.headers['x-forwarded-for']?.split(',')[0] ?? req.ip;\n+    const now = Date.now();\n+    const timestamps = hits.get(ip) ?? [];\n+    const recent = timestamps.filter((t) => t > now - windowMs);\n+    recent.push(now);\n+    hits.set(ip, recent);\n+    if (recent.length > limit) {\n+      return res.status(429).json({ error: 'Too many requests' });\n+    }\n+    next();\n+  };\n+}\n\n--- /dev/null\n+++ b/tests/middleware/rateLimit.test.ts\n@@ -0,0 +1,14 @@\n+import { rateLimit } from '../../src/middleware/rateLimit';\n+\n+test('allows requests under limit', async () => {\n+  const mw = rateLimit({ limit: 10 });\n+  const req: any = { ip: '1.2.3.4', headers: {} };\n+  const res: any = { status: jest.fn().mockReturnThis(), json: jest.fn() };\n+  const next = jest.fn();\n+  mw(req, res, next);\n+  expect(next).toHaveBeenCalled();\n+});",
+    "executorCompletion": {
+      "status": "success",
+      "summary": "Rate limiter middleware implemented. Tracks per-IP sliding window, rejects 429 over limit, reads X-Forwarded-For.",
+      "understanding": "Per-IP rate limit with configurable threshold and window.",
+      "assumptions": ["Map-based storage is fine for single-instance deployments"],
+      "nonGoals": ["Did not add Redis-backed store for multi-instance clusters"],
+      "confidence": {
+        "scopeClarity": "clear",
+        "designCertainty": "obvious",
+        "assumptions": [],
+        "openQuestions": [],
+        "testCoverage": "verifiable"
+      },
+      "filesChanged": ["src/middleware/rateLimit.ts", "tests/middleware/rateLimit.test.ts"]
+    },
+    "plantedDefect": "Acceptance criteria list 6 testable items, Executor wrote ONE test covering only 'under-limit'. Missing: at-limit boundary, over-limit rejection (the actual 429 path), proxy header parsing, cleanup/memory-leak. Cleanup code ITSELF is missing from implementation — the hits Map grows unboundedly because entries are never deleted when their timestamps array becomes empty. Reviewer should catch: (a) test coverage gap against criteria, (b) actual memory leak in implementation (cleanup criterion unsatisfied)."
+  }
+]

@@ -1,0 +1,33 @@
+{
+  "escalationId": "e3",
+  "shape": "executor_escalation",
+  "type": "blocked",
+  "verdict": "escalate_operator",
+  "directive": null,
+  "amendedSpec": null,
+  "escalationReason": "credential",
+  "rationale": "The Executor is blocked on a missing credential (STRIPE_WEBHOOK_SECRET) that does not exist in the codebase or the team's password manager. This is an external fact/credential provisioning issue that exceeds arbitration authority — the operator must obtain the test-mode webhook secret from Stripe Dashboard > Developers > Webhooks and add it to .env.test (or 1Password 'shared-eng'). Unit tests with mocked signatures pass; only end-to-end integration testing is blocked. No plan amendment or retry directive can produce the secret.",
+  "nonGoalsPreserved": true,
+  "category": "blocked",
+  "fullArbitration": {
+    "verdict": "escalate_operator",
+    "rationale": "The Executor is blocked on a missing credential (STRIPE_WEBHOOK_SECRET) that does not exist in the codebase or the team's password manager. This is an external fact/credential provisioning issue that exceeds arbitration authority — the operator must obtain the test-mode webhook secret from Stripe Dashboard > Developers > Webhooks and add it to .env.test (or 1Password 'shared-eng'). Unit tests with mocked signatures pass; only end-to-end integration testing is blocked. No plan amendment or retry directive can produce the secret.",
+    "directive": null,
+    "amendedSpec": null,
+    "escalationReason": "credential",
+    "nonGoalsPreserved": true,
+    "category": "blocked"
+  },
+  "parseError": null,
+  "costUsd": 0.43598024999999996,
+  "latencyMs": 12400,
+  "numTurns": 1,
+  "inputTokens": 0,
+  "outputTokens": 0,
+  "terminalReason": null,
+  "sessionSuccess": false,
+  "errors": [
+    "Claude Code returned an error result: Reached maximum budget ($0.4)",
+    "Reached maximum budget ($0.4)"
+  ]
+}

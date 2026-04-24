@@ -1,0 +1,30 @@
+{
+  "escalationId": "e1",
+  "shape": "executor_escalation",
+  "type": "scope_unclear",
+  "verdict": "retry_with_directive",
+  "directive": "Use per-username keying via keyFn: (req) => req.body?.username. Reorder middleware on the login route so body parsing precedes the rate-limit check. Do not implement composite keying — per-username alone matches the project's stated threat (credential stuffing via IP rotation).",
+  "amendedSpec": null,
+  "escalationReason": null,
+  "rationale": "The project description explicitly targets credential stuffing, which is defined by attackers rotating IPs while targeting fixed accounts — per-IP keying does not address the stated threat. The Executor's own framing confirms this: per-username 'catches credential stuffing where attacker rotates IPs but targets the same account.' Per-IP matches the /api/signup pattern but is the wrong tool for the declared threat model. The composite option introduces 2x state complexity not present in the original plan and would constitute scope creep. Middleware reorder to read body.username before the rate-limit check is an integration detail within the phase scope, not a contract change. All three non-goals are preserved: no new DB tables (existing rate-limit state), session tokens untouched, /api/auth/login external contract unchanged.",
+  "nonGoalsPreserved": true,
+  "category": "design_decision",
+  "fullArbitration": {
+    "verdict": "retry_with_directive",
+    "rationale": "The project description explicitly targets credential stuffing, which is defined by attackers rotating IPs while targeting fixed accounts — per-IP keying does not address the stated threat. The Executor's own framing confirms this: per-username 'catches credential stuffing where attacker rotates IPs but targets the same account.' Per-IP matches the /api/signup pattern but is the wrong tool for the declared threat model. The composite option introduces 2x state complexity not present in the original plan and would constitute scope creep. Middleware reorder to read body.username before the rate-limit check is an integration detail within the phase scope, not a contract change. All three non-goals are preserved: no new DB tables (existing rate-limit state), session tokens untouched, /api/auth/login external contract unchanged.",
+    "directive": "Use per-username keying via keyFn: (req) => req.body?.username. Reorder middleware on the login route so body parsing precedes the rate-limit check. Do not implement composite keying — per-username alone matches the project's stated threat (credential stuffing via IP rotation).",
+    "amendedSpec": null,
+    "escalationReason": null,
+    "nonGoalsPreserved": true,
+    "category": "design_decision"
+  },
+  "parseError": null,
+  "costUsd": 0.11951550000000001,
+  "latencyMs": 35966,
+  "numTurns": 2,
+  "inputTokens": 4,
+  "outputTokens": 1575,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

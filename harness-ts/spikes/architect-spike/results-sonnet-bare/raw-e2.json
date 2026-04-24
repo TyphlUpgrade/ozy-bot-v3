@@ -1,0 +1,30 @@
+{
+  "escalationId": "e2",
+  "shape": "executor_escalation",
+  "type": "design_decision",
+  "verdict": "retry_with_directive",
+  "directive": "Implement Strategy B: add an idempotency_key column to the orders table with a 24-hour partial unique index, and check for duplicates on INSERT. Do not use Redis SETNX for idempotency — Redis eviction under memory pressure violates the acceptance criterion that duplicate delivery must produce exactly one order record.",
+  "amendedSpec": null,
+  "escalationReason": null,
+  "rationale": "The acceptance criterion 'Duplicate message delivery produces exactly one order record' is a hard guarantee, not a best-effort goal. Strategy A fails this criterion: Redis eviction under memory pressure allows a duplicate record to be written — a real production scenario that cannot be dismissed. Strategy B (idempotency_key column + partial unique index on the orders table) provides a durable, database-enforced guarantee that survives memory pressure. The non-goal 'do not introduce new external service dependencies beyond the existing Redis instance' targets new services, not schema changes to the existing database — the Executor's interpretation is correct. No non-goal is violated by adding a column to an existing table.",
+  "nonGoalsPreserved": true,
+  "category": "design_decision",
+  "fullArbitration": {
+    "verdict": "retry_with_directive",
+    "rationale": "The acceptance criterion 'Duplicate message delivery produces exactly one order record' is a hard guarantee, not a best-effort goal. Strategy A fails this criterion: Redis eviction under memory pressure allows a duplicate record to be written — a real production scenario that cannot be dismissed. Strategy B (idempotency_key column + partial unique index on the orders table) provides a durable, database-enforced guarantee that survives memory pressure. The non-goal 'do not introduce new external service dependencies beyond the existing Redis instance' targets new services, not schema changes to the existing database — the Executor's interpretation is correct. No non-goal is violated by adding a column to an existing table.",
+    "directive": "Implement Strategy B: add an idempotency_key column to the orders table with a 24-hour partial unique index, and check for duplicates on INSERT. Do not use Redis SETNX for idempotency — Redis eviction under memory pressure violates the acceptance criterion that duplicate delivery must produce exactly one order record.",
+    "amendedSpec": null,
+    "escalationReason": null,
+    "nonGoalsPreserved": true,
+    "category": "design_decision"
+  },
+  "parseError": null,
+  "costUsd": 0.0858276,
+  "latencyMs": 25387,
+  "numTurns": 2,
+  "inputTokens": 4,
+  "outputTokens": 1200,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

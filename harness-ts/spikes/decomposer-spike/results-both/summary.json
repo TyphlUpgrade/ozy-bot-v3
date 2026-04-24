@@ -1,0 +1,49 @@
+{
+  "runAt": "2026-04-24T01:06:01.502Z",
+  "model": "claude-sonnet-4-6",
+  "plugins": [
+    "omc",
+    "caveman"
+  ],
+  "variant": "claude-sonnet-4-6+omc+caveman",
+  "totalProjects": 2,
+  "parseErrorCount": 0,
+  "totalSubagentInvocations": 0,
+  "totalCostUsd": 0.74509705,
+  "avgCostUsd": 0.372548525,
+  "avgLatencyMs": 207360,
+  "perProject": [
+    {
+      "id": "medium",
+      "complexity": "medium",
+      "phases": 6,
+      "expected": "6-12",
+      "nonGoalsPreserved": "5/5",
+      "nonGoalsAdded": 0,
+      "criticalPathLen": 5,
+      "depsValid": true,
+      "hasRationale": true,
+      "subagents": 0,
+      "cost": 0.3401524,
+      "latencyMs": 138297,
+      "turns": 3,
+      "parseError": null
+    },
+    {
+      "id": "large",
+      "complexity": "large",
+      "phases": 18,
+      "expected": "18-28",
+      "nonGoalsPreserved": "6/7",
+      "nonGoalsAdded": 3,
+      "criticalPathLen": 12,
+      "depsValid": true,
+      "hasRationale": true,
+      "subagents": 0,
+      "cost": 0.40494465,
+      "latencyMs": 276423,
+      "turns": 5,
+      "parseError": null
+    }
+  ]
+}

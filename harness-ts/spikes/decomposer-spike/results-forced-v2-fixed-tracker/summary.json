@@ -1,0 +1,32 @@
+{
+  "runAt": "2026-04-24T16:36:41.616Z",
+  "model": "claude-sonnet-4-6",
+  "plugins": [
+    "omc"
+  ],
+  "variant": "claude-sonnet-4-6+omc",
+  "totalProjects": 1,
+  "parseErrorCount": 0,
+  "totalSubagentInvocations": 2,
+  "totalCostUsd": 1.3589378000000003,
+  "avgCostUsd": 1.3589378000000003,
+  "avgLatencyMs": 763686,
+  "perProject": [
+    {
+      "id": "large",
+      "complexity": "large",
+      "phases": 21,
+      "expected": "18-28",
+      "nonGoalsPreserved": "7/7",
+      "nonGoalsAdded": 1,
+      "criticalPathLen": 15,
+      "depsValid": true,
+      "hasRationale": true,
+      "subagents": 2,
+      "cost": 1.3589378000000003,
+      "latencyMs": 763686,
+      "turns": 7,
+      "parseError": null
+    }
+  ]
+}

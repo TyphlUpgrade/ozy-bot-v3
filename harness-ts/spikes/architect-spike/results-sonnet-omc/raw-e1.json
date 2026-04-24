@@ -1,0 +1,30 @@
+{
+  "escalationId": "e1",
+  "shape": "executor_escalation",
+  "type": "scope_unclear",
+  "verdict": "retry_with_directive",
+  "directive": "Use per-username rate limiting: key on `body.username` via the existing `keyFn` parameter in src/middleware/ratelimit.ts. Accept the middleware reorder so body parsing precedes the rate-limit check for this endpoint. Do not use per-IP as the sole key — it does not defend against credential stuffing where attackers rotate IPs. Composite (per-IP AND per-username) is a fallback only if the middleware reorder proves architecturally impossible within this file.",
+  "amendedSpec": null,
+  "escalationReason": null,
+  "rationale": "The escalation presents two valid approaches, making this a design_decision, not scope_unclear. The project description is explicit: the goal is to 'resist credential stuffing attacks.' Credential stuffing attackers rotate IPs to target fixed accounts, so per-IP rate limiting directly fails the stated threat model. Per-username is the correct choice. The middleware reorder (body read before rate-limit check) is a necessary trade-off, not a scope concern — it is an implementation detail within the existing middleware file and does not violate any non-goal. The composite option is acceptable only if the Executor finds the middleware reorder architecturally untenable, but per-IP alone is not acceptable.",
+  "nonGoalsPreserved": true,
+  "category": "design_decision",
+  "fullArbitration": {
+    "verdict": "retry_with_directive",
+    "rationale": "The escalation presents two valid approaches, making this a design_decision, not scope_unclear. The project description is explicit: the goal is to 'resist credential stuffing attacks.' Credential stuffing attackers rotate IPs to target fixed accounts, so per-IP rate limiting directly fails the stated threat model. Per-username is the correct choice. The middleware reorder (body read before rate-limit check) is a necessary trade-off, not a scope concern — it is an implementation detail within the existing middleware file and does not violate any non-goal. The composite option is acceptable only if the Executor finds the middleware reorder architecturally untenable, but per-IP alone is not acceptable.",
+    "directive": "Use per-username rate limiting: key on `body.username` via the existing `keyFn` parameter in src/middleware/ratelimit.ts. Accept the middleware reorder so body parsing precedes the rate-limit check for this endpoint. Do not use per-IP as the sole key — it does not defend against credential stuffing where attackers rotate IPs. Composite (per-IP AND per-username) is a fallback only if the middleware reorder proves architecturally impossible within this file.",
+    "amendedSpec": null,
+    "escalationReason": null,
+    "nonGoalsPreserved": true,
+    "category": "design_decision"
+  },
+  "parseError": null,
+  "costUsd": 0.13521285,
+  "latencyMs": 38696,
+  "numTurns": 2,
+  "inputTokens": 6,
+  "outputTokens": 1702,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

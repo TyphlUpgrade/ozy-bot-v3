@@ -1,0 +1,116 @@
+{
+  "runAt": "2026-04-23T22:56:10.048Z",
+  "model": "claude-sonnet-4-6",
+  "mode": "persistent",
+  "plugins": [],
+  "totalCalls": 10,
+  "resolvedCount": 9,
+  "escalatedCount": 1,
+  "errorCount": 0,
+  "resolutionRate": 0.9,
+  "totalCostUsd": 0.5816589,
+  "avgCostUsd": 0.05816589,
+  "avgLatencyMs": 37073,
+  "growth": [
+    {
+      "call": 1,
+      "phaseId": "p1",
+      "inputTokens": 4,
+      "outputTokens": 1372,
+      "costUsd": 0.08946855,
+      "cumulativeCostUsd": 0.08946855,
+      "latencyMs": 29758,
+      "verdict": "retry_with_directive"
+    },
+    {
+      "call": 2,
+      "phaseId": "p2",
+      "inputTokens": 4,
+      "outputTokens": 1577,
+      "costUsd": 0.04627515,
+      "cumulativeCostUsd": 0.1357437,
+      "latencyMs": 34601,
+      "verdict": "retry_with_directive"
+    },
+    {
+      "call": 3,
+      "phaseId": "p3",
+      "inputTokens": 4,
+      "outputTokens": 751,
+      "costUsd": 0.0319611,
+      "cumulativeCostUsd": 0.1677048,
+      "latencyMs": 19771,
+      "verdict": "escalate_operator"
+    },
+    {
+      "call": 4,
+      "phaseId": "p4",
+      "inputTokens": 4,
+      "outputTokens": 1903,
+      "costUsd": 0.0564621,
+      "cumulativeCostUsd": 0.2241669,
+      "latencyMs": 42831,
+      "verdict": "retry_with_directive"
+    },
+    {
+      "call": 5,
+      "phaseId": "p5",
+      "inputTokens": 4,
+      "outputTokens": 1966,
+      "costUsd": 0.05758574999999999,
+      "cumulativeCostUsd": 0.28175265,
+      "latencyMs": 42594,
+      "verdict": "retry_with_directive"
+    },
+    {
+      "call": 6,
+      "phaseId": "p6",
+      "inputTokens": 4,
+      "outputTokens": 2385,
+      "costUsd": 0.06710550000000001,
+      "cumulativeCostUsd": 0.34885815,
+      "latencyMs": 48888,
+      "verdict": "retry_with_directive"
+    },
+    {
+      "call": 7,
+      "phaseId": "p7",
+      "inputTokens": 4,
+      "outputTokens": 1415,
+      "costUsd": 0.05149755,
+      "cumulativeCostUsd": 0.4003557,
+      "latencyMs": 34581,
+      "verdict": "retry_with_directive"
+    },
+    {
+      "call": 8,
+      "phaseId": "p8",
+      "inputTokens": 4,
+      "outputTokens": 1684,
+      "costUsd": 0.057435749999999994,
+      "cumulativeCostUsd": 0.45779145,
+      "latencyMs": 37306,
+      "verdict": "retry_with_directive"
+    },
+    {
+      "call": 9,
+      "phaseId": "p9",
+      "inputTokens": 4,
+      "outputTokens": 1535,
+      "costUsd": 0.055438799999999996,
+      "cumulativeCostUsd": 0.51323025,
+      "latencyMs": 35829,
+      "verdict": "retry_with_directive"
+    },
+    {
+      "call": 10,
+      "phaseId": "p10",
+      "inputTokens": 4,
+      "outputTokens": 2111,
+      "costUsd": 0.06842865,
+      "cumulativeCostUsd": 0.5816589,
+      "latencyMs": 44571,
+      "verdict": "retry_with_directive"
+    }
+  ]
+}

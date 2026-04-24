@@ -1,0 +1,33 @@
+{
+  "escalationId": "e4",
+  "shape": "review_arbitration",
+  "type": "review_arbitration",
+  "verdict": "retry_with_directive",
+  "directive": "In src/jobs/reconciliation/diffInventory.ts aliasMatch(): when a warehouse SKU resolves to multiple DB SKUs via the reverse-alias index, sum dbQty across all aliased DB SKUs and compare that sum to warehouseQty to compute delta; emit a single {sku, warehouseQty, dbQty: <sum>, delta} record (do not emit one per alias, do not compare per-alias). Update the 'one warehouse SKU → multiple DB SKUs' test to assert non-flagging when the alias sum equals warehouseQty (e.g., SKU-W=10, SKU-A=7, SKU-B=3 → no discrepancy), and add a companion case where the sum differs (e.g., SKU-W=10, SKU-A=7, SKU-B=2 → delta=1).",
+  "amendedSpec": null,
+  "escalationReason": null,
+  "rationale": "Reviewer's Round 2 rejection is a concrete, actionable logic defect, not a spec defect. The phase spec permits one warehouse SKU mapping to multiple DB SKUs but did not pin down aggregation semantics; the Reviewer has now articulated the correct semantics (sum dbQty across aliases before comparing to warehouseQty). The fix is localized to aliasMatch aggregation and one test. This is a quality concern the Executor can resolve with a specific directive — neither a plan defect nor scope expansion. Non-goals (read-only flagging, ingestion untouched, 60s timeout) are unaffected.",
+  "nonGoalsPreserved": true,
+  "category": "review_arbitration",
+  "fullArbitration": {
+    "verdict": "retry_with_directive",
+    "rationale": "Reviewer's Round 2 rejection is a concrete, actionable logic defect, not a spec defect. The phase spec permits one warehouse SKU mapping to multiple DB SKUs but did not pin down aggregation semantics; the Reviewer has now articulated the correct semantics (sum dbQty across aliases before comparing to warehouseQty). The fix is localized to aliasMatch aggregation and one test. This is a quality concern the Executor can resolve with a specific directive — neither a plan defect nor scope expansion. Non-goals (read-only flagging, ingestion untouched, 60s timeout) are unaffected.",
+    "directive": "In src/jobs/reconciliation/diffInventory.ts aliasMatch(): when a warehouse SKU resolves to multiple DB SKUs via the reverse-alias index, sum dbQty across all aliased DB SKUs and compare that sum to warehouseQty to compute delta; emit a single {sku, warehouseQty, dbQty: <sum>, delta} record (do not emit one per alias, do not compare per-alias). Update the 'one warehouse SKU → multiple DB SKUs' test to assert non-flagging when the alias sum equals warehouseQty (e.g., SKU-W=10, SKU-A=7, SKU-B=3 → no discrepancy), and add a companion case where the sum differs (e.g., SKU-W=10, SKU-A=7, SKU-B=2 → delta=1).",
+    "amendedSpec": null,
+    "escalationReason": null,
+    "nonGoalsPreserved": true,
+    "category": "review_arbitration"
+  },
+  "parseError": null,
+  "costUsd": 0.4867365,
+  "latencyMs": 21448,
+  "numTurns": 1,
+  "inputTokens": 0,
+  "outputTokens": 0,
+  "terminalReason": null,
+  "sessionSuccess": false,
+  "errors": [
+    "Claude Code returned an error result: Reached maximum budget ($0.4)",
+    "Reached maximum budget ($0.4)"
+  ]
+}

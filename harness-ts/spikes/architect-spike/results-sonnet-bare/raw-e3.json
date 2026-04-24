@@ -1,0 +1,30 @@
+{
+  "escalationId": "e3",
+  "shape": "executor_escalation",
+  "type": "blocked",
+  "verdict": "escalate_operator",
+  "directive": null,
+  "amendedSpec": null,
+  "escalationReason": "credential",
+  "rationale": "The Executor is blocked on a missing external credential: STRIPE_WEBHOOK_SECRET is absent from .env.test and has no entry in the 1Password 'shared-eng' vault (where Braintree equivalents live). Unit tests with mocked signatures pass; the only gap is full integration testing, which requires the actual test-mode webhook secret from Stripe Dashboard > Developers > Webhooks. No directive or plan amendment can provision a credential that was never created — this requires a human with Stripe Dashboard access and 1Password vault write permissions.",
+  "nonGoalsPreserved": true,
+  "category": "blocked",
+  "fullArbitration": {
+    "verdict": "escalate_operator",
+    "rationale": "The Executor is blocked on a missing external credential: STRIPE_WEBHOOK_SECRET is absent from .env.test and has no entry in the 1Password 'shared-eng' vault (where Braintree equivalents live). Unit tests with mocked signatures pass; the only gap is full integration testing, which requires the actual test-mode webhook secret from Stripe Dashboard > Developers > Webhooks. No directive or plan amendment can provision a credential that was never created — this requires a human with Stripe Dashboard access and 1Password vault write permissions.",
+    "directive": null,
+    "amendedSpec": null,
+    "escalationReason": "credential",
+    "nonGoalsPreserved": true,
+    "category": "blocked"
+  },
+  "parseError": null,
+  "costUsd": 0.0765174,
+  "latencyMs": 17667,
+  "numTurns": 2,
+  "inputTokens": 4,
+  "outputTokens": 732,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

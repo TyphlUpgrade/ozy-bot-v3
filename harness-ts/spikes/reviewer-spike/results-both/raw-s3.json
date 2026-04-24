@@ -1,0 +1,87 @@
+{
+  "scenarioId": "s3",
+  "label": "security_sql_injection",
+  "expectedVerdict": "reject_or_request_changes",
+  "verdict": "reject",
+  "weightedRisk": 0.665,
+  "findingCount": 4,
+  "criticalFindingCount": 2,
+  "criteriaMetCount": 1,
+  "criteriaTotal": 4,
+  "category": "security_concern",
+  "summary": "Reject on SQL injection. The handler passes `req.query.q` verbatim into a raw SQL string via `$queryRawUnsafe` — every search request is an injection point. This is not a cosmetic fix: the implementation approach must change to parameterized queries before any other concern matters. Secondary blockers: route registration is missing from the diff (criterion 1 unverifiable), and the performance claim rests on an assumed GIN trigram index with no migration evidence (criterion 4 unverifiable). The logical direction — ILIKE, 100-row limit, early-exit on empty q — is sound. Reimplement with `prisma.$queryRaw` tagged templates or Prisma ORM `mode: 'insensitive'`, add the router wiring, and include the migration or index evidence before re-review.",
+  "fullReview": {
+    "verdict": "reject",
+    "riskScore": {
+      "correctness": 0.7,
+      "integration": 0.6,
+      "stateCorruption": 0.8,
+      "performance": 0.7,
+      "regression": 0.4,
+      "weighted": 0.665
+    },
+    "findings": [
+      {
+        "severity": "critical",
+        "file": "src/routes/users.ts",
+        "line": 43,
+        "description": "`$queryRawUnsafe` interpolates `req.query.q` directly into SQL — attacker controls arbitrary SQL via the q parameter (classic injection: `' OR '1'='1`, stacked statements, exfil via UNION).",
+        "suggestion": "Replace with Prisma tagged template `prisma.$queryRaw\\`SELECT id, name, email FROM users WHERE name ILIKE ${'%' + q + '%'} LIMIT 100\\`` or use `prisma.user.findMany({ where: { name: { contains: q, mode: 'insensitive' } }, take: 100 })`."
+      },
+      {
+        "severity": "critical",
+        "file": "src/routes/users.ts",
+        "line": null,
+        "description": "Route registration for GET /api/users/search is absent from the diff — `searchUsers` may be an unreachable dead function.",
+        "suggestion": "Include the router file change that wires `GET /api/users/search` to `searchUsers`, or show it already existed."
+      },
+      {
+        "severity": "warning",
+        "file": "src/routes/users.ts",
+        "line": 43,
+        "description": "ILIKE with a leading wildcard (`'%q%'`) cannot use a B-tree index; requires a `pg_trgm` GIN index. Executor asserts this index exists per prior migration, but no migration file appears in the diff.",
+        "suggestion": "Include the migration that adds the GIN trigram index, or run `\\d users` and paste the index list as evidence. Without it, criterion 4 is unverifiable and the query will full-scan at 1M rows."
+      },
+      {
+        "severity": "warning",
+        "file": "tests/routes/users.test.ts",
+        "line": null,
+        "description": "Test file is listed in `filesChanged` but is absent from the diff — cannot verify coverage of SQL metacharacter input, mixed-case queries, empty result, or the no-q early-return path.",
+        "suggestion": "Include the test diff. At minimum verify: `q` containing `'`, `%`, `_`; mixed-case search term vs lowercase stored name; empty array returned when no match; response when q is omitted."
+      }
+    ],
+    "summary": "Reject on SQL injection. The handler passes `req.query.q` verbatim into a raw SQL string via `$queryRawUnsafe` — every search request is an injection point. This is not a cosmetic fix: the implementation approach must change to parameterized queries before any other concern matters. Secondary blockers: route registration is missing from the diff (criterion 1 unverifiable), and the performance claim rests on an assumed GIN trigram index with no migration evidence (criterion 4 unverifiable). The logical direction — ILIKE, 100-row limit, early-exit on empty q — is sound. Reimplement with `prisma.$queryRaw` tagged templates or Prisma ORM `mode: 'insensitive'`, add the router wiring, and include the migration or index evidence before re-review.",
+    "criteriaAssessment": [
+      {
+        "criterion": "Endpoint accepts ?q=<search term> query param",
+        "met": false,
+        "evidence": "Handler reads `req.query.q` correctly, but no route registration appears in the diff. Cannot confirm `GET /api/users/search` is reachable."
+      },
+      {
+        "criterion": "Returns users whose name contains the search term (case-insensitive)",
+        "met": false,
+        "evidence": "ILIKE `'%q%'` is logically correct for case-insensitive partial match, but the query is SQL-injectable and cannot be shipped. Functional intent is present; implementation is broken at the construction layer."
+      },
+      {
+        "criterion": "Returns empty array if no matches",
+        "met": true,
+        "evidence": "Prisma raw query returns an empty array when no rows match; no special handling is needed or wrong here."
+      },
+      {
+        "criterion": "Performance acceptable for tables up to 1M rows (use index)",
+        "met": false,
+        "evidence": "Executor assumes a GIN trigram index exists per prior migration, but no migration file is in the diff. Leading-wildcard ILIKE without `pg_trgm` GIN = full sequential scan at 1M rows."
+      }
+    ],
+    "category": "security_concern"
+  },
+  "parseError": null,
+  "costUsd": 0.18423735,
+  "latencyMs": 76149,
+  "numTurns": 2,
+  "inputTokens": 6,
+  "outputTokens": 4096,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

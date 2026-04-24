@@ -1,0 +1,33 @@
+{
+  "escalationId": "p3",
+  "shape": "executor_escalation",
+  "type": "blocked",
+  "verdict": "escalate_operator",
+  "directive": null,
+  "amendedSpec": null,
+  "escalationReason": "credential",
+  "rationale": "The block is a missing credential (PAGERDUTY_API_KEY) gated behind human-controlled access paths: the PagerDuty admin console is restricted to the on-call team, and IAM access requires a 2-3 day IT ticket. No code change, directive, or plan amendment can resolve an absent secret. The non-goal 'do not introduce new secrets beyond PAGERDUTY_API_KEY' confirms this key is in scope and expected — it simply has not been provisioned yet. The operator must either file the IT ticket, engage the on-call team directly, or provide a temporary test key to unblock staging verification.",
+  "nonGoalsPreserved": true,
+  "category": "blocked",
+  "fullArbitration": {
+    "verdict": "escalate_operator",
+    "rationale": "The block is a missing credential (PAGERDUTY_API_KEY) gated behind human-controlled access paths: the PagerDuty admin console is restricted to the on-call team, and IAM access requires a 2-3 day IT ticket. No code change, directive, or plan amendment can resolve an absent secret. The non-goal 'do not introduce new secrets beyond PAGERDUTY_API_KEY' confirms this key is in scope and expected — it simply has not been provisioned yet. The operator must either file the IT ticket, engage the on-call team directly, or provide a temporary test key to unblock staging verification.",
+    "directive": null,
+    "amendedSpec": null,
+    "escalationReason": "credential",
+    "nonGoalsPreserved": true,
+    "category": "blocked"
+  },
+  "parseError": null,
+  "costUsd": 0.0319611,
+  "latencyMs": 19771,
+  "numTurns": 2,
+  "inputTokens": 4,
+  "outputTokens": 751,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": [],
+  "callIndex": 3,
+  "cumulativeCostUsd": 0.1677048,
+  "cumulativeTurns": 6
+}

@@ -1,0 +1,101 @@
+{
+  "scenarioId": "s3",
+  "label": "security_sql_injection",
+  "expectedVerdict": "reject_or_request_changes",
+  "verdict": "reject",
+  "weightedRisk": 0.645,
+  "findingCount": 6,
+  "criticalFindingCount": 1,
+  "criteriaMetCount": 1,
+  "criteriaTotal": 4,
+  "category": "security_concern",
+  "summary": "Rejecting on a critical SQL injection defect. The `searchUsers` handler passes user input from `req.query.q` directly into `prisma.$queryRawUnsafe` via string interpolation — the function's own name signals it bypasses parameterization. Any caller can inject arbitrary SQL, including destructive statements. This is not a style issue; it is a security vulnerability that must be fixed before merge. The correct fix is `prisma.$queryRaw` with a tagged template literal, which Prisma parameterizes automatically. Beyond the injection, the performance criterion is unverifiable because the GIN trigram index is assumed from a migration absent from the diff, and the route registration is not shown. These would be `request_changes` on their own; the injection makes them moot.",
+  "fullReview": {
+    "verdict": "reject",
+    "riskScore": {
+      "correctness": 0.8,
+      "integration": 0.5,
+      "stateCorruption": 0.9,
+      "performance": 0.6,
+      "regression": 0.1,
+      "weighted": 0.645
+    },
+    "findings": [
+      {
+        "severity": "critical",
+        "file": "src/routes/users.ts",
+        "line": 44,
+        "description": "SQL injection: user-controlled `req.query.q` is directly interpolated into a raw SQL string passed to `prisma.$queryRawUnsafe`, allowing arbitrary SQL execution by any caller.",
+        "suggestion": "Replace with `prisma.$queryRaw` and a tagged template literal: `prisma.$queryRaw\\`SELECT id, name, email FROM users WHERE name ILIKE ${'%' + q + '%'} LIMIT 100\\`` — Prisma parameterizes tagged template slots automatically."
+      },
+      {
+        "severity": "warning",
+        "file": "src/routes/users.ts",
+        "line": null,
+        "description": "Performance criterion requires an index for 1M-row tables, but the GIN trigram index is assumed from a migration not shown in the diff; ILIKE with a leading wildcard is a full table scan without pg_trgm.",
+        "suggestion": "Show the migration that creates the GIN index (e.g., `CREATE INDEX ON users USING gin(name gin_trgm_ops)`) or add it — criterion 4 cannot be verified without it."
+      },
+      {
+        "severity": "warning",
+        "file": "src/routes/users.ts",
+        "line": null,
+        "description": "Route registration for GET /api/users/search is not shown in the diff; the handler exists but cannot be confirmed to be wired to the correct path.",
+        "suggestion": "Include the router file change (e.g., `router.get('/search', searchUsers)`) in the diff so criterion 1 is verifiable."
+      },
+      {
+        "severity": "warning",
+        "file": "src/routes/users.ts",
+        "line": 47,
+        "description": "No error handling around the database query — an unhandled promise rejection will crash or hang the request if the DB call fails.",
+        "suggestion": "Wrap in try/catch and return an appropriate HTTP error response, consistent with the error handling pattern used by the other handlers in this file."
+      },
+      {
+        "severity": "note",
+        "file": "src/routes/users.ts",
+        "line": 44,
+        "description": "`LIMIT 100` without `ORDER BY` produces non-deterministic result ordering across identical queries.",
+        "suggestion": "Add `ORDER BY name` or another stable column to make results consistent."
+      },
+      {
+        "severity": "note",
+        "file": "tests/routes/users.test.ts",
+        "line": null,
+        "description": "Test diff is not included in the review input; cannot verify that SQL injection, empty-result, and case-insensitivity cases are actually exercised.",
+        "suggestion": "Include the test diff in future reviews — test coverage is an acceptance criterion signal, not a given."
+      }
+    ],
+    "summary": "Rejecting on a critical SQL injection defect. The `searchUsers` handler passes user input from `req.query.q` directly into `prisma.$queryRawUnsafe` via string interpolation — the function's own name signals it bypasses parameterization. Any caller can inject arbitrary SQL, including destructive statements. This is not a style issue; it is a security vulnerability that must be fixed before merge. The correct fix is `prisma.$queryRaw` with a tagged template literal, which Prisma parameterizes automatically. Beyond the injection, the performance criterion is unverifiable because the GIN trigram index is assumed from a migration absent from the diff, and the route registration is not shown. These would be `request_changes` on their own; the injection makes them moot.",
+    "criteriaAssessment": [
+      {
+        "criterion": "Endpoint accepts ?q=<search term> query param",
+        "met": false,
+        "evidence": "The handler reads `req.query.q` correctly, but no route registration is present in the diff — `GET /api/users/search` cannot be confirmed as wired up."
+      },
+      {
+        "criterion": "Returns users whose name contains the search term (case-insensitive)",
+        "met": false,
+        "evidence": "ILIKE would satisfy case-insensitive partial match, but the critical SQL injection defect means the implementation cannot be accepted as correct — malicious input bypasses the intended behavior entirely."
+      },
+      {
+        "criterion": "Returns empty array if no matches",
+        "met": true,
+        "evidence": "Prisma raw queries return an empty array when no rows match; the early return on empty `q` also covers that path."
+      },
+      {
+        "criterion": "Performance acceptable for tables up to 1M rows (use index)",
+        "met": false,
+        "evidence": "Executor assumed a GIN trigram index exists from a prior migration, but no migration appears in the diff. ILIKE with a leading wildcard (`%q%`) cannot use a btree index and requires pg_trgm with a GIN index to avoid a full table scan on 1M rows. Criterion is unverifiable and likely unmet."
+      }
+    ],
+    "category": "security_concern"
+  },
+  "parseError": null,
+  "costUsd": 0.1781631,
+  "latencyMs": 71098,
+  "numTurns": 3,
+  "inputTokens": 9,
+  "outputTokens": 3495,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

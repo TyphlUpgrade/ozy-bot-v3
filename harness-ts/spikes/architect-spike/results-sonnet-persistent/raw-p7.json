@@ -1,0 +1,33 @@
+{
+  "escalationId": "p7",
+  "shape": "review_arbitration",
+  "type": "review_arbitration",
+  "verdict": "retry_with_directive",
+  "directive": "Remove the pg_dump snapshot-consistency test — it reflects Option B, which was not chosen in phase 4. Replace it with a test that validates Option A semantics: simulate an interrupted mid-run by stopping the script after N batches and assert that (a) already-committed batches are durably present in the fixture DB, and (b) re-running the script from scratch is idempotent for those rows via dedup_key (no duplicates in the PD payload output). Also fix docker-compose teardown: add an afterAll (or equivalent) that unconditionally stops and removes the fixture containers even when tests fail, to prevent orphaned containers on CI.",
+  "amendedSpec": null,
+  "escalationReason": null,
+  "rationale": "Two Reviewer rejections. Round 1 (CI budget exceeded) was correctly fixed — 10k rows, 4.1 min, within budget. Round 2 identifies two real defects. First: the snapshot-consistency test is premised on phase 4 choosing Option B (pg_dump snapshot), but the p4 arbitration directed Option A — drop the wrapping transaction, commit per batch, accept snapshot-inconsistency risk, do not introduce a pg_dump step. That test is validating behavior that does not exist in the implementation and will false-pass. Second: docker-compose fixture not torn down on test failure leaves orphan containers, a standard CI hygiene issue. Both are specific and fixable.",
+  "nonGoalsPreserved": true,
+  "category": "review_arbitration",
+  "fullArbitration": {
+    "verdict": "retry_with_directive",
+    "rationale": "Two Reviewer rejections. Round 1 (CI budget exceeded) was correctly fixed — 10k rows, 4.1 min, within budget. Round 2 identifies two real defects. First: the snapshot-consistency test is premised on phase 4 choosing Option B (pg_dump snapshot), but the p4 arbitration directed Option A — drop the wrapping transaction, commit per batch, accept snapshot-inconsistency risk, do not introduce a pg_dump step. That test is validating behavior that does not exist in the implementation and will false-pass. Second: docker-compose fixture not torn down on test failure leaves orphan containers, a standard CI hygiene issue. Both are specific and fixable.",
+    "directive": "Remove the pg_dump snapshot-consistency test — it reflects Option B, which was not chosen in phase 4. Replace it with a test that validates Option A semantics: simulate an interrupted mid-run by stopping the script after N batches and assert that (a) already-committed batches are durably present in the fixture DB, and (b) re-running the script from scratch is idempotent for those rows via dedup_key (no duplicates in the PD payload output). Also fix docker-compose teardown: add an afterAll (or equivalent) that unconditionally stops and removes the fixture containers even when tests fail, to prevent orphaned containers on CI.",
+    "amendedSpec": null,
+    "escalationReason": null,
+    "nonGoalsPreserved": true,
+    "category": "review_arbitration"
+  },
+  "parseError": null,
+  "costUsd": 0.05149755,
+  "latencyMs": 34581,
+  "numTurns": 2,
+  "inputTokens": 4,
+  "outputTokens": 1415,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": [],
+  "callIndex": 7,
+  "cumulativeCostUsd": 0.4003557,
+  "cumulativeTurns": 14
+}

@@ -1,0 +1,78 @@
+{
+  "runAt": "2026-04-23T23:56:59.287Z",
+  "model": "claude-sonnet-4-6",
+  "plugins": [
+    "omc",
+    "caveman"
+  ],
+  "variant": "claude-sonnet-4-6+omc+caveman",
+  "totalScenarios": 5,
+  "verdictAccuracy": 0.8,
+  "verdictMatches": 4,
+  "errorCount": 0,
+  "totalCostUsd": 0.9451092,
+  "avgCostUsd": 0.18902184,
+  "avgLatencyMs": 72474.6,
+  "perScenario": [
+    {
+      "id": "s1",
+      "label": "clean_trivial_pr",
+      "expected": "approve",
+      "actual": "request_changes",
+      "match": false,
+      "weightedRisk": 0.2425,
+      "critical": 1,
+      "criteriaMet": "3/3",
+      "cost": 0.22972845000000003,
+      "latencyMs": 73757
+    },
+    {
+      "id": "s2",
+      "label": "correctness_bug_off_by_one",
+      "expected": "reject_or_request_changes",
+      "actual": "reject",
+      "match": true,
+      "weightedRisk": 0.41,
+      "critical": 1,
+      "criteriaMet": "4/5",
+      "cost": 0.16406954999999998,
+      "latencyMs": 49362
+    },
+    {
+      "id": "s3",
+      "label": "security_sql_injection",
+      "expected": "reject_or_request_changes",
+      "actual": "reject",
+      "match": true,
+      "weightedRisk": 0.665,
+      "critical": 2,
+      "criteriaMet": "1/4",
+      "cost": 0.18423735,
+      "latencyMs": 76149
+    },
+    {
+      "id": "s4",
+      "label": "performance_quadratic",
+      "expected": "request_changes",
+      "actual": "request_changes",
+      "match": true,
+      "weightedRisk": 0.255,
+      "critical": 1,
+      "criteriaMet": "4/5",
+      "cost": 0.1545126,
+      "latencyMs": 73822
+    },
+    {
+      "id": "s5",
+      "label": "test_coverage_gap",
+      "expected": "request_changes",
+      "actual": "request_changes",
+      "match": true,
+      "weightedRisk": 0.34,
+      "critical": 2,
+      "criteriaMet": "4/6",
+      "cost": 0.21256125,
+      "latencyMs": 89283
+    }
+  ]
+}

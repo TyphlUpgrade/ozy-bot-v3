@@ -1,0 +1,30 @@
+{
+  "escalationId": "e2",
+  "shape": "executor_escalation",
+  "type": "design_decision",
+  "verdict": "retry_with_directive",
+  "directive": "Use Strategy A. Implement the idempotency check with a single atomic Redis command: `SET idempotency:{order_id} 1 NX PX 86400000` (SET with NX flag and 86400000ms TTL). Do NOT use the two-command SETNX + EXPIRE sequence — it has a race window between the two commands. Key a code comment: 'Redis maxmemory-policy must be volatile-lru, volatile-ttl, or noeviction; allkeys-* eviction policies will break the 24h idempotency guarantee.' No schema changes to the orders table.",
+  "amendedSpec": null,
+  "escalationReason": null,
+  "rationale": "This is a straightforward design_decision between two technically valid strategies. The non-goal 'do not introduce new external service dependencies beyond the existing Redis instance' speaks to services, not schema, so Strategy B is not strictly forbidden. However, Strategy A is the correct choice: it uses Redis, which the phase spec and project non-goals already treat as the approved external dependency for this pipeline, and it matches existing codebase patterns (Executor confirmed this). Strategy B introduces an irreversible schema migration to the orders table — the Executor explicitly flags this as high-impact and non-reversible — and schema migrations carry coordination cost that is not warranted when a Redis-native solution already fits. The one real risk with Strategy A is eviction invalidating the 24h window, but this is fully mitigated by using the atomic SET NX PX form (single command, not deprecated SETNX + EXPIRE) and documenting the maxmemory-policy dependency.",
+  "nonGoalsPreserved": true,
+  "category": "design_decision",
+  "fullArbitration": {
+    "verdict": "retry_with_directive",
+    "rationale": "This is a straightforward design_decision between two technically valid strategies. The non-goal 'do not introduce new external service dependencies beyond the existing Redis instance' speaks to services, not schema, so Strategy B is not strictly forbidden. However, Strategy A is the correct choice: it uses Redis, which the phase spec and project non-goals already treat as the approved external dependency for this pipeline, and it matches existing codebase patterns (Executor confirmed this). Strategy B introduces an irreversible schema migration to the orders table — the Executor explicitly flags this as high-impact and non-reversible — and schema migrations carry coordination cost that is not warranted when a Redis-native solution already fits. The one real risk with Strategy A is eviction invalidating the 24h window, but this is fully mitigated by using the atomic SET NX PX form (single command, not deprecated SETNX + EXPIRE) and documenting the maxmemory-policy dependency.",
+    "directive": "Use Strategy A. Implement the idempotency check with a single atomic Redis command: `SET idempotency:{order_id} 1 NX PX 86400000` (SET with NX flag and 86400000ms TTL). Do NOT use the two-command SETNX + EXPIRE sequence — it has a race window between the two commands. Key a code comment: 'Redis maxmemory-policy must be volatile-lru, volatile-ttl, or noeviction; allkeys-* eviction policies will break the 24h idempotency guarantee.' No schema changes to the orders table.",
+    "amendedSpec": null,
+    "escalationReason": null,
+    "nonGoalsPreserved": true,
+    "category": "design_decision"
+  },
+  "parseError": null,
+  "costUsd": 0.16834575000000002,
+  "latencyMs": 66142,
+  "numTurns": 3,
+  "inputTokens": 9,
+  "outputTokens": 3022,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

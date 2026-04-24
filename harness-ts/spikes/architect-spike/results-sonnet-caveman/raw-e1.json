@@ -1,0 +1,30 @@
+{
+  "escalationId": "e1",
+  "shape": "executor_escalation",
+  "type": "scope_unclear",
+  "verdict": "retry_with_directive",
+  "directive": "Use per-username rate limiting: pass `keyFn: (req) => req.body?.username` to the existing ratelimit middleware in src/middleware/ratelimit.ts. Ensure body-parser middleware runs before the rate-limit middleware in the login route chain. Configure threshold and cooldown window in config/auth.yml. Return 429 when the per-username key exceeds threshold.",
+  "amendedSpec": null,
+  "escalationReason": null,
+  "rationale": "The project's stated threat is credential stuffing — attackers rotate IPs but target the same account. Per-IP rate limiting does not address this threat. Per-username directly caps attempts against a single account regardless of source IP, which is the correct defense. The existing ratelimit.ts middleware already supports a keyFn parameter, so per-username requires only passing `(req) => req.body.username` as the key — no new tables, no API contract change. Body parsing before rate limit check is a standard middleware ordering adjustment, not a scope violation.",
+  "nonGoalsPreserved": true,
+  "category": "design_decision",
+  "fullArbitration": {
+    "verdict": "retry_with_directive",
+    "rationale": "The project's stated threat is credential stuffing — attackers rotate IPs but target the same account. Per-IP rate limiting does not address this threat. Per-username directly caps attempts against a single account regardless of source IP, which is the correct defense. The existing ratelimit.ts middleware already supports a keyFn parameter, so per-username requires only passing `(req) => req.body.username` as the key — no new tables, no API contract change. Body parsing before rate limit check is a standard middleware ordering adjustment, not a scope violation.",
+    "directive": "Use per-username rate limiting: pass `keyFn: (req) => req.body?.username` to the existing ratelimit middleware in src/middleware/ratelimit.ts. Ensure body-parser middleware runs before the rate-limit middleware in the login route chain. Configure threshold and cooldown window in config/auth.yml. Return 429 when the per-username key exceeds threshold.",
+    "amendedSpec": null,
+    "escalationReason": null,
+    "nonGoalsPreserved": true,
+    "category": "design_decision"
+  },
+  "parseError": null,
+  "costUsd": 0.08721,
+  "latencyMs": 26773,
+  "numTurns": 2,
+  "inputTokens": 4,
+  "outputTokens": 1076,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

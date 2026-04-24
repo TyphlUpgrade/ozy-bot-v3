@@ -1,0 +1,50 @@
+[
+  {
+    "id": "medium",
+    "name": "redis-job-queue-migration",
+    "description": "Replace the current in-memory job queue with a Redis-backed queue supporting at-least-once delivery, dead-letter handling, and configurable retry. Producers and consumers currently use a shared Map<jobId, Job> in src/queue/memory.ts; migration must preserve the producer/consumer API contract so existing callers continue to compile and function. The goal is durability + horizontal scale (queue survives process restart, multiple consumer instances).",
+    "nonGoals": [
+      "Do not change the producer/consumer API — existing callers must compile without modification",
+      "Do not introduce new authentication or credentials beyond the existing REDIS_URL environment variable",
+      "Do not remove the in-memory implementation — keep behind a feature flag for rollback",
+      "Do not support exactly-once delivery — at-least-once with idempotency_key is sufficient",
+      "Do not implement priority queues, scheduled (delayed) jobs, or cron-like features in this project — those are out of scope"
+    ],
+    "constraints": [
+      "Node.js + TypeScript + ioredis client library (already in package.json)",
+      "Integration tests must pass against a real Redis instance (docker-compose fixture)",
+      "Cutover must be reversible via feature flag within 5 minutes without data loss",
+      "p99 enqueue latency must stay under 10ms against staging Redis",
+      "Dead-letter queue must retain failed jobs for 14 days minimum"
+    ],
+    "expectedPhaseRange": "6-12",
+    "complexityClassification": "medium"
+  },
+  {
+    "id": "large",
+    "name": "postgres-to-cockroach-migration",
+    "description": "Migrate the production application database from PostgreSQL 14 to CockroachDB (cloud-hosted) with zero downtime and zero data loss during the cutover. The application uses Prisma ORM across ~40 tables totaling ~2TB, with moderate write throughput (peak 5k writes/sec during business hours). Critical paths include user authentication, billing transactions, and audit log append. Business requirement: complete migration within 6 weeks of project start, with live cutover executed during a 2-hour scheduled maintenance window. Rollback must be possible for 30 days post-cutover.",
+    "nonGoals": [
+      "Do not change the Prisma schema semantics — client-side code must compile and pass tests unchanged",
+      "Do not remove PostgreSQL until 30-day post-cutover stability window passes",
+      "Do not migrate denormalized read-replica data or analytics pipelines — those are a separate post-cutover project",
+      "Do not introduce multi-region writes — single-region CockroachDB only (multi-region is future scope)",
+      "Do not disable any existing monitoring, alerting, or logging paths during migration",
+      "Do not increase p99 application latency by more than 15% vs PostgreSQL baseline measured over the migration week",
+      "Do not modify business logic or application behavior — this is a pure storage-layer migration"
+    ],
+    "constraints": [
+      "Node.js + TypeScript + Prisma ORM (no raw SQL currently — all queries through Prisma client)",
+      "CockroachDB Cloud Serverless tier for staging, Dedicated tier for production",
+      "Dual-write period required for data validation before cutover (write to both databases, read from Postgres, compare)",
+      "Migration tooling must support schema diff + data sync with throughput sufficient for 2TB over the 2-hour window",
+      "Rollback plan must be tested end-to-end in staging before production cutover",
+      "Audit log table has foreign-key constraints on 12 other tables — coordinate schema migration ordering",
+      "PII-containing tables (users, payments) require additional data validation checks + encryption-at-rest verification",
+      "CockroachDB has known differences from PostgreSQL in transaction semantics (serializable by default) — audit affected code paths",
+      "Billing transactions are financial — zero data loss is a hard requirement, not a target"
+    ],
+    "expectedPhaseRange": "18-28",
+    "complexityClassification": "large"
+  }
+]

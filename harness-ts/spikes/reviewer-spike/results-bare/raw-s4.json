@@ -1,0 +1,78 @@
+{
+  "scenarioId": "s4",
+  "label": "performance_quadratic",
+  "expectedVerdict": "request_changes",
+  "verdict": "request_changes",
+  "weightedRisk": 0.245,
+  "findingCount": 2,
+  "criticalFindingCount": 1,
+  "criteriaMetCount": 4,
+  "criteriaTotal": 5,
+  "category": "performance_regression",
+  "summary": "The function is logically correct and satisfies criteria 1–4 (export shape, return contract, empty-input, case normalization). It fails criterion 5 on algorithmic grounds: the combination of `seen.includes()` (O(N) array scan) inside the outer loop and a second O(N) counting loop per unique email produces O(N²) behavior. At N=100,000 this is roughly 5–10 billion comparisons — unusable in practice. The fix is a one-liner redesign using `Map<string, number>` and is non-invasive to the public API. The missing test file is a secondary concern but prevents verifying coverage of the explicit edge-case criteria.",
+  "fullReview": {
+    "verdict": "request_changes",
+    "riskScore": {
+      "correctness": 0.2,
+      "integration": 0.1,
+      "stateCorruption": 0,
+      "performance": 0.95,
+      "regression": 0.15,
+      "weighted": 0.245
+    },
+    "findings": [
+      {
+        "severity": "critical",
+        "file": "src/users/duplicates.ts",
+        "line": 12,
+        "description": "`seen.includes(normalized)` is an O(N) linear scan called inside the O(N) outer loop, and the inner counting loop at line 16 adds another O(N) pass per unique email — making the overall complexity O(N²), which at N=100k yields ~10^10 operations and will take tens of seconds in any JS runtime.",
+        "suggestion": "Replace with a single-pass `Map<string, number>` that increments counts in O(N), then one O(K) filter-and-map over the map entries — no nested loops needed."
+      },
+      {
+        "severity": "warning",
+        "file": "tests/users/duplicates.test.ts",
+        "line": null,
+        "description": "The completion signal lists `tests/users/duplicates.test.ts` in `filesChanged`, but the file is absent from the diff — test coverage for edge cases (empty input, all-unique list, case-normalization, large N) cannot be verified.",
+        "suggestion": "Include the test file in the diff so coverage of acceptance criteria 3 and 4 can be confirmed by review."
+      }
+    ],
+    "summary": "The function is logically correct and satisfies criteria 1–4 (export shape, return contract, empty-input, case normalization). It fails criterion 5 on algorithmic grounds: the combination of `seen.includes()` (O(N) array scan) inside the outer loop and a second O(N) counting loop per unique email produces O(N²) behavior. At N=100,000 this is roughly 5–10 billion comparisons — unusable in practice. The fix is a one-liner redesign using `Map<string, number>` and is non-invasive to the public API. The missing test file is a secondary concern but prevents verifying coverage of the explicit edge-case criteria.",
+    "criteriaAssessment": [
+      {
+        "criterion": "Function exported from src/users/duplicates.ts",
+        "met": true,
+        "evidence": "`export function detectDuplicates(...)` appears at line 6 of the new file `src/users/duplicates.ts`."
+      },
+      {
+        "criterion": "Returns array of { email, count } for emails appearing 2+ times",
+        "met": true,
+        "evidence": "`Duplicate` interface defines `{ email: string; count: number }`, and the `count >= 2` guard at line 19 ensures only true duplicates are pushed."
+      },
+      {
+        "criterion": "Handles empty input (returns empty array)",
+        "met": true,
+        "evidence": "The outer `for...of` loop over an empty array produces zero iterations; `result` is initialized to `[]` and returned unchanged."
+      },
+      {
+        "criterion": "Handles case-insensitive email matching (foo@x.com and FOO@X.COM are duplicates)",
+        "met": true,
+        "evidence": "`user.email.toLowerCase()` is applied before both deduplication (`seen`) and the counting comparison at line 17."
+      },
+      {
+        "criterion": "Performance acceptable for 100k user lists",
+        "met": false,
+        "evidence": "The implementation is O(N²): `seen.includes()` is O(N) per outer-loop iteration, and the inner counting loop at line 16 is another O(N) per unique email. At N=100,000 this is on the order of 5–10 billion comparisons."
+      }
+    ],
+    "category": "performance_regression"
+  },
+  "parseError": null,
+  "costUsd": 0.17318025000000004,
+  "latencyMs": 90084,
+  "numTurns": 3,
+  "inputTokens": 7,
+  "outputTokens": 4871,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}

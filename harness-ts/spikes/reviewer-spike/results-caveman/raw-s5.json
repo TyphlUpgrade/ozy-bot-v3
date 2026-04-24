@@ -1,0 +1,97 @@
+{
+  "scenarioId": "s5",
+  "label": "test_coverage_gap",
+  "expectedVerdict": "request_changes",
+  "verdict": "request_changes",
+  "weightedRisk": 0.31,
+  "findingCount": 4,
+  "criticalFindingCount": 2,
+  "criteriaMetCount": 4,
+  "criteriaTotal": 6,
+  "category": "test_coverage_gap",
+  "summary": "Core 429 rejection logic and sliding-window algorithm are correct. The diff fails on two acceptance criteria: (1) expired Map *entries* are never removed — only timestamps within an active entry are filtered — so IPs that stop sending requests leave stale Map entries that accumulate indefinitely (criterion 5 unmet, concrete OOM risk under churn); (2) the test suite covers only the under-limit happy path, omitting at-limit boundary, over-limit rejection, proxy header parsing, and cleanup — 5 of 6 required cases absent (criterion 6 unmet). Both defects are specific and fixable without redesign; the approach is sound.",
+  "fullReview": {
+    "verdict": "request_changes",
+    "riskScore": {
+      "correctness": 0.3,
+      "integration": 0.35,
+      "stateCorruption": 0.45,
+      "performance": 0.25,
+      "regression": 0.05,
+      "weighted": 0.31
+    },
+    "findings": [
+      {
+        "severity": "critical",
+        "file": "src/middleware/rateLimit.ts",
+        "line": 12,
+        "description": "IP entries are never deleted from the Map — only timestamps within an active IP's array are filtered. IPs that stop sending requests keep their entry (and any remaining timestamps) in the Map forever, leaking memory without bound.",
+        "suggestion": "After filtering, check `if (recent.length === 0) hits.delete(ip)` before `hits.set(ip, recent)`, or add a periodic `setInterval` sweep that deletes entries whose filtered array is empty."
+      },
+      {
+        "severity": "critical",
+        "file": "tests/middleware/rateLimit.test.ts",
+        "line": null,
+        "description": "Test file contains only 1 of the 6 required test cases (under-limit). Missing: at-limit boundary (exactly N requests pass), over-limit rejection (N+1 returns 429), X-Forwarded-For header parsing, and cleanup/expiry behavior.",
+        "suggestion": "Add tests for at-limit (N calls, all pass), over-limit (N+1 call returns 429 with correct JSON body), X-Forwarded-For (set header to '10.0.0.1, 192.168.1.1', verify 10.0.0.1 is the tracked key), and cleanup (advance mock clock past windowMs, verify Map entry removed or timestamp array emptied)."
+      },
+      {
+        "severity": "warning",
+        "file": "src/middleware/rateLimit.ts",
+        "line": 8,
+        "description": "The returned middleware function's `req`, `res`, and `next` parameters are untyped implicit `any`. In strict TypeScript projects this will fail or produce unsafe inference.",
+        "suggestion": "Type parameters with Express's `Request`, `Response`, `NextFunction` from `@types/express`, or define a minimal interface matching what the function actually accesses."
+      },
+      {
+        "severity": "note",
+        "file": "src/middleware/rateLimit.ts",
+        "line": 9,
+        "description": "X-Forwarded-For is client-controlled — any caller can spoof an arbitrary IP string to bypass the per-IP limit or poison the Map with arbitrary keys.",
+        "suggestion": "If this middleware is a security control, only trust X-Forwarded-For when `req.socket.remoteAddress` matches a known trusted proxy CIDR; otherwise fall through to `req.ip`."
+      }
+    ],
+    "summary": "Core 429 rejection logic and sliding-window algorithm are correct. The diff fails on two acceptance criteria: (1) expired Map *entries* are never removed — only timestamps within an active entry are filtered — so IPs that stop sending requests leave stale Map entries that accumulate indefinitely (criterion 5 unmet, concrete OOM risk under churn); (2) the test suite covers only the under-limit happy path, omitting at-limit boundary, over-limit rejection, proxy header parsing, and cleanup — 5 of 6 required cases absent (criterion 6 unmet). Both defects are specific and fixable without redesign; the approach is sound.",
+    "criteriaAssessment": [
+      {
+        "criterion": "Middleware rejects with 429 when limit exceeded",
+        "met": true,
+        "evidence": "Line 14-16: `recent.push(now)` before the check means `recent.length > limit` triggers on the (limit+1)th request. Returns `res.status(429).json({ error: 'Too many requests' })` correctly."
+      },
+      {
+        "criterion": "Tracks per-IP with sliding 60-second window",
+        "met": true,
+        "evidence": "Line 12: `timestamps.filter((t) => t > now - windowMs)` correctly implements a sliding window — only timestamps within the last `windowMs` milliseconds count."
+      },
+      {
+        "criterion": "Default limit: 100/minute, configurable via middleware options",
+        "met": true,
+        "evidence": "Lines 4-5: `opts.limit ?? 100` and `opts.windowMs ?? 60_000` provide correct defaults and allow caller override via `RateLimitOptions`."
+      },
+      {
+        "criterion": "Correctly handles X-Forwarded-For header when behind proxy",
+        "met": true,
+        "evidence": "Line 9: `req.headers['x-forwarded-for']?.split(',')[0]` extracts the first (leftmost/client) IP from the header, falling back to `req.ip`."
+      },
+      {
+        "criterion": "Cleans up expired entries to prevent memory leak",
+        "met": false,
+        "evidence": "The `filter` on line 12 removes old timestamps only for the IP currently making a request. IP keys for silent clients are never deleted from the `hits` Map. A high-churn scenario (many unique short-lived IPs) will grow the Map without bound."
+      },
+      {
+        "criterion": "Unit tests cover: under-limit, at-limit, over-limit, proxy header, cleanup",
+        "met": false,
+        "evidence": "tests/middleware/rateLimit.test.ts contains exactly one test ('allows requests under limit'). Tests for at-limit boundary, over-limit 429, X-Forwarded-For header, and cleanup/expiry are entirely absent."
+      }
+    ],
+    "category": "test_coverage_gap"
+  },
+  "parseError": null,
+  "costUsd": 0.1917408,
+  "latencyMs": 95902,
+  "numTurns": 3,
+  "inputTokens": 7,
+  "outputTokens": 5574,
+  "terminalReason": "completed",
+  "sessionSuccess": true,
+  "errors": []
+}
