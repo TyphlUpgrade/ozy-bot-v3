@@ -14,6 +14,7 @@ import type { HarnessConfig } from "./lib/config.js";
 import { readEscalation, type EscalationSignal } from "./lib/escalation.js";
 import { readCheckpoints, type CheckpointSignal } from "./lib/checkpoint.js";
 import { evaluateResponseLevel, type ResponseLevel } from "./lib/response.js";
+import { sanitizeTaskId } from "./lib/text.js";
 
 // --- Task file schema ---
 
@@ -36,14 +37,8 @@ export class TaskFileValidationError extends Error {
   }
 }
 
-// O4: Path traversal validation on task IDs (untrusted Discord/file input)
-const SAFE_TASK_ID = /^[a-zA-Z0-9_-]+$/;
-
-function sanitizeTaskId(raw: string): string | null {
-  if (!SAFE_TASK_ID.test(raw)) return null;
-  if (raw.length > 128) return null;
-  return raw;
-}
+// O4: Path-traversal-safe task IDs live in src/lib/text.ts (`sanitizeTaskId`).
+// Imported above; no local copy to keep one source of truth.
 
 /**
  * Parse a task file from disk.

@@ -21,7 +21,11 @@
 
 import type { OrchestratorEvent } from "../orchestrator.js";
 import { DISCORD_AGENT_DEFAULTS, type DiscordConfig, type DiscordAgentIdentity } from "../lib/config.js";
+import { sanitize, redactSecrets } from "../lib/text.js";
 import type { AgentIdentity, DiscordSender } from "./types.js";
+
+// Re-export for backward-compat — Wave 3 moved these to src/lib/text.ts.
+export { sanitize, redactSecrets } from "../lib/text.js";
 
 type ChannelKey = "dev_channel" | "ops_channel" | "escalation_channel";
 type IdentityKey = "orchestrator" | "architect" | "reviewer";
@@ -33,37 +37,6 @@ interface NotifierEntry<K extends EventType> {
   identity: IdentityKey;
   /** Build the Discord message body from the event. Null → skip emission. */
   format: (event: EventByType<K>) => string | null;
-}
-
-// --- Sanitization helpers ---
-
-const MAX_FIELD_LEN = 500;
-
-const SECRET_PATTERNS: readonly RegExp[] = [
-  /sk-[a-zA-Z0-9_-]{20,}/g,           // OpenAI / Anthropic secret key shape
-  /AKIA[0-9A-Z]{16}/g,                // AWS access key ID
-  /ghp_[A-Za-z0-9]{30,}/g,            // GitHub personal token
-  /xox[baprs]-[A-Za-z0-9-]{10,}/g,    // Slack tokens
-  /(?:[A-Za-z0-9+/]{40,}=*)/g,        // long base64 chunks (noisy; last)
-];
-
-export function redactSecrets(raw: string): string {
-  let out = raw;
-  for (const p of SECRET_PATTERNS) out = out.replace(p, "[REDACTED]");
-  return out;
-}
-
-/**
- * Neutralize Discord-meaningful sequences in untrusted text so it cannot ping
- * everyone, break out of the surrounding code span, or inject arbitrary
- * markdown. Keeps output human-readable.
- */
-export function sanitize(raw: string, maxLen: number = MAX_FIELD_LEN): string {
-  const stripped = raw
-    .replace(/@(everyone|here)/g, "@​$1")  // zero-width joiner neutralizes mention
-    .replace(/`/g, "\\`");                        // don't escape the surrounding code span
-  if (stripped.length <= maxLen) return stripped;
-  return `${stripped.slice(0, maxLen)}…`;
 }
 
 function shortTaskId(id: string): string {
