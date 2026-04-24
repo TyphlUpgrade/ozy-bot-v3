@@ -387,11 +387,7 @@ export class ArchitectManager {
     return this.runArbitration(task, this.buildReviewArbitrationPrompt(task, rejection));
   }
 
-  /**
-   * Build arbitration prompt for a reviewer rejection. Fences every
-   * operator-tainted / reviewer-generated field with <untrusted:*> XML blocks
-   * so the Architect's system prompt treats them as data, not instructions.
-   */
+  /** Fences operator- and reviewer-supplied text in <untrusted:*> blocks so the Architect treats them as data, not instructions. */
   buildReviewArbitrationPrompt(task: TaskRecord, rejection: ReviewResult): string {
     const priorDirectiveBlock = task.lastDirective
       ? `\n<untrusted:prior-architect-directive>\n\`\`\`text\n${task.lastDirective}\n\`\`\`\n</untrusted:prior-architect-directive>\n`
@@ -418,12 +414,7 @@ ${priorDirectiveBlock}
 Write your verdict to \`.harness/architect-verdict.json\` per the schema in §5 of your system prompt, then conclude.`;
   }
 
-  /**
-   * Build arbitration prompt for a task escalation signal. Same untrusted
-   * fencing as review-arbitration; additionally includes lastError when
-   * present so the Architect can judge whether the Executor was stuck vs.
-   * wrong.
-   */
+  /** Same fencing as buildReviewArbitrationPrompt; adds task.lastError so the Architect can distinguish stuck vs wrong. */
   buildEscalationPrompt(task: TaskRecord, escalation: EscalationSignal): string {
     const lastErrorBlock = task.lastError
       ? `\n<untrusted:task-last-error>\n\`\`\`text\n${task.lastError}\n\`\`\`\n</untrusted:task-last-error>\n`
@@ -463,8 +454,6 @@ Write your verdict to \`.harness/architect-verdict.json\` per the schema in §5 
       return { type: "escalate_operator", rationale: "architect_session_unavailable" };
     }
 
-    // Stale-verdict defense — prior arbitration's verdict file would otherwise
-    // be read as this round's answer.
     this.unlinkStaleVerdict(session.worktreePath);
 
     const ac = new AbortController();
@@ -500,13 +489,7 @@ Write your verdict to \`.harness/architect-verdict.json\` per the schema in §5 
     return { type: "escalate_operator", rationale: "architect_no_verdict_written" };
   }
 
-  /**
-   * Stale-verdict defense: the Architect writes a fresh verdict per
-   * arbitration. Unlinking before spawn guarantees that any file we read
-   * after consumeStream was written by THIS arbitration round, not a prior
-   * one. unlink failures are rare (permissions, worktree gone) and are
-   * best-effort — a subsequent schema check still rejects corrupt files.
-   */
+  /** Stale-verdict defense: unlink-before-spawn guarantees a subsequent read returns THIS round's verdict, not a prior one. Best-effort; schema check is the backstop. */
   private unlinkStaleVerdict(worktreePath: string): void {
     const path = join(worktreePath, ".harness", "architect-verdict.json");
     try { if (existsSync(path)) unlinkSync(path); } catch { /* best-effort */ }

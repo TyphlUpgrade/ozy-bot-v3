@@ -627,14 +627,7 @@ export class Orchestrator {
     });
   }
 
-  /**
-   * Drive the Architect arbitration round for a task that has entered
-   * `review_arbitration` (reviewer-rejection threshold crossed) or has raised
-   * an escalation. Emits `architect_arbitration_fired`, invokes the
-   * ArchitectManager, emits `arbitration_verdict`, then applies the verdict.
-   * If the ArchitectManager is not configured (standalone orchestrator),
-   * the task is marked `failed` — Wave A / standalone behavior.
-   */
+  /** Drive an Architect arbitration round. Standalone tasks or orchestrators without an architectManager fail permanently. */
   private async routeArbitration(
     task: TaskRecord,
     cause: ArbitrationCause,
@@ -679,11 +672,7 @@ export class Orchestrator {
       };
     }
 
-    const rationale = verdict.type === "retry_with_directive"
-      ? verdict.directive
-      : verdict.type === "plan_amendment"
-        ? verdict.rationale
-        : verdict.rationale;
+    const rationale = verdict.type === "retry_with_directive" ? verdict.directive : verdict.rationale;
     this.emit({
       type: "arbitration_verdict",
       taskId: task.id,
@@ -695,17 +684,6 @@ export class Orchestrator {
     this.applyArchitectVerdict(task, verdict);
   }
 
-  /**
-   * Apply an ArchitectVerdict to a task in `review_arbitration` (or, for
-   * escalation-sourced arbitration, any intermediate state). Routes:
-   *
-   * - `retry_with_directive`: store directive on task, reset
-   *   reviewerRejectionCount to 0, transition → active, schedule retry.
-   * - `plan_amendment`: update the phase spec via ProjectStore, reset
-   *   rejection count, transition → active, schedule retry.
-   * - `escalate_operator`: transition → failed, emit task_failed with
-   *   the Architect's rationale.
-   */
   private applyArchitectVerdict(task: TaskRecord, verdict: ArchitectVerdict): void {
     switch (verdict.type) {
       case "retry_with_directive": {
