@@ -265,7 +265,11 @@ Depends: Phase 2A escalation protocol. Phase 2B pre-requisites #1, #3, #5, #6 re
 - **Wave 1.75 item 9** (concurrent-session smoke) — `920e02f`. Live test PASS.
 - **Wave 2** (Discord outbound: 13 new OrchestratorEvent variants + DiscordNotifier + WebhookSender + sanitize/redactSecrets defense) — commit `0fe90f4`. +45 tests. Multi-perspective review: architect/security/code-reviewer all APPROVE.
 
-**Pending:** Wave 3 (Discord inbound: `!task`, `!project`, NL routing, accumulator), Wave A (Reviewer gate), Wave B/B.5 (Architect lifecycle + smoke), Wave 4 (escalation routing), Wave C (arbitration), Wave 6-split (dialogue), Wave D (compaction handoff + e2e).
+**Additional completed (session 2026-04-24):**
+- **Wave 3** (Discord inbound: `!task`, `!project`, `!status`, `!abort`, `!retry`, `!reply`; NL classification with deterministic + LLM-fallback stages; MessageAccumulator with 2s debounce + `!` bypass; ReactionClient stub) — commit `07ed8c4`. +36 tests. Security defenses: @everyone/@here sanitize, secret redaction, project name length cap, `!reply` state-gating. Wave 2+3 roundtrip integration test committed as `066bde9`.
+- **Wave A** (Reviewer gate: ephemeral Reviewer session, mandatory-for-project review, `review_arbitration` state wiring with interim Wave A→C warning) — commit `414cd45`. +33 tests. Security defenses: untrusted-prompt fencing, stale-review.json defense, expanded disallowlist (`WebFetch`/`WebSearch`/`Task`/`Agent`/`Cron*`/`RemoteTrigger`/`ScheduleWakeup`), spawn+consumeStream fail-safe wrapping.
+
+**Pending:** Wave B (Architect session lifecycle + decomposition), Wave B.5 (Architect smoke test), Wave 4 (escalation routing), Wave C (arbitration routing + Architect listener consumes `review_arbitration`), Wave 6-split (dialogue: standalone proposal.json vs project Architect channel), Wave D (compaction handoff + e2e validation).
 
 **Test count progression:** 280 (Phase 2A) → 328 (Waves 1 + 1.5) → 373 (+ Wave 2).
 
