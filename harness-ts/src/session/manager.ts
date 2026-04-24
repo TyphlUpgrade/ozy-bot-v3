@@ -9,7 +9,11 @@ import { execSync } from "node:child_process";
 import type { Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { SDKClient, type SessionConfig, type SessionResult } from "./sdk.js";
 import { StateManager, type TaskRecord } from "../lib/state.js";
-import type { HarnessConfig } from "../lib/config.js";
+import {
+  DEFAULT_EXECUTOR_SYSTEM_PROMPT,
+  PERSISTENT_SESSION_WARN_THRESHOLD_DEFAULT,
+  type HarnessConfig,
+} from "../lib/config.js";
 import type { ConfidenceAssessment } from "../lib/types.js";
 
 // --- Completion signal schema ---
@@ -192,6 +196,10 @@ export class SessionManager {
   private readonly gitOps: GitOps;
   private readonly tmuxOps: TmuxOps;
   private readonly activeSessions: Map<string, ActiveSession> = new Map();
+  // Wave C / U4 — monotonic cumulative counter of Executor spawns. Each spawn
+  // corresponds to a `persistSession: true` SDK record, so this doubles as an
+  // observability proxy for disk-accumulated session records.
+  private cumulativeSessionSpawns = 0;
 
   constructor(
     sdk: SDKClient,
@@ -314,10 +322,27 @@ export class SessionManager {
       enabledPlugins,
       hooks: {}, // Wave 1 Item 2: explicit empty to prevent filesystem-discovered hooks
       ...(this.config.pipeline.max_budget_usd ? { maxBudgetUsd: this.config.pipeline.max_budget_usd } : {}),
-      ...(this.config.systemPrompt ? { systemPrompt: this.config.systemPrompt } : {}),
+      // Wave C / U3: enrichment default. Operator override wins; otherwise Executor always
+      // receives the enriched completion-contract prompt (understanding/assumptions/nonGoals/confidence).
+      systemPrompt: this.config.systemPrompt ?? DEFAULT_EXECUTOR_SYSTEM_PROMPT,
     };
 
     const { query, abortController } = this.sdk.spawnSession(sessionConfig);
+
+    // Wave C / U4 — persistent-session observability. Every spawn is a
+    // `persistSession: true` record; once cumulative spawns exceed the
+    // configured threshold we warn once per spawn-above-threshold.
+    this.cumulativeSessionSpawns += 1;
+    const threshold =
+      this.config.pipeline.persistent_session_warn_threshold
+        ?? PERSISTENT_SESSION_WARN_THRESHOLD_DEFAULT;
+    if (this.cumulativeSessionSpawns > threshold) {
+      console.warn(
+        `WARN SessionManager persistent-session count ${this.cumulativeSessionSpawns} ` +
+          `exceeds threshold ${threshold}. Session records accumulate on disk under ` +
+          `${this.config.project.session_dir}; consider periodic cleanup.`,
+      );
+    }
 
     // Track active session
     const activeSession: ActiveSession = {
@@ -410,5 +435,14 @@ export class SessionManager {
   /** Number of active sessions */
   get activeCount(): number {
     return this.activeSessions.size;
+  }
+
+  /**
+   * Wave C / U4 — cumulative Executor spawn count since manager construction.
+   * Each spawn allocates a persistSession SDK record, so this doubles as an
+   * observability proxy for disk-accumulated session records.
+   */
+  get persistentSessionCount(): number {
+    return this.cumulativeSessionSpawns;
   }
 }

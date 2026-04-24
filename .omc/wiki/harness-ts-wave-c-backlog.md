@@ -5,108 +5,77 @@ tags: ["harness-ts", "wave-c", "backlog", "three-tier"]
 updated: 2026-04-24
 ---
 
-# Wave C Backlog — Deferred Action List
+# Wave C Backlog — Status + Remaining Action List
 
-Picked up at end of the 2026-04-24 session. Ordered by leverage. Run through top-to-bottom when Wave C starts.
+**Second-session status (2026-04-24 cont'd):** bugs 1+2, SEC M1/M2, CR M2, U3, U4, and the 3-phase live stress have all landed. Remaining items are live-API spikes (4, 5) + deferred Wave D (U5) + on-arrival CR M1.
 
 ## Context
 
 Live end-to-end project run (commit `8e11a3b`, `scripts/live-project.ts`) passed 5/5 checks with `$0.69` total cost in 66.8s. BUT surfaced two production bugs mocks never caught. Plan M.15 has full detail:
 `.omc/plans/ralplan-harness-ts-three-tier-architect.md` section M.15.
 
-## Blocking bugs (fix first — one-liners, no design risk)
+## ✅ Completed items (commits + evidence)
 
-### 1. `TaskFile.projectId` not propagated to `TaskRecord.projectId`
+| # | Item | Commits | Evidence |
+|---|------|---------|----------|
+| 1 | Bug 1 — `TaskFile.projectId` propagation | `d2388b3` | +2 tests; live-run `review_mandatory` now fires on project phases |
+| 2 | Bug 2 — Project auto-completion | `d2388b3` | +2 tests; 3-phase stress `project state=completed` + `project_completed` event |
+| 3 | 3-phase real-SDK stress (`scripts/live-project-3phase.ts`) | `7d4e7ed` | PASS 7/7 checks, `$0.75`, 177s elapsed |
+| SEC M1 | `validateArchitectCompactionSummary` full schema check | `7d4e7ed` | +6 tests; malformed → fallback to projectStore summary |
+| SEC M2 | Architect disallowlist (network + cron + team) | `7d4e7ed` | +1 test asserting Task NOT blocked |
+| CR M2 | `finalCostUsd` aggregated from StateManager | `7d4e7ed` | +1 test asserting cost round-trip |
+| U3 | Executor enrichment default (`DEFAULT_EXECUTOR_SYSTEM_PROMPT`) | *this ralph session* | +2 tests; SessionManager falls through to enriched prompt when `config.systemPrompt` unset |
+| U4 | persistSession accumulation observability | *this ralph session* | `persistentSessionCount` accessor + `persistent_session_warn_threshold` config + 3 tests |
 
-- **Where:** `harness-ts/src/orchestrator.ts` `scanForTasks` ~line 240
-- **Symptom:** `scanForTasks` calls `state.createTask(prompt, id)` — drops `projectId` and `phaseId` from the ingested TaskFile.
-- **Consequence:** Wave A project-mandatory review gate silently bypassed for every project phase (`task.projectId === undefined` at routing time).
-- **Fix scope:** 2-line edit, plus 1 regression test asserting round-trip via `scanForTasks`.
-- **Patch:**
-  ```typescript
-  const task = this.state.createTask(taskFile.prompt, taskId);
-  if (taskFile.projectId) {
-    this.state.updateTask(task.id, {
-      projectId: taskFile.projectId,
-      phaseId: taskFile.phaseId ?? task.id,
-    });
-  }
-  ```
+Cumulative test count: 484 → **500** (+16). Live-run cost this turn: `$0.75` (3-phase stress).
 
-### 2. Project auto-completion not wired
+## 🔓 Remaining items
 
-- **Where:** `harness-ts/src/orchestrator.ts` `handleMergeResult` "merged" case ~line 630
-- **Symptom:** After all phases reach `done`, project record stays in `state: "decomposing"` forever. `projectStore.markPhaseDone` + `completeProject` never called.
-- **Consequence:** `project_completed` event never fires; projects never close.
-- **Fix scope:** ~10 lines + 2 regression tests.
-- **Patch sketch:**
-  ```typescript
-  // inside handleMergeResult "merged" case, after existing transition to "done":
-  if (task.projectId && task.phaseId) {
-    this.projectStore.markPhaseDone(task.projectId, task.phaseId);
-    if (!this.projectStore.hasActivePhases(task.projectId)) {
-      const p = this.projectStore.getProject(task.projectId)!;
-      this.projectStore.completeProject(task.projectId);
-      this.emit({
-        type: "project_completed",
-        projectId: task.projectId,
-        phaseCount: p.phases.length,
-        totalCostUsd: p.totalCostUsd,
-      });
-    }
-  }
-  ```
+### 4. Caveman × structured JSON on Executor (live spike, ~`$1`)
 
-## Validation run (after fixes 1 + 2 land)
+Risk: Reviewer spike M.11.5 showed caveman corrupting structured verdict JSON. Executor writes `completion.json` with the same shape — same risk surface. First two live runs (minimal + enriched + 3-phase) were clean, but sample size is small.
 
-### 3. 3-phase real-SDK project run
+**Observable acceptance threshold:** ≥ 95% field-preservation across 5 independent Executor runs against a strict-JSON completion contract. Count every top-level schema field (`status`, `commitSha`, `summary`, `filesChanged`, `understanding`, `assumptions`, `nonGoals`, `confidence`) + every `confidence.*` sub-field. Below 95% → drop caveman from Executor defaults and fall back to the validated enriched prompt alone.
 
-Write a test script similar to `live-project.ts` but with a project the Architect decomposes into ≥ 3 phases where later phases depend on earlier. Stresses state machine + concurrency + project completion. Budget cap: `$5` total.
+**Spike execution plan:**
+- Proposed path: `scripts/spike-caveman-json.ts`
+- Shape: 5 parallel invocations of `live-run.ts --mode enriched` equivalents, each using a slightly different trivial task prompt to prevent prompt caching from skewing results. Record each completion.json and diff against the schema.
+- Budget ceiling: `$1` total. Per-run orchestrator cap: `$0.25`.
+- One-command invocation: `npx tsx scripts/spike-caveman-json.ts` (script will stream pass/fail per run and print the 8-field preservation ratio).
+- Decision output: committed as a new section in `ralplan-harness-ts-three-tier-architect.md` M.15.x.
 
-Assert: all phases land on trunk in order, project state → `completed`, `project_completed` event fires.
+### 5. OMC plugin dead-weight on Executor (live spike, informed by #4)
 
-## Spikes (before Wave C design decisions lock)
+Per M.13.3, single-mode Executors don't invoke OMC specialists unprompted. Loading OMC adds init overhead for no benefit. The 3-phase live run corroborated: Executor never delegated.
 
-### 4. Caveman × structured JSON on Executor
+**Observable acceptance threshold:** ≥ 20% init-overhead reduction on Executor cold-start wall-time when OMC plugin disabled, with zero regression on completion compliance. Keep OMC for Architect (decomposer, M.12 validated) and future parallel-Reviewer (M.14).
 
-Risk: Reviewer spike M.11.5 showed caveman corrupting structured verdict JSON. Executor writes `completion.json` — same risk surface. First live run was clean on a trivial task; one data point.
+**Spike execution plan:**
+- Proposed path: `scripts/spike-omc-overhead.ts`
+- Shape: 3 Executor runs with `plugins: { "oh-my-claudecode@omc": false }` against the same trivial task; 3 runs with OMC enabled; measure wall-clock from spawn → first completion.json write. Compare medians.
+- Budget ceiling: `$0.50` total (runs are cheap without OMC init + Haiku-equivalent Sonnet).
+- One-command invocation: `npx tsx scripts/spike-omc-overhead.ts`.
+- Decision output: if threshold met, flip `DEFAULT_PLUGINS["oh-my-claudecode@omc"]` to `false` in `src/session/manager.ts` for Executor; operators override via `config.pipeline.plugins`.
 
-Design: 5 Executor runs against strict-JSON completion contract including confidence block. Measure field preservation rate. Acceptance: ≥ 95% round-trip; below that → drop caveman from Executor defaults.
+### U5 — Budget tuning (deferred to Wave D)
 
-Cost: ~`$1` total.
+Live runs used `~9×` under the per-phase cap ($0.11 actual vs $1 cap). Graduated caps by Architect-declared phase complexity would fit better (e.g. phase.complexity = "trivial" → $0.25; "standard" → $1.00; "complex" → $3.00). Defer to Wave D; no urgency while project-cost aggregation is accurate (CR M2 fixed that).
 
-### 5. OMC plugin dead-weight on Executor
+### CR M1 — `buildSessionConfig` helper (on-arrival)
 
-Per M.13.3, single-mode Executors don't invoke OMC specialists unprompted. Loading OMC adds init overhead for no benefit.
+SessionManager + ReviewGate + ArchitectManager all hand-assemble `SessionConfig`. Extract a shared helper when a fourth caller arrives. Not blocking Wave C; deliberately held until extraction delivers de-duplication leverage (currently 3 callers, marginal).
 
-Recommendation pending spike 4: drop OMC from Executor defaults. Keep for Architect (decomposer, M.12 validated) and future parallel-Reviewer (M.14).
+## Session summary (rolling)
 
-## Unknowns — Executor tier (M.15.2)
-
-- **U3 — Enrichment adoption:** real Executor produced compliance 0/4 (base fields only). Phase 2A graduated response routing never fires in production. Options: (a) enrich Executor systemPrompt globally per `live-run.ts` enriched mode, or (b) Architect injects self-assess directive per-phase. Prefer (a) for Wave C default.
-
-- **U4 — persistSession accumulation:** every Executor phase keeps its session via `persistSession: true`. 100 phases = 100 persistent records. No cleanup path. Not urgent (single-project runs don't accumulate) but flag for Phase 4 observability.
-
-- **U5 — Budget tuning:** $0.11 actual vs $1 cap = 9× over. Graduated caps by Architect-declared phase complexity would fit better. Defer to Wave D.
-
-## Deferred from Wave B Phase 4 review (low priority)
-
-- **SEC M1 (compaction summary schema validation):** fence every field shape in `readArchitectSummaryFile`, not just nonGoals.
-- **SEC M2 (Architect disallowlist narrow):** currently Architect has full OMC tool surface. Block network (`WebFetch`, `WebSearch`) + `Cron*` + `TeamCreate`/`TeamDelete` while keeping `Task` for OMC delegation.
-- **Code-reviewer M1 (`buildSessionConfig` helper):** SessionManager + ReviewGate + ArchitectManager all hand-assemble SessionConfig. Extract shared helper when a fourth caller arrives.
-- **Code-reviewer M2 (synthesized summary finalCostUsd = 0):** fallback summary in `requestSummary` sets finalCostUsd = 0 per phase. Aggregate from projectStore.
+- First-session commits: 32 (Waves 1 / 1.5 / 1.75 item 9 / 2 / 3 / A / B).
+- This ralph session: Wave C hardening + U3 + U4.
+- Test count: 280 → 484 (session 1) → **500** (session 2, +16 this turn).
+- Live runs: 6 total, all PASS.
+- Real bugs found: 2 (both closed this turn).
+- Cumulative live-run API cost across both sessions: ~`$1.95`.
 
 ## Plan references
 
 - Section M.15 (live run): `.omc/plans/ralplan-harness-ts-three-tier-architect.md`
 - Wave C scope: plan Section F Wave C
 - Spike configs: plan Section M.13.4
-
-## Session summary
-
-- 31 commits landed this session
-- Waves 1 / 1.5 / 1.75 item 9 / 2 / 3 / A / B all shipped + reviewed
-- Test count: 280 → 484 (+204)
-- Live runs: 5 total (4 Wave 1-2 validations + 1 end-to-end project) — all PASS
-- Real bugs found: 2 (both noted above)
-- Cumulative live-run API cost this session: ~$1.20

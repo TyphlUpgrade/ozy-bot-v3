@@ -32,7 +32,10 @@ export interface PipelineConfig {
   max_tier1_escalations?: number;         // circuit breaker — max escalation cycles before permanent failure (default 2)
   plugins?: Record<string, boolean>;      // Wave 1 Item 1 — OMC/caveman plugin enablement, merges with defaults
   disallowed_tools?: string[];            // Wave 1 Item 3 — additional tools to block, extends default blocklist
+  persistent_session_warn_threshold?: number; // Wave C / U4 — warn after N cumulative Executor spawns (default 100)
 }
+
+export const PERSISTENT_SESSION_WARN_THRESHOLD_DEFAULT = 100;
 
 export interface DiscordAgentIdentity {
   name: string;
@@ -165,6 +168,14 @@ function parsePipeline(raw: Record<string, unknown>): PipelineConfig {
     );
     config.disallowed_tools = tools;
   }
+  // Wave C / U4: persistent-session warn threshold
+  if (raw.persistent_session_warn_threshold !== undefined) {
+    config.persistent_session_warn_threshold = optionalNumber(
+      raw,
+      "persistent_session_warn_threshold",
+      PERSISTENT_SESSION_WARN_THRESHOLD_DEFAULT,
+    );
+  }
   return config;
 }
 
@@ -271,6 +282,51 @@ function parseArchitect(raw: Record<string, unknown>): ArchitectFileConfig {
   if (typeof raw.prompt_path === "string") out.prompt_path = raw.prompt_path;
   return out;
 }
+
+// --- Executor system prompt default (Wave C / U3) ---
+
+/**
+ * Wave C Executor system prompt default. Every Executor phase MUST write an
+ * enriched completion.json with understanding / assumptions / nonGoals /
+ * confidence blocks. Phase 2A graduated-response routing depends on these
+ * fields; a base-fields-only completion silently lands at response_level 1.
+ *
+ * Kept identical to scripts/live-run.ts SYSTEM_PROMPT_ENRICHED (validated
+ * 4/4 compliance in prior live runs). Operators may override via
+ * HarnessConfig.systemPrompt; SessionManager falls through to this default.
+ */
+export const DEFAULT_EXECUTOR_SYSTEM_PROMPT = `You are working inside a harness-managed git worktree.
+
+When you finish your task, you MUST:
+1. Commit your changes with a short message.
+2. Create directory \`.harness/\` if missing.
+3. Write \`.harness/completion.json\` with this JSON shape (all fields required):
+
+\`\`\`
+{
+  "status": "success" | "failure",
+  "commitSha": "<full sha of your final commit>",
+  "summary": "<one sentence>",
+  "filesChanged": ["path1", "path2"],
+  "understanding": "<one-paragraph restatement of the task as you interpreted it>",
+  "assumptions": ["<assumption 1>", "<assumption 2>"],
+  "nonGoals": ["<thing you deliberately did not do 1>", "<thing 2>"],
+  "confidence": {
+    "scopeClarity": "clear" | "partial" | "unclear",
+    "designCertainty": "obvious" | "alternatives_exist" | "guessing",
+    "testCoverage": "verifiable" | "partial" | "untestable",
+    "assumptions": [
+      { "description": "<same as top-level assumption>", "impact": "high" | "low", "reversible": true | false }
+    ],
+    "openQuestions": ["<question the operator may need to answer>"]
+  }
+}
+\`\`\`
+
+All enrichment fields are required. Be honest about uncertainty: if the scope is not fully clear, say so; if you are guessing on design, say so. Do not fabricate certainty.
+
+The completion file is how the orchestrator knows you are done. If you do not write it, the task will be marked failed.
+`;
 
 // --- System Prompt Loader ---
 

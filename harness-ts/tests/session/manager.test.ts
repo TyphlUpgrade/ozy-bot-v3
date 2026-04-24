@@ -262,6 +262,34 @@ describe("SessionManager", () => {
         }),
       );
     });
+
+    it("falls back to DEFAULT_EXECUTOR_SYSTEM_PROMPT when config.systemPrompt is unset (U3)", async () => {
+      const queryFn: QueryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const config = makeConfig();
+      // Do NOT set config.systemPrompt — exercise the U3 default path.
+      const mgr = new SessionManager(sdk, state, config, mockGitOps());
+      const task = state.createTask("do the thing", "task-default-prompt");
+      await mgr.spawnTask(task);
+
+      const appended = (queryFn as ReturnType<typeof vi.fn>).mock.calls[0][0].options.systemPrompt.append;
+      expect(appended).toMatch(/understanding/);
+      expect(appended).toMatch(/assumptions/);
+      expect(appended).toMatch(/nonGoals/);
+      expect(appended).toMatch(/confidence/);
+    });
+
+    it("DEFAULT_EXECUTOR_SYSTEM_PROMPT contains all four Phase 2A enrichment fields", async () => {
+      const { DEFAULT_EXECUTOR_SYSTEM_PROMPT } = await import("../../src/lib/config.js");
+      for (const field of ["understanding", "assumptions", "nonGoals", "confidence"]) {
+        expect(DEFAULT_EXECUTOR_SYSTEM_PROMPT).toContain(field);
+      }
+      // Phase 2A confidence sub-fields must also appear so Executor knows the full schema.
+      for (const sub of ["scopeClarity", "designCertainty", "testCoverage"]) {
+        expect(DEFAULT_EXECUTOR_SYSTEM_PROMPT).toContain(sub);
+      }
+    });
   });
 
   describe("completion signal", () => {
@@ -800,6 +828,59 @@ describe("SessionManager", () => {
       // The result still comes through because our mock generator isn't abort-aware
       // In production, the SDK would terminate the stream on abort
       expect(result).toBeTruthy();
+    });
+  });
+
+  describe("Wave C / U4 — persistent-session observability", () => {
+    it("persistentSessionCount reflects cumulative spawnTask calls", async () => {
+      const queryFn: QueryFn = vi.fn().mockImplementation(() => mockQuery([makeResultSuccess()]));
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const config = makeConfig();
+      const mgr = new SessionManager(sdk, state, config, mockGitOps());
+
+      expect(mgr.persistentSessionCount).toBe(0);
+      for (let i = 0; i < 3; i++) {
+        const task = state.createTask(`p${i}`, `task-ps-${i}`);
+        await mgr.spawnTask(task);
+      }
+      expect(mgr.persistentSessionCount).toBe(3);
+    });
+
+    it("warns once per spawn above configured threshold", async () => {
+      const queryFn: QueryFn = vi.fn().mockImplementation(() => mockQuery([makeResultSuccess()]));
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const config = makeConfig();
+      config.pipeline.persistent_session_warn_threshold = 2;
+      const mgr = new SessionManager(sdk, state, config, mockGitOps());
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      for (let i = 0; i < 4; i++) {
+        const task = state.createTask(`p${i}`, `task-thresh-${i}`);
+        await mgr.spawnTask(task);
+      }
+      // threshold=2 → spawns 3 and 4 both trigger (count > threshold). 1 and 2 do NOT.
+      expect(warnSpy.mock.calls.length).toBe(2);
+      expect(warnSpy.mock.calls[0][0]).toMatch(/persistent-session count 3.*threshold 2/);
+      expect(warnSpy.mock.calls[1][0]).toMatch(/persistent-session count 4.*threshold 2/);
+      warnSpy.mockRestore();
+    });
+
+    it("default threshold is 100 when unconfigured (no warn under 100)", async () => {
+      const queryFn: QueryFn = vi.fn().mockImplementation(() => mockQuery([makeResultSuccess()]));
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const config = makeConfig();
+      const mgr = new SessionManager(sdk, state, config, mockGitOps());
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      for (let i = 0; i < 5; i++) {
+        const task = state.createTask(`p${i}`, `task-default-${i}`);
+        await mgr.spawnTask(task);
+      }
+      expect(warnSpy.mock.calls.filter((c) => /persistent-session count/.test(c[0] as string))).toHaveLength(0);
+      warnSpy.mockRestore();
     });
   });
 });
