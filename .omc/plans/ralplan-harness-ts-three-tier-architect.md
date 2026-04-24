@@ -1998,3 +1998,39 @@ Against potential production savings from correctly-locked plan: cheap insurance
 ---
 
 *End of Revision 2 + Section M.1-M.13 spike validation and methodology-correction amendments. Architect + Reviewer tier configurations empirically validated via corrected methodology. Architect decomposer configuration defined per M.12.2 with graduated rigor. Executor configuration deferred to observation via Wave 2-enabled real tasks.*
+
+---
+
+### M.14 Future Spike: Parallel code-reviewer Subagents (Reviewer Tier)
+
+**Status:** OPEN — not yet spiked.
+**Origin:** Operator observation during Wave 1 live-run debrief (2026-04-24).
+**Hypothesis:** Reviewer tier quality lifts meaningfully when Reviewer is allowed to fan out `code-reviewer` subagents (via OMC `Agent` tool) in parallel across review dimensions (correctness, security, performance, integration, regression). Locked M.11/M.13 Reviewer config disabled OMC because specialists never fired *unprompted* — but an explicit forced-delegation directive (per M.12 decomposer finding) could change that and surface defects the single-pass Reviewer misses.
+
+**Why worth spiking:**
+- M.11 Reviewer baseline: 80% verdict accuracy, 5-dim scoring, 0 specialist invocations. False-negative risk on edge dimensions (e.g., subtle concurrency bugs) unmeasured.
+- M.12 Decomposer result: forced-delegation lifts quality (21 vs 18 phases, caught 3 defects bare missed) at ~3x cost. Applying the same pattern to Reviewer may surface the same lift.
+- OMC catalog includes `code-reviewer`, `security-reviewer`, `test-engineer`, `verifier`. Each has distinct training focus — parallel fan-out could produce diverse findings bare sonnet misses.
+
+**Design sketch:**
+- Variant baseline: `claude-sonnet-4-6`, ephemeral, no OMC (current M.11 lock).
+- Variant parallel: `claude-sonnet-4-6` + OMC + explicit directive: "Fan out one `code-reviewer`, one `security-reviewer`, one `test-engineer` in parallel. Aggregate findings before writing verdict."
+- Reuse spike harness at `harness-ts/spikes/reviewer-spike/` — add a `--variant=parallel-specialists` mode.
+- Measurement: instrument tracker (tool_use name = `Agent`, input.subagent_type) to confirm specialists fire. Compare verdict accuracy, finding coverage, false-negative rate against baseline.
+
+**Acceptance criteria:**
+- At least 3 of 5 scenarios show specialist invocation count ≥ 2 when directive is explicit (validates forced-delegation pattern applies).
+- Verdict accuracy ≥ baseline (no regression) AND finding coverage strictly greater on ≥ 2 scenarios (net lift).
+- Cost ≤ $0.70/review (3x baseline ceiling; if higher, gate to high-risk tasks only).
+- Latency ≤ 180s (parallelism should keep latency close to baseline despite more agents).
+
+**Blockers:**
+- Reviewer tier itself not yet built (Wave A).
+- Build order: Wave A (Reviewer ephemeral baseline) → this spike as Wave A+ validation → lock parallel config (or discard).
+
+**Expected outcome:** Either
+- (a) Parallel specialists fire, lift finding quality → promote `parallel-specialists` to locked Reviewer config for high-risk tasks (mode: "reviewed" in task file), keep single-pass as default; OR
+- (b) Specialists still don't fire with explicit directive, or findings overlap with bare sonnet → keep M.13.4 locked config, close spike with null result.
+
+Track in plan Wave A completion criteria.
+
