@@ -6,7 +6,7 @@ updated: 2026-04-09
 _Full listing: `wiki_list` · Targeted lookup: `wiki_query`_
 
 ## Harness-TS (Active)
-- [Harness-TS Architecture](harness-ts-architecture.md) — 6-module orchestrator, SDK sessions, merge queue, 112 tests
+- [Harness-TS Architecture](harness-ts-architecture.md) — orchestrator, SDK sessions, merge queue, three-tier project lifecycle scaffolding, Discord outbound. 373 tests (Phase 2A + three-tier Waves 1 / 1.5 / 1.75 item 9 / 2 landed 2026-04-24)
 - [Ambiguity Protections](harness-ts-ambiguity-protections.md) — Prior art from Python harness, TS translation, dialogue agent design
 - [Graduated Response Model](harness-ts-graduated-response.md) — Signal-driven escalation levels, structured confidence, dialogue agent
 

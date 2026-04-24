@@ -245,19 +245,31 @@ Items that must be resolved before or alongside Phase 2B Discord integration:
 
 | # | Severity | Finding | Status | Resolution |
 |---|----------|---------|--------|------------|
-| 1 | CRITICAL | `settingSources: ["project"]` doesn't load OMC plugins (user-level `enabledPlugins`) | **OPEN** | Option C recommended: use SDK `Options.settings` with inline `enabledPlugins: { "oh-my-claudecode@omc": true, "caveman@caveman": true }` at flag layer. Both plugins intentional — OMC for orchestration, caveman for cost control + accuracy. Option B fallback: register in project `.claude/settings.json`. Option A (`["user","project"]`) rejected — leaks `model: "opus"`, env vars, statusLine. |
-| 2 | CRITICAL | No hard budget kill | **FIXED** (Wave 5) | `max_budget_usd` wired to SDK `maxBudgetUsd`. Budget exhaustion (`error_max_budget_usd`) short-circuits to permanent failure, never retries. |
-| 3 | HIGH | Persistent-mode hook fights abortController | **MITIGATED** | Currently safe: `settingSources: ["project"]` excludes user settings → OMC plugin not loaded → hook never registers. Fragile if #1 is resolved by loading OMC. Fix when implementing #1: pass `hooks: {}` in SDK Options to prevent filesystem-discovered hooks, or selectively exclude `persistent-mode.cjs`. |
-| 4 | HIGH | Crash path doesn't clean up worktrees | **FIXED** (Wave 5) | `cleanupWorktree()` added to `merge_result: "error"` case and catch block. `recoverFromCrash()` now cleans up `failed`-state worktrees. |
-| 5 | MEDIUM | Cron/remote triggers escape lifecycle | **OPEN** | Block `CronCreate`, `CronDelete`, `CronList`, `RemoteTrigger`, `ScheduleWakeup` via `disallowedTools`. These create resources that outlive sessions with no cleanup path. |
-| 6 | MEDIUM | `/team` spawns tmux panes outside SDK lifecycle | **OPEN — by design** | User wants agents to use `/team`. Mitigation: add tmux cleanup to `cleanupWorktree()` (`tmux kill-session -t "*task-{id}*"`). Add cleanup sweep to `shutdown()`/`abortAll()`. |
+| 1 | CRITICAL | `settingSources: ["project"]` doesn't load OMC plugins (user-level `enabledPlugins`) | **FIXED** (three-tier Wave 1, 2026-04-24) | Option C shipped: `Options.settings.enabledPlugins = { "oh-my-claudecode@omc": true, "caveman@caveman": true }` applied at SessionManager layer (default) with per-config override. Empirically validated by 4 live SDK runs. |
+| 2 | CRITICAL | No hard budget kill | **FIXED** (Phase 2A Wave 5) | `max_budget_usd` wired to SDK `maxBudgetUsd`. Budget exhaustion (`error_max_budget_usd`) short-circuits to permanent failure, never retries. |
+| 3 | HIGH | Persistent-mode hook fights abortController | **FIXED** (three-tier Wave 1, 2026-04-24) | `hooks: {}` now passed explicitly on every SDK Options to block filesystem-discovered hook registration. |
+| 4 | HIGH | Crash path doesn't clean up worktrees | **FIXED** (Phase 2A Wave 5) | `cleanupWorktree()` added to `merge_result: "error"` case and catch block. `recoverFromCrash()` now cleans up `failed`-state worktrees. |
+| 5 | MEDIUM | Cron/remote triggers escape lifecycle | **FIXED** (three-tier Wave 1, 2026-04-24) | `DEFAULT_DISALLOWED_TOOLS` blocks `CronCreate`, `CronDelete`, `CronList`, `RemoteTrigger`, `ScheduleWakeup` at the SessionManager layer; config-specified additions merge on top. |
+| 6 | MEDIUM | `/team` spawns tmux panes outside SDK lifecycle | **FIXED** (three-tier Wave 1, 2026-04-24) | `TmuxOps.killSessionsByPattern('task-{id}*')` invoked on `cleanupWorktree` and in `abortAll` sweep. Failures swallowed so git cleanup always runs. |
 | 7 | LOW | No concurrent agent race conditions | **CONFIRMED OK** | Worktree isolation solid. Merge gate FIFO handles contention. `.omc/` exclusion prevents state leaking to trunk. |
 
 ---
 
-### Phase 2B: Discord Integration — NOT STARTED
+### Phase 2B: Discord Integration — PARTIAL (Wave 2 outbound complete)
 
-Depends: Phase 2A escalation protocol. Phase 2B pre-requisites #1, #3, #5, #6 should be resolved in Phase 2B Wave 1.
+Depends: Phase 2A escalation protocol. Phase 2B pre-requisites #1, #3, #5, #6 resolved in three-tier Wave 1 (2026-04-24). See `.omc/plans/ralplan-harness-ts-three-tier-architect.md` Wave 1 for details.
+
+**Status (2026-04-24):** Plan supersedes original Phase 2B layout. The three-tier Architect/Executor/Reviewer plan integrates Phase 2B into a revised wave sequence. Completed:
+- **Wave 1** (pre-reqs: OMC plugin loading, hook defense, cron/remote block, tmux cleanup) — committed `d96444f` + `b78a0f7` (+ `getTrunkBranch` fix).
+- **Wave 1.5** (state schema extensions + ProjectStore + TaskFile mode/projectId/phaseId + processTask decomposition) — commits `e274036` / `32b459d` / `be323ac` / `34e434c`. +31 tests.
+- **Wave 1.75 item 9** (concurrent-session smoke) — `920e02f`. Live test PASS.
+- **Wave 2** (Discord outbound: 13 new OrchestratorEvent variants + DiscordNotifier + WebhookSender + sanitize/redactSecrets defense) — commit `0fe90f4`. +45 tests. Multi-perspective review: architect/security/code-reviewer all APPROVE.
+
+**Pending:** Wave 3 (Discord inbound: `!task`, `!project`, NL routing, accumulator), Wave A (Reviewer gate), Wave B/B.5 (Architect lifecycle + smoke), Wave 4 (escalation routing), Wave C (arbitration), Wave 6-split (dialogue), Wave D (compaction handoff + e2e).
+
+**Test count progression:** 280 (Phase 2A) → 328 (Waves 1 + 1.5) → 373 (+ Wave 2).
+
+**Live validation to date:** 4 real-SDK runs against scratch repos (minimal, enriched, vague, concurrent) — all PASS. Wave 1 plugins + Phase 2A enrichment + Phase 2A graduated response routing + concurrent isolation all confirmed end-to-end. Total live cost ~$0.50.
 
 **Goal:** Operator can submit tasks, see pipeline events, and respond to escalation — all via Discord.
 
