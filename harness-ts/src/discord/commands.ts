@@ -23,7 +23,7 @@ import { randomUUID } from "node:crypto";
 import type { StateManager } from "../lib/state.js";
 import type { ProjectStore } from "../lib/project.js";
 import type { HarnessConfig } from "../lib/config.js";
-import type { OrchestratorEvent } from "../orchestrator.js";
+import type { Orchestrator, OrchestratorEvent } from "../orchestrator.js";
 import { sanitize, sanitizeTaskId } from "../lib/text.js";
 
 // --- Intent types ---
@@ -93,6 +93,13 @@ export interface CommandRouterDeps {
   projectStore?: ProjectStore;
   /** Optional event emit hook — if present, router fires project lifecycle events. */
   emit?: (event: OrchestratorEvent) => void;
+  /**
+   * Wave B: optional Orchestrator for `!project <name>` end-to-end declaration.
+   * When present, cmdProjectDeclare calls `orchestrator.declareProject(...)`
+   * which spawns the Architect + decomposes. When absent, falls back to the
+   * projectStore-only path (Wave 3 behavior: creates record, emits event).
+   */
+  orchestrator?: Orchestrator;
 }
 
 // --- Validation constants ---
@@ -150,6 +157,7 @@ export class CommandRouter {
   private readonly taskSink: TaskSink;
   private readonly projectStore?: ProjectStore;
   private readonly emit?: (event: OrchestratorEvent) => void;
+  private readonly orchestrator?: Orchestrator;
 
   constructor(deps: CommandRouterDeps) {
     this.state = deps.state;
@@ -159,6 +167,7 @@ export class CommandRouter {
     this.taskSink = deps.taskSink;
     this.projectStore = deps.projectStore;
     this.emit = deps.emit;
+    this.orchestrator = deps.orchestrator;
   }
 
   /** Handle a structured command (the leading `!` has already been stripped). */
@@ -273,7 +282,7 @@ export class CommandRouter {
     return `Response sent to \`${taskId}\`.`;
   }
 
-  private cmdProject(args: string): string {
+  private async cmdProject(args: string): Promise<string> {
     const trimmed = args.trim();
     if (!trimmed) return "Usage: `!project <name>\\n<description>\\nNON-GOALS:\\n- ...`";
 
@@ -290,7 +299,7 @@ export class CommandRouter {
     return this.cmdProjectDeclare(trimmed);
   }
 
-  private cmdProjectDeclare(body: string): string {
+  private async cmdProjectDeclare(body: string): Promise<string> {
     if (!this.projectStore) return "Project store not configured.";
     const firstNewline = body.indexOf("\n");
     if (firstNewline < 0) {
@@ -306,6 +315,18 @@ export class CommandRouter {
     if (nonGoals === null) {
       return "Missing required `NON-GOALS:` section. Add `NON-GOALS:` followed by one or more `- <item>` lines.";
     }
+
+    // Wave B: when orchestrator is wired, route through the full declare path
+    // (creates project + spawns Architect + fires decomposition). Fallback to
+    // projectStore-only is kept for Wave 3 tests that don't run the Architect.
+    if (this.orchestrator) {
+      const result = await this.orchestrator.declareProject(name, description, nonGoals);
+      if ("error" in result) {
+        return `Project declaration failed: ${sanitize(result.error, 200)}`;
+      }
+      return `Project \`${result.projectId}\` declared: **${sanitize(name, 80)}**. Architect spawned.`;
+    }
+
     const project = this.projectStore.createProject(name, description, nonGoals);
     this.emit?.({ type: "project_declared", projectId: project.id, name: project.name });
     return `Project \`${project.id}\` declared: **${sanitize(project.name, 80)}**.`;

@@ -16,6 +16,8 @@ import { readCheckpoints, type CheckpointSignal } from "./lib/checkpoint.js";
 import { evaluateResponseLevel, type ResponseLevel } from "./lib/response.js";
 import { sanitizeTaskId } from "./lib/text.js";
 import type { ReviewGate, ReviewResult } from "./gates/review.js";
+import type { ArchitectManager } from "./session/architect.js";
+import type { ProjectStore } from "./lib/project.js";
 
 // --- Task file schema ---
 
@@ -92,6 +94,10 @@ export interface OrchestratorDeps {
   /** Wave A: optional ReviewGate. When present, project tasks always go through review;
    *  standalone tasks go through review only when `shouldReview` returns true. */
   reviewGate?: ReviewGate;
+  /** Wave B: optional ArchitectManager. Required for project declaration + crash recovery. */
+  architectManager?: ArchitectManager;
+  /** Wave B: optional ProjectStore. Required alongside architectManager for declareProject. */
+  projectStore?: ProjectStore;
 }
 
 export type ArbitrationVerdict = "retry_with_directive" | "plan_amendment" | "escalate_operator";
@@ -135,6 +141,8 @@ export class Orchestrator {
   private readonly state: StateManager;
   private readonly config: HarnessConfig;
   private readonly reviewGate?: ReviewGate;
+  private readonly architectManager?: ArchitectManager;
+  private readonly projectStore?: ProjectStore;
   private running = false;
   private pollTimer?: ReturnType<typeof setTimeout>;
   private readonly eventListeners: ((event: OrchestratorEvent) => void)[] = [];
@@ -148,6 +156,8 @@ export class Orchestrator {
     this.state = deps.stateManager;
     this.config = deps.config;
     this.reviewGate = deps.reviewGate;
+    this.architectManager = deps.architectManager;
+    this.projectStore = deps.projectStore;
   }
 
   /** Register event listener */
@@ -673,6 +683,65 @@ export class Orchestrator {
   }
 
   /** Schedule a retry for a shelved task */
+  /**
+   * Wave B: declare a new project. Creates the project record, spawns the
+   * Architect session, and fires decomposition. On any failure emits
+   * `project_failed` and marks the project as failed. Caller gets a structured
+   * result rather than an exception.
+   */
+  async declareProject(
+    name: string,
+    description: string,
+    nonGoals: string[],
+  ): Promise<{ projectId: string; sessionId: string } | { error: string }> {
+    if (!this.architectManager || !this.projectStore) {
+      return { error: "ArchitectManager/ProjectStore not configured" };
+    }
+
+    const project = this.projectStore.createProject(name, description, nonGoals);
+    this.emit({ type: "project_declared", projectId: project.id, name: project.name });
+
+    const spawn = await this.architectManager.spawn(project.id, name, description, nonGoals);
+    if (spawn.status !== "success" || !spawn.sessionId) {
+      this.projectStore.failProject(project.id, spawn.error ?? "architect spawn failed");
+      this.emit({ type: "project_failed", projectId: project.id, reason: spawn.error ?? "architect spawn failed" });
+      return { error: spawn.error ?? "architect spawn failed" };
+    }
+    this.emit({ type: "architect_spawned", projectId: project.id, sessionId: spawn.sessionId });
+
+    const decomp = await this.architectManager.decompose(project.id);
+    if (decomp.status !== "success" || !decomp.phases) {
+      this.projectStore.failProject(project.id, decomp.error ?? "decompose failed");
+      this.emit({ type: "project_failed", projectId: project.id, reason: decomp.error ?? "decompose failed" });
+      return { error: decomp.error ?? "decompose failed" };
+    }
+    this.emit({ type: "project_decomposed", projectId: project.id, phaseCount: decomp.phases.length });
+
+    return { projectId: project.id, sessionId: spawn.sessionId };
+  }
+
+  /**
+   * Wave B: check each executing project's Architect liveness. If dead,
+   * respawn with `crash_recovery` reason + emit `architect_respawned`.
+   * Orchestrator calls this on every poll tick.
+   */
+  async checkArchitectHealth(): Promise<void> {
+    if (!this.architectManager || !this.projectStore) return;
+    for (const project of this.projectStore.getAllProjects()) {
+      if (project.state !== "decomposing" && project.state !== "executing") continue;
+      if (this.architectManager.isAlive(project.id)) continue;
+      const respawn = await this.architectManager.respawn(project.id, "crash_recovery");
+      if (respawn.status === "success" && respawn.sessionId) {
+        this.emit({
+          type: "architect_respawned",
+          projectId: project.id,
+          sessionId: respawn.sessionId,
+          reason: "crash_recovery",
+        });
+      }
+    }
+  }
+
   private scheduleRetry(taskId: string, delayMs: number): void {
     if (!this.running) return;
     setTimeout(() => {

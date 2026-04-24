@@ -9,6 +9,8 @@ import { MergeGate, type MergeGitOps } from "../src/gates/merge.js";
 import { StateManager, type TaskRecord } from "../src/lib/state.js";
 import type { HarnessConfig } from "../src/lib/config.js";
 import type { ReviewGate, ReviewResult, ReviewVerdict } from "../src/gates/review.js";
+import type { ArchitectManager } from "../src/session/architect.js";
+import { ProjectStore } from "../src/lib/project.js";
 import type { Query, SDKMessage, SDKResultSuccess } from "@anthropic-ai/claude-agent-sdk";
 
 // --- Test infrastructure ---
@@ -1420,5 +1422,171 @@ describe("Orchestrator — Wave A review gate + arbitration wiring", () => {
     await orch.processTask(state.getTask("t-warn-no")!);
     expect(consoleSpy).not.toHaveBeenCalled(); // no arbitration yet
     consoleSpy.mockRestore();
+  });
+});
+
+// --- Wave B: declareProject + Architect crash recovery ---
+
+function makeFakeArchitectManager(opts: {
+  spawnStatus?: "success" | "failure";
+  decomposeStatus?: "success" | "failure";
+  alive?: boolean;
+  respawnStatus?: "success" | "failure";
+} = {}): ArchitectManager {
+  return {
+    spawn: vi.fn().mockResolvedValue(
+      opts.spawnStatus === "failure"
+        ? { status: "failure", error: "spawn failed" }
+        : { status: "success", sessionId: "arch-sess-1" },
+    ),
+    respawn: vi.fn().mockResolvedValue(
+      opts.respawnStatus === "failure"
+        ? { status: "failure", error: "respawn failed" }
+        : { status: "success", sessionId: "arch-sess-2" },
+    ),
+    decompose: vi.fn().mockResolvedValue(
+      opts.decomposeStatus === "failure"
+        ? { status: "failure", error: "no phase files" }
+        : {
+            status: "success",
+            phases: [{ phaseId: "01", taskFilePath: "/tmp/x.json" }, { phaseId: "02", taskFilePath: "/tmp/y.json" }],
+          },
+    ),
+    isAlive: vi.fn().mockReturnValue(opts.alive ?? true),
+    getSession: vi.fn().mockReturnValue(undefined),
+    shutdown: vi.fn().mockResolvedValue(undefined),
+    shutdownAll: vi.fn().mockResolvedValue(undefined),
+    handleEscalation: vi.fn().mockResolvedValue({ type: "escalate_operator", rationale: "stub" }),
+    handleReviewArbitration: vi.fn().mockResolvedValue({ type: "escalate_operator", rationale: "stub" }),
+    compact: vi.fn().mockResolvedValue({ compacted: false, reason: "stub" }),
+    requestSummary: vi.fn().mockResolvedValue({}),
+    relayOperatorInput: vi.fn().mockResolvedValue(undefined),
+    shouldCompact: vi.fn().mockReturnValue(false),
+  } as unknown as ArchitectManager;
+}
+
+describe("Orchestrator — Wave B declareProject + Architect crash recovery", () => {
+  beforeEach(() => {
+    tmpDir = makeTmpDir();
+  });
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("declareProject happy path: project_declared + architect_spawned + project_decomposed", async () => {
+    const config = makeConfig();
+    mkdirSync(join(tmpDir, "tasks"), { recursive: true });
+    const state = new StateManager(join(tmpDir, "state.json"));
+    const projectStore = new ProjectStore(join(tmpDir, "projects.json"), join(tmpDir, "wt"));
+    const sessionMgr = new SessionManager(new SDKClient(vi.fn()), state, config, mockGitOps());
+    const mergeGate = new MergeGate(config.pipeline, tmpDir, mockMergeGitOps());
+    const architectManager = makeFakeArchitectManager();
+    const orch = new Orchestrator({
+      sessionManager: sessionMgr, mergeGate, stateManager: state, config, architectManager, projectStore,
+    });
+    const events: OrchestratorEvent[] = [];
+    orch.on((e) => events.push(e));
+
+    const result = await orch.declareProject("test-proj", "desc", ["no ui"]);
+    expect("projectId" in result).toBe(true);
+    expect(events.some((e) => e.type === "project_declared")).toBe(true);
+    expect(events.some((e) => e.type === "architect_spawned")).toBe(true);
+    const decomposed = events.find((e) => e.type === "project_decomposed");
+    expect(decomposed).toBeTruthy();
+    if (decomposed && decomposed.type === "project_decomposed") {
+      expect(decomposed.phaseCount).toBe(2);
+    }
+  });
+
+  it("declareProject returns {error} when architectManager is not configured", async () => {
+    const config = makeConfig();
+    mkdirSync(join(tmpDir, "tasks"), { recursive: true });
+    const state = new StateManager(join(tmpDir, "state.json"));
+    const sessionMgr = new SessionManager(new SDKClient(vi.fn()), state, config, mockGitOps());
+    const mergeGate = new MergeGate(config.pipeline, tmpDir, mockMergeGitOps());
+    const orch = new Orchestrator({ sessionManager: sessionMgr, mergeGate, stateManager: state, config });
+    const result = await orch.declareProject("x", "y", []);
+    expect("error" in result).toBe(true);
+  });
+
+  it("declareProject emits project_failed when spawn fails", async () => {
+    const config = makeConfig();
+    mkdirSync(join(tmpDir, "tasks"), { recursive: true });
+    const state = new StateManager(join(tmpDir, "state.json"));
+    const projectStore = new ProjectStore(join(tmpDir, "projects.json"), join(tmpDir, "wt"));
+    const sessionMgr = new SessionManager(new SDKClient(vi.fn()), state, config, mockGitOps());
+    const mergeGate = new MergeGate(config.pipeline, tmpDir, mockMergeGitOps());
+    const architectManager = makeFakeArchitectManager({ spawnStatus: "failure" });
+    const orch = new Orchestrator({
+      sessionManager: sessionMgr, mergeGate, stateManager: state, config, architectManager, projectStore,
+    });
+    const events: OrchestratorEvent[] = [];
+    orch.on((e) => events.push(e));
+    const result = await orch.declareProject("proj", "d", []);
+    expect("error" in result).toBe(true);
+    expect(events.some((e) => e.type === "project_failed")).toBe(true);
+  });
+
+  it("declareProject emits project_failed when decompose fails", async () => {
+    const config = makeConfig();
+    mkdirSync(join(tmpDir, "tasks"), { recursive: true });
+    const state = new StateManager(join(tmpDir, "state.json"));
+    const projectStore = new ProjectStore(join(tmpDir, "projects.json"), join(tmpDir, "wt"));
+    const sessionMgr = new SessionManager(new SDKClient(vi.fn()), state, config, mockGitOps());
+    const mergeGate = new MergeGate(config.pipeline, tmpDir, mockMergeGitOps());
+    const architectManager = makeFakeArchitectManager({ decomposeStatus: "failure" });
+    const orch = new Orchestrator({
+      sessionManager: sessionMgr, mergeGate, stateManager: state, config, architectManager, projectStore,
+    });
+    const events: OrchestratorEvent[] = [];
+    orch.on((e) => events.push(e));
+    const result = await orch.declareProject("proj", "d", []);
+    expect("error" in result).toBe(true);
+    const failed = events.find((e) => e.type === "project_failed");
+    expect(failed).toBeTruthy();
+    if (failed && failed.type === "project_failed") expect(failed.reason).toMatch(/no phase files|decompose/i);
+  });
+
+  it("checkArchitectHealth respawns dead Architect + emits architect_respawned", async () => {
+    const config = makeConfig();
+    mkdirSync(join(tmpDir, "tasks"), { recursive: true });
+    const state = new StateManager(join(tmpDir, "state.json"));
+    const projectStore = new ProjectStore(join(tmpDir, "projects.json"), join(tmpDir, "wt"));
+    projectStore.createProject("stuck", "d", []);
+    const sessionMgr = new SessionManager(new SDKClient(vi.fn()), state, config, mockGitOps());
+    const mergeGate = new MergeGate(config.pipeline, tmpDir, mockMergeGitOps());
+    // Architect isAlive returns false → triggers respawn
+    const architectManager = makeFakeArchitectManager({ alive: false });
+    const orch = new Orchestrator({
+      sessionManager: sessionMgr, mergeGate, stateManager: state, config, architectManager, projectStore,
+    });
+    const events: OrchestratorEvent[] = [];
+    orch.on((e) => events.push(e));
+    await orch.checkArchitectHealth();
+    expect((architectManager.respawn as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(
+      expect.any(String),
+      "crash_recovery",
+    );
+    const respawned = events.find((e) => e.type === "architect_respawned");
+    expect(respawned).toBeTruthy();
+    if (respawned && respawned.type === "architect_respawned") {
+      expect(respawned.reason).toBe("crash_recovery");
+    }
+  });
+
+  it("checkArchitectHealth skips healthy Architect", async () => {
+    const config = makeConfig();
+    mkdirSync(join(tmpDir, "tasks"), { recursive: true });
+    const state = new StateManager(join(tmpDir, "state.json"));
+    const projectStore = new ProjectStore(join(tmpDir, "projects.json"), join(tmpDir, "wt"));
+    projectStore.createProject("healthy", "d", []);
+    const sessionMgr = new SessionManager(new SDKClient(vi.fn()), state, config, mockGitOps());
+    const mergeGate = new MergeGate(config.pipeline, tmpDir, mockMergeGitOps());
+    const architectManager = makeFakeArchitectManager({ alive: true });
+    const orch = new Orchestrator({
+      sessionManager: sessionMgr, mergeGate, stateManager: state, config, architectManager, projectStore,
+    });
+    await orch.checkArchitectHealth();
+    expect((architectManager.respawn as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
   });
 });
