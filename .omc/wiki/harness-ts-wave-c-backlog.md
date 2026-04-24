@@ -27,35 +27,40 @@ Live end-to-end project run (commit `8e11a3b`, `scripts/live-project.ts`) passed
 | U3 | Executor enrichment default (`DEFAULT_EXECUTOR_SYSTEM_PROMPT`) | *this ralph session* | +2 tests; SessionManager falls through to enriched prompt when `config.systemPrompt` unset |
 | U4 | persistSession accumulation observability | *this ralph session* | `persistentSessionCount` accessor + `persistent_session_warn_threshold` config + 3 tests |
 
-Cumulative test count: 484 → **500** (+16). Live-run cost this turn: `$0.75` (3-phase stress).
+Cumulative test count: 484 → **500** (+16). Live-run cost this turn: `$0.75` (3-phase stress) + `$1.221` (spikes 4 + 5).
+
+### 4. Caveman × structured JSON on Executor — ✅ PASS (100%)
+
+**Result:** 5 Executor runs through `scripts/spike-caveman-json.ts`, each with a distinct trivial file-creation task, caveman + OMC both enabled per production defaults. Every run wrote a complete completion.json.
+
+| runs | top fields (8) | confidence subfields (5) | overall |
+|------|----------------|--------------------------|---------|
+| 5    | 40/40 (100%)   | 25/25 (100%)             | 65/65 (**100%**) |
+
+Total cost: `$0.607`. Wall range: 23–36s per run.
+
+**Decision:** Caveman safe on Executor structured-JSON contract. No change to `DEFAULT_PLUGINS`. The M.11.5 Reviewer finding does not reproduce at the Executor tier — likely because the enriched prompt fences the schema in a code block that caveman preserves verbatim.
+
+Spike script: `scripts/spike-caveman-json.ts`.
+
+### 5. OMC plugin dead-weight on Executor — ✅ threshold FAIL (3.8% < 20%) — keep OMC
+
+**Result:** 6 Executor runs via `scripts/spike-omc-overhead.ts` (3 with `oh-my-claudecode@omc: true`, 3 with `false`, interleaved to spread cache warming). Caveman kept on for both arms.
+
+| arm     | wall median | cost median | preservation |
+|---------|-------------|-------------|--------------|
+| OMC ON  | 25891 ms    | $0.119      | 100% (39/39) |
+| OMC OFF | 24899 ms    | $0.070      | 100% (39/39) |
+
+Wall reduction (OFF vs ON): **3.8%** — far below the 20% threshold. Total spend: `$0.614`.
+
+**Decision:** KEEP OMC in Executor defaults. Init-overhead savings are negligible; the hypothesis that "OMC loading dominates Executor cold-start" does not hold at the wall-clock level.
+
+**Secondary observation (not a formal threshold):** OMC-OFF token cost ran ~42% lower ($0.070 vs $0.119 median). Sample size is small (3 per arm), and the OFF runs' $0.070 may reflect a cache hit on the smaller plugin surface. Worth re-measuring if per-phase spend becomes a constraint; not urgent while per-phase budget is 9× over-provisioned (U5 territory).
+
+Spike script: `scripts/spike-omc-overhead.ts`.
 
 ## 🔓 Remaining items
-
-### 4. Caveman × structured JSON on Executor (live spike, ~`$1`)
-
-Risk: Reviewer spike M.11.5 showed caveman corrupting structured verdict JSON. Executor writes `completion.json` with the same shape — same risk surface. First two live runs (minimal + enriched + 3-phase) were clean, but sample size is small.
-
-**Observable acceptance threshold:** ≥ 95% field-preservation across 5 independent Executor runs against a strict-JSON completion contract. Count every top-level schema field (`status`, `commitSha`, `summary`, `filesChanged`, `understanding`, `assumptions`, `nonGoals`, `confidence`) + every `confidence.*` sub-field. Below 95% → drop caveman from Executor defaults and fall back to the validated enriched prompt alone.
-
-**Spike execution plan:**
-- Proposed path: `scripts/spike-caveman-json.ts`
-- Shape: 5 parallel invocations of `live-run.ts --mode enriched` equivalents, each using a slightly different trivial task prompt to prevent prompt caching from skewing results. Record each completion.json and diff against the schema.
-- Budget ceiling: `$1` total. Per-run orchestrator cap: `$0.25`.
-- One-command invocation: `npx tsx scripts/spike-caveman-json.ts` (script will stream pass/fail per run and print the 8-field preservation ratio).
-- Decision output: committed as a new section in `ralplan-harness-ts-three-tier-architect.md` M.15.x.
-
-### 5. OMC plugin dead-weight on Executor (live spike, informed by #4)
-
-Per M.13.3, single-mode Executors don't invoke OMC specialists unprompted. Loading OMC adds init overhead for no benefit. The 3-phase live run corroborated: Executor never delegated.
-
-**Observable acceptance threshold:** ≥ 20% init-overhead reduction on Executor cold-start wall-time when OMC plugin disabled, with zero regression on completion compliance. Keep OMC for Architect (decomposer, M.12 validated) and future parallel-Reviewer (M.14).
-
-**Spike execution plan:**
-- Proposed path: `scripts/spike-omc-overhead.ts`
-- Shape: 3 Executor runs with `plugins: { "oh-my-claudecode@omc": false }` against the same trivial task; 3 runs with OMC enabled; measure wall-clock from spawn → first completion.json write. Compare medians.
-- Budget ceiling: `$0.50` total (runs are cheap without OMC init + Haiku-equivalent Sonnet).
-- One-command invocation: `npx tsx scripts/spike-omc-overhead.ts`.
-- Decision output: if threshold met, flip `DEFAULT_PLUGINS["oh-my-claudecode@omc"]` to `false` in `src/session/manager.ts` for Executor; operators override via `config.pipeline.plugins`.
 
 ### U5 — Budget tuning (deferred to Wave D)
 
@@ -68,11 +73,16 @@ SessionManager + ReviewGate + ArchitectManager all hand-assemble `SessionConfig`
 ## Session summary (rolling)
 
 - First-session commits: 32 (Waves 1 / 1.5 / 1.75 item 9 / 2 / 3 / A / B).
-- This ralph session: Wave C hardening + U3 + U4.
-- Test count: 280 → 484 (session 1) → **500** (session 2, +16 this turn).
-- Live runs: 6 total, all PASS.
-- Real bugs found: 2 (both closed this turn).
-- Cumulative live-run API cost across both sessions: ~`$1.95`.
+- This session: Wave C hardening + U3 + U4 + spikes 4 + 5.
+- Test count: 280 → 484 (session 1) → **500** (session 2).
+- Live runs: 17 total (6 prior + 5 spike-4 + 6 spike-5), all PASS on compliance.
+- Real bugs found: 2 (both closed).
+- Cumulative live-run API cost across both sessions: ~`$3.17` ($1.95 prior + $1.22 spikes).
+
+## Spike decisions (Wave C design lock)
+
+- Caveman stays in Executor defaults (100% field preservation).
+- OMC stays in Executor defaults (wall reduction 3.8% — below 20% threshold). Token-cost side signal (~42% cheaper without OMC) logged for possible re-measurement under Wave D budget tuning.
 
 ## Plan references
 
