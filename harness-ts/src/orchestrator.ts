@@ -713,8 +713,11 @@ export class Orchestrator {
           lastDirective: verdict.directive,
           reviewerRejectionCount: 0,
         });
-        this.state.transition(task.id, "active");
         this.sessions.cleanupWorktree(task.id);
+        // shelved → pending → processTask (scheduleRetry contract). The
+        // transition must run AFTER worktree cleanup so recovery paths do
+        // not resurface the stale worktree.
+        this.state.transition(task.id, "shelved");
         this.scheduleRetry(task.id, this.config.pipeline.retry_delay_ms);
         break;
       }
@@ -727,8 +730,8 @@ export class Orchestrator {
           prompt: verdict.updatedPhaseSpec,
           reviewerRejectionCount: 0,
         });
-        this.state.transition(task.id, "active");
         this.sessions.cleanupWorktree(task.id);
+        this.state.transition(task.id, "shelved");
         this.scheduleRetry(task.id, this.config.pipeline.retry_delay_ms);
         break;
       }

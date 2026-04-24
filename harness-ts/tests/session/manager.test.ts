@@ -263,6 +263,35 @@ describe("SessionManager", () => {
       );
     });
 
+    it("prepends task.lastDirective to the SDK prompt when set (P1 retry path)", async () => {
+      const queryFn: QueryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const config = makeConfig();
+      const mgr = new SessionManager(sdk, state, config, mockGitOps());
+      const task = state.createTask("do the thing", "task-dir");
+      state.updateTask(task.id, { lastDirective: "avoid global mutation" });
+      await mgr.spawnTask(state.getTask(task.id)!);
+
+      const promptSent = (queryFn as ReturnType<typeof vi.fn>).mock.calls[0][0].prompt as string;
+      expect(promptSent).toMatch(/Architect directive \(from prior arbitration\)/);
+      expect(promptSent).toMatch(/avoid global mutation/);
+      // Original task prompt must still be present.
+      expect(promptSent).toMatch(/do the thing/);
+    });
+
+    it("omits directive block when task.lastDirective is unset", async () => {
+      const queryFn: QueryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const config = makeConfig();
+      const mgr = new SessionManager(sdk, state, config, mockGitOps());
+      const task = state.createTask("pristine", "task-no-dir");
+      await mgr.spawnTask(task);
+      const promptSent = (queryFn as ReturnType<typeof vi.fn>).mock.calls[0][0].prompt as string;
+      expect(promptSent).toBe("pristine");
+    });
+
     it("falls back to DEFAULT_EXECUTOR_SYSTEM_PROMPT when config.systemPrompt is unset (U3)", async () => {
       const queryFn: QueryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
       const sdk = new SDKClient(queryFn);

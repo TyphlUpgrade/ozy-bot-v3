@@ -308,9 +308,15 @@ export class SessionManager {
     const configPlugins = this.config.pipeline.plugins ?? {};
     const enabledPlugins = { ...DEFAULT_PLUGINS, ...configPlugins };
 
+    // P1: prepend Architect retry directive (if any) so the Executor sees
+    // the arbitration guidance on the next attempt.
+    const promptWithDirective = task.lastDirective
+      ? `# Architect directive (from prior arbitration)\n\n${task.lastDirective}\n\n---\n\n${task.prompt}`
+      : task.prompt;
+
     // Spawn SDK session
     const sessionConfig: SessionConfig = {
-      prompt: task.prompt,
+      prompt: promptWithDirective,
       cwd: worktreePath,
       settingSources: ["project"],
       permissionMode: "bypassPermissions",

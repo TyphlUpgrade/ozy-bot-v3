@@ -36,12 +36,15 @@ const VALID_TRANSITIONS: Record<TaskState, readonly TaskState[]> = {
   done: [],
   failed: ["pending"], // can retry
   shelved: ["pending", "active", "failed"],
-  escalation_wait: ["active", "failed"],
+  // P1 Architect verdict path: escalation_wait → shelved lets scheduleRetry
+  // unshelve and re-process the task after the Architect issues a verdict.
+  escalation_wait: ["active", "failed", "shelved"],
   paused: ["active", "failed"],
   // review_arbitration exit edges mirror reviewing's non-terminal destinations:
-  // back to active (retry_with_directive), merging (arbitration override — gated by C.3),
-  // failed (plan_amendment cancels current task), or escalation_wait (cap reached).
-  review_arbitration: ["active", "merging", "failed", "escalation_wait"],
+  // back to active (retry_with_directive via shelved queue), merging (arbitration
+  // override — gated by C.3), failed (plan_amendment cancels current task),
+  // escalation_wait (cap reached), or shelved (P1 retry path).
+  review_arbitration: ["active", "merging", "failed", "escalation_wait", "shelved"],
 };
 
 // --- Task Record ---

@@ -1552,7 +1552,7 @@ describe("Orchestrator — P1-B arbitration verdict routing", () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("retry_with_directive: stores directive, resets reviewerRejectionCount, transitions active, schedules retry", async () => {
+  it("retry_with_directive: stores directive, resets reviewerRejectionCount, shelves for retry", async () => {
     const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 1 });
     const architectManager = makeFakeArchitectManager({
       reviewVerdict: { type: "retry_with_directive", directive: "wrap iteration in null-check" },
@@ -1566,7 +1566,8 @@ describe("Orchestrator — P1-B arbitration verdict routing", () => {
     const updated = state.getTask("t-rd")!;
     expect(updated.lastDirective).toBe("wrap iteration in null-check");
     expect(updated.reviewerRejectionCount).toBe(0);
-    expect(updated.state).toBe("active");
+    // Task is shelved waiting for scheduleRetry tick → pending → processTask.
+    expect(updated.state).toBe("shelved");
     // arbitration_verdict event carries the directive as rationale
     const verdictEv = events.find((e) => e.type === "arbitration_verdict");
     expect(verdictEv).toBeTruthy();
@@ -1609,7 +1610,7 @@ describe("Orchestrator — P1-B arbitration verdict routing", () => {
     const updated = state.getTask("t-pa")!;
     expect(updated.prompt).toBe("NEW SPEC: handle both list and single input");
     expect(updated.reviewerRejectionCount).toBe(0);
-    expect(updated.state).toBe("active");
+    expect(updated.state).toBe("shelved");
     const verdictEv = events.find((e) => e.type === "arbitration_verdict");
     expect(verdictEv && verdictEv.type === "arbitration_verdict" && verdictEv.verdict).toBe("plan_amendment");
   });
@@ -1720,7 +1721,7 @@ describe("Orchestrator — P1-B arbitration verdict routing", () => {
     state.updateTask("t-nops", { projectId: "proj", phaseId: "ph" });
     await orch.processTask(state.getTask("t-nops")!);
     expect(state.getTask("t-nops")!.prompt).toBe("alt spec");
-    expect(state.getTask("t-nops")!.state).toBe("active");
+    expect(state.getTask("t-nops")!.state).toBe("shelved");
   });
 });
 
