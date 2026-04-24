@@ -45,3 +45,21 @@ export function sanitize(raw: string, maxLen: number = MAX_FIELD_LEN): string {
   if (stripped.length <= maxLen) return stripped;
   return `${stripped.slice(0, maxLen)}…`;
 }
+
+const RATIONALE_MAX_LEN = 1024;
+// ESC + CSI / OSC + control chars we never want embedded in operator-facing
+// reasons. Keeps \n and \t — those are legitimately useful in multi-line text.
+// eslint-disable-next-line no-control-regex
+const CONTROL_RE = /\x1b\[[0-9;]*[A-Za-z]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
+
+/**
+ * Cap + strip hostile characters from an Architect-supplied rationale before
+ * embedding in task.lastError / task_failed.reason / project_failed.reason.
+ * The Architect is trusted, but its output can still contain model-generated
+ * control chars or ANSI escapes that would corrupt Discord / TTY output.
+ */
+export function truncateRationale(raw: string, maxLen: number = RATIONALE_MAX_LEN): string {
+  const stripped = raw.replace(CONTROL_RE, "");
+  if (stripped.length <= maxLen) return stripped;
+  return `${stripped.slice(0, maxLen)}…`;
+}

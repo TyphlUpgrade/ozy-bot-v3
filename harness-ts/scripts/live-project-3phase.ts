@@ -16,16 +16,8 @@
  * Usage: npx tsx scripts/live-project-3phase.ts
  */
 
-import {
-  mkdirSync,
-  writeFileSync,
-  readFileSync,
-  existsSync,
-  copyFileSync,
-} from "node:fs";
-import { join, dirname } from "node:path";
-import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import { execSync } from "node:child_process";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { Orchestrator, type OrchestratorEvent } from "../src/orchestrator.js";
@@ -39,31 +31,14 @@ import { ArchitectManager } from "../src/session/architect.js";
 import { DiscordNotifier } from "../src/discord/notifier.js";
 import type { DiscordSender, AgentIdentity } from "../src/discord/types.js";
 import type { HarnessConfig } from "../src/lib/config.js";
-
-const __filename = fileURLToPath(import.meta.url);
-const HARNESS_ROOT = dirname(dirname(__filename));
-
-function initScratchRepo(): string {
-  const root = join(tmpdir(), `harness-3phase-${Date.now()}`);
-  mkdirSync(root, { recursive: true });
-  mkdirSync(join(root, "tasks"), { recursive: true });
-  mkdirSync(join(root, "worktrees"), { recursive: true });
-  mkdirSync(join(root, "sessions"), { recursive: true });
-  mkdirSync(join(root, "config", "harness"), { recursive: true });
-  for (const promptFile of ["architect-prompt.md", "review-prompt.md"]) {
-    copyFileSync(
-      join(HARNESS_ROOT, "config", "harness", promptFile),
-      join(root, "config", "harness", promptFile),
-    );
-  }
-  execSync("git init -b main", { cwd: root, stdio: "ignore" });
-  execSync("git config user.email 3phase@harness.test", { cwd: root, stdio: "ignore" });
-  execSync("git config user.name 3phase", { cwd: root, stdio: "ignore" });
-  writeFileSync(join(root, "README.md"), "# scratch 3-phase project\n");
-  writeFileSync(join(root, ".gitignore"), "tasks/\nworktrees/\nsessions/\nstate.json\nprojects.json\nstate.log.jsonl\n");
-  execSync("git add -A && git commit -m init", { cwd: root, stdio: "ignore" });
-  return root;
-}
+import {
+  initScratchRepo,
+  buildBaseConfig,
+  installSigintHandler,
+  isProjectTerminal,
+  DEFAULT_POLL_LOOP_MS,
+  DEFAULT_RUN_TIMEOUT_MS,
+} from "./lib/scratch-repo.js";
 
 const EXECUTOR_PROMPT = `You are an Executor in a harness-managed git worktree.
 
@@ -82,43 +57,10 @@ The completion file is how the orchestrator knows you are done. If you do not wr
 `;
 
 function buildConfig(root: string): HarnessConfig {
-  return {
-    project: {
-      name: "3phase-project",
-      root,
-      task_dir: join(root, "tasks"),
-      state_file: join(root, "state.json"),
-      worktree_base: join(root, "worktrees"),
-      session_dir: join(root, "sessions"),
-    },
-    pipeline: {
-      poll_interval: 3,
-      test_command: "true",
-      max_retries: 1,
-      test_timeout: 120,
-      escalation_timeout: 600,
-      retry_delay_ms: 5_000,
-      max_session_retries: 1,
-      max_budget_usd: 1.0,
-      auto_escalate_on_max_retries: false,
-      max_tier1_escalations: 1,
-    },
-    discord: {
-      bot_token_env: "UNUSED",
-      dev_channel: "dev",
-      ops_channel: "ops",
-      escalation_channel: "esc",
-      agents: {
-        orchestrator: { name: "Harness", avatar_url: "" },
-        architect: { name: "Architect", avatar_url: "" },
-        reviewer: { name: "Reviewer", avatar_url: "" },
-      },
-    },
-    reviewer: {
-      max_budget_usd: 1.0,
-      timeout_ms: 180_000,
-      arbitration_threshold: 2,
-    },
+  return buildBaseConfig({
+    root,
+    projectName: "3phase-project",
+    reviewer: { max_budget_usd: 1.0, timeout_ms: 180_000, arbitration_threshold: 2 },
     architect: {
       max_budget_usd: 6.0,
       compaction_threshold_pct: 0.9,
@@ -126,11 +68,16 @@ function buildConfig(root: string): HarnessConfig {
       prompt_path: join(root, "config", "harness", "architect-prompt.md"),
     },
     systemPrompt: EXECUTOR_PROMPT,
-  };
+  });
 }
 
 async function main(): Promise<void> {
-  const root = initScratchRepo();
+  const root = initScratchRepo({
+    prefix: "harness-3phase",
+    gitEmail: "3phase@harness.test",
+    gitName: "3phase",
+    promptFiles: ["architect-prompt.md", "review-prompt.md"],
+  });
   console.log(`[3phase] scratch root: ${root}`);
 
   const config = buildConfig(root);
@@ -181,6 +128,11 @@ async function main(): Promise<void> {
   });
   orch.on((ev) => notifier.handleEvent(ev));
 
+  installSigintHandler([
+    { shutdown: () => orch.shutdown() },
+    { shutdown: () => architectManager.shutdownAll() },
+  ]);
+
   const startedAt = Date.now();
   console.log(`[3phase] declaring project...`);
   const result = await orch.declareProject(
@@ -210,19 +162,16 @@ async function main(): Promise<void> {
 
   orch.start();
 
-  const TIMEOUT_MS = 30 * 60 * 1000;
   const isDone = (): boolean => {
     const tasks = state.getAllTasks();
     if (tasks.length === 0) return false;
     const project = projectStore.getProject(result.projectId);
-    if (project && (project.state === "completed" || project.state === "failed" || project.state === "aborted")) {
-      return true;
-    }
+    if (isProjectTerminal(project?.state)) return true;
     return tasks.length >= 3 && tasks.every((t) => t.state === "done" || t.state === "failed");
   };
 
-  while (!isDone() && Date.now() - startedAt < TIMEOUT_MS) {
-    await new Promise((r) => setTimeout(r, 2000));
+  while (!isDone() && Date.now() - startedAt < DEFAULT_RUN_TIMEOUT_MS) {
+    await new Promise((r) => setTimeout(r, DEFAULT_POLL_LOOP_MS));
   }
 
   await orch.shutdown();

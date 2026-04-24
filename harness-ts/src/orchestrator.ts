@@ -14,7 +14,7 @@ import type { HarnessConfig } from "./lib/config.js";
 import { readEscalation, type EscalationSignal } from "./lib/escalation.js";
 import { readCheckpoints, type CheckpointSignal } from "./lib/checkpoint.js";
 import { evaluateResponseLevel, type ResponseLevel } from "./lib/response.js";
-import { sanitizeTaskId } from "./lib/text.js";
+import { sanitizeTaskId, truncateRationale } from "./lib/text.js";
 import type { ReviewGate, ReviewResult } from "./gates/review.js";
 import type { ArchitectManager, ArchitectVerdict } from "./session/architect.js";
 import type { ProjectStore } from "./lib/project.js";
@@ -714,32 +714,60 @@ export class Orchestrator {
         break;
       }
       case "escalate_operator": {
+        const safeRationale = truncateRationale(verdict.rationale);
         this.state.transition(task.id, "failed");
         this.state.updateTask(task.id, {
-          lastError: `architect_escalate_operator: ${verdict.rationale}`,
+          lastError: `architect_escalate_operator: ${safeRationale}`,
         });
         this.emit({
           type: "task_failed",
           taskId: task.id,
-          reason: `architect escalation: ${verdict.rationale}`,
+          reason: `architect escalation: ${safeRationale}`,
         });
         this.sessions.cleanupWorktree(task.id);
-        // Cascade to project: mark the phase failed; if it was the last active
-        // phase, fail the project so orchestrator loops terminate. Multi-phase
-        // projects with other active phases stay open.
-        if (task.projectId && task.phaseId && this.projectStore) {
-          this.projectStore.markPhaseFailed(task.projectId, task.phaseId, verdict.rationale);
-          if (!this.projectStore.hasActivePhases(task.projectId)) {
-            this.projectStore.failProject(task.projectId, `architect_escalate_operator: ${verdict.rationale}`);
-            this.emit({
-              type: "project_failed",
-              projectId: task.projectId,
-              reason: `architect escalation: ${verdict.rationale}`,
-            });
-          }
-        }
+        this.cascadePhaseOutcome(task, "failed", safeRationale);
         break;
       }
+    }
+  }
+
+  /**
+   * Cascade a phase's terminal outcome into the project record. Marks the
+   * phase done/failed; if no active phases remain, finalizes the project
+   * and emits the matching project-level event. No-op for standalone tasks
+   * or when projectStore is not injected.
+   */
+  private cascadePhaseOutcome(
+    task: TaskRecord,
+    outcome: "done" | "failed",
+    rationale?: string,
+  ): void {
+    if (!task.projectId || !task.phaseId || !this.projectStore) return;
+    const store = this.projectStore;
+    if (outcome === "done") {
+      store.markPhaseDone(task.projectId, task.phaseId);
+    } else {
+      store.markPhaseFailed(task.projectId, task.phaseId, rationale ?? "");
+    }
+    if (store.hasActivePhases(task.projectId)) return;
+    const project = store.getProject(task.projectId);
+    if (!project) return;
+    if (outcome === "done") {
+      store.completeProject(task.projectId);
+      this.emit({
+        type: "project_completed",
+        projectId: task.projectId,
+        phaseCount: project.phases.length,
+        totalCostUsd: project.totalCostUsd,
+      });
+    } else {
+      const reason = rationale ?? "";
+      store.failProject(task.projectId, `architect_escalate_operator: ${reason}`);
+      this.emit({
+        type: "project_failed",
+        projectId: task.projectId,
+        reason: `architect escalation: ${reason}`,
+      });
     }
   }
 
@@ -758,21 +786,7 @@ export class Orchestrator {
         });
         this.emit({ type: "task_done", taskId: task.id });
         this.sessions.cleanupWorktree(task.id);
-        if (task.projectId && task.phaseId && this.projectStore) {
-          this.projectStore.markPhaseDone(task.projectId, task.phaseId);
-          if (!this.projectStore.hasActivePhases(task.projectId)) {
-            const project = this.projectStore.getProject(task.projectId);
-            if (project) {
-              this.projectStore.completeProject(task.projectId);
-              this.emit({
-                type: "project_completed",
-                projectId: task.projectId,
-                phaseCount: project.phases.length,
-                totalCostUsd: project.totalCostUsd,
-              });
-            }
-          }
-        }
+        this.cascadePhaseOutcome(task, "done");
         break;
 
       case "rebase_conflict": {

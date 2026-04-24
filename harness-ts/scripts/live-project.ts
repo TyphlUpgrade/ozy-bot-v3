@@ -20,16 +20,8 @@
  * any session that overruns.
  */
 
-import {
-  mkdirSync,
-  writeFileSync,
-  readFileSync,
-  existsSync,
-  copyFileSync,
-} from "node:fs";
-import { join, dirname } from "node:path";
-import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import { execSync } from "node:child_process";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { Orchestrator, type OrchestratorEvent } from "../src/orchestrator.js";
@@ -43,74 +35,19 @@ import { ArchitectManager } from "../src/session/architect.js";
 import { DiscordNotifier } from "../src/discord/notifier.js";
 import type { DiscordSender, AgentIdentity } from "../src/discord/types.js";
 import type { HarnessConfig } from "../src/lib/config.js";
-
-const __filename = fileURLToPath(import.meta.url);
-const HARNESS_ROOT = dirname(dirname(__filename));
-
-// ---------- Scratch repo bootstrap ----------
-
-function initScratchRepo(): string {
-  const root = join(tmpdir(), `harness-live-proj-${Date.now()}`);
-  mkdirSync(root, { recursive: true });
-  mkdirSync(join(root, "tasks"), { recursive: true });
-  mkdirSync(join(root, "worktrees"), { recursive: true });
-  mkdirSync(join(root, "sessions"), { recursive: true });
-  mkdirSync(join(root, "config", "harness"), { recursive: true });
-  // Copy Architect + Reviewer prompts into the scratch repo so the managers
-  // find them at their canonical path.
-  for (const promptFile of ["architect-prompt.md", "review-prompt.md"]) {
-    copyFileSync(
-      join(HARNESS_ROOT, "config", "harness", promptFile),
-      join(root, "config", "harness", promptFile),
-    );
-  }
-  execSync("git init -b main", { cwd: root, stdio: "ignore" });
-  execSync("git config user.email live-proj@harness.test", { cwd: root, stdio: "ignore" });
-  execSync("git config user.name live-proj", { cwd: root, stdio: "ignore" });
-  writeFileSync(join(root, "README.md"), "# scratch live project\n");
-  writeFileSync(join(root, ".gitignore"), "tasks/\nworktrees/\nsessions/\nstate.json\nprojects.json\nstate.log.jsonl\n");
-  execSync("git add -A && git commit -m init", { cwd: root, stdio: "ignore" });
-  return root;
-}
+import {
+  initScratchRepo,
+  buildBaseConfig,
+  installSigintHandler,
+  DEFAULT_POLL_LOOP_MS,
+  DEFAULT_RUN_TIMEOUT_MS,
+} from "./lib/scratch-repo.js";
 
 function buildConfig(root: string): HarnessConfig {
-  return {
-    project: {
-      name: "live-project",
-      root,
-      task_dir: join(root, "tasks"),
-      state_file: join(root, "state.json"),
-      worktree_base: join(root, "worktrees"),
-      session_dir: join(root, "sessions"),
-    },
-    pipeline: {
-      poll_interval: 3,
-      test_command: "true",
-      max_retries: 1,
-      test_timeout: 120,
-      escalation_timeout: 600,
-      retry_delay_ms: 5_000,
-      max_session_retries: 1,
-      max_budget_usd: 1.0, // Executor cap (sonnet + OMC + caveman per production config)
-      auto_escalate_on_max_retries: false,
-      max_tier1_escalations: 1,
-    },
-    discord: {
-      bot_token_env: "UNUSED",
-      dev_channel: "dev",
-      ops_channel: "ops",
-      escalation_channel: "esc",
-      agents: {
-        orchestrator: { name: "Harness", avatar_url: "" },
-        architect: { name: "Architect", avatar_url: "" },
-        reviewer: { name: "Reviewer", avatar_url: "" },
-      },
-    },
-    reviewer: {
-      max_budget_usd: 1.0,
-      timeout_ms: 180_000,
-      arbitration_threshold: 2,
-    },
+  return buildBaseConfig({
+    root,
+    projectName: "live-project",
+    reviewer: { max_budget_usd: 1.0, timeout_ms: 180_000, arbitration_threshold: 2 },
     architect: {
       max_budget_usd: 4.0, // Opus + 200-line system prompt + OMC/caveman plugins is heavy
       compaction_threshold_pct: 0.90, // avoid compaction during this run
@@ -118,7 +55,7 @@ function buildConfig(root: string): HarnessConfig {
       prompt_path: join(root, "config", "harness", "architect-prompt.md"),
     },
     systemPrompt: EXECUTOR_PROMPT,
-  };
+  });
 }
 
 const EXECUTOR_PROMPT = `You are an Executor in a harness-managed git worktree.
@@ -140,7 +77,12 @@ The completion file is how the orchestrator knows you are done. If you do not wr
 // ---------- Runner ----------
 
 async function main(): Promise<void> {
-  const root = initScratchRepo();
+  const root = initScratchRepo({
+    prefix: "harness-live-proj",
+    gitEmail: "live-proj@harness.test",
+    gitName: "live-proj",
+    promptFiles: ["architect-prompt.md", "review-prompt.md"],
+  });
   console.log(`[live-project] scratch root: ${root}`);
 
   const config = buildConfig(root);
@@ -193,6 +135,11 @@ async function main(): Promise<void> {
   });
   orch.on((ev) => notifier.handleEvent(ev));
 
+  installSigintHandler([
+    { shutdown: () => orch.shutdown() },
+    { shutdown: () => architectManager.shutdownAll() },
+  ]);
+
   const startedAt = Date.now();
   console.log(`[live-project] declaring project...`);
   const result = await orch.declareProject(
@@ -211,15 +158,14 @@ async function main(): Promise<void> {
   orch.start();
 
   // Wait for all phase tasks to reach terminal (done or failed) OR global timeout.
-  const TIMEOUT_MS = 20 * 60 * 1000;
   const isDone = (): boolean => {
     const tasks = state.getAllTasks();
     if (tasks.length === 0) return false; // haven't picked up any phase yet
     return tasks.every((t) => t.state === "done" || t.state === "failed");
   };
 
-  while (!isDone() && Date.now() - startedAt < TIMEOUT_MS) {
-    await new Promise((r) => setTimeout(r, 2000));
+  while (!isDone() && Date.now() - startedAt < DEFAULT_RUN_TIMEOUT_MS) {
+    await new Promise((r) => setTimeout(r, DEFAULT_POLL_LOOP_MS));
   }
 
   await orch.shutdown();

@@ -1663,6 +1663,61 @@ describe("Orchestrator — P1-B arbitration verdict routing", () => {
     expect(ph?.state).toBe("failed");
   });
 
+  it("escalate_operator no-ops cascade when projectStore is absent", async () => {
+    const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 1 });
+    const architectManager = makeFakeArchitectManager({
+      reviewVerdict: { type: "escalate_operator", rationale: "no store" },
+    });
+    // No projectStore injected — legacy orchestrator mode.
+    const { orch, state, events } = setupWithReview({
+      reviewGate: gate, withCompletion: true, architectManager,
+    });
+    state.createTask("x", "t-nostore");
+    state.updateTask("t-nostore", { projectId: "proj", phaseId: "ph" });
+    await orch.processTask(state.getTask("t-nostore")!);
+    expect(state.getTask("t-nostore")!.state).toBe("failed");
+    expect(events.some((e) => e.type === "project_failed")).toBe(false);
+  });
+
+  it("escalate_operator no-ops cascade for standalone task (no projectId)", async () => {
+    const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 1 });
+    const architectManager = makeFakeArchitectManager({
+      reviewVerdict: { type: "escalate_operator", rationale: "standalone" },
+    });
+    const projectStore = new ProjectStore(join(tmpDir, "projects.json"), join(tmpDir, "wt"));
+    const { orch, state, events } = setupWithReview({
+      reviewGate: gate, withCompletion: true, architectManager, projectStore,
+    });
+    state.createTask("x", "t-standalone");
+    // No projectId/phaseId — standalone task. Note: routeArbitration also
+    // guards standalone above; we still want to confirm cascade is a no-op.
+    await orch.processTask(state.getTask("t-standalone")!);
+    expect(events.some((e) => e.type === "project_failed")).toBe(false);
+  });
+
+  it("escalate_operator with sibling phase in 'active' state leaves project open (hasActivePhases respects active)", async () => {
+    const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 1 });
+    const architectManager = makeFakeArchitectManager({
+      reviewVerdict: { type: "escalate_operator", rationale: "active sibling" },
+    });
+    const projectStore = new ProjectStore(join(tmpDir, "projects.json"), join(tmpDir, "wt"));
+    const proj = projectStore.createProject("p-active-sibling", "d", []);
+    projectStore.addPhase(proj.id, "failing phase", "ph-fail");
+    projectStore.addPhase(proj.id, "active sibling", "ph-act");
+    projectStore.attachTask(proj.id, "ph-fail", "t-fail");
+    projectStore.attachTask(proj.id, "ph-act", "t-active"); // sibling already active
+    const { orch, state, events } = setupWithReview({
+      reviewGate: gate, withCompletion: true, architectManager, projectStore,
+    });
+    state.createTask("x", "t-fail");
+    state.updateTask("t-fail", { projectId: proj.id, phaseId: "ph-fail" });
+    await orch.processTask(state.getTask("t-fail")!);
+    expect(projectStore.getProject(proj.id)!.state).toBe("decomposing");
+    expect(events.some((e) => e.type === "project_failed")).toBe(false);
+    const activePhase = projectStore.getProject(proj.id)!.phases.find((p) => p.id === "ph-act");
+    expect(activePhase?.state).toBe("active"); // untouched
+  });
+
   it("escalate_operator: transitions failed, emits task_failed with architect rationale", async () => {
     const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 1 });
     const architectManager = makeFakeArchitectManager({

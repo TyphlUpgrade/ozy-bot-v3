@@ -30,6 +30,15 @@ import type { ReviewResult } from "../gates/review.js";
  * retry-only authority. `Task` is NOT blocked — OMC subagent delegation is
  * validated (plan M.12) and a core decomposition pattern.
  */
+/**
+ * Neutralize triple-backtick sequences in untrusted text before embedding
+ * inside a fenced text block. Matches the existing `relayOperatorMessage`
+ * defense — mismatch used to be a slop-cleaner finding.
+ */
+function fenceEscape(raw: string): string {
+  return raw.replace(/```/g, "​```");
+}
+
 export const ARCHITECT_DISALLOWED_TOOLS: readonly string[] = [
   "WebFetch",
   "WebSearch",
@@ -390,7 +399,7 @@ export class ArchitectManager {
   /** Fences operator- and reviewer-supplied text in <untrusted:*> blocks so the Architect treats them as data, not instructions. */
   buildReviewArbitrationPrompt(task: TaskRecord, rejection: ReviewResult): string {
     const priorDirectiveBlock = task.lastDirective
-      ? `\n<untrusted:prior-architect-directive>\n\`\`\`text\n${task.lastDirective}\n\`\`\`\n</untrusted:prior-architect-directive>\n`
+      ? `\n<untrusted:prior-architect-directive>\n\`\`\`text\n${fenceEscape(task.lastDirective)}\n\`\`\`\n</untrusted:prior-architect-directive>\n`
       : "";
     return `The Reviewer rejected this phase. Decide an Architect verdict per §5 of your system prompt.
 
@@ -401,13 +410,13 @@ Reviewer verdict: ${rejection.verdict}
 
 <untrusted:task-prompt>
 \`\`\`text
-${task.prompt}
+${fenceEscape(task.prompt)}
 \`\`\`
 </untrusted:task-prompt>
 
 <untrusted:reviewer-summary>
 \`\`\`text
-${rejection.summary}
+${fenceEscape(rejection.summary)}
 \`\`\`
 </untrusted:reviewer-summary>
 ${priorDirectiveBlock}
@@ -417,10 +426,10 @@ Write your verdict to \`.harness/architect-verdict.json\` per the schema in §5 
   /** Same fencing as buildReviewArbitrationPrompt; adds task.lastError so the Architect can distinguish stuck vs wrong. */
   buildEscalationPrompt(task: TaskRecord, escalation: EscalationSignal): string {
     const lastErrorBlock = task.lastError
-      ? `\n<untrusted:task-last-error>\n\`\`\`text\n${task.lastError}\n\`\`\`\n</untrusted:task-last-error>\n`
+      ? `\n<untrusted:task-last-error>\n\`\`\`text\n${fenceEscape(task.lastError)}\n\`\`\`\n</untrusted:task-last-error>\n`
       : "";
     const priorDirectiveBlock = task.lastDirective
-      ? `\n<untrusted:prior-architect-directive>\n\`\`\`text\n${task.lastDirective}\n\`\`\`\n</untrusted:prior-architect-directive>\n`
+      ? `\n<untrusted:prior-architect-directive>\n\`\`\`text\n${fenceEscape(task.lastDirective)}\n\`\`\`\n</untrusted:prior-architect-directive>\n`
       : "";
     return `The Executor has raised an escalation on this phase. Decide an Architect verdict per §5 of your system prompt.
 
@@ -431,13 +440,13 @@ Escalation type: ${escalation.type}
 
 <untrusted:task-prompt>
 \`\`\`text
-${task.prompt}
+${fenceEscape(task.prompt)}
 \`\`\`
 </untrusted:task-prompt>
 
 <untrusted:escalation-question>
 \`\`\`text
-${escalation.question}
+${fenceEscape(escalation.question)}
 \`\`\`
 </untrusted:escalation-question>
 ${lastErrorBlock}${priorDirectiveBlock}

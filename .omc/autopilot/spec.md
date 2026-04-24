@@ -1,40 +1,53 @@
-# Autopilot Spec — P2 Live Arbitration Flow Test
+# Autopilot Spec — Harness-TS Validator Follow-up Refactors
 
 ## Goal
-Validate the P1 Architect verdict wiring end-to-end with real Architect SDK output. Confirm that when a reviewer rejects a project phase, the orchestrator consults the Architect, the Architect writes a well-formed `.harness/architect-verdict.json`, the orchestrator parses it, applies the verdict, and the Executor retries successfully.
+Close the 11 validator-flagged follow-ups accumulated from P1 + P2 multi-perspective reviews. All items are mechanical refactors / small hardening; no API spend; tests grow modestly.
 
-## Scope anchor
-Code surface exercised: `src/orchestrator.ts::routeArbitration + applyArchitectVerdict` (P1-B), `src/session/architect.ts::runArbitration + buildReviewArbitrationPrompt + readArchitectVerdict` (P1-A), `src/session/manager.ts` directive-surfacing (P1 gap fix), `config/harness/architect-prompt.md §5` verdict contract.
+## Scope — 11 items
 
-## Constraints
-- Budget cap: Architect $6, Executor $1 per run × 2 runs = $2. Target total ~$3.
-- Real SDK for Architect + Executor. Mocked Reviewer (injected verdict sequence: reject → approve) so the test is deterministic.
-- Reviewer `arbitration_threshold = 1` so the first rejection triggers arbitration.
-- Single-phase project to keep the test tight.
+### Medium severity (5)
 
-## PASS criteria (binary)
-1. `architect_spawned` event fired.
-2. `project_decomposed` event fired (phaseCount ≥ 1).
-3. Exactly ONE `review_arbitration_entered` event (first Reviewer rejection trips threshold=1).
-4. `architect_arbitration_fired` event with `cause = "review_disagreement"`.
-5. `arbitration_verdict` event with verdict in `{retry_with_directive, plan_amendment}` (not `escalate_operator`).
-6. At least TWO `session_complete` events (original + retry after verdict).
-7. Exactly ONE `task_done` event (retry passes Reviewer).
-8. `project_completed` event (project state → completed).
-9. Expected output file present on trunk.
+1. **Cascade symmetry extraction** — `src/orchestrator.ts`: `applyArchitectVerdict::escalate_operator` and `handleMergeResult::merged` both follow `phase.markX → maybe-project.X → emit-project-event`. Extract a private helper `finalizePhaseOutcome(task, "done"|"failed", rationale?)` that returns the project event to emit (or null). Both call sites collapse.
 
-## FAIL modes we want to surface
-- Architect writes malformed/missing verdict.json → `architect_no_verdict_written` rationale → escalate_operator. Indicates §5 prompt contract is ambiguous.
-- Architect emits `executor_correct` or other disallowed type → schema rejects → escalate_operator. Indicates prompt text not sticky enough.
-- Directive stored but not surfaced in retry prompt (gap 2 from architect review).
-- Verdict file from prior run leaks through (stale-file defense failed).
+2. **Scratch-repo helper** — `scripts/live-project.ts`, `scripts/live-project-3phase.ts`, `scripts/live-project-arbitration.ts` duplicate `initScratchRepo` + `buildConfig` (~120 lines × 3). Extract `scripts/lib/scratch-repo.ts` with `initScratchRepo({ prefix })` and `buildBaseConfig({ root, name, overrides })`. Retrofit all 3 scripts.
 
-## Deliverable
-- `harness-ts/scripts/live-project-arbitration.ts` — one-shot script that spins a scratch repo, declares a project, runs the loop, asserts the PASS checks, exits 0/1.
-- Update `.omc/wiki/harness-ts-wave-c-backlog.md` with the result.
+3. **InjectedReviewGate shared fixture** — move from inline in `scripts/live-project-arbitration.ts` to `scripts/lib/stub-review-gate.ts`. Constructor accepts `verdicts: ReviewVerdict[]` queue; falls back to `approve` when exhausted. Callers can program any sequence.
+
+4. **Cascade test gaps** — `tests/orchestrator.test.ts`: add tests for (a) escalate_operator with no `projectStore` injected (orchestrator legacy mode), (b) multiple pending phases where sibling is in `active` state, (c) standalone task (no projectId/phaseId) hits the guard and no-ops.
+
+5. **CR M1 `buildSessionConfig` helper** — `SessionManager.spawnTask`, `ReviewGate.runReview`, `ArchitectManager.spawnSessionWithPrompt` all hand-assemble `SessionConfig`. Extract `buildSessionConfig(opts)` in `src/session/sdk.ts` or new `src/session/config.ts`. Four+ callers after stub-gate extraction.
+
+### Low severity (6)
+
+6. **Scratch dir mkdtempSync** — 3 live scripts use `join(tmpdir(), \`harness-*-${Date.now()}\`)` + `mkdirSync({recursive:true})` → symlink-race-able. Swap for `mkdtempSync(join(tmpdir(), "harness-*-"))`. Addressed alongside item 2.
+
+7. **Rationale length-cap** — `orchestrator.ts` applyArchitectVerdict escalate_operator embeds `verdict.rationale` unbounded in `lastError` + `task_failed.reason` + `project_failed.reason`. Cap at 1KB + strip ANSI/control chars before embedding. New helper `truncateRationale(s)` in `src/lib/text.ts`.
+
+8. **Fence-escape parity** — `src/session/architect.ts::buildReviewArbitrationPrompt` + `buildEscalationPrompt` embed operator text inside `<untrusted:*>` XML + triple-backtick text blocks but don't neutralize triple-backticks in the data. `relayOperatorMessage` already does this with `.replace(/\`\`\`/g, "​\`\`\`")`. Apply same escape to both builders.
+
+9. **Script SIGINT cleanup** — live scripts rely on `main().catch` for top-level only. Add `process.on("SIGINT", () => orch.shutdown())` + try/finally around wait loop in the shared scratch-repo helper. Addressed alongside item 2.
+
+10. **Magic numbers in live scripts** — `25 * 60 * 1000`, `2000` poll cadence, `30 * 60 * 1000`. Extract to named consts at top of each script (or, if item 2 ships, in the shared helper).
+
+11. **Unified terminal predicate** — 3 scripts have 3 slightly different project-done checks. Unify in shared helper (addressed alongside item 2).
+
+## Out of scope
+- P3 mass stress (separate autopilot)
+- Live crash-recovery + OMC re-measure (separate autopilots)
+- Wave B.5 Architect smoke (separate autopilot)
+- Wave 6-split + Wave D (need ralplan first)
+- Discord live (blocked on bot token)
+
+## PASS criteria
+- All 518 existing tests still pass.
+- +≥6 new tests (cascade edge-cases + shared-helper smoke + stub-gate queue).
+- `npm run lint` clean.
+- `npm run build` clean.
+- No net API cost (mock-only).
+- Multi-perspective Phase 4 validation: architect + security + code-reviewer all APPROVE.
+- 3 live scripts still typecheck.
 
 ## Non-goals
-- Not validating mass-phase (that's P3).
-- Not validating crash recovery (separate test).
-- Not validating Discord integration live (separate work).
-- Not chasing `plan_amendment` vs `retry_with_directive` preference — either is a pass as long as it's not `escalate_operator`.
+- Behavior changes (pure refactor + small hardening).
+- New features.
+- Re-running any existing live script.
