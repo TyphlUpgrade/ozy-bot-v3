@@ -2,6 +2,7 @@
 
 **Date:** 2026-04-12
 **Status:** APPROVED — Consensus reached (Architect APPROVE_WITH_CONDITIONS → Critic APPROVE)
+**SUPERSEDED IN PART:** `.omc/plans/ralplan-harness-ts-three-tier-architect.md` (2026-04-23) replaces Waves 5 and 6 with three-tier Waves A, B, B.5, C, 6-split, D. Waves 1, 1.5, 1.75, 2, 3, 4 remain as approved with additive extensions documented in the three-tier plan's Section B integration map.
 **Depends:** Phase 2A (COMPLETE, 280 tests), Phase 1.5 (`resumeSession` verified)
 **Goal:** Operator controls the pipeline via Discord. High-stakes tasks pass independent review. Ambiguous tasks go through dialogue before implementation.
 
