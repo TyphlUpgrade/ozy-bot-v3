@@ -318,9 +318,29 @@ Depends: Phase 2A-3 functional.
 | **Cost tracking dashboard** | `src/lib/cost.ts` (new) | ~40 lines | Per-task and aggregate cost tracking. Budget burn rate. Alert when approaching daily/weekly limits. |
 | **Session metrics** | `src/session/sdk.ts` | ~30 lines | Track session duration, turn count, token usage per task. Expose via events. |
 | **Health monitoring** | `src/lib/health.ts` (new) | ~50 lines | Daemon health check endpoint. Active session count, queue depth, last poll time, error rate. |
-| **Stuck detection** | `src/session/sdk.ts` + `src/orchestrator.ts` | ~30 lines | SDK message stream is the heartbeat — stream silence = stuck. Configurable timeout (default 5min no messages). Distinguishes active (messages flowing) from stuck (silence). On stuck: abort session, retry or escalate depending on circuit breaker count. |
+| **Stuck detection** | `src/session/sdk.ts` + `src/orchestrator.ts` | ~30 lines | SDK message stream is the heartbeat — stream silence = stuck. Configurable timeout (default 5min no messages). Distinguishes active (messages flowing) from stuck (silence). On stuck: abort session, retry or escalate depending on circuit breaker count. **See "Stall detection — observation from autopilot Wave 2/3 runs" below for expanded requirements.** |
 | **Crash recovery hardening** | `src/orchestrator.ts` | ~40 lines | Improve crash recovery: detect stale worktrees, handle partial state, recover from mid-merge crashes. |
 | **E2E test suite** | `tests/e2e/` (new directory) | ~200 lines | Tests against real SDK (costs money), real git repos. Run manually or in CI with budget cap. Validates Phase 1.5 items permanently. |
+
+#### Stall detection — observation from autopilot Wave 2/3 runs (2026-04-24)
+
+**Observation:** during Wave 2 and Wave 3 autopilot cycles, the driving agent (autopilot Phase 2/3/4 orchestrator) occasionally paused silently mid-phase without producing terminal output. No error. No "stop" signal. No escalation. Just silence until the operator poked it back to life. This is the *meta-orchestration* analogue of the single-session "SDK stream silence" case the stuck-detection row above is scoped for — and when it happens in production Executor sessions, the harness currently has no recovery path.
+
+**Why the existing stuck-detection row isn't enough:**
+- It's scoped to the SDK message stream within a single session. A silent agent *can still emit tool calls* that look like heartbeats while making no real progress on the task.
+- A "stalled-on-thought" session that emits occasional tool_use messages (re-reading files, re-grepping) passes the heartbeat test but is semantically stuck.
+- Multi-phase workflows (autopilot) have cross-phase stalls: Phase 3 QA completes, Phase 4 reviewers return, and the orchestrator silently fails to advance to Phase 5 cleanup. No single session is stuck — the *meta-loop* is.
+
+**Production requirements (Phase 4+ expansion):**
+1. **Semantic progress watchdog.** Beyond raw SDK stream silence, track whether the agent has advanced state (new file writes, new commits, new .harness/* signal files). Stream activity without state advance for ≥ N minutes = stuck. Dimension: `last_state_advance_at` per session.
+2. **Meta-phase watchdog.** For autopilot-style multi-phase runs, track phase transition timestamps. If the current phase has a documented "next action" (e.g., Phase 4 completes → Phase 5 cleanup) but no transition occurs within a budget, fire a **nudge**.
+3. **Nudge protocol.** On stall detection, inject a single targeted message into the session: "You appear to have stopped mid-phase. Current phase: {phase}. Next action: {next}. Continue, or report the blocker." Give the agent one chance to recover before aborting.
+4. **Telemetry.** Every stall/nudge/abort decision emits a structured event (`stall_detected`, `nudge_sent`, `stall_abort`) with the reason and which watchdog triggered. This is critical for tuning thresholds — current autopilot silent-stall was hard to diagnose without logs.
+5. **Escalation tie-in.** After N failed nudges on the same session/phase, escalate to operator with the stall context as the question body. The operator sees the same state the nudge saw and can decide to retry, amend the plan, or abort.
+
+**Extension of the Stuck detection row:** expand scope to cover the semantic + meta-phase layers above, not just raw stream silence. Estimated additional effort: ~60-80 lines in `src/orchestrator.ts` for the meta-phase watchdog + event variants, plus test coverage.
+
+**Track:** operator-flagged during autopilot Wave 3 debrief (2026-04-24). Add to Phase 4 acceptance criteria when that wave kicks off.
 
 ---
 
