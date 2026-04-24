@@ -30,6 +30,8 @@ export interface PipelineConfig {
   max_budget_usd?: number;                // per-task budget cap — budget_report events at 50%/80%
   auto_escalate_on_max_retries?: boolean; // auto-escalate after max_session_retries exhausted (default true)
   max_tier1_escalations?: number;         // circuit breaker — max escalation cycles before permanent failure (default 2)
+  plugins?: Record<string, boolean>;      // Wave 1 Item 1 — OMC/caveman plugin enablement, merges with defaults
+  disallowed_tools?: string[];            // Wave 1 Item 3 — additional tools to block, extends default blocklist
 }
 
 export interface DiscordAgentIdentity {
@@ -130,6 +132,21 @@ function parsePipeline(raw: Record<string, unknown>): PipelineConfig {
   if (raw.max_budget_usd !== undefined) config.max_budget_usd = optionalNumber(raw, "max_budget_usd", 0);
   if (raw.auto_escalate_on_max_retries !== undefined) config.auto_escalate_on_max_retries = optionalBoolean(raw, "auto_escalate_on_max_retries", true);
   if (raw.max_tier1_escalations !== undefined) config.max_tier1_escalations = optionalNumber(raw, "max_tier1_escalations", 2);
+  // Wave 1 Item 1: plugin enablement
+  if (raw.plugins !== undefined && raw.plugins && typeof raw.plugins === "object" && !Array.isArray(raw.plugins)) {
+    const plugins: Record<string, boolean> = {};
+    for (const [name, enabled] of Object.entries(raw.plugins as Record<string, unknown>)) {
+      if (typeof enabled === "boolean") plugins[name] = enabled;
+    }
+    config.plugins = plugins;
+  }
+  // Wave 1 Item 3: additional disallowed tools
+  if (Array.isArray(raw.disallowed_tools)) {
+    const tools = (raw.disallowed_tools as unknown[]).filter(
+      (s): s is string => typeof s === "string",
+    );
+    config.disallowed_tools = tools;
+  }
   return config;
 }
 

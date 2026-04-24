@@ -309,4 +309,76 @@ describe("SDKClient", () => {
       expect(opts.resume).toBe("old-session");
     });
   });
+
+  // Wave 1 pre-requisites
+  describe("Wave 1: plugins / hooks / disallowedTools", () => {
+    it("Item 1: passes enabledPlugins via options.settings", () => {
+      const queryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+      const client = new SDKClient(queryFn);
+      client.spawnSession({
+        prompt: "test",
+        cwd: "/tmp",
+        enabledPlugins: {
+          "oh-my-claudecode@omc": true,
+          "caveman@caveman": true,
+        },
+      });
+      const opts = queryFn.mock.calls[0][0].options;
+      expect(opts.settings).toBeDefined();
+      expect((opts.settings as { enabledPlugins?: Record<string, boolean> }).enabledPlugins).toEqual({
+        "oh-my-claudecode@omc": true,
+        "caveman@caveman": true,
+      });
+    });
+
+    it("Item 1: omits settings when enabledPlugins empty or missing", () => {
+      const queryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+      const client = new SDKClient(queryFn);
+      client.spawnSession({ prompt: "test", cwd: "/tmp" });
+      const opts = queryFn.mock.calls[0][0].options;
+      expect(opts.settings).toBeUndefined();
+    });
+
+    it("Item 2: always sets options.hooks to empty object by default", () => {
+      const queryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+      const client = new SDKClient(queryFn);
+      client.spawnSession({ prompt: "test", cwd: "/tmp" });
+      const opts = queryFn.mock.calls[0][0].options;
+      expect(opts.hooks).toBeDefined();
+      expect(opts.hooks).toEqual({});
+    });
+
+    it("Item 2: passes custom hooks through when provided", () => {
+      const queryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+      const client = new SDKClient(queryFn);
+      const customHooks = { PreToolUse: [{ matcher: "Bash", hooks: [] }] };
+      client.spawnSession({
+        prompt: "test",
+        cwd: "/tmp",
+        hooks: customHooks as unknown as Partial<Record<string, unknown[]>>,
+      });
+      const opts = queryFn.mock.calls[0][0].options;
+      expect(opts.hooks).toEqual(customHooks);
+    });
+
+    it("Item 3: propagates disallowedTools to options", () => {
+      const queryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+      const client = new SDKClient(queryFn);
+      client.spawnSession({
+        prompt: "test",
+        cwd: "/tmp",
+        disallowedTools: ["CronCreate", "RemoteTrigger"],
+      });
+      const opts = queryFn.mock.calls[0][0].options;
+      expect(opts.disallowedTools).toEqual(["CronCreate", "RemoteTrigger"]);
+    });
+
+    it("Item 3: omits disallowedTools when not provided", () => {
+      const queryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+      const client = new SDKClient(queryFn);
+      client.spawnSession({ prompt: "test", cwd: "/tmp" });
+      const opts = queryFn.mock.calls[0][0].options;
+      expect(opts.disallowedTools).toBeUndefined();
+    });
+  });
 });

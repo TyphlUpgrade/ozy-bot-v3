@@ -29,6 +29,10 @@ export interface SessionConfig {
   resume?: string;
   abortController?: AbortController;
   persistSession?: boolean;
+  /** Map of plugin-id → enabled (Wave 1 Item 1). Loads via Options.settings.enabledPlugins. */
+  enabledPlugins?: Record<string, boolean>;
+  /** Programmatic hooks. Always set (default {}) so filesystem-discovered hooks like persistent-mode do not load (Wave 1 Item 2). */
+  hooks?: Partial<Record<string, unknown[]>>;
 }
 
 export interface SessionResult {
@@ -138,6 +142,18 @@ export class SDKClient {
         append: config.systemPrompt,
       };
     }
+
+    // Wave 1 Item 1: plugin loading via Options.settings.enabledPlugins
+    // TODO: remove cast when SDK types expose `settings.enabledPlugins` directly.
+    // Validated empirically in architect-spike v3 (sonnet+OMC) — see plan Section M.3.
+    if (config.enabledPlugins && Object.keys(config.enabledPlugins).length > 0) {
+      (options as Options & { settings?: unknown }).settings = {
+        enabledPlugins: config.enabledPlugins,
+      };
+    }
+
+    // Wave 1 Item 2: always set hooks to block filesystem-discovered hooks (e.g. persistent-mode.cjs)
+    options.hooks = (config.hooks ?? {}) as Options["hooks"];
 
     const q = this.queryFn({ prompt: config.prompt, options });
     return { query: q, abortController: ac };

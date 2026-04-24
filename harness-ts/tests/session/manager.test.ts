@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { SessionManager, type GitOps, type CompletionSignal } from "../../src/session/manager.js";
+import { SessionManager, type GitOps, type TmuxOps, type CompletionSignal } from "../../src/session/manager.js";
 import { SDKClient, type QueryFn } from "../../src/session/sdk.js";
 import { StateManager } from "../../src/lib/state.js";
 import type { HarnessConfig } from "../../src/lib/config.js";
@@ -557,6 +557,211 @@ describe("SessionManager", () => {
       // abortAll only clears internal activeSessions map, not SDK controllers directly
       // (those were registered via sdk.registerController)
       expect(mgr.activeCount).toBe(0);
+    });
+  });
+
+  // Wave 1 pre-requisites
+  describe("Wave 1: plugins / hooks / disallowedTools / tmux", () => {
+    function mockTmuxOps(): TmuxOps {
+      return {
+        killSessionsByPattern: vi.fn(),
+      };
+    }
+
+    it("Item 1+2 sub-fix: sessionConfig uses persistSession=true, hooks={}, and merged plugins", async () => {
+      const queryFn: QueryFn = vi.fn().mockReturnValue(
+        mockQuery([makeResultSuccess()]),
+      );
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const config = makeConfig();
+      const mgr = new SessionManager(sdk, state, config, mockGitOps());
+
+      const task = state.createTask("test", "task-plugins");
+      await mgr.spawnTask(task);
+
+      const opts = (queryFn as ReturnType<typeof vi.fn>).mock.calls[0][0].options;
+      // persistSession fix: was false, now true
+      expect(opts.persistSession).toBe(true);
+      // hooks defense: always empty object
+      expect(opts.hooks).toEqual({});
+      // default plugins merged
+      expect(opts.settings).toBeDefined();
+      const plugins = (opts.settings as { enabledPlugins: Record<string, boolean> }).enabledPlugins;
+      expect(plugins["oh-my-claudecode@omc"]).toBe(true);
+      expect(plugins["caveman@caveman"]).toBe(true);
+    });
+
+    it("Item 1: config plugins override defaults per-entry", async () => {
+      const queryFn: QueryFn = vi.fn().mockReturnValue(
+        mockQuery([makeResultSuccess()]),
+      );
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const config = makeConfig();
+      config.pipeline.plugins = {
+        "caveman@caveman": false, // override default
+        "custom-plugin@scope": true, // add new
+      };
+      const mgr = new SessionManager(sdk, state, config, mockGitOps());
+
+      const task = state.createTask("test", "task-plugin-override");
+      await mgr.spawnTask(task);
+
+      const opts = (queryFn as ReturnType<typeof vi.fn>).mock.calls[0][0].options;
+      const plugins = (opts.settings as { enabledPlugins: Record<string, boolean> }).enabledPlugins;
+      expect(plugins["oh-my-claudecode@omc"]).toBe(true);      // default preserved
+      expect(plugins["caveman@caveman"]).toBe(false);           // overridden
+      expect(plugins["custom-plugin@scope"]).toBe(true);        // added
+    });
+
+    it("Item 3: spawnTask applies default disallowedTools (cron/remote/wakeup)", async () => {
+      const queryFn: QueryFn = vi.fn().mockReturnValue(
+        mockQuery([makeResultSuccess()]),
+      );
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const config = makeConfig();
+      const mgr = new SessionManager(sdk, state, config, mockGitOps());
+
+      const task = state.createTask("test", "task-disallowed");
+      await mgr.spawnTask(task);
+
+      const opts = (queryFn as ReturnType<typeof vi.fn>).mock.calls[0][0].options;
+      expect(opts.disallowedTools).toEqual(
+        expect.arrayContaining([
+          "CronCreate",
+          "CronDelete",
+          "CronList",
+          "RemoteTrigger",
+          "ScheduleWakeup",
+        ]),
+      );
+    });
+
+    it("Item 3: config disallowed_tools extend defaults (union, not override)", async () => {
+      const queryFn: QueryFn = vi.fn().mockReturnValue(
+        mockQuery([makeResultSuccess()]),
+      );
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const config = makeConfig();
+      config.pipeline.disallowed_tools = ["WebFetch", "WebSearch"];
+      const mgr = new SessionManager(sdk, state, config, mockGitOps());
+
+      const task = state.createTask("test", "task-disallowed-extra");
+      await mgr.spawnTask(task);
+
+      const opts = (queryFn as ReturnType<typeof vi.fn>).mock.calls[0][0].options;
+      expect(opts.disallowedTools).toEqual(
+        expect.arrayContaining([
+          "CronCreate",
+          "CronDelete",
+          "CronList",
+          "RemoteTrigger",
+          "ScheduleWakeup",
+          "WebFetch",
+          "WebSearch",
+        ]),
+      );
+    });
+
+    it("Item 4: cleanupWorktree invokes tmux kill with task-{id} pattern", () => {
+      const queryFn: QueryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const config = makeConfig();
+      const git = mockGitOps();
+      const tmux = mockTmuxOps();
+      const mgr = new SessionManager(sdk, state, config, git, tmux);
+
+      mgr.cleanupWorktree("task-abc");
+      expect(tmux.killSessionsByPattern).toHaveBeenCalledWith("task-task-abc");
+    });
+
+    it("Item 4: abortAll invokes tmux sweep with harness- pattern", () => {
+      const queryFn: QueryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const config = makeConfig();
+      const tmux = mockTmuxOps();
+      const mgr = new SessionManager(sdk, state, config, mockGitOps(), tmux);
+
+      mgr.abortAll();
+      expect(tmux.killSessionsByPattern).toHaveBeenCalledWith("harness-");
+    });
+
+    it("Item 4 extension: cleanupProject removes Architect worktree + branch", async () => {
+      const queryFn: QueryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const config = makeConfig();
+      const git = mockGitOps();
+      (git.branchExists as ReturnType<typeof vi.fn>).mockReturnValue(true);
+      const tmux = mockTmuxOps();
+      const mgr = new SessionManager(sdk, state, config, git, tmux);
+
+      await mgr.cleanupProject("proj-42");
+
+      expect(git.removeWorktree).toHaveBeenCalledWith(
+        config.project.root,
+        expect.stringContaining("architect-proj-42"),
+      );
+      expect(git.deleteBranch).toHaveBeenCalledWith(
+        config.project.root,
+        "harness/architect-proj-42",
+      );
+    });
+
+    it("Item 4 extension: cleanupProject sweeps architect-{projectId} tmux pattern", async () => {
+      const queryFn: QueryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const config = makeConfig();
+      const tmux = mockTmuxOps();
+      const mgr = new SessionManager(sdk, state, config, mockGitOps(), tmux);
+
+      await mgr.cleanupProject("proj-77");
+
+      expect(tmux.killSessionsByPattern).toHaveBeenCalledWith("architect-proj-77");
+    });
+
+    it("Item 4 extension: cleanupProject silent on missing worktree/branch", async () => {
+      const queryFn: QueryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const config = makeConfig();
+      const git = mockGitOps();
+      // Branch doesn't exist, worktree removal throws
+      (git.branchExists as ReturnType<typeof vi.fn>).mockReturnValue(false);
+      (git.removeWorktree as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        throw new Error("worktree not found");
+      });
+      const tmux = mockTmuxOps();
+      const mgr = new SessionManager(sdk, state, config, git, tmux);
+
+      await expect(mgr.cleanupProject("proj-missing")).resolves.toBeUndefined();
+      expect(git.deleteBranch).not.toHaveBeenCalled();
+      // Tmux sweep still fires
+      expect(tmux.killSessionsByPattern).toHaveBeenCalledWith("architect-proj-missing");
+    });
+
+    it("Item 4: tmux failure is swallowed — cleanupWorktree still succeeds", () => {
+      const queryFn: QueryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+      const sdk = new SDKClient(queryFn);
+      const state = new StateManager(join(tmpDir, "state.json"));
+      const config = makeConfig();
+      const git = mockGitOps();
+      const tmux: TmuxOps = {
+        killSessionsByPattern: vi.fn(() => {
+          throw new Error("tmux server not running");
+        }),
+      };
+      const mgr = new SessionManager(sdk, state, config, git, tmux);
+
+      expect(() => mgr.cleanupWorktree("task-xyz")).not.toThrow();
+      // git cleanup still happened despite tmux throw
+      expect(git.removeWorktree).toHaveBeenCalledOnce();
     });
   });
 
