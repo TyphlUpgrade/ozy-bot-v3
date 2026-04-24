@@ -86,6 +86,7 @@ export interface TaskRecord {
   phaseId?: string;                // phase identifier within project; defaults to task.id
   arbitrationCount?: number;       // per-task Architect arbitrations on THIS phase
   reviewerRejectionCount?: number; // per-task Reviewer rejections on THIS phase
+  lastDirective?: string;          // most recent Architect retry_with_directive verdict text
 }
 
 // Known keys for defensive deserialization (B7). Unknown keys are silently dropped on load.
@@ -98,7 +99,7 @@ const KNOWN_KEYS: ReadonlySet<string> = new Set([
   // Phase 2B-3
   "dialogueMessages", "dialoguePendingConfirmation", "reviewResult",
   // Three-tier (Wave 1.5b)
-  "projectId", "phaseId", "arbitrationCount", "reviewerRejectionCount",
+  "projectId", "phaseId", "arbitrationCount", "reviewerRejectionCount", "lastDirective",
 ]);
 
 // --- Event Log (O9: write-only) ---

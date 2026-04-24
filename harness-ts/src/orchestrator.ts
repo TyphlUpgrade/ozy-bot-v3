@@ -16,7 +16,7 @@ import { readCheckpoints, type CheckpointSignal } from "./lib/checkpoint.js";
 import { evaluateResponseLevel, type ResponseLevel } from "./lib/response.js";
 import { sanitizeTaskId } from "./lib/text.js";
 import type { ReviewGate, ReviewResult } from "./gates/review.js";
-import type { ArchitectManager } from "./session/architect.js";
+import type { ArchitectManager, ArchitectVerdict } from "./session/architect.js";
 import type { ProjectStore } from "./lib/project.js";
 
 // --- Task file schema ---
@@ -148,7 +148,6 @@ export class Orchestrator {
   private readonly eventListeners: ((event: OrchestratorEvent) => void)[] = [];
   /** Tracks task ids that have already emitted the interim Wave A→C "listener not wired" warning,
    *  so the log fires exactly once per task per Section C.6. */
-  private readonly arbitrationWarnedTasks: Set<string> = new Set();
 
   constructor(deps: OrchestratorDeps) {
     this.sessions = deps.sessionManager;
@@ -329,6 +328,12 @@ export class Orchestrator {
         if (escalation) {
           this.state.transition(task.id, "escalation_wait");
           this.emit({ type: "escalation_needed", taskId: task.id, escalation });
+          // Project phases: consult the Architect before parking for operator.
+          // Standalone tasks (no projectId): stay in escalation_wait for operator response.
+          const refreshed = this.state.getTask(task.id);
+          if (refreshed?.projectId && this.architectManager) {
+            await this.routeArbitration(refreshed, "escalation", undefined, escalation);
+          }
           return;
         }
       }
@@ -454,11 +459,19 @@ export class Orchestrator {
         lastError: reason,
         tier1EscalationCount: current.tier1EscalationCount + 1,
       });
+      const escalation: EscalationSignal = {
+        type: "persistent_failure",
+        question: `Task failed ${maxSessionRetries} times: ${reason}`,
+      };
       this.emit({
         type: "escalation_needed",
         taskId: task.id,
-        escalation: { type: "persistent_failure", question: `Task failed ${maxSessionRetries} times: ${reason}` },
+        escalation,
       });
+      const refreshed = this.state.getTask(task.id)!;
+      if (refreshed.projectId && this.architectManager) {
+        await this.routeArbitration(refreshed, "escalation", undefined, escalation);
+      }
       return;
     }
 
@@ -599,14 +612,7 @@ export class Orchestrator {
         projectId: task.projectId,
         reviewerRejectionCount: newCount,
       });
-      if (!this.arbitrationWarnedTasks.has(task.id)) {
-        // Section C.6 interim warning — removed in Wave C when the Architect listener wires in.
-        console.warn(
-          `WARN task=${task.id} in review_arbitration but architect listener not yet wired (Wave A/B/C window); merge blocked`,
-        );
-        this.arbitrationWarnedTasks.add(task.id);
-      }
-      // Merge blocked — no further action until Wave C.
+      await this.routeArbitration(this.state.getTask(task.id)!, "review_disagreement", review);
       return;
     }
 
@@ -619,6 +625,127 @@ export class Orchestrator {
       attempt: newCount,
       maxRetries: threshold,
     });
+  }
+
+  /**
+   * Drive the Architect arbitration round for a task that has entered
+   * `review_arbitration` (reviewer-rejection threshold crossed) or has raised
+   * an escalation. Emits `architect_arbitration_fired`, invokes the
+   * ArchitectManager, emits `arbitration_verdict`, then applies the verdict.
+   * If the ArchitectManager is not configured (standalone orchestrator),
+   * the task is marked `failed` — Wave A / standalone behavior.
+   */
+  private async routeArbitration(
+    task: TaskRecord,
+    cause: ArbitrationCause,
+    review?: ReviewResult,
+    escalation?: EscalationSignal,
+  ): Promise<void> {
+    if (!task.projectId) {
+      this.state.transition(task.id, "failed");
+      this.emit({ type: "task_failed", taskId: task.id, reason: "arbitration_without_projectId" });
+      return;
+    }
+    if (!this.architectManager) {
+      this.state.transition(task.id, "failed");
+      this.emit({
+        type: "task_failed",
+        taskId: task.id,
+        reason: "arbitration_fired_without_architectManager",
+      });
+      return;
+    }
+
+    this.emit({
+      type: "architect_arbitration_fired",
+      taskId: task.id,
+      projectId: task.projectId,
+      cause,
+    });
+
+    let verdict: ArchitectVerdict;
+    try {
+      if (cause === "review_disagreement" && review) {
+        verdict = await this.architectManager.handleReviewArbitration(task, review);
+      } else if (cause === "escalation" && escalation) {
+        verdict = await this.architectManager.handleEscalation(task, escalation);
+      } else {
+        verdict = { type: "escalate_operator", rationale: "routeArbitration_bad_inputs" };
+      }
+    } catch (err) {
+      verdict = {
+        type: "escalate_operator",
+        rationale: `architect_manager_threw: ${(err as Error).message}`,
+      };
+    }
+
+    const rationale = verdict.type === "retry_with_directive"
+      ? verdict.directive
+      : verdict.type === "plan_amendment"
+        ? verdict.rationale
+        : verdict.rationale;
+    this.emit({
+      type: "arbitration_verdict",
+      taskId: task.id,
+      projectId: task.projectId,
+      verdict: verdict.type,
+      rationale,
+    });
+
+    this.applyArchitectVerdict(task, verdict);
+  }
+
+  /**
+   * Apply an ArchitectVerdict to a task in `review_arbitration` (or, for
+   * escalation-sourced arbitration, any intermediate state). Routes:
+   *
+   * - `retry_with_directive`: store directive on task, reset
+   *   reviewerRejectionCount to 0, transition → active, schedule retry.
+   * - `plan_amendment`: update the phase spec via ProjectStore, reset
+   *   rejection count, transition → active, schedule retry.
+   * - `escalate_operator`: transition → failed, emit task_failed with
+   *   the Architect's rationale.
+   */
+  private applyArchitectVerdict(task: TaskRecord, verdict: ArchitectVerdict): void {
+    switch (verdict.type) {
+      case "retry_with_directive": {
+        this.state.updateTask(task.id, {
+          lastDirective: verdict.directive,
+          reviewerRejectionCount: 0,
+        });
+        this.state.transition(task.id, "active");
+        this.sessions.cleanupWorktree(task.id);
+        this.scheduleRetry(task.id, this.config.pipeline.retry_delay_ms);
+        break;
+      }
+      case "plan_amendment": {
+        if (task.projectId && task.phaseId && this.projectStore) {
+          this.projectStore.updatePhaseSpec(task.projectId, task.phaseId, verdict.updatedPhaseSpec);
+        }
+        this.state.updateTask(task.id, {
+          lastDirective: verdict.rationale,
+          prompt: verdict.updatedPhaseSpec,
+          reviewerRejectionCount: 0,
+        });
+        this.state.transition(task.id, "active");
+        this.sessions.cleanupWorktree(task.id);
+        this.scheduleRetry(task.id, this.config.pipeline.retry_delay_ms);
+        break;
+      }
+      case "escalate_operator": {
+        this.state.transition(task.id, "failed");
+        this.state.updateTask(task.id, {
+          lastError: `architect_escalate_operator: ${verdict.rationale}`,
+        });
+        this.emit({
+          type: "task_failed",
+          taskId: task.id,
+          reason: `architect escalation: ${verdict.rationale}`,
+        });
+        this.sessions.cleanupWorktree(task.id);
+        break;
+      }
+    }
   }
 
   /** Branch on merge gate result: merged / rebase_conflict / test_failed / test_timeout / error. */
@@ -788,15 +915,18 @@ export class Orchestrator {
         this.state.transition(task.id, "pending");
         this.processTask(this.state.getTask(task.id)!);
       }
-      // Section C.6: review_arbitration persists across restarts. The Architect
-      // listener (Wave C) consumes this state; preserve it + worktree so the
-      // listener has the diff to arbitrate over. Re-emit the interim warning
-      // so post-restart ops see the stuck task.
+      // Section C.6: review_arbitration persists across restarts. The cached
+      // TaskRecord.reviewResult is a reduced summary (verdict + weightedRisk +
+      // findingCount) — not enough for fair Architect arbitration. Escalate
+      // to operator on restart; the operator can re-run the Reviewer if they
+      // want fresh arbitration data.
       if (task.state === "review_arbitration") {
-        console.warn(
-          `WARN task=${task.id} in review_arbitration but architect listener not yet wired (Wave A/B/C window); merge blocked`,
-        );
-        this.arbitrationWarnedTasks.add(task.id);
+        this.state.transition(task.id, "failed");
+        this.emit({
+          type: "task_failed",
+          taskId: task.id,
+          reason: "review_arbitration_resumed_after_crash — operator must restart the phase",
+        });
       }
       // Shelved tasks get retried (worktree already cleaned on shelve path)
       if (task.state === "shelved") {

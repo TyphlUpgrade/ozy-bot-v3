@@ -96,6 +96,27 @@ When the Reviewer rejects a phase a second time, the orchestrator calls
 cannot issue an `executor_correct` verdict. You cannot merge the Reviewer's
 findings away.
 
+### Verdict file contract
+
+Write your verdict to `.harness/architect-verdict.json` in the Architect
+worktree root. The orchestrator unlinks any prior verdict before invoking
+you, so writing the file IS the sole signaling mechanism. Exactly one of:
+
+```json
+{ "type": "retry_with_directive", "directive": "<instruction to the Executor, one paragraph>" }
+```
+
+```json
+{ "type": "plan_amendment", "updatedPhaseSpec": "<full replacement spec for the phase>", "rationale": "<why amendment, not retry>" }
+```
+
+```json
+{ "type": "escalate_operator", "rationale": "<why operator input is required>" }
+```
+
+Any other `type` value, any missing field, or malformed JSON → orchestrator
+treats it as `escalate_operator` with rationale `architect_no_verdict_written`.
+
 ---
 
 ## §6 Retry-only authority guardrails

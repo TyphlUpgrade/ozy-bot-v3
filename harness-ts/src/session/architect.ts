@@ -377,17 +377,83 @@ export class ArchitectManager {
     }
   }
 
-  // --- Arbitration (stubs for Wave B; real verdict parsing in Wave C) ---
+  // --- Arbitration (Wave C — real verdict parsing) ---
 
-  async handleEscalation(task: TaskRecord, _escalation: EscalationSignal): Promise<ArchitectVerdict> {
-    return this.runArbitrationStub(task, "escalation");
+  async handleEscalation(task: TaskRecord, escalation: EscalationSignal): Promise<ArchitectVerdict> {
+    return this.runArbitration(task, this.buildEscalationPrompt(task, escalation));
   }
 
-  async handleReviewArbitration(task: TaskRecord, _rejection: ReviewResult): Promise<ArchitectVerdict> {
-    return this.runArbitrationStub(task, "review_disagreement");
+  async handleReviewArbitration(task: TaskRecord, rejection: ReviewResult): Promise<ArchitectVerdict> {
+    return this.runArbitration(task, this.buildReviewArbitrationPrompt(task, rejection));
   }
 
-  private async runArbitrationStub(task: TaskRecord, cause: string): Promise<ArchitectVerdict> {
+  /**
+   * Build arbitration prompt for a reviewer rejection. Fences every
+   * operator-tainted / reviewer-generated field with <untrusted:*> XML blocks
+   * so the Architect's system prompt treats them as data, not instructions.
+   */
+  buildReviewArbitrationPrompt(task: TaskRecord, rejection: ReviewResult): string {
+    const priorDirectiveBlock = task.lastDirective
+      ? `\n<untrusted:prior-architect-directive>\n\`\`\`text\n${task.lastDirective}\n\`\`\`\n</untrusted:prior-architect-directive>\n`
+      : "";
+    return `The Reviewer rejected this phase. Decide an Architect verdict per §5 of your system prompt.
+
+Task ID: ${task.id}
+Phase ID: ${task.phaseId ?? "(unset)"}
+Reviewer rejection count on this phase: ${task.reviewerRejectionCount ?? 1}
+Reviewer verdict: ${rejection.verdict}
+
+<untrusted:task-prompt>
+\`\`\`text
+${task.prompt}
+\`\`\`
+</untrusted:task-prompt>
+
+<untrusted:reviewer-summary>
+\`\`\`text
+${rejection.summary}
+\`\`\`
+</untrusted:reviewer-summary>
+${priorDirectiveBlock}
+Write your verdict to \`.harness/architect-verdict.json\` per the schema in §5 of your system prompt, then conclude.`;
+  }
+
+  /**
+   * Build arbitration prompt for a task escalation signal. Same untrusted
+   * fencing as review-arbitration; additionally includes lastError when
+   * present so the Architect can judge whether the Executor was stuck vs.
+   * wrong.
+   */
+  buildEscalationPrompt(task: TaskRecord, escalation: EscalationSignal): string {
+    const lastErrorBlock = task.lastError
+      ? `\n<untrusted:task-last-error>\n\`\`\`text\n${task.lastError}\n\`\`\`\n</untrusted:task-last-error>\n`
+      : "";
+    const priorDirectiveBlock = task.lastDirective
+      ? `\n<untrusted:prior-architect-directive>\n\`\`\`text\n${task.lastDirective}\n\`\`\`\n</untrusted:prior-architect-directive>\n`
+      : "";
+    return `The Executor has raised an escalation on this phase. Decide an Architect verdict per §5 of your system prompt.
+
+Task ID: ${task.id}
+Phase ID: ${task.phaseId ?? "(unset)"}
+Retry count: ${task.retryCount}
+Escalation type: ${escalation.type}
+
+<untrusted:task-prompt>
+\`\`\`text
+${task.prompt}
+\`\`\`
+</untrusted:task-prompt>
+
+<untrusted:escalation-question>
+\`\`\`text
+${escalation.question}
+\`\`\`
+</untrusted:escalation-question>
+${lastErrorBlock}${priorDirectiveBlock}
+Write your verdict to \`.harness/architect-verdict.json\` per the schema in §5 of your system prompt, then conclude.`;
+  }
+
+  private async runArbitration(task: TaskRecord, prompt: string): Promise<ArchitectVerdict> {
     const projectId = task.projectId;
     if (!projectId) {
       return { type: "escalate_operator", rationale: "architect_invoked_without_project" };
@@ -397,11 +463,10 @@ export class ArchitectManager {
       return { type: "escalate_operator", rationale: "architect_session_unavailable" };
     }
 
-    // Stub: issue a resumeSession with the arbitration prompt, bound by the
-    // arbitrationTimeoutMs. If the timeout fires, return an escalate_operator
-    // verdict with the "architect_timeout" rationale. Real verdict parsing
-    // arrives in Wave C — here we just invoke the session and return the
-    // stub verdict deterministically.
+    // Stale-verdict defense — prior arbitration's verdict file would otherwise
+    // be read as this round's answer.
+    this.unlinkStaleVerdict(session.worktreePath);
+
     const ac = new AbortController();
     this.abortControllers.set(projectId, ac);
     let timedOut = false;
@@ -412,7 +477,7 @@ export class ArchitectManager {
 
     try {
       const { query } = this.sdk.resumeSession(session.sessionId, {
-        prompt: `Arbitrate ${cause} for task ${task.id}. Emit a verdict per §5-§6 of your system prompt.`,
+        prompt,
         cwd: session.worktreePath,
         abortController: ac,
         persistSession: true,
@@ -421,25 +486,30 @@ export class ArchitectManager {
       session.totalCostUsd += result.totalCostUsd;
       session.lastActivityAt = new Date().toISOString();
       this.projectStore.incrementCost(projectId, result.totalCostUsd);
-      if (timedOut) {
-        return { type: "escalate_operator", rationale: "architect_timeout" };
-      }
+      if (timedOut) return { type: "escalate_operator", rationale: "architect_timeout" };
     } catch {
-      if (timedOut) {
-        return { type: "escalate_operator", rationale: "architect_timeout" };
-      }
+      if (timedOut) return { type: "escalate_operator", rationale: "architect_timeout" };
       return { type: "escalate_operator", rationale: "architect_session_error" };
     } finally {
       clearTimeout(timer);
       this.abortControllers.delete(projectId);
     }
 
-    // Wave B stub: always return escalate_operator until Wave C parses the
-    // Architect's written verdict from .harness/architect-verdict.json.
-    // Check if a verdict file exists and try to parse it; fall back to stub.
     const parsed = this.readArchitectVerdict(session.worktreePath);
     if (parsed) return parsed;
-    return { type: "escalate_operator", rationale: "architect_stub_no_verdict_parsed_wave_c" };
+    return { type: "escalate_operator", rationale: "architect_no_verdict_written" };
+  }
+
+  /**
+   * Stale-verdict defense: the Architect writes a fresh verdict per
+   * arbitration. Unlinking before spawn guarantees that any file we read
+   * after consumeStream was written by THIS arbitration round, not a prior
+   * one. unlink failures are rare (permissions, worktree gone) and are
+   * best-effort — a subsequent schema check still rejects corrupt files.
+   */
+  private unlinkStaleVerdict(worktreePath: string): void {
+    const path = join(worktreePath, ".harness", "architect-verdict.json");
+    try { if (existsSync(path)) unlinkSync(path); } catch { /* best-effort */ }
   }
 
   private readArchitectVerdict(worktreePath: string): ArchitectVerdict | null {

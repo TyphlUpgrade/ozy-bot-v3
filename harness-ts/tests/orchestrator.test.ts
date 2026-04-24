@@ -9,7 +9,7 @@ import { MergeGate, type MergeGitOps } from "../src/gates/merge.js";
 import { StateManager, type TaskRecord } from "../src/lib/state.js";
 import type { HarnessConfig } from "../src/lib/config.js";
 import type { ReviewGate, ReviewResult, ReviewVerdict } from "../src/gates/review.js";
-import type { ArchitectManager } from "../src/session/architect.js";
+import type { ArchitectManager, ArchitectVerdict } from "../src/session/architect.js";
 import { ProjectStore } from "../src/lib/project.js";
 import type { Query, SDKMessage, SDKResultSuccess } from "@anthropic-ai/claude-agent-sdk";
 
@@ -1119,6 +1119,8 @@ function makeFakeReviewGate(
 function setupWithReview(opts: {
   reviewGate: ReviewGate;
   withCompletion?: boolean;
+  architectManager?: ArchitectManager;
+  projectStore?: ProjectStore;
 }): TestHarness {
   const config = makeConfig();
   mkdirSync(join(tmpDir, "tasks"), { recursive: true });
@@ -1154,6 +1156,8 @@ function setupWithReview(opts: {
     stateManager: state,
     config,
     reviewGate: opts.reviewGate,
+    architectManager: opts.architectManager,
+    projectStore: opts.projectStore,
   } as OrchestratorDeps);
 
   const events: OrchestratorEvent[] = [];
@@ -1270,35 +1274,39 @@ describe("Orchestrator — Wave A review gate + arbitration wiring", () => {
     expect(events.some((e) => e.type === "review_arbitration_entered")).toBe(false);
   });
 
-  it("review reject + project + count already 1 → transitions to review_arbitration at threshold", async () => {
+  it("review reject + project + count already 1 → threshold crossed → review_arbitration_entered fires (P1-B)", async () => {
     const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 2 });
-    const { orch, state, events } = setupWithReview({ reviewGate: gate, withCompletion: true });
+    const architectManager = makeFakeArchitectManager({
+      reviewVerdict: { type: "retry_with_directive", directive: "retry cleanly" },
+    });
+    const { orch, state, events } = setupWithReview({
+      reviewGate: gate, withCompletion: true, architectManager,
+    });
     const task = state.createTask("test", "t-arb");
     state.updateTask("t-arb", { projectId: "proj", reviewerRejectionCount: 1 });
-    const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     await orch.processTask(state.getTask("t-arb")!);
-    consoleSpy.mockRestore();
-    const updated = state.getTask("t-arb")!;
-    expect(updated.reviewerRejectionCount).toBe(2);
-    expect(updated.state).toBe("review_arbitration");
     const entered = events.find((e) => e.type === "review_arbitration_entered");
     expect(entered).toBeTruthy();
     if (entered && entered.type === "review_arbitration_entered") {
       expect(entered.reviewerRejectionCount).toBe(2);
       expect(entered.projectId).toBe("proj");
     }
+    // Architect was consulted.
+    expect(architectManager.handleReviewArbitration).toHaveBeenCalledOnce();
   });
 
-  it("interim Wave A→C warning fires exactly once per task in review_arbitration", async () => {
+  it("arbitration without architectManager → task_failed with explicit reason (P1-B fallback)", async () => {
     const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 2 });
-    const { orch, state } = setupWithReview({ reviewGate: gate, withCompletion: true });
+    const { orch, state, events } = setupWithReview({ reviewGate: gate, withCompletion: true });
     const task = state.createTask("test", "t-warn");
     state.updateTask("t-warn", { projectId: "proj", reviewerRejectionCount: 1 });
-    const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     await orch.processTask(state.getTask("t-warn")!);
-    expect(consoleSpy).toHaveBeenCalledOnce();
-    expect(consoleSpy.mock.calls[0][0]).toMatch(/review_arbitration but architect listener not yet wired/);
-    consoleSpy.mockRestore();
+    expect(state.getTask("t-warn")!.state).toBe("failed");
+    const failed = events.find((e) => e.type === "task_failed");
+    expect(failed).toBeTruthy();
+    if (failed && failed.type === "task_failed") {
+      expect(failed.reason).toContain("arbitration_fired_without_architectManager");
+    }
   });
 
   it("request_changes verdict treated same as reject for retry path", async () => {
@@ -1314,14 +1322,17 @@ describe("Orchestrator — Wave A review gate + arbitration wiring", () => {
 
   it("configurable arbitration_threshold honored (threshold=1 triggers arbitration on first reject)", async () => {
     const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 1 });
-    const { orch, state, events } = setupWithReview({ reviewGate: gate, withCompletion: true });
+    const architectManager = makeFakeArchitectManager({
+      reviewVerdict: { type: "retry_with_directive", directive: "try again" },
+    });
+    const { orch, state, events } = setupWithReview({
+      reviewGate: gate, withCompletion: true, architectManager,
+    });
     const task = state.createTask("test", "t-1");
     state.updateTask("t-1", { projectId: "proj" });
-    const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     await orch.processTask(state.getTask("t-1")!);
-    consoleSpy.mockRestore();
-    expect(state.getTask("t-1")!.state).toBe("review_arbitration");
     expect(events.some((e) => e.type === "review_arbitration_entered")).toBe(true);
+    expect(architectManager.handleReviewArbitration).toHaveBeenCalledOnce();
   });
 
   it("review result persists into task.reviewResult on any verdict", async () => {
@@ -1394,31 +1405,24 @@ describe("Orchestrator — Wave A review gate + arbitration wiring", () => {
     expect(call[2].summary).toBe("Fixed it");
   });
 
-  it("arbitration warning fires exactly once across multiple transitions on same task", async () => {
-    const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 1 });
-    const { orch, state } = setupWithReview({ reviewGate: gate, withCompletion: true });
-    const task = state.createTask("test", "t-once");
-    state.updateTask("t-once", { projectId: "proj" });
-    const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    await orch.processTask(state.getTask("t-once")!);
-    // Attempting to reprocess doesn't realistically happen for review_arbitration state,
-    // but the warned-set persists across calls. We only check first warning fired cleanly.
-    expect(consoleSpy).toHaveBeenCalledOnce();
-    consoleSpy.mockRestore();
-  });
-
   it("reviewGate threshold exposed to handleReviewReject logic matches config", async () => {
-    // Create a gate with threshold 5 and verify retry runs through to count 5.
+    // threshold 5; task starts at count 4; expect exactly one arbitration fire after count=5.
     const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 5 });
-    const { orch, state } = setupWithReview({ reviewGate: gate, withCompletion: true });
+    const architectManager = makeFakeArchitectManager({
+      reviewVerdict: { type: "retry_with_directive", directive: "retry once" },
+    });
+    const { orch, state, events } = setupWithReview({
+      reviewGate: gate, withCompletion: true, architectManager,
+    });
     const task = state.createTask("test", "t-thresh");
     state.updateTask("t-thresh", { projectId: "proj", reviewerRejectionCount: 4 });
-    const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     await orch.processTask(state.getTask("t-thresh")!);
-    consoleSpy.mockRestore();
-    const updated = state.getTask("t-thresh")!;
-    expect(updated.reviewerRejectionCount).toBe(5);
-    expect(updated.state).toBe("review_arbitration");
+    const entered = events.find((e) => e.type === "review_arbitration_entered");
+    expect(entered).toBeTruthy();
+    if (entered && entered.type === "review_arbitration_entered") {
+      expect(entered.reviewerRejectionCount).toBe(5);
+    }
+    expect(architectManager.handleReviewArbitration).toHaveBeenCalledOnce();
   });
 
   it("approve verdict with zero findings proceeds cleanly without any retry signal", async () => {
@@ -1494,7 +1498,14 @@ function makeFakeArchitectManager(opts: {
   decomposeStatus?: "success" | "failure";
   alive?: boolean;
   respawnStatus?: "success" | "failure";
+  reviewVerdict?: ArchitectVerdict;
+  escalationVerdict?: ArchitectVerdict;
+  reviewThrow?: Error;
 } = {}): ArchitectManager {
+  const reviewVerdict: ArchitectVerdict =
+    opts.reviewVerdict ?? { type: "escalate_operator", rationale: "fake_default" };
+  const escalationVerdict: ArchitectVerdict =
+    opts.escalationVerdict ?? { type: "escalate_operator", rationale: "fake_default" };
   return {
     spawn: vi.fn().mockResolvedValue(
       opts.spawnStatus === "failure"
@@ -1518,14 +1529,200 @@ function makeFakeArchitectManager(opts: {
     getSession: vi.fn().mockReturnValue(undefined),
     shutdown: vi.fn().mockResolvedValue(undefined),
     shutdownAll: vi.fn().mockResolvedValue(undefined),
-    handleEscalation: vi.fn().mockResolvedValue({ type: "escalate_operator", rationale: "stub" }),
-    handleReviewArbitration: vi.fn().mockResolvedValue({ type: "escalate_operator", rationale: "stub" }),
+    handleEscalation: vi.fn().mockImplementation(() => {
+      if (opts.reviewThrow) return Promise.reject(opts.reviewThrow);
+      return Promise.resolve(escalationVerdict);
+    }),
+    handleReviewArbitration: vi.fn().mockImplementation(() => {
+      if (opts.reviewThrow) return Promise.reject(opts.reviewThrow);
+      return Promise.resolve(reviewVerdict);
+    }),
     compact: vi.fn().mockResolvedValue({ compacted: false, reason: "stub" }),
     requestSummary: vi.fn().mockResolvedValue({}),
     relayOperatorInput: vi.fn().mockResolvedValue(undefined),
     shouldCompact: vi.fn().mockReturnValue(false),
   } as unknown as ArchitectManager;
 }
+
+describe("Orchestrator — P1-B arbitration verdict routing", () => {
+  beforeEach(() => {
+    tmpDir = makeTmpDir();
+  });
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("retry_with_directive: stores directive, resets reviewerRejectionCount, transitions active, schedules retry", async () => {
+    const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 1 });
+    const architectManager = makeFakeArchitectManager({
+      reviewVerdict: { type: "retry_with_directive", directive: "wrap iteration in null-check" },
+    });
+    const { orch, state, events } = setupWithReview({
+      reviewGate: gate, withCompletion: true, architectManager,
+    });
+    state.createTask("original spec", "t-rd");
+    state.updateTask("t-rd", { projectId: "proj", phaseId: "ph" });
+    await orch.processTask(state.getTask("t-rd")!);
+    const updated = state.getTask("t-rd")!;
+    expect(updated.lastDirective).toBe("wrap iteration in null-check");
+    expect(updated.reviewerRejectionCount).toBe(0);
+    expect(updated.state).toBe("active");
+    // arbitration_verdict event carries the directive as rationale
+    const verdictEv = events.find((e) => e.type === "arbitration_verdict");
+    expect(verdictEv).toBeTruthy();
+    if (verdictEv && verdictEv.type === "arbitration_verdict") {
+      expect(verdictEv.verdict).toBe("retry_with_directive");
+      expect(verdictEv.rationale).toBe("wrap iteration in null-check");
+    }
+    // architect_arbitration_fired also emitted, with cause=review_disagreement
+    const fired = events.find((e) => e.type === "architect_arbitration_fired");
+    expect(fired).toBeTruthy();
+    if (fired && fired.type === "architect_arbitration_fired") {
+      expect(fired.cause).toBe("review_disagreement");
+    }
+  });
+
+  it("plan_amendment: updates phase spec via ProjectStore, rewrites prompt, resets count, transitions active", async () => {
+    const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 1 });
+    const architectManager = makeFakeArchitectManager({
+      reviewVerdict: {
+        type: "plan_amendment",
+        updatedPhaseSpec: "NEW SPEC: handle both list and single input",
+        rationale: "phase spec ambiguous on input shape",
+      },
+    });
+    // Need a real ProjectStore with the phase pre-registered so updatePhaseSpec can run.
+    const projectStore = new ProjectStore(join(tmpDir, "projects.json"), join(tmpDir, "wt"));
+    const proj = projectStore.createProject("p-amend", "desc", []);
+    projectStore.addPhase(proj.id, "original spec", "ph-1");
+    projectStore.attachTask(proj.id, "ph-1", "t-pa");
+
+    const { orch, state, events } = setupWithReview({
+      reviewGate: gate, withCompletion: true, architectManager, projectStore,
+    });
+    state.createTask("original spec", "t-pa");
+    state.updateTask("t-pa", { projectId: proj.id, phaseId: "ph-1" });
+
+    await orch.processTask(state.getTask("t-pa")!);
+
+    expect(projectStore.getProject(proj.id)!.phases[0].spec).toBe("NEW SPEC: handle both list and single input");
+    const updated = state.getTask("t-pa")!;
+    expect(updated.prompt).toBe("NEW SPEC: handle both list and single input");
+    expect(updated.reviewerRejectionCount).toBe(0);
+    expect(updated.state).toBe("active");
+    const verdictEv = events.find((e) => e.type === "arbitration_verdict");
+    expect(verdictEv && verdictEv.type === "arbitration_verdict" && verdictEv.verdict).toBe("plan_amendment");
+  });
+
+  it("escalate_operator: transitions failed, emits task_failed with architect rationale", async () => {
+    const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 1 });
+    const architectManager = makeFakeArchitectManager({
+      reviewVerdict: {
+        type: "escalate_operator",
+        rationale: "external API contract ambiguity",
+      },
+    });
+    const { orch, state, events } = setupWithReview({
+      reviewGate: gate, withCompletion: true, architectManager,
+    });
+    state.createTask("ambiguous spec", "t-eo");
+    state.updateTask("t-eo", { projectId: "proj", phaseId: "ph" });
+    await orch.processTask(state.getTask("t-eo")!);
+    expect(state.getTask("t-eo")!.state).toBe("failed");
+    const failed = events.find((e) => e.type === "task_failed");
+    expect(failed).toBeTruthy();
+    if (failed && failed.type === "task_failed") {
+      expect(failed.reason).toContain("external API contract ambiguity");
+    }
+    // lastError captures the escalation context for operator triage
+    expect(state.getTask("t-eo")!.lastError).toContain("architect_escalate_operator");
+  });
+
+  it("architectManager.handleReviewArbitration throws → escalate_operator synthesized", async () => {
+    const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 1 });
+    const architectManager = makeFakeArchitectManager({
+      reviewThrow: new Error("network blip"),
+    });
+    const { orch, state, events } = setupWithReview({
+      reviewGate: gate, withCompletion: true, architectManager,
+    });
+    state.createTask("x", "t-throw");
+    state.updateTask("t-throw", { projectId: "proj", phaseId: "ph" });
+    await orch.processTask(state.getTask("t-throw")!);
+    expect(state.getTask("t-throw")!.state).toBe("failed");
+    const verdictEv = events.find((e) => e.type === "arbitration_verdict");
+    expect(verdictEv).toBeTruthy();
+    if (verdictEv && verdictEv.type === "arbitration_verdict") {
+      expect(verdictEv.verdict).toBe("escalate_operator");
+      expect(verdictEv.rationale).toMatch(/architect_manager_threw.*network blip/);
+    }
+  });
+
+  it("escalation-source arbitration: routes to Architect when task has projectId (P1-B)", async () => {
+    const gate = makeFakeReviewGate("approve"); // review irrelevant — we exit via escalation
+    const architectManager = makeFakeArchitectManager({
+      escalationVerdict: { type: "retry_with_directive", directive: "re-read the prompt" },
+    });
+    const config = makeConfig();
+    mkdirSync(join(tmpDir, "tasks"), { recursive: true });
+    const gitOps = mockGitOps();
+    (gitOps.createWorktree as ReturnType<typeof vi.fn>).mockImplementation(
+      (_b: string, _br: string, wtPath: string) => {
+        mkdirSync(join(wtPath, ".harness"), { recursive: true });
+        writeFileSync(
+          join(wtPath, ".harness", "completion.json"),
+          JSON.stringify({ status: "success", commitSha: "abc", summary: "S", filesChanged: ["f.ts"] }),
+        );
+        // Escalation signal takes priority over completion.
+        writeFileSync(
+          join(wtPath, ".harness", "escalation.json"),
+          JSON.stringify({ type: "blocked", question: "which file?" }),
+        );
+      },
+    );
+    const queryFn: QueryFn = vi.fn().mockReturnValue(mockQuery([makeResultSuccess()]));
+    const sdk = new SDKClient(queryFn);
+    const state = new StateManager(join(tmpDir, "state.json"));
+    const sessionMgr = new SessionManager(sdk, state, config, gitOps);
+    const mergeGate = new MergeGate(config.pipeline, tmpDir, mockMergeGitOps());
+    const orch = new Orchestrator({
+      sessionManager: sessionMgr, mergeGate, stateManager: state, config,
+      reviewGate: gate, architectManager,
+    });
+    const events: OrchestratorEvent[] = [];
+    orch.on((e) => events.push(e));
+    state.createTask("x", "t-esc");
+    state.updateTask("t-esc", { projectId: "proj", phaseId: "ph" });
+    await orch.processTask(state.getTask("t-esc")!);
+    expect(architectManager.handleEscalation).toHaveBeenCalledOnce();
+    const verdictEv = events.find((e) => e.type === "arbitration_verdict");
+    expect(verdictEv && verdictEv.type === "arbitration_verdict" && verdictEv.verdict).toBe("retry_with_directive");
+    const fired = events.find((e) => e.type === "architect_arbitration_fired");
+    expect(fired && fired.type === "architect_arbitration_fired" && fired.cause).toBe("escalation");
+  });
+
+  it("plan_amendment: no-ops ProjectStore call when store is unavailable (still updates task)", async () => {
+    // Unusual but legal: plan_amendment verdict returned but projectStore not
+    // injected. Task prompt should still update; phase spec update silently skipped.
+    const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 1 });
+    const architectManager = makeFakeArchitectManager({
+      reviewVerdict: {
+        type: "plan_amendment",
+        updatedPhaseSpec: "alt spec",
+        rationale: "fix bad spec",
+      },
+    });
+    const { orch, state } = setupWithReview({
+      reviewGate: gate, withCompletion: true, architectManager,
+      // no projectStore
+    });
+    state.createTask("x", "t-nops");
+    state.updateTask("t-nops", { projectId: "proj", phaseId: "ph" });
+    await orch.processTask(state.getTask("t-nops")!);
+    expect(state.getTask("t-nops")!.prompt).toBe("alt spec");
+    expect(state.getTask("t-nops")!.state).toBe("active");
+  });
+});
 
 describe("Orchestrator — Wave B declareProject + Architect crash recovery", () => {
   beforeEach(() => {

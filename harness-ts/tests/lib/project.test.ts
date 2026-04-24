@@ -78,6 +78,25 @@ describe("ProjectStore", () => {
     expect(phase.state).toBe("active");
   });
 
+  it("updatePhaseSpec replaces phase.spec (P1-C)", () => {
+    const store = freshStore();
+    const proj = store.createProject("p", "d", []);
+    const phaseId = store.addPhase(proj.id, "original spec");
+    store.updatePhaseSpec(proj.id, phaseId, "amended spec — handle empty list");
+    expect(store.getProject(proj.id)!.phases[0].spec).toBe("amended spec — handle empty list");
+  });
+
+  it("updatePhaseSpec throws on unknown project", () => {
+    const store = freshStore();
+    expect(() => store.updatePhaseSpec("missing", "ph", "x")).toThrow();
+  });
+
+  it("updatePhaseSpec throws on unknown phase", () => {
+    const store = freshStore();
+    const proj = store.createProject("p", "d", []);
+    expect(() => store.updatePhaseSpec(proj.id, "missing", "x")).toThrow();
+  });
+
   it("markPhaseDone / markPhaseFailed update phase state", () => {
     const store = freshStore();
     const proj = store.createProject("p", "d", []);

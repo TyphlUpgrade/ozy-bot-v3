@@ -233,6 +233,18 @@ export class ProjectStore {
     this.touch(project);
   }
 
+  /**
+   * Replace a phase's spec. Used by the Architect `plan_amendment` verdict
+   * (P1) when the reviewer-rejected phase is determined to have a bad spec
+   * rather than a bad execution. Throws if project or phase is missing.
+   */
+  updatePhaseSpec(projectId: string, phaseId: string, newSpec: string): void {
+    const project = this.requireProject(projectId);
+    const phase = this.requirePhase(project, phaseId);
+    phase.spec = newSpec;
+    this.touch(project);
+  }
+
   incrementCost(projectId: string, costUsd: number): void {
     const project = this.requireProject(projectId);
     project.totalCostUsd += costUsd;
