@@ -2034,3 +2034,120 @@ Against potential production savings from correctly-locked plan: cheap insurance
 
 Track in plan Wave A completion criteria.
 
+---
+
+### M.15 First end-to-end real-SDK project run (post-Wave-B, 2026-04-24)
+
+**Goal:** validate declareProject → Architect decompose → Executor phase → merge against live SDK, not mocks. Script: `harness-ts/scripts/live-project.ts`.
+
+**Scope of first run:** 1-phase trivial project ("add hello.ts with one line of TS"), 2 non-goals.
+
+**Outcome: PASS (5/5 checks).**
+
+| Metric | Value |
+|---|---|
+| Elapsed | 66.8s |
+| Total cost | $0.69 |
+| Architect cost | $0.58 (Opus + 200-line system prompt + OMC + caveman) |
+| Executor cost | $0.11 (sonnet + OMC + caveman) |
+| Events emitted | 21 |
+| Discord messages routed via notifier | 7 |
+| Trunk commits | 3 (init + executor-add + merge) |
+
+**Checks that passed:**
+- `project_declared` fired
+- `architect_spawned` fired
+- `project_decomposed` fired (1 phase as expected)
+- Phase task file written by Architect, picked up by `scanForTasks`
+- Executor produced `.harness/completion.json` with valid schema (after adding Executor systemPrompt to the live-run config)
+- Merge gate processed the phase, rebased + merged onto trunk
+- `task_done` emitted
+- hello.ts content on trunk matches Architect's phase prompt exactly
+
+#### M.15.1 Real bugs surfaced (mock-invisible)
+
+**Bug 1 — TaskFile.projectId not propagated to TaskRecord.projectId.** Architect wrote phase files with `{id, prompt, priority, projectId, phaseId}`. `orchestrator.scanForTasks` calls `state.createTask(prompt, id)` which only persists `{id, prompt}`. `projectId` and `phaseId` are silently dropped. Consequence: **every Wave A project-mandatory review gate is bypassed at runtime** because `task.projectId === undefined`. The integration tests never caught this because they called `state.updateTask(id, {projectId})` directly in test setup — they never exercised the ingest lane.
+
+**Fix scope:** 2-line edit in `scanForTasks`:
+```typescript
+const task = this.state.createTask(taskFile.prompt, taskId);
+if (taskFile.projectId) {
+  this.state.updateTask(task.id, {
+    projectId: taskFile.projectId,
+    phaseId: taskFile.phaseId ?? task.id,
+  });
+}
+```
+Plus a regression test asserting scanForTasks round-trips projectId + phaseId into TaskRecord.
+
+**Bug 2 — Project auto-completion not wired.** After all phases reach `done`, the project record stays in `state: "decomposing"` forever. `projectStore.markPhaseDone` and `projectStore.completeProject` are never called from the merge success path. `project_completed` event never emitted.
+
+**Fix scope:** 5-10 lines in `handleMergeResult` "merged" case:
+```typescript
+if (task.projectId && task.phaseId) {
+  this.projectStore.markPhaseDone(task.projectId, task.phaseId);
+  if (!this.projectStore.hasActivePhases(task.projectId)) {
+    const p = this.projectStore.getProject(task.projectId)!;
+    this.projectStore.completeProject(task.projectId);
+    this.emit({
+      type: "project_completed",
+      projectId: task.projectId,
+      phaseCount: p.phases.length,
+      totalCostUsd: p.totalCostUsd,
+    });
+  }
+}
+```
+Plus regression tests for phase-done + all-phases-done → completeProject + event.
+
+**Both bugs are Wave C scope per plan.** Elevate priority — they block any real project lifecycle validation beyond this one run.
+
+#### M.15.2 Executor tier behavior (lead-engineer analysis)
+
+**Observed:**
+- 14s latency, $0.11 cost, compliance score 0/4 (base fields only; no confidence/understanding/assumptions/nonGoals)
+- No OMC subagent invocation (matches M.13.3 — single-mode Executors don't fire specialists unprompted)
+- No /team spawn, no tmux
+- Budget utilization 11% of $1 cap
+
+**Unknowns needing validation:**
+
+**U1 — caveman × structured JSON.** Reviewer spike M.11.5 showed caveman corrupting structured JSON verdict. Executor writes `completion.json` — same risk. This run's JSON was clean but a single trivial-task data point. **Recommend spike before Wave C:** 5 Executor runs with strict-JSON completion contract + confidence block; measure field preservation rate. If <95%, **drop caveman from Executor defaults** for any task that writes structured signals.
+
+**U2 — OMC plugin cost on Executor.** M.13.3 showed OMC specialists don't fire unprompted for single-mode agents. Loading OMC adds init overhead for no benefit. **Recommend:** drop OMC from Executor defaults. Keep OMC for Architect (decomposer, M.12 validated) and future parallel-Reviewer (M.14). Architect's phase prompts can opt specific phases into OMC via explicit `Task(subagent_type=...)` directives.
+
+**U3 — Enrichment adoption.** Phase 2A graduated response routing (levels 0-4) requires Executor to populate confidence. Real Executor did not. Two options:
+- (a) Enrich Executor systemPrompt per live-run.ts enriched mode (demonstrated compliance 4/4 in that harness)
+- (b) Have Architect inject enrichment demand into each phase prompt
+Option (a) simpler, (b) more surgical per-phase. Prefer (a) for Wave C default.
+
+**U4 — persistSession accumulation.** Wave 1 Item 1 sub-fix sets Executor `persistSession: true`. Every phase persists its session. 100 phases = 100 persistent session records. No cleanup path. **Not urgent** (single-project runs don't accumulate in practice) but flag for Phase 4 observability work.
+
+**U5 — Budget tuning.** Simple phase $0.11, ceiling $1 = 9× over-provisioned. Complex phases may need $2+. Flat caps don't fit. **Recommend Wave D:** graduated caps by Architect-declared phase complexity (add `complexity: "trivial" | "standard" | "complex"` to decomposed phase file; Executor spawn picks budget from complexity-to-cap table).
+
+#### M.15.3 Architect tier behavior (observed)
+
+- Decomposition produced exactly 1 phase for a 1-phase project (as expected)
+- Architect prompt contract held: phase file JSON schema valid, phaseId format "01"
+- Cost $0.58 — dominated by Opus + 200-line system prompt + OMC/caveman plugin init
+- Session duration 26s end-to-end (spawn → decompose)
+
+**Architect observations:**
+- Budget $0.50 was too tight (prior run hit cap on spawn alone). Raised to $4 for this run; actual spend $0.58. **Production default should be $2-3** with overrides for large projects.
+- OMC forced-delegation not exercised — trivial project didn't need it. Revisit with multi-phase run.
+
+#### M.15.4 Action items before further real-SDK runs
+
+1. **Fix Bug 1** (projectId propagation) — one-line edit + 1 test.
+2. **Fix Bug 2** (project auto-completion) — ~10 lines + 2 tests.
+3. **Run 3-phase project** with later-phase-depends-on-earlier. Stresses state + budget + project completion.
+4. **Spike caveman × structured JSON** on Executor — directly blocks Wave C Reviewer which is already validated as caveman-vulnerable.
+5. **Consider dropping OMC from Executor defaults** — pre-Wave-C config decision.
+
+#### M.15.5 Reference run
+
+Scratch repo preserved at `/tmp/harness-live-proj-1777062487967/` (time-stamped). Commit sha `005850f` on the scratch trunk. Full event log in `/tmp/live-project.log`.
+
+Script: `harness-ts/scripts/live-project.ts` — committed as permanent regression harness. Re-run after any Wave C change to confirm no end-to-end regression.
+
+
