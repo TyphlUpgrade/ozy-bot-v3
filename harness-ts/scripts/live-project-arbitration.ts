@@ -271,38 +271,43 @@ async function main(): Promise<void> {
     console.log(`greet.ts NOT on trunk`);
   }
 
-  // PASS criteria. Relaxed from the spec because real Architect reasonably
-  // challenges reviewer concerns it can't ground in the task prompt — that's
-  // correct behavior, not a bug. We verify the VERDICT-PARSING path works
-  // end-to-end regardless of which of the 3 types the Architect chooses.
+  // PASS criteria. The script is configured so the stub Reviewer's concern
+  // IS grounded in the task prompt, so escalate_operator here indicates a
+  // regression (Architect should retry or amend). We accept retry_with_directive
+  // OR plan_amendment but forbid escalate_operator.
   const architectSpawned = events.some((e) => e.type === "architect_spawned");
   const decomposed = events.some((e) => e.type === "project_decomposed");
   const arbEntered = events.filter((e) => e.type === "review_arbitration_entered").length;
   const arbFired = events.find((e) => e.type === "architect_arbitration_fired");
   const arbVerdict = events.find((e) => e.type === "arbitration_verdict");
+  const verdictType = arbVerdict && arbVerdict.type === "arbitration_verdict" ? arbVerdict.verdict : null;
+  const verdictOk = verdictType === "retry_with_directive" || verdictType === "plan_amendment";
   const sessionCompletes = events.filter((e) => e.type === "session_complete").length;
-  const projectTerminal = project?.state === "completed" || project?.state === "failed";
+  const taskDoneCount = events.filter((e) => e.type === "task_done").length;
+  const projectCompleted = events.some((e) => e.type === "project_completed");
+  const greetOk = existsSync(greetPath);
 
   console.log(`\nchecks:`);
   console.log(`  architect_spawned:              ${architectSpawned}`);
   console.log(`  project_decomposed:             ${decomposed}`);
   console.log(`  review_arbitration_entered=1:   ${arbEntered === 1} (actual: ${arbEntered})`);
   console.log(`  architect_arbitration_fired:    ${!!arbFired} cause=${arbFired && arbFired.type === "architect_arbitration_fired" ? arbFired.cause : "-"}`);
-  console.log(
-    `  arbitration_verdict parsed:     ${!!arbVerdict} ` +
-      `verdict=${arbVerdict && arbVerdict.type === "arbitration_verdict" ? arbVerdict.verdict : "-"}`,
-  );
-  console.log(`  session_complete ≥ 1:           ${sessionCompletes >= 1} (actual: ${sessionCompletes})`);
-  console.log(`  project reached terminal state: ${projectTerminal} (state=${project?.state})`);
+  console.log(`  arbitration_verdict non-escalate: ${verdictOk} verdict=${verdictType ?? "-"}`);
+  console.log(`  session_complete ≥ 2 (retry ran): ${sessionCompletes >= 2} (actual: ${sessionCompletes})`);
+  console.log(`  task_done ≥ 1:                  ${taskDoneCount >= 1} (actual: ${taskDoneCount})`);
+  console.log(`  project_completed event:        ${projectCompleted}`);
+  console.log(`  greet.ts on trunk:              ${greetOk}`);
 
   const pass =
     architectSpawned &&
     decomposed &&
     arbEntered === 1 &&
     !!arbFired &&
-    !!arbVerdict &&
-    sessionCompletes >= 1 &&
-    projectTerminal;
+    verdictOk &&
+    sessionCompletes >= 2 &&
+    taskDoneCount >= 1 &&
+    projectCompleted &&
+    greetOk;
 
   console.log(`\nRESULT: ${pass ? "PASS" : "FAIL"}`);
   console.log(`scratch preserved at: ${root}`);
