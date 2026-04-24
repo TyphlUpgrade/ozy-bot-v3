@@ -267,6 +267,12 @@ export class Orchestrator {
       }
 
       const task = this.state.createTask(taskFile.prompt, taskId);
+      if (taskFile.projectId) {
+        this.state.updateTask(task.id, {
+          projectId: taskFile.projectId,
+          phaseId: taskFile.phaseId ?? task.id,
+        });
+      }
 
       // Remove the file — we've ingested it
       try { unlinkSync(filePath); } catch { /* ignore */ }
@@ -630,6 +636,21 @@ export class Orchestrator {
         });
         this.emit({ type: "task_done", taskId: task.id });
         this.sessions.cleanupWorktree(task.id);
+        if (task.projectId && task.phaseId && this.projectStore) {
+          this.projectStore.markPhaseDone(task.projectId, task.phaseId);
+          if (!this.projectStore.hasActivePhases(task.projectId)) {
+            const project = this.projectStore.getProject(task.projectId);
+            if (project) {
+              this.projectStore.completeProject(task.projectId);
+              this.emit({
+                type: "project_completed",
+                projectId: task.projectId,
+                phaseCount: project.phases.length,
+                totalCostUsd: project.totalCostUsd,
+              });
+            }
+          }
+        }
         break;
 
       case "rebase_conflict": {

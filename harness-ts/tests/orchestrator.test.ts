@@ -123,6 +123,7 @@ interface TestHarness {
   gitOps: GitOps;
   mergeGitOps: MergeGitOps;
   queryFn: QueryFn;
+  projectStore?: ProjectStore;
 }
 
 function setupHarness(opts?: {
@@ -130,6 +131,7 @@ function setupHarness(opts?: {
   withCompletion?: boolean;
   mergeGitOverrides?: Partial<MergeGitOps>;
   freshQueryPerCall?: boolean;
+  withProjectStore?: boolean;
 }): TestHarness {
   const config = makeConfig();
   mkdirSync(join(tmpDir, "tasks"), { recursive: true });
@@ -163,17 +165,22 @@ function setupHarness(opts?: {
   const mergeGitOps_ = { ...mockMergeGitOps(), ...opts?.mergeGitOverrides };
   const mergeGate = new MergeGate(config.pipeline, tmpDir, mergeGitOps_);
 
+  const projectStore = opts?.withProjectStore
+    ? new ProjectStore(join(tmpDir, "projects.json"), join(tmpDir, "wt"))
+    : undefined;
+
   const orch = new Orchestrator({
     sessionManager: sessionMgr,
     mergeGate,
     stateManager: state,
     config,
+    projectStore,
   });
 
   const events: OrchestratorEvent[] = [];
   orch.on((e) => events.push(e));
 
-  return { orch, state, config, events, gitOps, mergeGitOps: mergeGitOps_, queryFn };
+  return { orch, state, config, events, gitOps, mergeGitOps: mergeGitOps_, queryFn, projectStore };
 }
 
 function dropTask(taskDir: string, id: string, prompt: string): void {
@@ -291,10 +298,27 @@ describe("Orchestrator", () => {
 
       const task = state.getTask("proj-task");
       expect(task).toBeTruthy();
-      // TaskFile fields parsed but not yet persisted to TaskRecord (routeByProject
-      // in Wave 1.5a + project attachment in Wave B wires the projectId into state).
-      // The smoke check here is that the file was accepted, not rejected.
       expect(task!.prompt).toBe("phase 1: add logger");
+      expect(task!.projectId).toBe("proj-abc");
+      expect(task!.phaseId).toBe("phase-1");
+    });
+
+    it("defaults phaseId to task.id when TaskFile omits it", () => {
+      const { orch, state } = setupHarness({ withCompletion: true });
+      writeFileSync(
+        join(tmpDir, "tasks", "phase-only-proj.json"),
+        JSON.stringify({
+          id: "phase-only-proj",
+          prompt: "single-phase project",
+          projectId: "proj-solo",
+        }),
+      );
+
+      orch.scanForTasks();
+
+      const task = state.getTask("phase-only-proj");
+      expect(task!.projectId).toBe("proj-solo");
+      expect(task!.phaseId).toBe("phase-only-proj");
     });
 
     it("rejects task file with projectId + mode:dialogue (Section C.2)", () => {
@@ -374,6 +398,44 @@ describe("Orchestrator", () => {
 
       expect(state.getTask("no-signal")!.state).toBe("failed");
       expect(state.getTask("no-signal")!.lastError).toContain("No completion signal");
+    });
+
+    it("emits project_completed when final phase merges (Bug 2: auto-completion)", async () => {
+      const { orch, state, events, projectStore } = setupHarness({ withCompletion: true, withProjectStore: true });
+      const project = projectStore!.createProject("p-auto", "desc", []);
+      projectStore!.addPhase(project.id, "only phase", "phase-a");
+      projectStore!.attachTask(project.id, "phase-a", "t-phase-a");
+      const task = state.createTask("only phase", "t-phase-a");
+      state.updateTask(task.id, { projectId: project.id, phaseId: "phase-a" });
+      const refreshed = state.getTask("t-phase-a")!;
+
+      await orch.processTask(refreshed);
+
+      expect(state.getTask("t-phase-a")!.state).toBe("done");
+      const completed = events.find((e) => e.type === "project_completed");
+      expect(completed).toBeTruthy();
+      if (completed && completed.type === "project_completed") {
+        expect(completed.projectId).toBe(project.id);
+        expect(completed.phaseCount).toBe(1);
+      }
+      expect(projectStore!.getProject(project.id)!.state).toBe("completed");
+    });
+
+    it("does not emit project_completed while active phases remain", async () => {
+      const { orch, state, events, projectStore } = setupHarness({ withCompletion: true, withProjectStore: true });
+      const project = projectStore!.createProject("p-multi", "d", []);
+      projectStore!.addPhase(project.id, "phase 1", "phase-1");
+      projectStore!.addPhase(project.id, "phase 2", "phase-2");
+      projectStore!.attachTask(project.id, "phase-1", "t-p1");
+      const task = state.createTask("phase 1", "t-p1");
+      state.updateTask(task.id, { projectId: project.id, phaseId: "phase-1" });
+      const refreshed = state.getTask("t-p1")!;
+
+      await orch.processTask(refreshed);
+
+      expect(state.getTask("t-p1")!.state).toBe("done");
+      expect(events.some((e) => e.type === "project_completed")).toBe(false);
+      expect(projectStore!.getProject(project.id)!.state).toBe("decomposing");
     });
   });
 
