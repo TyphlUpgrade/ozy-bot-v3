@@ -6,8 +6,9 @@
 
 import { readdirSync, readFileSync, unlinkSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { SessionManager } from "./session/manager.js";
+import { SessionManager, type CompletionSignal } from "./session/manager.js";
 import { MergeGate, type MergeResult } from "./gates/merge.js";
+import type { SessionResult } from "./session/sdk.js";
 import { StateManager, type TaskRecord } from "./lib/state.js";
 import type { HarnessConfig } from "./lib/config.js";
 import { readEscalation, type EscalationSignal } from "./lib/escalation.js";
@@ -245,10 +246,34 @@ export class Orchestrator {
     }
   }
 
-  /** Full task lifecycle: spawn session -> check completion -> merge or fail */
+  /**
+   * Routing precedence (evaluated in order):
+   *
+   *   1. task.projectId !== undefined
+   *        → routeByProject (Wave B); mode/response_level subordinate.
+   *        → All project behavior (mandatory review, Architect arbitration,
+   *          project-channel dialogue) gates on this single boolean.
+   *
+   *   2. TaskFile.mode === "dialogue" && task.projectId === undefined
+   *        → pre-pipeline dialogue (Wave 6-split); DialogueSession + proposal.json.
+   *
+   *   3. Otherwise
+   *        → standard pipeline: Executor → shouldReview(task) → (review?) → merge.
+   *        → responseLevel routes merge / review / escalation as per Phase 2A.
+   *
+   * Conflict: projectId + mode:"dialogue" combined → REJECTED at task ingest
+   * (throws TaskFileValidationError). Project dialogue happens through the
+   * Architect, not through the standalone dialogue session. See Section C.2.
+   *
+   * Full task lifecycle: spawn session -> check completion -> merge or fail.
+   */
   async processTask(task: TaskRecord): Promise<void> {
     try {
-      // Spawn agent session
+      // Routing precedence rule 1: project-scoped tasks go through project dispatch.
+      // Wave 1.5a stub — returns false so standard pipeline handles today's tasks;
+      // Wave B wires cost-ceiling precheck, phase attachment, and Architect routing.
+      if (await this.routeByProject(task)) return;
+
       const { result, completion } = await this.sessions.spawnTask(task);
 
       this.emit({
@@ -257,33 +282,10 @@ export class Orchestrator {
         success: result.success,
       });
 
-      // Check for checkpoints (informational — always emit if present)
+      this.emitInformationalEvents(task, completion);
+
+      // Check for escalation signal — takes priority over completion.
       const worktreePath = this.state.getTask(task.id)?.worktreePath;
-      if (worktreePath) {
-        const checkpoints = readCheckpoints(worktreePath);
-        if (checkpoints.length > 0) {
-          this.emit({ type: "checkpoint_detected", taskId: task.id, checkpoints });
-        }
-      }
-
-      // Completion compliance event (informational)
-      if (completion) {
-        this.emit({
-          type: "completion_compliance",
-          taskId: task.id,
-          hasConfidence: completion.confidence !== undefined,
-          hasUnderstanding: completion.understanding !== undefined,
-          hasAssumptions: completion.assumptions !== undefined,
-          hasNonGoals: completion.nonGoals !== undefined,
-          complianceScore:
-            (completion.confidence !== undefined ? 1 : 0) +
-            (completion.understanding !== undefined ? 1 : 0) +
-            (completion.assumptions !== undefined ? 1 : 0) +
-            (completion.nonGoals !== undefined ? 1 : 0),
-        });
-      }
-
-      // Check for escalation signal — takes priority over completion
       if (worktreePath) {
         const escalation = readEscalation(worktreePath);
         if (escalation) {
@@ -293,166 +295,12 @@ export class Orchestrator {
         }
       }
 
-      // Session failed — route through retry/escalation logic
       if (!result.success || !completion || completion.status !== "success") {
-        const reason = !result.success
-          ? result.errors.join("; ")
-          : !completion
-            ? "No completion signal"
-            : `Agent reported failure: ${completion.summary}`;
-
-        // Clean up worktree before any retry/escalation decision
-        this.sessions.cleanupWorktree(task.id);
-
-        // Budget exhaustion — permanent failure, never retry (would burn more money)
-        if (result.terminalReason === "error_max_budget_usd") {
-          this.state.transition(task.id, "failed");
-          this.state.updateTask(task.id, { lastError: `Budget exhausted ($${result.totalCostUsd.toFixed(2)})` });
-          this.emit({ type: "budget_exhausted", taskId: task.id, totalCostUsd: result.totalCostUsd });
-          this.emit({ type: "task_failed", taskId: task.id, reason: "Budget exhausted" });
-          return;
-        }
-
-        const retryCount = this.state.incrementRetry(task.id);
-        const maxSessionRetries = this.config.pipeline.max_session_retries ?? 3;
-
-        if (retryCount < maxSessionRetries) {
-          // Retry: active -> failed -> pending -> processTask
-          this.state.transition(task.id, "failed");
-          this.state.updateTask(task.id, { lastError: reason });
-          this.state.transition(task.id, "pending");
-          this.emit({ type: "retry_scheduled", taskId: task.id, attempt: retryCount + 1, maxRetries: maxSessionRetries });
-          const updated = this.state.getTask(task.id)!;
-          await this.processTask(updated);
-          return;
-        }
-
-        // Max retries exhausted — escalate or fail
-        const autoEscalate = this.config.pipeline.auto_escalate_on_max_retries ?? true;
-        const maxEscalations = this.config.pipeline.max_tier1_escalations ?? 2;
-        const current = this.state.getTask(task.id)!;
-
-        if (autoEscalate && current.tier1EscalationCount < maxEscalations) {
-          // Auto-escalate: active -> escalation_wait
-          this.state.transition(task.id, "escalation_wait");
-          this.state.updateTask(task.id, {
-            lastError: reason,
-            tier1EscalationCount: current.tier1EscalationCount + 1,
-          });
-          this.emit({
-            type: "escalation_needed",
-            taskId: task.id,
-            escalation: { type: "persistent_failure", question: `Task failed ${maxSessionRetries} times: ${reason}` },
-          });
-          return;
-        }
-
-        // Circuit breaker: permanent failure
-        this.state.transition(task.id, "failed");
-        this.state.updateTask(task.id, {
-          lastError: autoEscalate
-            ? `Circuit breaker: exhausted ${maxSessionRetries} retries × ${maxEscalations} escalation cycles`
-            : reason,
-        });
-        this.emit({ type: "task_failed", taskId: task.id, reason });
+        await this.handleSessionFailure(task, result, completion);
         return;
       }
 
-      // Graduated response routing (informational in Phase 2A — all levels proceed to merge)
-      const responseResult = evaluateResponseLevel(completion, result);
-      this.emit({
-        type: "response_level",
-        taskId: task.id,
-        level: responseResult.level,
-        name: responseResult.name,
-        reasons: responseResult.reasons,
-      });
-
-      // Route to merge gate
-      this.state.transition(task.id, "merging");
-      const updatedTask = this.state.getTask(task.id)!;
-      const mergeResult = await this.mergeGate.enqueue(
-        task.id,
-        updatedTask.worktreePath!,
-        updatedTask.branchName!,
-      );
-
-      this.emit({ type: "merge_result", taskId: task.id, result: mergeResult });
-
-      switch (mergeResult.status) {
-        case "merged":
-          this.state.transition(task.id, "done");
-          this.state.updateTask(task.id, {
-            summary: completion.summary,
-            filesChanged: completion.filesChanged,
-          });
-          this.emit({ type: "task_done", taskId: task.id });
-          // Cleanup worktree
-          this.sessions.cleanupWorktree(task.id);
-          break;
-
-        case "rebase_conflict": {
-          const attempts = this.state.incrementRebaseAttempts(task.id);
-          // Clean up worktree so retry can re-create it
-          this.sessions.cleanupWorktree(task.id);
-          if (attempts >= this.config.pipeline.max_retries) {
-            this.state.transition(task.id, "failed");
-            this.state.updateTask(task.id, {
-              lastError: `Rebase conflict after ${attempts} attempts`,
-            });
-            this.emit({
-              type: "task_failed",
-              taskId: task.id,
-              reason: `Rebase conflict persists (${attempts} attempts)`,
-            });
-          } else {
-            this.state.transition(task.id, "shelved");
-            this.emit({
-              type: "task_shelved",
-              taskId: task.id,
-              reason: `Rebase conflict (attempt ${attempts}/${this.config.pipeline.max_retries})`,
-            });
-            // Schedule auto-retry — delay from config
-            this.scheduleRetry(task.id, this.config.pipeline.retry_delay_ms);
-          }
-          break;
-        }
-
-        case "test_failed":
-          this.state.transition(task.id, "failed");
-          this.state.updateTask(task.id, {
-            lastError: `Tests failed: ${mergeResult.error}`,
-          });
-          this.emit({
-            type: "task_failed",
-            taskId: task.id,
-            reason: `Tests failed`,
-          });
-          this.sessions.cleanupWorktree(task.id);
-          break;
-
-        case "test_timeout":
-          this.state.transition(task.id, "failed");
-          this.state.updateTask(task.id, { lastError: "Test timeout" });
-          this.emit({
-            type: "task_failed",
-            taskId: task.id,
-            reason: "Test timeout",
-          });
-          this.sessions.cleanupWorktree(task.id);
-          break;
-
-        case "error":
-          this.state.transition(task.id, "failed");
-          this.state.updateTask(task.id, { lastError: mergeResult.error });
-          this.emit({
-            type: "task_failed",
-            taskId: task.id,
-            reason: mergeResult.error,
-          });
-          this.sessions.cleanupWorktree(task.id);
-          break;
-      }
+      await this.routeByResponseLevel(task, completion, result);
     } catch (err) {
       // Unexpected error — fail the task and clean up worktree
       const reason = (err as Error).message;
@@ -468,6 +316,237 @@ export class Orchestrator {
         // State transition may also fail if task is in incompatible state
       }
       this.emit({ type: "task_failed", taskId: task.id, reason });
+    }
+  }
+
+  /**
+   * Project-aware dispatch entry point. Wave 1.5a stub.
+   *
+   * Returns true iff the task was fully handled by the project path (caller
+   * should short-circuit). Returns false to fall through to the standard
+   * Executor pipeline.
+   *
+   * Today this is a no-op pass-through: even project-scoped tasks continue
+   * through the standard pipeline because Wave B has not wired the project
+   * cost-ceiling precheck, phase attachment, or Architect routing yet.
+   *
+   * Wave B will flesh this out to:
+   *   - consult projectStore for the current project + phase
+   *   - enforce budgetCeilingUsd via Section C.4 precheck
+   *   - call projectStore.attachTask(projectId, phaseId, task.id)
+   *   - on Architect-owned work, spawn the Architect session instead
+   */
+  private async routeByProject(_task: TaskRecord): Promise<boolean> {
+    // Wave B hook — kept intentionally minimal so Wave 1.5a lands with zero
+    // behavior change. Any project-aware decision belongs here, not inline.
+    return false;
+  }
+
+  /** Emit checkpoint + completion-compliance events (informational, never blocks flow). */
+  private emitInformationalEvents(task: TaskRecord, completion: CompletionSignal | null): void {
+    const worktreePath = this.state.getTask(task.id)?.worktreePath;
+    if (worktreePath) {
+      const checkpoints = readCheckpoints(worktreePath);
+      if (checkpoints.length > 0) {
+        this.emit({ type: "checkpoint_detected", taskId: task.id, checkpoints });
+      }
+    }
+    if (completion) {
+      this.emit({
+        type: "completion_compliance",
+        taskId: task.id,
+        hasConfidence: completion.confidence !== undefined,
+        hasUnderstanding: completion.understanding !== undefined,
+        hasAssumptions: completion.assumptions !== undefined,
+        hasNonGoals: completion.nonGoals !== undefined,
+        complianceScore:
+          (completion.confidence !== undefined ? 1 : 0) +
+          (completion.understanding !== undefined ? 1 : 0) +
+          (completion.assumptions !== undefined ? 1 : 0) +
+          (completion.nonGoals !== undefined ? 1 : 0),
+      });
+    }
+  }
+
+  /** Handle session failure: budget exhaustion > retry > auto-escalation > circuit breaker. */
+  private async handleSessionFailure(
+    task: TaskRecord,
+    result: SessionResult,
+    completion: CompletionSignal | null,
+  ): Promise<void> {
+    const reason = !result.success
+      ? result.errors.join("; ")
+      : !completion
+        ? "No completion signal"
+        : `Agent reported failure: ${completion.summary}`;
+
+    // Clean up worktree before any retry/escalation decision
+    this.sessions.cleanupWorktree(task.id);
+
+    // Budget exhaustion — permanent failure, never retry (would burn more money)
+    if (result.terminalReason === "error_max_budget_usd") {
+      this.state.transition(task.id, "failed");
+      this.state.updateTask(task.id, { lastError: `Budget exhausted ($${result.totalCostUsd.toFixed(2)})` });
+      this.emit({ type: "budget_exhausted", taskId: task.id, totalCostUsd: result.totalCostUsd });
+      this.emit({ type: "task_failed", taskId: task.id, reason: "Budget exhausted" });
+      return;
+    }
+
+    const retryCount = this.state.incrementRetry(task.id);
+    const maxSessionRetries = this.config.pipeline.max_session_retries ?? 3;
+
+    if (retryCount < maxSessionRetries) {
+      this.state.transition(task.id, "failed");
+      this.state.updateTask(task.id, { lastError: reason });
+      this.state.transition(task.id, "pending");
+      this.emit({ type: "retry_scheduled", taskId: task.id, attempt: retryCount + 1, maxRetries: maxSessionRetries });
+      const updated = this.state.getTask(task.id)!;
+      await this.processTask(updated);
+      return;
+    }
+
+    // Max retries exhausted — escalate or fail
+    const autoEscalate = this.config.pipeline.auto_escalate_on_max_retries ?? true;
+    const maxEscalations = this.config.pipeline.max_tier1_escalations ?? 2;
+    const current = this.state.getTask(task.id)!;
+
+    if (autoEscalate && current.tier1EscalationCount < maxEscalations) {
+      this.state.transition(task.id, "escalation_wait");
+      this.state.updateTask(task.id, {
+        lastError: reason,
+        tier1EscalationCount: current.tier1EscalationCount + 1,
+      });
+      this.emit({
+        type: "escalation_needed",
+        taskId: task.id,
+        escalation: { type: "persistent_failure", question: `Task failed ${maxSessionRetries} times: ${reason}` },
+      });
+      return;
+    }
+
+    // Circuit breaker: permanent failure
+    this.state.transition(task.id, "failed");
+    this.state.updateTask(task.id, {
+      lastError: autoEscalate
+        ? `Circuit breaker: exhausted ${maxSessionRetries} retries × ${maxEscalations} escalation cycles`
+        : reason,
+    });
+    this.emit({ type: "task_failed", taskId: task.id, reason });
+  }
+
+  /**
+   * Decide whether the review gate should fire for this task.
+   *
+   * Wave 1.5a stub — always returns false (Phase 2A path, no review gate).
+   * Wave A will wire real trigger logic based on:
+   *   - responseLevel >= 2 (reviewed / dialogue)
+   *   - TaskFile.mode === "reviewed"
+   *   - task.projectId !== undefined (project phases are always reviewed)
+   */
+  private shouldReview(
+    _task: TaskRecord,
+    _completion: CompletionSignal,
+    _result: SessionResult,
+    _responseLevel: ResponseLevel,
+  ): boolean {
+    return false;
+  }
+
+  /** Route task based on response level: today always merge, Wave A routes to review. */
+  private async routeByResponseLevel(
+    task: TaskRecord,
+    completion: CompletionSignal,
+    result: SessionResult,
+  ): Promise<void> {
+    const responseResult = evaluateResponseLevel(completion, result);
+    this.emit({
+      type: "response_level",
+      taskId: task.id,
+      level: responseResult.level,
+      name: responseResult.name,
+      reasons: responseResult.reasons,
+    });
+
+    // Wave A hook: if (this.shouldReview(task, completion, result, responseResult.level))
+    //   route to Reviewer session. Until wired, always fall through to merge gate.
+    void this.shouldReview(task, completion, result, responseResult.level);
+
+    this.state.transition(task.id, "merging");
+    const updatedTask = this.state.getTask(task.id)!;
+    const mergeResult = await this.mergeGate.enqueue(
+      task.id,
+      updatedTask.worktreePath!,
+      updatedTask.branchName!,
+    );
+
+    this.emit({ type: "merge_result", taskId: task.id, result: mergeResult });
+    this.handleMergeResult(task, mergeResult, completion);
+  }
+
+  /** Branch on merge gate result: merged / rebase_conflict / test_failed / test_timeout / error. */
+  private handleMergeResult(
+    task: TaskRecord,
+    mergeResult: MergeResult,
+    completion: CompletionSignal,
+  ): void {
+    switch (mergeResult.status) {
+      case "merged":
+        this.state.transition(task.id, "done");
+        this.state.updateTask(task.id, {
+          summary: completion.summary,
+          filesChanged: completion.filesChanged,
+        });
+        this.emit({ type: "task_done", taskId: task.id });
+        this.sessions.cleanupWorktree(task.id);
+        break;
+
+      case "rebase_conflict": {
+        const attempts = this.state.incrementRebaseAttempts(task.id);
+        this.sessions.cleanupWorktree(task.id);
+        if (attempts >= this.config.pipeline.max_retries) {
+          this.state.transition(task.id, "failed");
+          this.state.updateTask(task.id, {
+            lastError: `Rebase conflict after ${attempts} attempts`,
+          });
+          this.emit({
+            type: "task_failed",
+            taskId: task.id,
+            reason: `Rebase conflict persists (${attempts} attempts)`,
+          });
+        } else {
+          this.state.transition(task.id, "shelved");
+          this.emit({
+            type: "task_shelved",
+            taskId: task.id,
+            reason: `Rebase conflict (attempt ${attempts}/${this.config.pipeline.max_retries})`,
+          });
+          this.scheduleRetry(task.id, this.config.pipeline.retry_delay_ms);
+        }
+        break;
+      }
+
+      case "test_failed":
+        this.state.transition(task.id, "failed");
+        this.state.updateTask(task.id, {
+          lastError: `Tests failed: ${mergeResult.error}`,
+        });
+        this.emit({ type: "task_failed", taskId: task.id, reason: `Tests failed` });
+        this.sessions.cleanupWorktree(task.id);
+        break;
+
+      case "test_timeout":
+        this.state.transition(task.id, "failed");
+        this.state.updateTask(task.id, { lastError: "Test timeout" });
+        this.emit({ type: "task_failed", taskId: task.id, reason: "Test timeout" });
+        this.sessions.cleanupWorktree(task.id);
+        break;
+
+      case "error":
+        this.state.transition(task.id, "failed");
+        this.state.updateTask(task.id, { lastError: mergeResult.error });
+        this.emit({ type: "task_failed", taskId: task.id, reason: mergeResult.error });
+        this.sessions.cleanupWorktree(task.id);
+        break;
     }
   }
 
