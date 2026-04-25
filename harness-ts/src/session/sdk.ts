@@ -189,7 +189,7 @@ export class SDKClient {
 
       if (classifyMessage(msg) === "system_init") {
         const m = (msg as unknown as { model?: unknown }).model;
-        if (typeof m === "string" && m.length > 0) initModel = m;
+        if (typeof m === "string" && m.trim().length > 0) initModel = m.trim();
       }
 
       if (msg.type === "result") {
@@ -209,7 +209,7 @@ export class SDKClient {
       };
     }
 
-    return { ...result, modelName: initModel };
+    return { ...result, modelName: result.modelName ?? initModel };
   }
 
   /** Register an abort controller for a session (for external abort) */

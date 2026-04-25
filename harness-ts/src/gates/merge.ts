@@ -90,7 +90,7 @@ export const realMergeGitOps: MergeGitOps = {
 
   rebase(cwd: string, trunk: string): { success: boolean; conflictFiles: string[] } {
     try {
-      execSync(`git rebase ${trunk}`, execOpts(cwd));
+      execFileSync("git", ["rebase", trunk], { cwd, stdio: "pipe" });
       return { success: true, conflictFiles: [] };
     } catch (err) {
       // Parse conflict files from git status
@@ -116,7 +116,11 @@ export const realMergeGitOps: MergeGitOps = {
   },
 
   mergeNoFf(trunkCwd: string, branchName: string): string {
-    execSync(`git merge --no-ff ${branchName} -m "harness: merge ${branchName}"`, execOpts(trunkCwd));
+    execFileSync(
+      "git",
+      ["merge", "--no-ff", branchName, "-m", `harness: merge ${branchName}`],
+      { cwd: trunkCwd, stdio: "pipe" },
+    );
     return (execSync("git rev-parse HEAD", execOpts(trunkCwd)) as unknown as string).trim();
   },
 
@@ -180,17 +184,21 @@ export const realMergeGitOps: MergeGitOps = {
   },
 
   scrubHarnessFromHead(cwd: string): boolean {
+    let tracked = "";
     try {
-      const tracked = execFileSync("git", ["ls-tree", "-r", "--name-only", "HEAD", ".harness"], {
+      tracked = execFileSync("git", ["ls-tree", "-r", "--name-only", "HEAD", ".harness"], {
         cwd, stdio: "pipe", encoding: "utf-8",
       }) as unknown as string;
-      if (tracked.trim().length === 0) return false;
-      execFileSync("git", ["rm", "-r", "--cached", ".harness"], { cwd, stdio: "pipe" });
-      execFileSync("git", ["commit", "--amend", "--no-edit"], { cwd, stdio: "pipe" });
-      return true;
     } catch {
       return false;
     }
+    if (tracked.trim().length === 0) return false;
+    // Two-step scrub. If `git rm` succeeds but `commit --amend` fails the
+    // index is half-modified — surface that as a thrown error rather than a
+    // silent `false` so the caller can abort the merge.
+    execFileSync("git", ["rm", "-r", "--cached", ".harness"], { cwd, stdio: "pipe" });
+    execFileSync("git", ["commit", "--amend", "--no-edit"], { cwd, stdio: "pipe" });
+    return true;
   },
 
   getUserEmail(cwd: string): string | undefined {

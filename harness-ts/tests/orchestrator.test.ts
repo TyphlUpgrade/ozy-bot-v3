@@ -1038,10 +1038,10 @@ describe("Orchestrator", () => {
       const wt = join(tmpDir, "worktrees", "task-m-bound");
       mkdirSync(wt, { recursive: true });
       seedMerging(state, "m-bound", wt);
-      state.updateTask("m-bound", { recoveryAttempts: 2 });
+      state.updateTask("m-bound", { recoveryAttempts: 3 });
       orch.start();
-      // Increments 2 → 3 (reaches bound), then marks failed.
-      expect(state.getTask("m-bound")!.recoveryAttempts).toBe(3);
+      // Increments 3 → 4 (over MAX=3), then marks failed.
+      expect(state.getTask("m-bound")!.recoveryAttempts).toBe(4);
       expect(state.getTask("m-bound")!.state).toBe("failed");
       expect(state.getTask("m-bound")!.lastError).toBe("max_recovery_attempts_exceeded");
       expect(

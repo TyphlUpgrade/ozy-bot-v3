@@ -601,14 +601,23 @@ export class Orchestrator {
     completion: CompletionSignal,
     sessionResult: SessionResult,
   ): string {
-    const summary = completion.summary.length > 72
-      ? `${completion.summary.slice(0, 72)}…`
-      : completion.summary;
+    // Strip CR/LF from any interpolated field so trailers can't be forged via
+    // a summary or model name that contains "\n\nModel: attacker".
+    const sanitize = (s: string): string => s.replace(/[\r\n]+/g, " ");
+    // Budget summary against the full subject (≤100 chars) so a long taskId
+    // doesn't push the line past git's readable-log width.
+    const SUBJECT_BUDGET = 100;
+    const overhead = `harness: ${task.id} — `.length;
+    const summaryBudget = Math.max(20, SUBJECT_BUDGET - overhead - 1);
+    const cleanSummary = sanitize(completion.summary);
+    const summary = cleanSummary.length > summaryBudget
+      ? `${cleanSummary.slice(0, summaryBudget)}…`
+      : cleanSummary;
     const subject = `harness: ${task.id} — ${summary}`;
     const trailers = [
-      `Model: ${sessionResult.modelName ?? "unknown"}`,
-      `Session: ${sessionResult.sessionId}`,
-      `Phase: ${task.phaseId ?? "standalone"}`,
+      `Model: ${sanitize(sessionResult.modelName ?? "unknown")}`,
+      `Session: ${sanitize(sessionResult.sessionId)}`,
+      `Phase: ${sanitize(task.phaseId ?? "standalone")}`,
     ].join("\n");
     return `${subject}\n\n${trailers}`;
   }
@@ -997,10 +1006,11 @@ export class Orchestrator {
           });
           continue;
         }
-        // Guard 3 (Fresh-2): bound recovery depth.
+        // Guard 3 (Fresh-2): bound recovery depth. `>` so MAX=3 grants 3
+        // actual attempts; the 4th tip-over fails fast.
         const attempts = (updated.recoveryAttempts ?? 0) + 1;
         this.state.setRecoveryAttempts(task.id, attempts);
-        if (attempts >= MAX_RECOVERY_ATTEMPTS) {
+        if (attempts > MAX_RECOVERY_ATTEMPTS) {
           this.state.updateTask(task.id, { lastError: "max_recovery_attempts_exceeded" });
           this.state.transition(task.id, "failed");
           this.emit({
@@ -1011,7 +1021,10 @@ export class Orchestrator {
           continue;
         }
         if (this.mergeGate.branchHasCommitsAheadOfTrunk(updated.worktreePath)) {
-          // (b): orchestrator commit exists; re-enqueue.
+          // (b): orchestrator commit exists; re-enqueue. Mark the synthetic
+          // completion as recovered so downstream consumers (Discord, state
+          // log) can distinguish it from an Executor-reported success.
+          const recoveredSummary = `[recovered] ${updated.summary ?? updated.prompt.slice(0, 60)}`;
           void this.mergeGate
             .enqueueProposed(
               task.id,
@@ -1022,7 +1035,7 @@ export class Orchestrator {
             )
             .then((r) => this.handleMergeResult(task, r, {
               status: "success",
-              summary: "orchestrator-recovered",
+              summary: recoveredSummary,
               filesChanged: [],
             }));
         } else {
