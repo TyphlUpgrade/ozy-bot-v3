@@ -294,12 +294,16 @@ describe("CommandRouter — three-tier project commands", () => {
     expect(emitted.some((e) => e.type === "project_aborted")).toBe(true);
   });
 
-  it("'start a new project' NL hands off to cmdProjectDeclare (no NON-GOALS → instructive error)", async () => {
+  it("'start a new project' NL falls through to LLM classifier (regex no longer routes declare_project)", async () => {
+    // CW-4 routing fix: declare_project is intentionally not regex-matched.
+    // The structured `{description, nonGoals[]}` shape requires prose
+    // extraction that regex can't do; free-form prose must reach the LLM
+    // classifier so non-goals get parsed from natural language. With the
+    // default UnknownIntentClassifier in tests, the NL message lands on the
+    // unknown-intent fallback.
     const r = makeRouter();
     const reply = await r.handleNaturalLanguage("start a new project to rewrite auth", "dev", "user1");
-    // NL sentence has no newline+NON-GOALS block, so cmdProjectDeclare returns
-    // the usage hint — same error the user would get for a malformed !project.
-    expect(reply).toMatch(/Usage: `!project|Missing required `NON-GOALS:`/);
+    expect(reply).toMatch(/No active project or dialogue|!task|!project|!dialogue/);
   });
 
   it("'abort project <id>' NL routes to project_abort (first-call confirmation)", async () => {

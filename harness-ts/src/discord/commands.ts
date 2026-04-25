@@ -133,13 +133,10 @@ const PROJECT_NAME_MAX = 120;
 // --- NL patterns (deterministic fast-path) ---
 
 const NL_PATTERNS: Array<{ pattern: RegExp; build: (m: RegExpMatchArray) => CommandIntent }> = [
-  // Project intents FIRST — "status of project ..." otherwise collides with status_query.
-  // Require sentence-final (no trailing text) after the optional determiner sequence to avoid
-  // "start a project status dashboard" eagerly declaring a project.
-  {
-    pattern: /^(?:start|begin|kick ?off)\s+(?:(?:a|the|new|my|our|another)\s+)*project\b(.*)$/i,
-    build: (m) => ({ type: "declare_project", message: m[0].trim() }),
-  },
+  // CW-4 routing fix: declare_project is intentionally NOT regex-matched. The
+  // structured `{description, nonGoals[]}` shape requires prose extraction;
+  // free-form "start a project to do X, no tests please" must reach the LLM
+  // classifier so non-goals get parsed from natural language.
   {
     pattern: /^(?:status|progress|state)\s+of\s+project\s+(\S+)/i,
     build: (m) => ({ type: "project_status", projectId: m[1] }),
