@@ -10,7 +10,7 @@ import { SessionManager, type CompletionSignal } from "./session/manager.js";
 import { MergeGate, type MergeResult } from "./gates/merge.js";
 import type { SessionResult } from "./session/sdk.js";
 import { StateManager, type TaskRecord } from "./lib/state.js";
-import type { HarnessConfig } from "./lib/config.js";
+import { MAX_RECOVERY_ATTEMPTS, type HarnessConfig } from "./lib/config.js";
 import { readEscalation, type EscalationSignal } from "./lib/escalation.js";
 import { readCheckpoints, type CheckpointSignal } from "./lib/checkpoint.js";
 import { evaluateResponseLevel, type ResponseLevel } from "./lib/response.js";
@@ -980,6 +980,58 @@ export class Orchestrator {
       // Failed tasks with orphaned worktrees — clean up (safety net)
       if (task.state === "failed" && task.worktreePath) {
         this.sessions.cleanupWorktree(task.id);
+      }
+      // WA-6: merging-state recovery. Crash points:
+      //   (a) before orchestrator stage → branch empty + worktree dirty → re-run
+      //   (b) after stage, before merge → branch has 1 commit → re-enqueue with alreadyCommitted
+      if (task.state === "merging") {
+        const updated = this.state.getTask(task.id)!;
+        // Guard 1+2: worktreePath defined AND present on disk.
+        if (!updated.worktreePath || !existsSync(updated.worktreePath)) {
+          this.state.updateTask(task.id, { lastError: "merging_recovery_worktree_missing" });
+          this.state.transition(task.id, "failed");
+          this.emit({
+            type: "task_failed",
+            taskId: task.id,
+            reason: "merging_recovery_worktree_missing",
+          });
+          continue;
+        }
+        // Guard 3 (Fresh-2): bound recovery depth.
+        const attempts = (updated.recoveryAttempts ?? 0) + 1;
+        this.state.setRecoveryAttempts(task.id, attempts);
+        if (attempts >= MAX_RECOVERY_ATTEMPTS) {
+          this.state.updateTask(task.id, { lastError: "max_recovery_attempts_exceeded" });
+          this.state.transition(task.id, "failed");
+          this.emit({
+            type: "task_failed",
+            taskId: task.id,
+            reason: "max_recovery_attempts_exceeded",
+          });
+          continue;
+        }
+        if (this.mergeGate.branchHasCommitsAheadOfTrunk(updated.worktreePath)) {
+          // (b): orchestrator commit exists; re-enqueue.
+          void this.mergeGate
+            .enqueueProposed(
+              task.id,
+              updated.worktreePath,
+              updated.branchName!,
+              "harness: orchestrator-recovered",
+              { alreadyCommitted: true },
+            )
+            .then((r) => this.handleMergeResult(task, r, {
+              status: "success",
+              summary: "orchestrator-recovered",
+              filesChanged: [],
+            }));
+        } else {
+          // (a): no commit yet; cleanup + re-run from scratch.
+          this.sessions.cleanupWorktree(task.id);
+          this.state.transition(task.id, "failed");
+          this.state.transition(task.id, "pending");
+          this.processTask(this.state.getTask(task.id)!);
+        }
       }
     }
   }

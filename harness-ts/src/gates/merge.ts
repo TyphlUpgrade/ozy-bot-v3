@@ -270,6 +270,16 @@ export class MergeGate {
     return this.gitOps.getTrunkBranch(this.trunkCwd);
   }
 
+  /**
+   * WA-6: does the worktree branch have commits ahead of trunk? Used by
+   * `recoverFromCrash` to distinguish "crashed before stage" vs
+   * "crashed after orchestrator commit but before merge" in the `merging`
+   * recovery branch.
+   */
+  branchHasCommitsAheadOfTrunk(worktreePath: string, trunk?: string): boolean {
+    return this.gitOps.branchHasCommitsAheadOfTrunk(worktreePath, trunk ?? this.getTrunkBranch());
+  }
+
   /** Process the next item in the queue (FIFO, exclusive) */
   private async processNext(): Promise<void> {
     if (this.processing || this.queue.length === 0) return;

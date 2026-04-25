@@ -90,6 +90,7 @@ export interface TaskRecord {
   arbitrationCount?: number;       // per-task Architect arbitrations on THIS phase
   reviewerRejectionCount?: number; // per-task Reviewer rejections on THIS phase
   lastDirective?: string;          // most recent Architect retry_with_directive verdict text
+  recoveryAttempts?: number;       // WA-6 / Fresh-2: recoverFromCrash depth bound (max 3)
 }
 
 // Known keys for defensive deserialization (B7). Unknown keys are silently dropped on load.
@@ -103,6 +104,7 @@ const KNOWN_KEYS: ReadonlySet<string> = new Set([
   "dialogueMessages", "dialoguePendingConfirmation", "reviewResult",
   // Three-tier (Wave 1.5b)
   "projectId", "phaseId", "arbitrationCount", "reviewerRejectionCount", "lastDirective",
+  "recoveryAttempts",
 ]);
 
 // --- Event Log (O9: write-only) ---
@@ -326,6 +328,15 @@ export class StateManager {
     Object.assign(task, updates, { updatedAt: new Date().toISOString() });
     this.persist();
     return task;
+  }
+
+  /** WA-6 Fresh-2: record crash-recovery attempt count. Throws if task missing. */
+  setRecoveryAttempts(taskId: string, n: number): void {
+    const task = this.store.tasks[taskId];
+    if (!task) throw new Error(`Task not found: ${taskId}`);
+    task.recoveryAttempts = n;
+    task.updatedAt = new Date().toISOString();
+    this.persist();
   }
 
   /** Reload from disk (for crash recovery) */

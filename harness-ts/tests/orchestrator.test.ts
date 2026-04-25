@@ -1001,6 +1001,113 @@ describe("Orchestrator", () => {
     });
   });
 
+  describe("WA-6 crash recovery — merging state", () => {
+    function seedMerging(state: StateManager, id: string, worktreePath: string): void {
+      state.createTask("work", id);
+      state.transition(id, "active");
+      state.updateTask(id, { worktreePath, branchName: `harness/task-${id}` });
+      state.transition(id, "reviewing");
+      state.transition(id, "merging");
+    }
+
+    it("transitions merging task to failed when worktreePath is undefined", () => {
+      const { orch, state, events } = setupHarness({ withCompletion: false });
+      state.createTask("work", "m-noWt");
+      state.transition("m-noWt", "active");
+      state.transition("m-noWt", "reviewing");
+      state.transition("m-noWt", "merging");
+      // No worktreePath set.
+      orch.start();
+      expect(state.getTask("m-noWt")!.state).toBe("failed");
+      expect(state.getTask("m-noWt")!.lastError).toBe("merging_recovery_worktree_missing");
+      expect(events.some((e) => e.type === "task_failed" && e.reason === "merging_recovery_worktree_missing")).toBe(true);
+      orch.shutdown();
+    });
+
+    it("transitions merging task to failed when worktreePath does not exist on disk", () => {
+      const { orch, state, events } = setupHarness({ withCompletion: false });
+      seedMerging(state, "m-missing", join(tmpDir, "gone", "nope"));
+      orch.start();
+      expect(state.getTask("m-missing")!.state).toBe("failed");
+      expect(state.getTask("m-missing")!.lastError).toBe("merging_recovery_worktree_missing");
+      orch.shutdown();
+    });
+
+    it("bounds recovery to MAX_RECOVERY_ATTEMPTS (Fresh-2)", () => {
+      const { orch, state, events } = setupHarness({ withCompletion: false });
+      const wt = join(tmpDir, "worktrees", "task-m-bound");
+      mkdirSync(wt, { recursive: true });
+      seedMerging(state, "m-bound", wt);
+      state.updateTask("m-bound", { recoveryAttempts: 2 });
+      orch.start();
+      // Increments 2 → 3 (reaches bound), then marks failed.
+      expect(state.getTask("m-bound")!.recoveryAttempts).toBe(3);
+      expect(state.getTask("m-bound")!.state).toBe("failed");
+      expect(state.getTask("m-bound")!.lastError).toBe("max_recovery_attempts_exceeded");
+      expect(
+        events.some((e) => e.type === "task_failed" && e.reason === "max_recovery_attempts_exceeded"),
+      ).toBe(true);
+      orch.shutdown();
+    });
+
+    it("increments recoveryAttempts on each merging-recovery pass", () => {
+      const { orch, state } = setupHarness({ withCompletion: false });
+      const wt = join(tmpDir, "worktrees", "task-m-incr");
+      mkdirSync(wt, { recursive: true });
+      seedMerging(state, "m-incr", wt);
+      // Start once → 1, but the recovery path takes sub-case (a) which calls processTask; await settle.
+      orch.start();
+      orch.shutdown();
+      expect(state.getTask("m-incr")!.recoveryAttempts).toBe(1);
+    });
+
+    it("sub-case (b): re-enqueues merging task with alreadyCommitted=true when branch has commits", () => {
+      const { orch, state, mergeGitOps } = setupHarness({
+        withCompletion: false,
+        mergeGitOverrides: {
+          branchHasCommitsAheadOfTrunk: vi.fn().mockReturnValue(true),
+        },
+      });
+      const wt = join(tmpDir, "worktrees", "task-m-b");
+      mkdirSync(wt, { recursive: true });
+      seedMerging(state, "m-b", wt);
+      orch.start();
+      // Cleanup NOT called because orchestrator-recovered path re-enqueues.
+      const rebase = mergeGitOps.rebase as ReturnType<typeof vi.fn>;
+      // Rebase should fire as part of re-enqueued merge processing.
+      expect(rebase).toHaveBeenCalled();
+      orch.shutdown();
+    });
+
+    it("sub-case (a): re-runs merging task from scratch when branch is empty", () => {
+      const { orch, state, gitOps } = setupHarness({
+        withCompletion: false,
+        mergeGitOverrides: {
+          branchHasCommitsAheadOfTrunk: vi.fn().mockReturnValue(false),
+        },
+      });
+      const wt = join(tmpDir, "worktrees", "task-m-a");
+      mkdirSync(wt, { recursive: true });
+      seedMerging(state, "m-a", wt);
+      orch.start();
+      // Sub-case (a) cleans the worktree + transitions failed → pending + re-runs processTask.
+      expect(gitOps.removeWorktree).toHaveBeenCalled();
+      orch.shutdown();
+    });
+  });
+
+  describe("WA-6 Fresh-2 / Iteration 4 — recoveryAttempts persistence", () => {
+    it("recoveryAttempts round-trips through state file save/load", () => {
+      const stateFile = join(tmpDir, "state-persist.json");
+      const a = new StateManager(stateFile);
+      a.createTask("x", "persist-1");
+      a.transition("persist-1", "active");
+      a.updateTask("persist-1", { recoveryAttempts: 2 });
+      const b = new StateManager(stateFile);
+      expect(b.getTask("persist-1")!.recoveryAttempts).toBe(2);
+    });
+  });
+
   describe("Phase 2A — completion compliance", () => {
     it("fully enriched completion -> complianceScore 4", async () => {
       const { orch, state, events, gitOps } = setupHarness();
