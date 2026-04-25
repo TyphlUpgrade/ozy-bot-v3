@@ -44,6 +44,23 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/**
+ * Phase 4 H1 — parse Discord 429 `retry_after` (seconds) from response body.
+ * Returns milliseconds, falling back to 1000ms if the body is unparseable or
+ * the field is absent. Body parse failure must not abort the drain loop.
+ */
+async function parseRetryAfterMs(res: { json: () => Promise<unknown> }): Promise<number> {
+  try {
+    const body = (await res.json()) as { retry_after?: unknown };
+    if (typeof body?.retry_after === "number" && body.retry_after >= 0) {
+      return Math.ceil(body.retry_after * 1000);
+    }
+  } catch {
+    // fall through to default
+  }
+  return 1000;
+}
+
 export class BotSender implements DiscordSender {
   private readonly token: string;
   private readonly minSpacingMs: number;
@@ -154,7 +171,15 @@ export class BotSender implements DiscordSender {
               }),
             },
           );
-          if (!res.ok) {
+          if (res.status === 429) {
+            // Phase 4 H1 — Discord 429: parse retry_after (seconds) from JSON
+            // body, sleep, then continue draining. lastSendTime advances to
+            // post-sleep so the next request waits at least minSpacingMs from
+            // the retry deadline (not from before the sleep).
+            const retryAfterMs = await parseRetryAfterMs(res);
+            console.warn(`[BotSender] 429 from ${next.channelId} — sleeping ${retryAfterMs}ms`);
+            await new Promise((r) => setTimeout(r, retryAfterMs));
+          } else if (!res.ok) {
             console.error(`[BotSender] send to ${next.channelId} -> ${res.status} ${res.statusText}`);
           } else {
             // CW-1 — Discord returns the created message object on 200/201; capture id.

@@ -110,17 +110,21 @@ async function main(): Promise<void> {
     { envVar: "DISCORD_WEBHOOK_ESCALATION", webhookName: "harness-escalation", channelId: escalation! },
   ];
 
-  // Deduplicate channels that map to the same id so we don't create dup webhooks.
-  const seen = new Map<string, Channel>();
+  // Phase 4 H1 (CR) — deduplicate channels that map to the same id so we don't
+  // make redundant API calls or emit redundant webhook env-vars. Provision
+  // once per unique channel id (using the first label's webhookName), then
+  // emit env-vars for every label that maps to that same id, all pointing at
+  // the single provisioned webhook URL.
+  const uniqueByChannelId = new Map<string, Channel>();
   for (const c of channels) {
-    if (!seen.has(c.channelId)) seen.set(c.channelId, c);
+    if (!uniqueByChannelId.has(c.channelId)) uniqueByChannelId.set(c.channelId, c);
   }
 
-  for (const channel of channels) {
+  const provisioned = new Map<string, { url: string; id: string }>();
+  for (const channel of uniqueByChannelId.values()) {
     try {
       const result = await provision(channel, token);
-      console.log(`${channel.envVar}=${result.url}`);
-      console.log(`${channel.envVar}_ID=${result.id}`);
+      provisioned.set(channel.channelId, result);
     } catch (err) {
       console.error(
         `[provision-webhooks] ${channel.envVar} (channel=${channel.channelId}) failed: ${
@@ -129,6 +133,15 @@ async function main(): Promise<void> {
       );
       process.exit(1);
     }
+  }
+
+  // Emit env-vars for every label, reusing the single provisioned webhook
+  // when multiple labels collapsed to the same channel id.
+  for (const channel of channels) {
+    const result = provisioned.get(channel.channelId);
+    if (!result) continue;
+    console.log(`${channel.envVar}=${result.url}`);
+    console.log(`${channel.envVar}_ID=${result.id}`);
   }
 }
 

@@ -55,13 +55,78 @@ describe("BotSender", () => {
   });
 
   it("logs (does not throw) on non-2xx responses", async () => {
-    const fetch = vi.fn().mockResolvedValue({ ok: false, status: 429, statusText: "Too Many Requests" });
+    // Use 500 here — 429 is exercised by the dedicated retry-after tests below.
+    const fetch = vi.fn().mockResolvedValue({ ok: false, status: 500, statusText: "Server Error" });
     const sender = new BotSender("t", { fetch, minSpacingMs: 0 });
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
     await sender.sendToChannel("c", "x");
     await vi.runAllTimersAsync();
-    expect(errSpy).toHaveBeenCalledWith(expect.stringMatching(/429/));
+    expect(errSpy).toHaveBeenCalledWith(expect.stringMatching(/500/));
     errSpy.mockRestore();
+  });
+
+  // Phase 4 H1 — Discord 429 handling: parse retry_after (seconds) from JSON
+  // body, sleep, then continue draining the next message.
+  it("on 429 sleeps for retry_after seconds before processing next message", async () => {
+    const fetch = vi
+      .fn()
+      // First call → 429 with retry_after=0.5s
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        statusText: "Too Many Requests",
+        json: async () => ({ retry_after: 0.5 }),
+      })
+      // Second call (different message) → success
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => ({ id: "msg-after-429" }),
+      });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const sender = new BotSender("t", { fetch, minSpacingMs: 0 });
+    void sender.sendToChannel("c", "first");
+    const second = sender.sendToChannelAndReturnId("c", "second");
+    // Run the 500ms retry-after sleep + any subsequent timers
+    await vi.advanceTimersByTimeAsync(499);
+    expect(fetch).toHaveBeenCalledOnce(); // still in retry-after sleep
+    await vi.advanceTimersByTimeAsync(2);
+    await vi.runAllTimersAsync();
+    const result = await second;
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(result.messageId).toBe("msg-after-429");
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/429/));
+    warnSpy.mockRestore();
+  });
+
+  it("on 429 with malformed body falls back to 1000ms sleep", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        statusText: "Too Many Requests",
+        json: async () => { throw new Error("bad json"); },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => ({ id: "msg-1" }),
+      });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const sender = new BotSender("t", { fetch, minSpacingMs: 0 });
+    void sender.sendToChannel("c", "first");
+    const second = sender.sendToChannelAndReturnId("c", "second");
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fetch).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(2);
+    await vi.runAllTimersAsync();
+    const result = await second;
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(result.messageId).toBe("msg-1");
+    warnSpy.mockRestore();
   });
 
   it("logs (does not throw) when fetch rejects", async () => {

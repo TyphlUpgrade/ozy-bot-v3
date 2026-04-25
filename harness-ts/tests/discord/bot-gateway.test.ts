@@ -321,4 +321,97 @@ describe("RawWsBotGateway", () => {
     await expect(gw.fetchReferenceUsername("m-cached", "chan-allowed")).resolves.toBe("eve");
     await expect(gw.fetchReferenceUsername("m-missing", "chan-allowed")).resolves.toBeNull();
   });
+
+  // Phase 4 M2 (sec) — fail-closed if MESSAGE_CREATE arrives before READY.
+  it("drops non-webhook messages received before READY (selfBotId null)", async () => {
+    const { gw, ws } = buildGateway();
+    const got: InboundMessage[] = [];
+    gw.on((m) => got.push(m));
+    await gw.start();
+    ws.inject(helloFrame());
+    // No READY frame — selfBotId is still null.
+    ws.inject(messageCreateFrame({ id: "m-pre-ready", channelId: "chan-allowed" }));
+    expect(got).toHaveLength(0);
+    // After READY, normal traffic flows.
+    ws.inject(readyFrame());
+    ws.inject(messageCreateFrame({ id: "m-after-ready", channelId: "chan-allowed" }, 3));
+    expect(got).toHaveLength(1);
+    expect(got[0].messageId).toBe("m-after-ready");
+  });
+
+  // Phase 4 M4 (CR) — zombie heartbeat detection. Two consecutive heartbeats
+  // without an ACK → ws.close(4000) and session reset.
+  it("closes connection with 4000 if heartbeat fires without prior ACK", async () => {
+    const { gw, ws } = buildGateway();
+    await gw.start();
+    ws.inject(helloFrame(5000));
+    ws.inject(readyFrame());
+    ws.sent = []; // discard IDENTIFY
+    // First heartbeat fires, no ACK injected.
+    await vi.advanceTimersByTimeAsync(5001);
+    expect(ws.parsedSent().filter((p) => p.op === 1)).toHaveLength(1);
+    expect(ws.closedWith).toBeNull();
+    // Second heartbeat fires → previous unacked → ws.close(4000).
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await vi.advanceTimersByTimeAsync(5001);
+    expect(ws.closedWith).toBe(4000);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/zombie/i));
+    warnSpy.mockRestore();
+  });
+
+  // Phase 4 M3 (CR) — exponential backoff + escalation after N consecutive
+  // non-fatal closes.
+  it("escalates to process.exit(2) after 10 consecutive non-fatal closes", async () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((_code?: number) => {
+      throw new Error("__exit_called__");
+    }) as never);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      // Test the bound directly: forcibly invoke onSocketClose 10 times.
+      // We use a clean gateway and drive ws.onclose. After the 10th close,
+      // the gateway calls process.exit(2) (which our spy throws to surface).
+      const { gw, ws } = buildGateway();
+      await gw.start();
+      // Trigger close 9 times — must NOT exit yet.
+      for (let i = 0; i < 9; i++) {
+        ws.onclose?.({ code: 4001 });
+      }
+      expect(exitSpy).not.toHaveBeenCalled();
+      // 10th close → escalate.
+      let threw = false;
+      try { ws.onclose?.({ code: 4001 }); }
+      catch { threw = true; }
+      expect(threw).toBe(true);
+      expect(exitSpy).toHaveBeenCalledWith(2);
+    } finally {
+      exitSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+  });
+
+  it("resets reconnect-failure counter on successful READY", async () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((_code?: number) => {
+      throw new Error("__exit_called__");
+    }) as never);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const { gw, ws } = buildGateway();
+      await gw.start();
+      // 9 closes accumulate counter to 9.
+      for (let i = 0; i < 9; i++) {
+        ws.onclose?.({ code: 4001 });
+      }
+      // READY now resets counter to 0.
+      ws.inject(helloFrame());
+      ws.inject(readyFrame());
+      // 10 more closes — must NOT exit since counter restarted from 0.
+      for (let i = 0; i < 9; i++) {
+        ws.onclose?.({ code: 4001 });
+      }
+      expect(exitSpy).not.toHaveBeenCalled();
+    } finally {
+      exitSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+  });
 });

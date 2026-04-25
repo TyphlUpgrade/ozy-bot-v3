@@ -37,6 +37,26 @@ describe("extractWebhookIdFrom", () => {
     expect(extractWebhookIdFrom("")).toBeNull();
     expect(extractWebhookIdFrom("https://discord.com/api/webhooks/")).toBeNull();
   });
+
+  // Phase 4 M1 (sec) — hostname-anchored regex must reject look-alike URLs.
+  it("returns null for non-discord hostnames containing the path shape", () => {
+    expect(extractWebhookIdFrom("https://evil.com/api/webhooks/123/abc/")).toBeNull();
+    expect(extractWebhookIdFrom("https://evil.com/api/v10/webhooks/123/abc")).toBeNull();
+  });
+
+  it("returns null for embedded discord paths inside other-host URLs", () => {
+    expect(
+      extractWebhookIdFrom("https://evil.com?next=https://discord.com/api/webhooks/123/abc/"),
+    ).toBeNull();
+    expect(
+      extractWebhookIdFrom("https://evil.com#https://discord.com/api/webhooks/123/abc"),
+    ).toBeNull();
+  });
+
+  it("accepts discordapp.com and subdomains (canary)", () => {
+    expect(extractWebhookIdFrom("https://discordapp.com/api/webhooks/111/tok")).toBe("111");
+    expect(extractWebhookIdFrom("https://canary.discord.com/api/webhooks/222/tok")).toBe("222");
+  });
 });
 
 describe("buildSendersForChannels", () => {
@@ -135,5 +155,74 @@ describe("buildSendersForChannels", () => {
     expect(senders[""]).toBeUndefined();
     expect(senders["200"]).toBeInstanceOf(BotSender);
     expect(senders["300"]).toBeInstanceOf(BotSender);
+  });
+
+  // Phase 4 H1 (sec) — fetch-based webhook client retries once on 429.
+  it("fetchWebhookClient retries once on 429 after retry_after sleep", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const fetch = vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 429,
+          statusText: "Too Many Requests",
+          json: async () => ({ retry_after: 0.5 }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => ({ id: "msg-after-429" }),
+        });
+      const cfg = baseConfig({
+        webhooks: { dev: "https://discord.com/api/webhooks/111/devtok" },
+      });
+      const senders = buildSendersForChannels(cfg, "tok", { fetch });
+      const dev = senders["100"];
+      const p = dev.sendToChannelAndReturnId("100", "hi");
+      // First fetch already issued; advance through 500ms retry-after sleep.
+      await vi.advanceTimersByTimeAsync(501);
+      await vi.runAllTimersAsync();
+      const result = await p;
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(result.messageId).toBe("msg-after-429");
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/429/));
+    } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("fetchWebhookClient throws after second 429 (single retry only)", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const fetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 429,
+        statusText: "Too Many Requests",
+        json: async () => ({ retry_after: 0.1 }),
+      });
+      const cfg = baseConfig({
+        webhooks: { dev: "https://discord.com/api/webhooks/111/devtok" },
+      });
+      const senders = buildSendersForChannels(cfg, "tok", { fetch });
+      const dev = senders["100"];
+      const p = dev.sendToChannelAndReturnId("100", "hi");
+      await vi.advanceTimersByTimeAsync(150);
+      await vi.runAllTimersAsync();
+      const result = await p;
+      // Second 429 → WebhookSender outer wrapper logs + resolves messageId null.
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(result.messageId).toBeNull();
+      expect(errSpy).toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      errSpy.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });

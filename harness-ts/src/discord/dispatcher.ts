@@ -41,6 +41,18 @@ export interface InboundDispatcherDeps {
  * Classify a `relayOperatorInput` failure into one of four operator-visible
  * kinds. Order matters: "no_session" is the most specific (architect.ts throws
  * `No Architect session for ...` on a missing session), so check it first.
+ *
+ * Phase 4 H2 (CR) — production reality check: today, `architectManager
+ * .relayOperatorInput` only throws `No Architect session for ${projectId}`,
+ * so only the `no_session` and `generic` branches are exercised by real
+ * traffic. The `session_terminated` (matches /session terminated|aborted/i)
+ * and `queue_full` (matches /queue full/i) regexes are intentionally retained
+ * forward-looking — they pre-classify error shapes the architect layer is
+ * expected to add later (typed termination errors, queue-overflow surface).
+ * Removing them now would just force re-introducing them when those errors
+ * land. Synthetic test cases for these branches exist in `dispatcher.test.ts`
+ * to lock in the routing contract; they are not exercising real production
+ * paths today.
  */
 export function classifyRelayError(err: Error): RelayFailureKind {
   const msg = err.message;

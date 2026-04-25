@@ -203,6 +203,13 @@ describe("InboundDispatcher", () => {
     expect(sentDev[0].content).toMatch(/proj-x/);
   });
 
+  // Phase 4 H2 (CR) — synthetic test only. Today, `relayOperatorInput` only
+  // throws `No Architect session for ${projectId}` — the session_terminated /
+  // queue_full branches below are forward-looking and not exercised by real
+  // production paths. They lock in the routing contract so when architect.ts
+  // adds typed termination errors / queue-overflow signals later, the
+  // dispatcher already knows how to surface them. See classifyRelayError
+  // docstring in dispatcher.ts.
   it("rule 3 (session_terminated): error matches /session terminated/ → session_terminated reply", async () => {
     const { am } = makeArchitectManager(async () => {
       throw new Error("session terminated mid-relay");

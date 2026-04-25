@@ -21,15 +21,21 @@ import type { DiscordSender, WebhookClient } from "./types.js";
 import type { DiscordConfig } from "../lib/config.js";
 
 /**
- * Discord webhook URL regex — matches `/api/webhooks/<id>/<token>` AND
- * `/api/v10/webhooks/<id>/<token>` (v\d+ optional segment). Capture group 1
- * is the webhook id (snowflake digits).
+ * Discord webhook URL regex — hostname-anchored to discord.com / discordapp.com
+ * (with optional subdomain like `canary.`). Matches the full URL shape
+ * `https://[sub.]discord(app)?.com/api/[v\d+/]webhooks/<id>/<token>[/]`.
+ * Capture group 1 is the webhook id (snowflake digits).
+ *
+ * Phase 4 M1 — anchored to prevent open-redirect/SSRF-style strings like
+ * `evil.com/api/webhooks/123/abc/` or `evil.com?next=https://discord.com/api/webhooks/123/abc/`
+ * from passing as discord webhooks. Both forms must return null.
  */
-const WEBHOOK_URL_RE = /\/api\/(?:v\d+\/)?webhooks\/(\d+)\//;
+const WEBHOOK_URL_RE = /^https:\/\/(?:[a-z]+\.)?discord(?:app)?\.com\/api\/(?:v\d+\/)?webhooks\/(\d+)\/[A-Za-z0-9_-]+\/?$/;
 
 /**
  * Extract the webhook id from a Discord webhook URL. Returns `null` if the
- * URL is malformed or doesn't match the expected shape.
+ * URL is malformed, points to a non-discord host, or doesn't match the
+ * expected shape.
  */
 export function extractWebhookIdFrom(url: string): string | null {
   if (typeof url !== "string" || url.length === 0) return null;
@@ -58,9 +64,29 @@ export interface SenderFactoryOptions {
 }
 
 /**
+ * Phase 4 H1 — parse Discord 429 `retry_after` (seconds) from response body.
+ * Returns milliseconds; falls back to 1000ms if body is absent or unparseable.
+ */
+async function parseRetryAfterMs(res: { json: () => Promise<unknown> }): Promise<number> {
+  try {
+    const body = (await res.json()) as { retry_after?: unknown };
+    if (typeof body?.retry_after === "number" && body.retry_after >= 0) {
+      return Math.ceil(body.retry_after * 1000);
+    }
+  } catch {
+    // fall through to default
+  }
+  return 1000;
+}
+
+/**
  * Default WebhookClient — fetch-based POST to the webhook URL with
  * `?wait=true`. On success returns the JSON body so WebhookSender can extract
  * `.id`. Errors propagate so WebhookSender's swallow-and-log wrapper logs them.
+ *
+ * Phase 4 H1 — on 429, parse retry_after, sleep, retry once before throwing.
+ * Single retry only; persistent 429 escalates to error so the WebhookSender
+ * outer drain-loop logs and continues with the next message.
  */
 function fetchWebhookClient(
   url: string,
@@ -69,16 +95,20 @@ function fetchWebhookClient(
   return {
     async send(options) {
       const target = `${url}${url.includes("?") ? "&" : "?"}wait=true`;
-      const res = await fetchImpl(target, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          content: options.content,
-          username: options.username,
-          avatar_url: options.avatarURL,
-          allowed_mentions: options.allowedMentions ?? { parse: [] },
-        }),
+      const body = JSON.stringify({
+        content: options.content,
+        username: options.username,
+        avatar_url: options.avatarURL,
+        allowed_mentions: options.allowedMentions ?? { parse: [] },
       });
+      const headers = { "Content-Type": "application/json" };
+      let res = await fetchImpl(target, { method: "POST", headers, body });
+      if (res.status === 429) {
+        const retryAfterMs = await parseRetryAfterMs(res);
+        console.warn(`[fetchWebhookClient] 429 — sleeping ${retryAfterMs}ms then retrying once`);
+        await new Promise((r) => setTimeout(r, retryAfterMs));
+        res = await fetchImpl(target, { method: "POST", headers, body });
+      }
       if (!res.ok) {
         throw new Error(`webhook ${res.status} ${res.statusText}`);
       }

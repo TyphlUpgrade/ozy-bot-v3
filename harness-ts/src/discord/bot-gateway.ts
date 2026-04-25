@@ -21,6 +21,13 @@ const OP_HELLO = 10;
 const OP_HEARTBEAT_ACK = 11;
 const CONTENT_MISSING_THRESHOLD = 10;
 const FATAL_CLOSE_CODES = new Set([4004, 4014]);
+// Phase 4 M3 (CR) — exponential backoff for non-fatal close reconnects.
+// 1s base, doubling per consecutive failure, capped at 30s. After 10
+// consecutive non-fatal closes we escalate to process.exit(2) on the
+// assumption that a non-recoverable issue has set in.
+const RECONNECT_BACKOFF_BASE_MS = 1000;
+const RECONNECT_BACKOFF_CAP_MS = 30000;
+const RECONNECT_FAILURE_LIMIT = 10;
 
 /** Minimal contract the `ws` `WebSocket` satisfies; lets tests inject fakes. */
 export interface WSLike {
@@ -70,6 +77,8 @@ export class RawWsBotGateway implements BotGateway {
   private contentMissingFired = false;
   private readonly emptyContentCounters = new Map<string, number>();
   private readonly referenceCache = new Map<string, string>();
+  // Phase 4 M3 — consecutive non-fatal close count, reset to 0 on READY.
+  private consecutiveReconnectFailures = 0;
 
   constructor(opts: RawWsBotGatewayOptions) {
     if (!opts.token || opts.token.trim().length === 0) throw new Error("RawWsBotGateway: token must be a non-empty string");
@@ -136,6 +145,18 @@ export class RawWsBotGateway implements BotGateway {
 
   private sendHeartbeat(): void {
     if (!this.ws) return;
+    // Phase 4 M4 (CR) — zombie connection detection. If the previous heartbeat
+    // was never ACKed by the time this one fires, the connection is stuck:
+    // close with 4000 (non-fatal — instructs Discord to drop the session) and
+    // reset session state so the reconnect path takes the IDENTIFY branch.
+    if (!this.lastHeartbeatAcked) {
+      console.warn("[RawWsBotGateway] heartbeat not acked — closing zombie connection (4000)");
+      this.ws.close(4000);
+      this.sessionId = null;
+      this.lastSeq = null;
+      if (this.heartbeatTimer) { clearTimeout(this.heartbeatTimer); this.heartbeatTimer = null; }
+      return;
+    }
     this.lastHeartbeatAcked = false;
     this.ws.send(JSON.stringify({ op: OP_HEARTBEAT, d: this.lastSeq }));
     this.scheduleHeartbeat();
@@ -160,7 +181,18 @@ export class RawWsBotGateway implements BotGateway {
     this.lastSeq = null;
     if (this.heartbeatTimer) { clearTimeout(this.heartbeatTimer); this.heartbeatTimer = null; }
     if (this.ws) this.ws.close(4000);
-    setTimeout(() => this.openSocket(), 1000);
+    setTimeout(() => this.openSocket(), this.reconnectDelayMs());
+  }
+
+  /**
+   * Phase 4 M3 (CR) — exponential backoff for non-fatal close reconnects.
+   * Returns 1s, 2s, 4s, ... capped at 30s. The counter increments on every
+   * non-fatal close in `onSocketClose` and resets to 0 on READY.
+   */
+  private reconnectDelayMs(): number {
+    const exp = Math.min(this.consecutiveReconnectFailures, 5); // 2**5 = 32 → cap engages
+    const ms = RECONNECT_BACKOFF_BASE_MS * 2 ** exp;
+    return Math.min(ms, RECONNECT_BACKOFF_CAP_MS);
   }
 
   private onDispatch(t: string, d: unknown): void {
@@ -169,6 +201,8 @@ export class RawWsBotGateway implements BotGateway {
       this.sessionId = r.session_id ?? null;
       this.resumeUrl = r.resume_gateway_url ?? null;
       this.selfBotId = r.user?.id ?? null;
+      // Phase 4 M3 — successful READY clears the consecutive-close counter.
+      this.consecutiveReconnectFailures = 0;
       return;
     }
     if (t !== "MESSAGE_CREATE") return;
@@ -201,6 +235,12 @@ export class RawWsBotGateway implements BotGateway {
   }
 
   private passesFilters(m: RawMessage): boolean {
+    // Phase 4 M2 — fail-closed before READY: if selfBotId is null we haven't
+    // received READY yet, so we cannot reliably distinguish our own messages
+    // from operator input. Drop non-webhook messages until READY lands.
+    // Webhook messages remain filterable by selfWebhookIds set so they are
+    // not blanket-dropped here.
+    if (this.selfBotId === null && !m.webhookId) return false;
     if (this.selfBotId && m.authorId === this.selfBotId) return false;
     if (m.webhookId && this.selfWebhookIds?.has(m.webhookId)) return false;
     if (m.isBot && (!m.webhookId || !this.selfWebhookIds?.has(m.webhookId))) return false;
@@ -225,7 +265,18 @@ export class RawWsBotGateway implements BotGateway {
       console.error(`[RawWsBotGateway] fatal close ${code} — auth failure or disallowed intents; exiting`);
       process.exit(2);
     }
-    setTimeout(() => this.openSocket(), 1000);
+    // Phase 4 M3 (CR) — track consecutive non-fatal closes. After 10 in a row
+    // without a successful READY, escalate to operator (process.exit) — at that
+    // point we are stuck in a reconnect loop and should not keep silently
+    // burning Discord rate limits.
+    this.consecutiveReconnectFailures += 1;
+    if (this.consecutiveReconnectFailures >= RECONNECT_FAILURE_LIMIT) {
+      console.error(
+        `[RawWsBotGateway] ${this.consecutiveReconnectFailures} consecutive non-fatal closes — escalating to operator (exit 2)`,
+      );
+      process.exit(2);
+    }
+    setTimeout(() => this.openSocket(), this.reconnectDelayMs());
   }
 }
 
