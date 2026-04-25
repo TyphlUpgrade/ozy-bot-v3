@@ -72,6 +72,8 @@ export class RawWsBotGateway implements BotGateway {
   private lastHeartbeatAcked = true;
   private selfWebhookIds: ReadonlySet<string> | null = null;
   private selfBotId: string | null = null;
+  // CW-4.5 — captured at READY for `@<botUsername>` mention detection in dispatcher.
+  private selfBotUsername: string | null = null;
   private readonly handlers: Array<(m: InboundMessage) => void> = [];
   private contentMissingHandler: (() => void) | null = null;
   private contentMissingFired = false;
@@ -107,6 +109,9 @@ export class RawWsBotGateway implements BotGateway {
   }
 
   onMessageContentMissing(handler: () => void): void { this.contentMissingHandler = handler; }
+
+  /** CW-4.5 — bot's own Discord username, captured from READY. Null until READY fires. */
+  getBotUsername(): string | null { return this.selfBotUsername; }
 
   private openSocket(): void {
     const ws = this.factory();
@@ -197,10 +202,12 @@ export class RawWsBotGateway implements BotGateway {
 
   private onDispatch(t: string, d: unknown): void {
     if (t === "READY") {
-      const r = d as { session_id?: string; resume_gateway_url?: string; user?: { id?: string } };
+      const r = d as { session_id?: string; resume_gateway_url?: string; user?: { id?: string; username?: string } };
       this.sessionId = r.session_id ?? null;
       this.resumeUrl = r.resume_gateway_url ?? null;
       this.selfBotId = r.user?.id ?? null;
+      // CW-4.5 — capture username for `@<bot>` mention detection.
+      this.selfBotUsername = r.user?.username ?? null;
       // Phase 4 M3 — successful READY clears the consecutive-close counter.
       this.consecutiveReconnectFailures = 0;
       return;

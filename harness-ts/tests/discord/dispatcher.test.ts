@@ -15,13 +15,15 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { InboundDispatcher } from "../../src/discord/dispatcher.js";
+import { InboundDispatcher, extractMentions } from "../../src/discord/dispatcher.js";
 import type { CommandRouter } from "../../src/discord/commands.js";
 import type { ArchitectManager } from "../../src/session/architect.js";
 import type { IdentityMap } from "../../src/discord/identity-map.js";
 import type { MessageContext } from "../../src/discord/message-context.js";
 import type { DiscordSender, InboundMessage, AgentIdentity } from "../../src/discord/types.js";
 import type { DiscordConfig } from "../../src/lib/config.js";
+import type { ChannelContextBuffer, ChannelMessage } from "../../src/discord/channel-context.js";
+import type { ProjectRecord } from "../../src/lib/project.js";
 
 // --- Fakes ---
 
@@ -488,6 +490,317 @@ describe("InboundDispatcher", () => {
   });
 
   // --- Dispatch never throws on internal errors (logged, not propagated) ---
+
+  // ============================================================
+  // CW-4.5 — mention routing + ChannelContextBuffer integration
+  // ============================================================
+
+  function makeProjectStore(projects: Array<Pick<ProjectRecord, "id" | "state">>): {
+    getAllProjects: () => ProjectRecord[];
+    getProject: (id: string) => ProjectRecord | undefined;
+  } {
+    const map = new Map<string, ProjectRecord>();
+    for (const p of projects) {
+      map.set(p.id, { id: p.id, state: p.state } as ProjectRecord);
+    }
+    return {
+      getAllProjects: () => Array.from(map.values()),
+      getProject: (id: string) => map.get(id),
+    };
+  }
+
+  function makeChannelBuffer(byChannel: Record<string, ChannelMessage[]> = {}): Pick<ChannelContextBuffer, "recent"> {
+    return {
+      recent(channelId: string, n = 5): ReadonlyArray<ChannelMessage> {
+        const arr = byChannel[channelId] ?? [];
+        if (n >= arr.length) return arr.slice();
+        return arr.slice(arr.length - n);
+      },
+    };
+  }
+
+  // ----- extractMentions: 3 forms × happy path -----
+
+  it("CW-4.5 mention form 1: plain `@architect-x` resolves via IdentityMap", () => {
+    const idmap = makeIdentityMap({ "architect-x": "architect" });
+    const out = extractMentions("@architect-x do foo", idmap, null, null);
+    expect(out.mentions).toHaveLength(1);
+    expect(out.mentions[0].agentKey).toBe("architect");
+    expect(out.cleanedContent).toBe("do foo");
+    expect(out.botMentioned).toBe(false);
+  });
+
+  it("CW-4.5 mention form 2: `<@123>` resolves to bot when selfBotId matches", () => {
+    const idmap = makeIdentityMap({});
+    const out = extractMentions("<@123> abort it", idmap, null, "123");
+    expect(out.botMentioned).toBe(true);
+    expect(out.mentions).toHaveLength(0);
+    expect(out.cleanedContent).toBe("abort it");
+  });
+
+  it("CW-4.5 mention form 3: `<@!123>` (nickname form) resolves to bot when selfBotId matches", () => {
+    const idmap = makeIdentityMap({});
+    const out = extractMentions("hey <@!123> status please", idmap, null, "123");
+    expect(out.botMentioned).toBe(true);
+    expect(out.cleanedContent).toBe("hey status please");
+  });
+
+  // ----- extractMentions: edge cases -----
+
+  it("CW-4.5 backtick escape: `@architect-x` inside backticks NOT detected", () => {
+    const idmap = makeIdentityMap({ "architect-x": "architect" });
+    const out = extractMentions("see `@architect-x` for spec", idmap, null, null);
+    expect(out.mentions).toHaveLength(0);
+  });
+
+  it("CW-4.5 triple-backtick fence: ```@architect-x``` NOT detected (Test 9b)", () => {
+    const idmap = makeIdentityMap({ "architect-x": "architect" });
+    const out = extractMentions("see ```@architect-x``` for spec", idmap, null, null);
+    expect(out.mentions).toHaveLength(0);
+  });
+
+  it("CW-4.5 word-boundary anchors: trailing punctuation matches; embedded does not", () => {
+    const idmap = makeIdentityMap({ "architect-x": "architect" });
+    // Trailing period — matches.
+    const a = extractMentions("@architect-x.", idmap, null, null);
+    expect(a.mentions).toHaveLength(1);
+    // Embedded in word — does NOT match.
+    const b = extractMentions("user@architect-x is fine", idmap, null, null);
+    expect(b.mentions).toHaveLength(0);
+    // Suffixed alphanumerics — does NOT match (regex permits then anchor fails).
+    const c = extractMentions("@architect-xfoo", idmap, null, null);
+    expect(c.mentions).toHaveLength(0);
+  });
+
+  // ----- Active-project resolution -----
+
+  it("CW-4.5 0 active projects: agent mention → instructive reply, no relay", async () => {
+    const { am, fn } = makeArchitectManager();
+    const ctx = makeMessageContext();
+    const idmap = makeIdentityMap({ "architect-x": "architect" });
+    const { router } = makeCommandRouter();
+    const projectStore = makeProjectStore([]); // no projects
+    const channelBuffer = makeChannelBuffer();
+
+    const d = new InboundDispatcher({
+      commandRouter: router,
+      architectManager: am,
+      identityMap: idmap,
+      senders,
+      config: baseConfig(),
+      messageContext: ctx,
+      projectStore,
+      channelBuffer,
+      getBotUsername: () => null,
+    });
+
+    await d.dispatch(inboundMessage({ content: "@architect-x do foo" }));
+
+    expect(fn).not.toHaveBeenCalled();
+    expect(sentDev).toHaveLength(1);
+    expect(sentDev[0].content).toMatch(/Multiple\/no active projects/);
+  });
+
+  it("CW-4.5 1 active project: agent mention relays cleanedContent", async () => {
+    const { am, calls } = makeArchitectManager();
+    const ctx = makeMessageContext();
+    const idmap = makeIdentityMap({ "architect-x": "architect" });
+    const { router } = makeCommandRouter();
+    const projectStore = makeProjectStore([{ id: "proj-A", state: "executing" }]);
+    const channelBuffer = makeChannelBuffer();
+
+    const d = new InboundDispatcher({
+      commandRouter: router,
+      architectManager: am,
+      identityMap: idmap,
+      senders,
+      config: baseConfig(),
+      messageContext: ctx,
+      projectStore,
+      channelBuffer,
+      getBotUsername: () => null,
+    });
+
+    await d.dispatch(inboundMessage({ content: "@architect-x make it console.log" }));
+
+    expect(calls).toEqual([{ projectId: "proj-A", message: "make it console.log" }]);
+    expect(sentDev).toHaveLength(0);
+  });
+
+  it("CW-4.5 2+ active no hint: agent mention → instructive reply, no relay", async () => {
+    const { am, fn } = makeArchitectManager();
+    const ctx = makeMessageContext();
+    const idmap = makeIdentityMap({ "architect-x": "architect" });
+    const { router } = makeCommandRouter();
+    const projectStore = makeProjectStore([
+      { id: "proj-A", state: "executing" },
+      { id: "proj-B", state: "decomposing" },
+    ]);
+    const channelBuffer = makeChannelBuffer(); // empty buffer = no hints
+
+    const d = new InboundDispatcher({
+      commandRouter: router,
+      architectManager: am,
+      identityMap: idmap,
+      senders,
+      config: baseConfig(),
+      messageContext: ctx,
+      projectStore,
+      channelBuffer,
+      getBotUsername: () => null,
+    });
+
+    await d.dispatch(inboundMessage({ content: "@architect-x what's blocking" }));
+
+    expect(fn).not.toHaveBeenCalled();
+    expect(sentDev).toHaveLength(1);
+    expect(sentDev[0].content).toMatch(/Multiple\/no active projects/);
+  });
+
+  it("CW-4.5 affinity hint coherent: 2 active but recent buffer agrees → routes via hint (Test 13b)", async () => {
+    const { am, calls } = makeArchitectManager();
+    const ctx = makeMessageContext();
+    const idmap = makeIdentityMap({ "architect-x": "architect" });
+    const { router } = makeCommandRouter();
+    const projectStore = makeProjectStore([
+      { id: "proj-A", state: "executing" },
+      { id: "proj-B", state: "executing" },
+    ]);
+    const buf = makeChannelBuffer({
+      dev: [
+        { author: "Architect", content: "phase 1 ok", timestamp: "t", projectIdHint: "proj-A" },
+        { author: "Architect", content: "phase 2 ok", timestamp: "t", projectIdHint: "proj-A" },
+        { author: "operator", content: "ok continue", timestamp: "t", projectIdHint: "proj-A" },
+      ],
+    });
+
+    const d = new InboundDispatcher({
+      commandRouter: router,
+      architectManager: am,
+      identityMap: idmap,
+      senders,
+      config: baseConfig(),
+      messageContext: ctx,
+      projectStore,
+      channelBuffer: buf,
+      getBotUsername: () => null,
+    });
+
+    await d.dispatch(inboundMessage({ content: "@architect-x what's blocking us?" }));
+
+    expect(calls).toEqual([{ projectId: "proj-A", message: "what's blocking us?" }]);
+    expect(sentDev).toHaveLength(0);
+  });
+
+  // ----- Relay error path -----
+
+  it("CW-4.5 relay throw: mention path classifies via classifyRelayError → operator-visible reply", async () => {
+    const { am } = makeArchitectManager(async () => {
+      throw new Error("No Architect session for proj-A");
+    });
+    const ctx = makeMessageContext();
+    const idmap = makeIdentityMap({ "architect-x": "architect" });
+    const { router } = makeCommandRouter();
+    const projectStore = makeProjectStore([{ id: "proj-A", state: "executing" }]);
+    const channelBuffer = makeChannelBuffer();
+
+    const d = new InboundDispatcher({
+      commandRouter: router,
+      architectManager: am,
+      identityMap: idmap,
+      senders,
+      config: baseConfig(),
+      messageContext: ctx,
+      projectStore,
+      channelBuffer,
+      getBotUsername: () => null,
+    });
+
+    await d.dispatch(inboundMessage({ content: "@architect-x ping" }));
+
+    expect(sentDev).toHaveLength(1);
+    expect(sentDev[0].content).toMatch(/no live Architect session/);
+    expect(sentDev[0].content).toMatch(/proj-A/);
+  });
+
+  // ----- Classifier recentMessages plumbing -----
+
+  it("CW-4.5 classifier recentMessages populated from buffer (CommandRouter integration)", async () => {
+    // This test imports CommandRouter directly to pin the recentMessages plumb.
+    const { CommandRouter } = await import("../../src/discord/commands.js");
+    const { StateManager } = await import("../../src/lib/state.js");
+    const { mkdirSync, rmSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+    const dir = join(tmpdir(), `disp-recent-${Date.now()}`);
+    mkdirSync(dir, { recursive: true });
+    try {
+      const state = new StateManager(join(dir, "state.json"));
+      const cfg = {
+        project: {
+          name: "t", root: dir, task_dir: dir, state_file: join(dir, "state.json"),
+          worktree_base: dir, session_dir: dir,
+        },
+        pipeline: {
+          poll_interval: 1, test_command: "true", max_retries: 1,
+          test_timeout: 60, escalation_timeout: 300, retry_delay_ms: 100,
+        },
+        discord: baseConfig(),
+      };
+      const captured: Array<{ recentMessages?: ReadonlyArray<{ author: string; content: string; timestamp: string }> }> = [];
+      const classifier = {
+        async classify(_text: string, c: { recentMessages?: ReadonlyArray<{ author: string; content: string; timestamp: string }> }) {
+          captured.push({ recentMessages: c.recentMessages });
+          return { type: "unknown" as const };
+        },
+      };
+      const router = new CommandRouter({
+        state, config: cfg, classifier,
+        abort: { abortTask() { /* noop */ } },
+        taskSink: { createTask: () => "t" },
+        recentMessagesProvider: (_chan) => [
+          { author: "alice", content: "hi", timestamp: "2026-01-01T00:00:00Z" },
+          { author: "bob", content: "yo", timestamp: "2026-01-01T00:00:01Z" },
+        ],
+      });
+      await router.handleNaturalLanguage("ambiguous text", "dev", "u1");
+      expect(captured).toHaveLength(1);
+      expect(captured[0].recentMessages).toHaveLength(2);
+      expect(captured[0].recentMessages?.[0].author).toBe("alice");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // ----- getBotUsername null at startup -----
+
+  it("CW-4.5 getBotUsername null pre-READY: bot mention does not crash and falls through", async () => {
+    const { am, fn } = makeArchitectManager();
+    const c = makeMessageContext();
+    const idmap = makeIdentityMap({});
+    const { router, handleNaturalLanguage } = makeCommandRouter();
+    const projectStore = makeProjectStore([]);
+    const channelBuffer = makeChannelBuffer();
+
+    const d = new InboundDispatcher({
+      commandRouter: router,
+      architectManager: am,
+      identityMap: idmap,
+      senders,
+      config: baseConfig(),
+      messageContext: c,
+      projectStore,
+      channelBuffer,
+      getBotUsername: () => null, // pre-READY
+    });
+
+    // `@ozy abort it` — selfBotUsername is null, so botMentioned = false.
+    // No agent mentions either → falls through to NL.
+    await d.dispatch(inboundMessage({ content: "@ozy abort it" }));
+
+    expect(fn).not.toHaveBeenCalled();
+    expect(handleNaturalLanguage).toHaveBeenCalledWith("@ozy abort it", "dev", "user-1");
+  });
 
   it("dispatch never throws even if handler.handleNaturalLanguage rejects", async () => {
     const { am } = makeArchitectManager();

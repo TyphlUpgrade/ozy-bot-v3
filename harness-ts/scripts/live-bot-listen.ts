@@ -44,6 +44,9 @@ import { buildIdentityMap } from "../src/discord/identity-map.js";
 import { InMemoryMessageContext } from "../src/discord/message-context.js";
 import { InboundDispatcher } from "../src/discord/dispatcher.js";
 import { RawWsBotGateway } from "../src/discord/bot-gateway.js";
+import { ChannelContextBuffer } from "../src/discord/channel-context.js";
+import type { InboundMessage } from "../src/discord/types.js";
+import type { MessageContext } from "../src/discord/message-context.js";
 import {
   CommandRouter,
   FileTaskSink,
@@ -74,6 +77,20 @@ function loadDotEnv(path: string): void {
 function fatal(msg: string, exitCode = 2): never {
   console.error(`[live-bot-listen] FATAL: ${msg}`);
   process.exit(exitCode);
+}
+
+/**
+ * CW-4.5 — compute the optional `projectIdHint` for a buffer append. Hint
+ * fires only on operator messages that REPLY to a recorded agent message
+ * (conservative). The dispatcher consumes this in `resolveProjectForChannel`
+ * to disambiguate multi-active-project channels.
+ */
+function computeProjectIdHint(msg: InboundMessage, messageContext: MessageContext): string | null {
+  if (msg.repliedToMessageId) {
+    const pid = messageContext.resolveProjectIdForMessage(msg.repliedToMessageId);
+    if (pid) return pid;
+  }
+  return null;
 }
 
 async function main(): Promise<void> {
@@ -190,6 +207,11 @@ async function main(): Promise<void> {
     systemPromptPath: join(harnessRoot, "config", "harness", "intent-classifier-prompt.md"),
     cwd: harnessRepoRoot,
   });
+  // CW-4.5 — single shared per-channel ring buffer feeding both the LLM
+  // classifier (via `recentMessagesProvider`) and the dispatcher's mention
+  // resolution (via `channelBuffer`).
+  const channelBuffer = new ChannelContextBuffer({ perChannelCap: 10, maxChannels: 50 });
+
   const commandRouter = new CommandRouter({
     state,
     config,
@@ -199,6 +221,14 @@ async function main(): Promise<void> {
     projectStore,
     emit: (ev) => notifier.handleEvent(ev),
     orchestrator: orch,
+    // CW-4.5 — strip projectIdHint from the classifier view (it's a
+    // dispatcher-private signal, not classifier-relevant data).
+    recentMessagesProvider: (channelId) =>
+      channelBuffer.recent(channelId, 5).map((m) => ({
+        author: m.author,
+        content: m.content,
+        timestamp: m.timestamp,
+      })),
   });
 
   // --- Gateway + dispatcher ---
@@ -229,8 +259,23 @@ async function main(): Promise<void> {
     senders,
     config: config.discord,
     messageContext,
+    // CW-4.5 v2 — narrow seams for mention rule 1.
+    projectStore,
+    channelBuffer,
+    getBotUsername: () => gateway.getBotUsername(),
   });
-  gateway.on((msg) => void dispatcher.dispatch(msg));
+  // CW-4.5 §8 — explicit single-handler swap. The wrapper appends to the
+  // shared ChannelContextBuffer BEFORE invoking the dispatcher so the message
+  // that triggered classification is included in its own recentMessages.
+  gateway.on((msg) => {
+    channelBuffer.append(msg.channelId, {
+      author: msg.authorUsername,
+      content: msg.content,
+      timestamp: msg.timestamp,
+      projectIdHint: computeProjectIdHint(msg, messageContext) ?? undefined,
+    });
+    void dispatcher.dispatch(msg);
+  });
 
   // --- Startup ops-channel notice (cross-w 6) ---
 

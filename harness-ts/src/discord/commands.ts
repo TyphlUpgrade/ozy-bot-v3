@@ -46,12 +46,18 @@ export interface ClassifyContext {
   activeProjectIds: string[];
   /**
    * CW-4: optional structural recent-messages array for LLM-backed
-   * classifiers. Declared here so future CW-4.5 can wire ChannelContextBuffer
-   * without touching this type again. v2 always passes undefined; classifier
-   * handles missing gracefully. Plain shape — does NOT import InboundMessage
-   * to keep commands.ts Discord-agnostic.
+   * classifiers. Populated in CW-4.5 from ChannelContextBuffer via the
+   * router's `recentMessagesProvider`. Plain shape — does NOT import
+   * InboundMessage to keep commands.ts Discord-agnostic.
    */
   recentMessages?: ReadonlyArray<{ author: string; content: string; timestamp: string }>;
+  /**
+   * CW-4.5 — true iff the dispatcher detected a `@<bot>` mention with no
+   * agent mention (bot-self direct address). Plumbed through but not yet
+   * consumed by classifiers; CW-4.6 will lower the confidence threshold
+   * when this is set.
+   */
+  directAddress?: boolean;
 }
 
 export interface IntentClassifier {
@@ -108,6 +114,16 @@ export interface CommandRouterDeps {
    * projectStore-only path (Wave 3 behavior: creates record, emits event).
    */
   orchestrator?: Orchestrator;
+  /**
+   * CW-4.5 — optional channel-scoped recent-message provider used to populate
+   * `ClassifyContext.recentMessages` for the LLM classifier. When undefined,
+   * classifier sees no context (CW-4 behavior preserved).
+   */
+  recentMessagesProvider?: (channelId: string) => ReadonlyArray<{
+    author: string;
+    content: string;
+    timestamp: string;
+  }>;
 }
 
 // --- Validation constants ---
@@ -166,6 +182,11 @@ export class CommandRouter {
   private readonly projectStore?: ProjectStore;
   private readonly emit?: (event: OrchestratorEvent) => void;
   private readonly orchestrator?: Orchestrator;
+  private readonly recentMessagesProvider?: (channelId: string) => ReadonlyArray<{
+    author: string;
+    content: string;
+    timestamp: string;
+  }>;
 
   constructor(deps: CommandRouterDeps) {
     this.state = deps.state;
@@ -176,6 +197,7 @@ export class CommandRouter {
     this.projectStore = deps.projectStore;
     this.emit = deps.emit;
     this.orchestrator = deps.orchestrator;
+    this.recentMessagesProvider = deps.recentMessagesProvider;
   }
 
   /** Handle a structured command (the leading `!` has already been stripped). */
@@ -208,6 +230,8 @@ export class CommandRouter {
       activeTaskIds: this.state.getTasksByState("active").map((t) => t.id),
       escalatedTaskIds: this.state.getTasksByState("escalation_wait").map((t) => t.id),
       activeProjectIds: this.projectStore?.getAllProjects().map((p) => p.id) ?? [],
+      // CW-4.5 — populate recentMessages from buffer when wired.
+      recentMessages: this.recentMessagesProvider?.(channelId),
     };
     let intent: CommandIntent;
     try {

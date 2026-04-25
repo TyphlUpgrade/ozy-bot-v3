@@ -39,12 +39,14 @@ function buildGateway(opts: {
   return { gw, ws };
 }
 
-function readyFrame(userId = "bot-self"): unknown {
+function readyFrame(userId = "bot-self", username?: string): unknown {
+  const user: { id: string; username?: string } = { id: userId };
+  if (username !== undefined) user.username = username;
   return {
     op: 0,
     s: 1,
     t: "READY",
-    d: { session_id: "sess-1", resume_gateway_url: "wss://resume", user: { id: userId } },
+    d: { session_id: "sess-1", resume_gateway_url: "wss://resume", user },
   };
 }
 
@@ -387,6 +389,28 @@ describe("RawWsBotGateway", () => {
       exitSpy.mockRestore();
       errSpy.mockRestore();
     }
+  });
+
+  // CW-4.5 — selfBotUsername capture.
+  it("READY decode captures user.username via getBotUsername()", async () => {
+    const { gw, ws } = buildGateway();
+    expect(gw.getBotUsername()).toBeNull();
+    await gw.start();
+    ws.inject(helloFrame());
+    ws.inject(readyFrame("B", "ozy"));
+    expect(gw.getBotUsername()).toBe("ozy");
+  });
+
+  it("getBotUsername() returns null pre-READY and stays null when READY omits username", async () => {
+    const { gw, ws } = buildGateway();
+    expect(gw.getBotUsername()).toBeNull();
+    await gw.start();
+    ws.inject(helloFrame());
+    // No READY yet — still null.
+    expect(gw.getBotUsername()).toBeNull();
+    // READY with no username field → still null (defensive).
+    ws.inject(readyFrame("bot-self")); // no username arg
+    expect(gw.getBotUsername()).toBeNull();
   });
 
   it("resets reconnect-failure counter on successful READY", async () => {

@@ -124,4 +124,6 @@ export interface BotGateway {
    * appears disabled (latched). Bootstrap wires this to send an ops-channel notice.
    */
   onMessageContentMissing(handler: () => void): void;
+  /** CW-4.5 — bot's own Discord username, captured from READY. Null until READY fires. */
+  getBotUsername(): string | null;
 }
