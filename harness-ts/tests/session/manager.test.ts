@@ -318,6 +318,15 @@ describe("SessionManager", () => {
         expect(DEFAULT_EXECUTOR_SYSTEM_PROMPT).toContain(sub);
       }
     });
+
+    it("DEFAULT_EXECUTOR_SYSTEM_PROMPT does NOT instruct `git commit` (WA-2 propose-then-commit)", async () => {
+      const { DEFAULT_EXECUTOR_SYSTEM_PROMPT } = await import("../../src/lib/config.js");
+      // No positive instruction to commit.
+      expect(DEFAULT_EXECUTOR_SYSTEM_PROMPT).not.toMatch(/run `git commit`\s*[^\.]/i);
+      expect(DEFAULT_EXECUTOR_SYSTEM_PROMPT).not.toMatch(/Commit your (?:code )?changes with/i);
+      // Explicit statement that orchestrator commits post-review.
+      expect(DEFAULT_EXECUTOR_SYSTEM_PROMPT).toMatch(/orchestrator will stage and commit/i);
+    });
   });
 
   describe("completion signal", () => {

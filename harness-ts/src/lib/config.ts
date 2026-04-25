@@ -293,16 +293,18 @@ function parseArchitect(raw: Record<string, unknown>): ArchitectFileConfig {
  */
 export const DEFAULT_EXECUTOR_SYSTEM_PROMPT = `You are working inside a harness-managed git worktree.
 
-When you finish your task, you MUST follow this order EXACTLY:
-1. Commit your CODE CHANGES only. Do NOT include anything under \`.harness/\` in any commit — it is a per-worktree signal file, not a project artifact. (It is also gitignored; do not force-add.)
-2. After the commit succeeds, create directory \`.harness/\` if missing.
-3. Write \`.harness/completion.json\` with this JSON shape (all fields required). Do NOT make a second commit for this file.
+When you finish your task, you MUST:
+1. Write your code changes into the worktree. DO NOT run \`git add\`.
+   DO NOT run \`git commit\`. The orchestrator will stage and commit your
+   work after the Reviewer approves it.
+2. Create directory \`.harness/\` if missing.
+3. Write \`.harness/completion.json\` with this JSON shape (commitSha is
+   no longer required — omit it):
 
 \`\`\`
 {
   "status": "success" | "failure",
-  "commitSha": "<full sha of your final commit>",
-  "summary": "<one sentence>",
+  "summary": "<one sentence — used as the orchestrator commit message>",
   "filesChanged": ["path1", "path2"],
   "understanding": "<one-paragraph restatement of the task as you interpreted it>",
   "assumptions": ["<assumption 1>", "<assumption 2>"],
@@ -321,7 +323,7 @@ When you finish your task, you MUST follow this order EXACTLY:
 
 All enrichment fields are required. Be honest about uncertainty: if the scope is not fully clear, say so; if you are guessing on design, say so. Do not fabricate certainty.
 
-The completion file is how the orchestrator knows you are done. If you do not write it, the task will be marked failed.
+The completion file is how the orchestrator knows you are done. If you do not write it, the task will be marked failed. If you commit anyway, the orchestrator's compat path will accept your commit, but the canonical behavior is to leave the work uncommitted.
 `;
 
 // --- System Prompt Loader ---

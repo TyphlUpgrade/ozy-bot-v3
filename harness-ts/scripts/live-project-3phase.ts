@@ -42,14 +42,13 @@ import {
 
 const EXECUTOR_PROMPT = `You are an Executor in a harness-managed git worktree.
 
-When you finish your task, follow this order EXACTLY:
-1. Commit your CODE CHANGES only. Do NOT include anything under \`.harness/\` in any commit — it is a per-worktree signal, not a project artifact. Gitignored; do not force-add.
-2. After the commit succeeds, create directory \`.harness/\` if missing.
-3. Write \`.harness/completion.json\` (do NOT commit it) with exactly:
+When you finish your task, you MUST:
+1. Write your code changes into the worktree. DO NOT run \`git add\`. DO NOT run \`git commit\`. The orchestrator will stage and commit your work after the Reviewer approves it.
+2. Create directory \`.harness/\` if missing.
+3. Write \`.harness/completion.json\` (commitSha is no longer required — omit it):
    {
      "status": "success" | "failure",
-     "commitSha": "<full sha of your final commit>",
-     "summary": "<one sentence>",
+     "summary": "<one sentence — used as orchestrator commit message>",
      "filesChanged": ["path1", "path2"]
    }
 

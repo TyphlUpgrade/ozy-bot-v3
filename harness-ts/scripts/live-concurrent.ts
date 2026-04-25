@@ -29,11 +29,10 @@ import type { HarnessConfig } from "../src/lib/config.js";
 
 const SYSTEM_PROMPT = `You are working inside a harness-managed git worktree.
 
-When you finish your task, commit your change and write .harness/completion.json:
+When you finish your task, write your files to disk (do NOT run \`git add\` or \`git commit\`; the orchestrator will stage and commit after Reviewer approval) and write .harness/completion.json:
 {
   "status": "success",
-  "commitSha": "<full sha>",
-  "summary": "<one sentence>",
+  "summary": "<one sentence — used as orchestrator commit message>",
   "filesChanged": ["<paths>"]
 }
 `;
@@ -75,14 +74,14 @@ const TASK_A_PROMPT = `Create file \`alpha.ts\` at repo root with contents:
 \`\`\`
 export const ALPHA = 1;
 \`\`\`
-Commit with message "add alpha". Write .harness/completion.json per system prompt.
+Do NOT run \`git add\` or \`git commit\`. Write .harness/completion.json per system prompt.
 filesChanged: ["alpha.ts"], summary: "Added alpha module".`;
 
 const TASK_B_PROMPT = `Create file \`beta.ts\` at repo root with contents:
 \`\`\`
 export const BETA = 2;
 \`\`\`
-Commit with message "add beta". Write .harness/completion.json per system prompt.
+Do NOT run \`git add\` or \`git commit\`. Write .harness/completion.json per system prompt.
 filesChanged: ["beta.ts"], summary: "Added beta module".`;
 
 async function main(): Promise<void> {

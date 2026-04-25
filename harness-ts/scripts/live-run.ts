@@ -71,13 +71,12 @@ const MODE = (process.argv.find((a) => a.startsWith("--mode="))?.slice("--mode="
 const SYSTEM_PROMPT_MINIMAL = `You are working inside a harness-managed git worktree.
 
 When you finish your task, you MUST:
-1. Commit your changes with a short message.
+1. Write your code changes into the worktree. DO NOT run \`git add\`. DO NOT run \`git commit\`. The orchestrator will stage and commit your work after the Reviewer approves it.
 2. Create directory .harness/ if missing.
-3. Write .harness/completion.json with exactly this JSON shape:
+3. Write .harness/completion.json (commitSha is no longer required — omit it):
    {
      "status": "success" | "failure",
-     "commitSha": "<full sha of your final commit>",
-     "summary": "<one sentence>",
+     "summary": "<one sentence — used as orchestrator commit message>",
      "filesChanged": ["path1", "path2"]
    }
 
@@ -87,13 +86,12 @@ The completion file is how the orchestrator knows you are done. If you do not wr
 const SYSTEM_PROMPT_ENRICHED = `You are working inside a harness-managed git worktree.
 
 When you finish your task, you MUST:
-1. Commit your changes with a short message.
+1. Write your code changes into the worktree. DO NOT run \`git add\`. DO NOT run \`git commit\`. The orchestrator will stage and commit your work after the Reviewer approves it.
 2. Create directory .harness/ if missing.
 3. Write .harness/completion.json with this JSON shape (all fields required):
    {
      "status": "success" | "failure",
-     "commitSha": "<full sha of your final commit>",
-     "summary": "<one sentence>",
+     "summary": "<one sentence — used as orchestrator commit message>",
      "filesChanged": ["path1", "path2"],
      "understanding": "<one-paragraph restatement of the task as you interpreted it>",
      "assumptions": ["<assumption 1>", "<assumption 2>"],
@@ -124,25 +122,16 @@ const TASK_PROMPT_MINIMAL = `Create a file named \`hello.ts\` at the repository 
 export const MESSAGE = 'hi';
 \`\`\`
 
-Then:
-1. \`git add hello.ts\`
-2. \`git commit -m "add hello module"\`
-3. Get the commit SHA via \`git rev-parse HEAD\`
-4. Write .harness/completion.json per the system prompt with:
+Then write .harness/completion.json per the system prompt with:
    - status: "success"
-   - commitSha: <the SHA>
    - summary: "Added hello.ts exporting MESSAGE constant"
    - filesChanged: ["hello.ts"]
 
-Do not run tests. Do not create any other files. Do not modify README.md.`;
+Do not run \`git add\` or \`git commit\`. The orchestrator will commit the work after Reviewer approves it. Do not run tests. Do not create any other files. Do not modify README.md.`;
 
 const TASK_PROMPT_ENRICHED = `Create a file named \`greet.ts\` at the repository root exporting a function \`greet(name: string): string\` that returns a greeting like "Hello, <name>!". Write one concise comment above the function explaining its purpose.
 
-Then:
-1. \`git add greet.ts\`
-2. \`git commit -m "add greet module"\`
-3. Get the commit SHA via \`git rev-parse HEAD\`
-4. Write .harness/completion.json per the system prompt, populating every required field including the enrichment block.
+Then write .harness/completion.json per the system prompt, populating every required field including the enrichment block. Do NOT run \`git add\` or \`git commit\` — the orchestrator will stage and commit after Reviewer approves.
 
 Guidance for the enrichment block:
 - "understanding": restate what you built and why
@@ -152,7 +141,7 @@ Guidance for the enrichment block:
 
 Do not run tests. Do not create any other files. Do not modify README.md.`;
 
-const TASK_PROMPT_VAGUE = `Make the repo a bit better. Add something useful and commit it.
+const TASK_PROMPT_VAGUE = `Make the repo a bit better. Add something useful. Do NOT run \`git add\` or \`git commit\`.
 
 When you are done, write .harness/completion.json per the system prompt with the enrichment block filled in honestly. The operator did not specify what "better" means — reflect that uncertainty in scopeClarity / designCertainty and in openQuestions. Do not guess a specific feature and present it as certain.
 
