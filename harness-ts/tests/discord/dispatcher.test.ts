@@ -16,7 +16,7 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { InboundDispatcher, extractMentions } from "../../src/discord/dispatcher.js";
-import type { CommandRouter } from "../../src/discord/commands.js";
+import { UNKNOWN_INTENT_REPLY_SENTINELS, type CommandRouter } from "../../src/discord/commands.js";
 import type { ArchitectManager } from "../../src/session/architect.js";
 import type { IdentityMap } from "../../src/discord/identity-map.js";
 import type { MessageContext } from "../../src/discord/message-context.js";
@@ -971,5 +971,32 @@ describe("InboundDispatcher", () => {
 
     expect(reactions.map((r) => r.emoji)).toContain("❌");
     expect(reactions[0].emoji).toBe("👀");
+  });
+
+  it("CW-5: reaction `🤔` fires when CommandRouter returns an unknown-intent sentinel", async () => {
+    const { am } = makeArchitectManager();
+    const ctx = makeMessageContext();
+    const idmap = makeIdentityMap({});
+    const { client: reactionClient, reactions } = makeReactionClient();
+
+    // Mock CommandRouter to return the first unknown-intent sentinel verbatim.
+    const router = {
+      handleCommand: vi.fn(async () => UNKNOWN_INTENT_REPLY_SENTINELS[0]),
+      handleNaturalLanguage: vi.fn(async () => UNKNOWN_INTENT_REPLY_SENTINELS[0]),
+    } as unknown as CommandRouter;
+
+    const d = new InboundDispatcher({
+      commandRouter: router,
+      architectManager: am,
+      identityMap: idmap,
+      senders,
+      config: baseConfig(),
+      messageContext: ctx,
+      reactionClient,
+    });
+
+    await d.dispatch(inboundMessage({ messageId: "m-10", content: "asdf" }));
+
+    expect(reactions.some((r) => r.emoji === "🤔")).toBe(true);
   });
 });

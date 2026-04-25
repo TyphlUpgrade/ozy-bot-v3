@@ -133,6 +133,13 @@ export function renderStaticTemplate(input: ResponseInput): string {
  * directly. Used as the dispatcher default and as the LLM fallback.
  */
 export class StaticResponseGenerator implements ResponseGenerator {
+  /**
+   * IMPORTANT: The exact phrases produced here are pinned by dispatcher tests
+   * (`tests/discord/dispatcher.test.ts`) so the static fallback chain remains
+   * predictable. The LLM path (`LlmResponseGenerator.generate`) DOES NOT
+   * preserve these substrings — model output is free-form prose. Tests that
+   * assert specific phrases run against the static generator only.
+   */
   async generate(input: ResponseInput): Promise<string> {
     return renderStaticTemplate(input);
   }

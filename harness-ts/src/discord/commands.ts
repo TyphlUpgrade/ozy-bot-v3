@@ -130,6 +130,18 @@ export interface CommandRouterDeps {
 
 const PROJECT_NAME_MAX = 120;
 
+/**
+ * Substring sentinels emitted by `dispatchIntent` when the router cannot
+ * resolve an operator message into a concrete intent. The dispatcher pattern-
+ * matches against these to attach the puzzled (🤔) reaction. Single source of
+ * truth — future copy edits update this list and dispatcher reaction logic
+ * stays in sync without grepping for literal phrases.
+ */
+export const UNKNOWN_INTENT_REPLY_SENTINELS: readonly string[] = [
+  "Could not understand",
+  "No active project or dialogue",
+] as const;
+
 // --- NL patterns (deterministic fast-path) ---
 
 const NL_PATTERNS: Array<{ pattern: RegExp; build: (m: RegExpMatchArray) => CommandIntent }> = [

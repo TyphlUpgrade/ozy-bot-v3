@@ -17,7 +17,7 @@ import type { ArchitectManager } from "../session/architect.js";
 import type { DiscordConfig } from "../lib/config.js";
 import type { ProjectStore } from "../lib/project.js";
 import type { ChannelContextBuffer } from "./channel-context.js";
-import type { CommandRouter } from "./commands.js";
+import { UNKNOWN_INTENT_REPLY_SENTINELS, type CommandRouter } from "./commands.js";
 import type { IdentityMap } from "./identity-map.js";
 import type { MessageContext } from "./message-context.js";
 import {
@@ -220,43 +220,6 @@ export function classifyRelayError(err: Error): RelayFailureKind {
   if (/session terminated|aborted/i.test(msg)) return "session_terminated";
   if (/queue full/i.test(msg)) return "queue_full";
   return "generic";
-}
-
-/**
- * Operator-visible reply for each relay failure kind. CW-5 rewrote these as
- * friendlier conversational prose; existing dispatcher tests pin specific
- * substrings (`no live Architect session`, `was terminated`, `queue is full`,
- * ``Reply to `${projectId}` failed``) which are preserved verbatim below.
- */
-export function relayFailureMessage(
-  kind: RelayFailureKind,
-  projectId: string,
-  raw: string,
-): string {
-  switch (kind) {
-    case "no_session":
-      return (
-        `The Architect for \`${projectId}\` has no live Architect session — it ` +
-        `may have completed or been aborted. Want me to start a fresh one? ` +
-        `You can also check with \`!project ${projectId} status\`.`
-      );
-    case "session_terminated":
-      return (
-        `Looks like the Architect session for \`${projectId}\` was terminated. ` +
-        `Re-issue the request via \`!project <name>\` and I'll spin up a fresh ` +
-        `one for you.`
-      );
-    case "queue_full":
-      return (
-        "Discord send queue is full right now — your reply was dropped on the " +
-        "floor. Give it about 30 seconds and try again."
-      );
-    case "generic":
-      return (
-        `Reply to \`${projectId}\` failed: ${raw.slice(0, 200)}. Mind giving ` +
-        `it another shot? If it keeps failing, run \`!project ${projectId} status\`.`
-      );
-  }
 }
 
 /**
@@ -532,9 +495,10 @@ export class InboundDispatcher {
    * (if any) goes to the channel sender via `sendToChannel`.
    *
    * CW-5 — when the command router returns its unknown-intent fallback string
-   * (matched by substring presence of `Could not understand` or `No active
-   * project or dialogue`), react with the puzzled emoji so the operator can
-   * tell at-a-glance that the harness didn't comprehend their message.
+   * (matched against `UNKNOWN_INTENT_REPLY_SENTINELS` from commands.ts —
+   * single source of truth so copy edits stay in sync), react with the puzzled
+   * emoji so the operator can tell at-a-glance that the harness didn't
+   * comprehend their message.
    */
   private async routeCommand(msg: InboundMessage): Promise<void> {
     const text = msg.content;
@@ -552,11 +516,13 @@ export class InboundDispatcher {
     if (reply && reply.length > 0) {
       this.sendToChannel(msg.channelId, reply);
       // CW-5 — distinguishable reactions for "didn't understand" vs. success.
-      if (
-        reply.includes("Could not understand") ||
-        reply.includes("No active project or dialogue")
-      ) {
-        this.react(msg.channelId, msg.messageId, REACTION_PUZZLED);
+      // Sentinels exported from commands.ts so this dispatcher and the router
+      // never disagree on what counts as "unknown intent" prose.
+      for (const sentinel of UNKNOWN_INTENT_REPLY_SENTINELS) {
+        if (reply.includes(sentinel)) {
+          this.react(msg.channelId, msg.messageId, REACTION_PUZZLED);
+          break;
+        }
       }
     }
   }

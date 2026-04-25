@@ -127,7 +127,10 @@ describe("StaticResponseGenerator", () => {
     expect(renderStaticTemplate({ kind: "relay_generic_error", operatorMessage: "x", fields: { projectId: "proj-C", rawError: "boom" } })).toContain("`proj-C`");
   });
 
-  it("preserves dispatcher.test.ts-pinned substrings", () => {
+  // Static fallback contract: phrases pinned here are guaranteed across the
+  // static generator only. LlmResponseGenerator output is free-form prose and
+  // does NOT preserve these substrings.
+  it("static fallback contract: preserves dispatcher.test.ts-pinned substrings", () => {
     expect(renderStaticTemplate({ kind: "no_session", operatorMessage: "", fields: { projectId: "p" } })).toMatch(/no live Architect session/);
     expect(renderStaticTemplate({ kind: "session_terminated", operatorMessage: "", fields: { projectId: "p" } })).toMatch(/was terminated/);
     expect(renderStaticTemplate({ kind: "queue_full", operatorMessage: "" })).toMatch(/queue is full/);
