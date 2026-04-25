@@ -75,9 +75,11 @@ export const realMergeGitOps: MergeGitOps = {
   },
 
   autoCommit(cwd: string, message: string, opts?: { amend?: boolean }): string {
-    // Stage everything except .omc/ and .harness/ — pathspec exclude handles nested paths.
-    // Argv form so `message` is never shell-interpreted.
-    execFileSync("git", ["add", "--all", "--", ":!.omc", ":!.harness"], { cwd, stdio: "pipe" });
+    // `git add --all` (no pathspec) stages tracked changes + untracked
+    // non-ignored. `.omc/` and `.harness/` are gitignored at the trunk level
+    // so they never reach the index — pathspec excludes here would fatal-out
+    // on the "paths are ignored by gitignore" check.
+    execFileSync("git", ["add", "--all"], { cwd, stdio: "pipe" });
     const commitArgs = ["commit", "-m", message];
     if (opts?.amend) commitArgs.push("--amend", "--no-edit");
     execFileSync("git", commitArgs, { cwd, stdio: "pipe" });

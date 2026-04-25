@@ -76,7 +76,7 @@ describe("realMergeGitOps — validation against real git", () => {
       initRepo(tmpDir);
       writeFileSync(join(tmpDir, "src.ts"), "export const x = 1;\n");
 
-      const sha = realMergeGitOps.autoCommit(tmpDir);
+      const sha = realMergeGitOps.autoCommit(tmpDir, "test");
 
       expect(sha).toMatch(/^[0-9a-f]{40}$/);
       expect(sha).toBe(git(tmpDir, "git rev-parse HEAD"));
@@ -87,15 +87,44 @@ describe("realMergeGitOps — validation against real git", () => {
 
     it("does NOT commit files inside .omc/", () => {
       initRepo(tmpDir);
+      // Real harness pipelines gitignore .omc and .harness at the trunk
+      // level; autoCommit relies on gitignore filtering rather than pathspec
+      // excludes (the latter fatals on gitignored matches).
+      writeFileSync(join(tmpDir, ".gitignore"), ".omc\n.harness\n");
+      git(tmpDir, "git add .gitignore");
+      git(tmpDir, "git commit -m 'add gitignore'");
+
       writeFileSync(join(tmpDir, "work.ts"), "const y = 2;\n");
       mkdirSync(join(tmpDir, ".omc"), { recursive: true });
       writeFileSync(join(tmpDir, ".omc", "secret.md"), "private\n");
 
-      realMergeGitOps.autoCommit(tmpDir);
+      realMergeGitOps.autoCommit(tmpDir, "test");
 
       const show = git(tmpDir, "git show --name-only --format='' HEAD");
       expect(show).toContain("work.ts");
       expect(show).not.toContain(".omc");
+    });
+
+    it("succeeds when .harness/ is gitignored and present in the worktree", () => {
+      // Regression: live 3-phase run hit "paths are ignored by gitignore"
+      // because a pure-exclusion pathspec needs a positive base. Reproduces
+      // the propose-then-commit flow where Executor writes .harness/completion.json
+      // into a worktree whose root .gitignore lists `.harness`.
+      initRepo(tmpDir);
+      writeFileSync(join(tmpDir, ".gitignore"), ".harness\n");
+      git(tmpDir, "git add .gitignore");
+      git(tmpDir, "git commit -m 'add gitignore'");
+
+      writeFileSync(join(tmpDir, "src.ts"), "export const x = 1;\n");
+      mkdirSync(join(tmpDir, ".harness"), { recursive: true });
+      writeFileSync(join(tmpDir, ".harness", "completion.json"), "{}\n");
+
+      const sha = realMergeGitOps.autoCommit(tmpDir, "harness: stage proposal");
+
+      expect(sha).toMatch(/^[0-9a-f]{40}$/);
+      const show = git(tmpDir, "git show --name-only --format='' HEAD");
+      expect(show).toContain("src.ts");
+      expect(show).not.toContain(".harness");
     });
   });
 

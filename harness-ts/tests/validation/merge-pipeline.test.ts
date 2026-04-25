@@ -19,6 +19,9 @@ function createRepo(dir: string): void {
   execSync("git config user.email 'test@test.com'", { cwd: dir, stdio: "pipe" });
   execSync("git config user.name 'Test'", { cwd: dir, stdio: "pipe" });
   writeFileSync(join(dir, "README.md"), "# Test Repo\n");
+  // Mirror the real harness setup: trunk gitignores .omc/ and .harness/
+  // so worktree autoCommit naturally skips them via gitignore filtering.
+  writeFileSync(join(dir, ".gitignore"), ".omc\n.harness\n");
   execSync("git add -A && git commit -m 'initial commit'", {
     cwd: dir,
     stdio: "pipe",
