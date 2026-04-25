@@ -24,6 +24,7 @@ import { DISCORD_AGENT_DEFAULTS, type DiscordConfig, type DiscordAgentIdentity }
 import { sanitize, redactSecrets } from "../lib/text.js";
 import type { AgentIdentity, DiscordSender } from "./types.js";
 import type { StateManager } from "../lib/state.js";
+import type { MessageContext } from "./message-context.js";
 
 // Re-export for backward-compat — Wave 3 moved these to src/lib/text.ts.
 export { sanitize, redactSecrets } from "../lib/text.js";
@@ -215,25 +216,19 @@ export interface DiscordNotifierOptions {
    */
   agents?: Record<string, DiscordAgentIdentity>;
   /**
-   * CW-1 — optional MessageContext store. CW-3 will record outbound message
-   * ids here so reply chains can resolve back to taskId / projectId. Wired now
-   * but unused (no-op) until CW-3 introduces the MessageContext class.
+   * CW-3 — optional MessageContext store. When provided, the notifier records
+   * outbound message ids for project-keyed events so a Discord reply to that
+   * message can be resolved back to the originating projectId by
+   * `InboundDispatcher`. Without it, the notifier falls back to fire-and-forget
+   * `sendToChannel` (no recording).
    */
-  messageContext?: MessageContextLike;
+  messageContext?: MessageContext;
   /**
-   * CW-1 — optional state manager for projectId resolution on task-keyed
-   * events. Wired now, used by CW-3.
+   * CW-3 — optional state manager. Used to resolve a projectId for task-keyed
+   * events (`task_*`, `merge_result`, etc.) via `state.getTask(taskId).projectId`.
+   * Without it, task-keyed events skip recording and use the legacy send path.
    */
   stateManager?: StateManager;
-}
-
-/**
- * Forward-compatible shape for CW-3's MessageContext. Empty for CW-1; CW-3
- * extends with `record(messageId, taskId | projectId, ...)` etc. Defined
- * inline so CW-1 doesn't depend on CW-3 source files.
- */
-export interface MessageContextLike {
-  // CW-3 will add methods here; CW-1 only wires the dependency.
 }
 
 function errMessage(err: unknown): string {
@@ -263,8 +258,8 @@ export class DiscordNotifier {
   private readonly defaultSender: DiscordSender | null;
   private readonly config: DiscordConfig;
   private readonly agents: Record<string, DiscordAgentIdentity>;
-  // CW-1 wiring — unused until CW-3 lands MessageContext.
-  private readonly messageContext: MessageContextLike | undefined;
+  // CW-3 — optional reply-routing wiring.
+  private readonly messageContext: MessageContext | undefined;
   private readonly stateManager: StateManager | undefined;
 
   constructor(senders: SenderInput, config: DiscordConfig, options: DiscordNotifierOptions = {}) {
@@ -307,11 +302,51 @@ export class DiscordNotifier {
     const sender = this.resolveSender(channel);
     if (!sender) return;
 
+    // CW-3 — record path: when MessageContext is wired and we can resolve a
+    // projectId for this event, capture the Discord-assigned message id so
+    // operator replies route back. Without messageContext, use the legacy
+    // fire-and-forget path (no recording, no API change).
+    if (this.messageContext) {
+      const projectId = this.resolveProjectId(event);
+      if (projectId !== null) {
+        const ctx = this.messageContext;
+        void sender
+          .sendToChannelAndReturnId(channel, body, identity)
+          .then(({ messageId }) => {
+            if (messageId !== null) ctx.recordAgentMessage(messageId, projectId);
+          })
+          .catch((err) => {
+            console.error(`[DiscordNotifier] sender failed for ${event.type} -> ${entry.channel}: ${errMessage(err)}`);
+          });
+        return;
+      }
+      // projectId null → fall through to plain sendToChannel (no recording).
+    }
+
     // Swallow sender failures — Discord hiccups never crash the pipeline.
     // Log only .message to avoid echoing request bodies back into logs.
     void sender.sendToChannel(channel, body, identity).catch((err) => {
       console.error(`[DiscordNotifier] sender failed for ${event.type} -> ${entry.channel}: ${errMessage(err)}`);
     });
+  }
+
+  /**
+   * CW-3 — resolve a projectId for any OrchestratorEvent variant. Project-keyed
+   * events return `event.projectId` directly; task-keyed events go through the
+   * StateManager (`getTask(taskId)?.projectId`). Returns `null` when:
+   *   - the event is neither project- nor task-keyed (poll_tick / shutdown);
+   *   - a task-keyed event has no stateManager configured;
+   *   - the task is not in state, or has no projectId (standalone task).
+   */
+  private resolveProjectId(event: OrchestratorEvent): string | null {
+    if ("projectId" in event && typeof event.projectId === "string") {
+      return event.projectId;
+    }
+    if ("taskId" in event && typeof event.taskId === "string") {
+      const task = this.stateManager?.getTask(event.taskId);
+      return task?.projectId ?? null;
+    }
+    return null;
   }
 
   private resolveChannel(key: ChannelKey): string {

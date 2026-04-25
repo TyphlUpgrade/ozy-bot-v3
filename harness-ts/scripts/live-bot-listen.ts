@@ -1,0 +1,256 @@
+/**
+ * CW-3 — live conversational Discord bootstrap.
+ *
+ * Wires `RawWsBotGateway` → `InboundDispatcher` → `CommandRouter`/Architect
+ * relay so an operator can `start project ...` in #dev and reply to agent
+ * messages to feed UNTRUSTED operator input back into the live Architect
+ * session.
+ *
+ * Pre-flight (cross-w 5): every configured channel MUST have a webhook
+ * URL — `extractWebhookIdFrom` returning null is a fatal config error
+ * because without registered self-webhook ids the gateway loops on its own
+ * outbound messages.
+ *
+ * Startup notice (cross-w 6): operator-visible warning to ops channel
+ * because conversational state (`MessageContext`) is in-memory and lost on
+ * restart.
+ *
+ * Usage:
+ *   set -a && source ../.env && set +a
+ *   DISCORD_WEBHOOK_DEV=... DISCORD_WEBHOOK_OPS=... DISCORD_WEBHOOK_ESCALATION=... \
+ *     npx tsx scripts/live-bot-listen.ts
+ */
+
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { query } from "@anthropic-ai/claude-agent-sdk";
+
+import { Orchestrator } from "../src/orchestrator.js";
+import { SDKClient } from "../src/session/sdk.js";
+import { SessionManager, realGitOps } from "../src/session/manager.js";
+import { MergeGate } from "../src/gates/merge.js";
+import { ReviewGate } from "../src/gates/review.js";
+import { StateManager } from "../src/lib/state.js";
+import { ProjectStore } from "../src/lib/project.js";
+import { ArchitectManager } from "../src/session/architect.js";
+import { loadConfig, DEFAULT_TRUNK_BRANCH } from "../src/lib/config.js";
+import { DiscordNotifier } from "../src/discord/notifier.js";
+import {
+  buildSendersForChannels,
+  extractWebhookIdFrom,
+} from "../src/discord/sender-factory.js";
+import { buildIdentityMap } from "../src/discord/identity-map.js";
+import { InMemoryMessageContext } from "../src/discord/message-context.js";
+import { InboundDispatcher } from "../src/discord/dispatcher.js";
+import { RawWsBotGateway } from "../src/discord/bot-gateway.js";
+import {
+  CommandRouter,
+  FileTaskSink,
+  UnknownIntentClassifier,
+  type AbortHook,
+} from "../src/discord/commands.js";
+import { installSigintHandler } from "./lib/scratch-repo.js";
+
+function loadDotEnv(path: string): void {
+  if (!existsSync(path)) return;
+  for (const line of readFileSync(path, "utf-8").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (!process.env[key]) process.env[key] = value;
+  }
+}
+
+function fatal(msg: string, exitCode = 2): never {
+  console.error(`[live-bot-listen] FATAL: ${msg}`);
+  process.exit(exitCode);
+}
+
+async function main(): Promise<void> {
+  const harnessRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+  loadDotEnv(join(harnessRoot, "..", ".env"));
+
+  const configPath =
+    process.env.HARNESS_CONFIG_PATH ?? join(harnessRoot, "config", "harness", "project.toml");
+  if (!existsSync(configPath)) {
+    fatal(
+      `config not found at ${configPath} — set HARNESS_CONFIG_PATH or create config/harness/project.toml`,
+    );
+  }
+  const config = loadConfig(configPath);
+  const token = process.env[config.discord.bot_token_env] ?? process.env.DISCORD_BOT_TOKEN;
+  if (!token) {
+    fatal(
+      `Discord bot token missing — set ${config.discord.bot_token_env} or DISCORD_BOT_TOKEN in env`,
+    );
+  }
+
+  // --- Cross-w 5: per-channel webhook ID validation, FATAL on miss ---
+
+  const channels: Array<{ name: string; channelId: string; envKey: string }> = [
+    { name: "dev_channel", channelId: config.discord.dev_channel, envKey: "DISCORD_WEBHOOK_DEV" },
+    { name: "ops_channel", channelId: config.discord.ops_channel, envKey: "DISCORD_WEBHOOK_OPS" },
+    {
+      name: "escalation_channel",
+      channelId: config.discord.escalation_channel,
+      envKey: "DISCORD_WEBHOOK_ESCALATION",
+    },
+  ];
+
+  // Carry the env-derived webhook URL into the parsed DiscordConfig so
+  // buildSendersForChannels picks WebhookSender for every channel.
+  config.discord.webhooks = {
+    dev: process.env.DISCORD_WEBHOOK_DEV,
+    ops: process.env.DISCORD_WEBHOOK_OPS,
+    escalation: process.env.DISCORD_WEBHOOK_ESCALATION,
+  };
+
+  const webhookIdsByChannel: Record<string, string> = {};
+  for (const ch of channels) {
+    const url = process.env[ch.envKey];
+    const id = extractWebhookIdFrom(url ?? "");
+    if (!id) {
+      console.error(
+        `[live-bot-listen] Channel ${ch.name} (${ch.channelId}) missing webhook URL via ${ch.envKey}.\n` +
+          `  Run: npx tsx scripts/provision-webhooks.ts`,
+      );
+      process.exit(2);
+    }
+    webhookIdsByChannel[ch.channelId] = id;
+  }
+
+  // --- Core construction (mirrors live-project-arbitration.ts) ---
+
+  const harnessRepoRoot = config.project.root;
+  const sdk = new SDKClient(query);
+  const state = new StateManager(config.project.state_file);
+  const projectStore = new ProjectStore(
+    join(harnessRepoRoot, "projects.json"),
+    config.project.worktree_base,
+  );
+  const sessions = new SessionManager(sdk, state, config);
+  const mergeGate = new MergeGate(config.pipeline, harnessRepoRoot);
+  const reviewGate = new ReviewGate({
+    sdk,
+    config,
+    getTrunkBranch: () => DEFAULT_TRUNK_BRANCH,
+  });
+  const architectManager = new ArchitectManager({
+    sdk,
+    projectStore,
+    stateManager: state,
+    gitOps: realGitOps,
+    config,
+  });
+
+  // --- Discord wiring ---
+
+  const senders = buildSendersForChannels(config.discord, token);
+  const messageContext = new InMemoryMessageContext({ maxEntries: 1000 });
+  const identityMap = buildIdentityMap(config.discord);
+  const notifier = new DiscordNotifier(senders, config.discord, {
+    messageContext,
+    stateManager: state,
+  });
+
+  const orch = new Orchestrator({
+    sessionManager: sessions,
+    mergeGate,
+    stateManager: state,
+    config,
+    reviewGate,
+    architectManager,
+    projectStore,
+  });
+  orch.on((ev) => notifier.handleEvent(ev));
+
+  // --- CommandRouter wiring ---
+
+  const noopAbort: AbortHook = {
+    abortTask(_taskId: string) {
+      // Live conversational v0 — abort routing arrives via `!abort` REST path
+      // through CommandRouter; this hook is a no-op until the gateway grows
+      // a SIGTERM-equivalent for in-flight sessions.
+    },
+  };
+  const taskSink = new FileTaskSink(config.project.task_dir);
+  const classifier = new UnknownIntentClassifier();
+  const commandRouter = new CommandRouter({
+    state,
+    config,
+    classifier,
+    abort: noopAbort,
+    taskSink,
+    projectStore,
+    emit: (ev) => notifier.handleEvent(ev),
+    orchestrator: orch,
+  });
+
+  // --- Gateway + dispatcher ---
+
+  const gateway = new RawWsBotGateway({
+    token,
+    allowedChannelIds: [
+      config.discord.dev_channel,
+      config.discord.ops_channel,
+      config.discord.escalation_channel,
+    ],
+  });
+  gateway.registerSelfWebhookIds(Object.values(webhookIdsByChannel));
+
+  // Critic 13 — surface MESSAGE_CONTENT-disabled state to the operator.
+  gateway.onMessageContentMissing(() => {
+    const opsSender = senders[config.discord.ops_channel];
+    void opsSender?.sendToChannel(
+      config.discord.ops_channel,
+      "**Warning:** MESSAGE_CONTENT intent appears disabled — enable in Discord Developer Portal, then restart.",
+    );
+  });
+
+  const dispatcher = new InboundDispatcher({
+    commandRouter,
+    architectManager,
+    identityMap,
+    senders,
+    config: config.discord,
+    messageContext,
+  });
+  gateway.on((msg) => void dispatcher.dispatch(msg));
+
+  // --- Startup ops-channel notice (cross-w 6) ---
+
+  const opsSender = senders[config.discord.ops_channel];
+  void opsSender?.sendToChannel(
+    config.discord.ops_channel,
+    "harness-ts started. Conversational state lost across restarts; please re-issue commands as `!project ...` or by replying to a fresh agent message that lands after this notice.",
+  );
+
+  installSigintHandler([
+    { shutdown: () => gateway.stop() },
+    { shutdown: () => orch.shutdown() },
+    { shutdown: () => architectManager.shutdownAll() },
+  ]);
+
+  await gateway.start();
+  orch.start();
+
+  console.log("[live-bot-listen] gateway + orchestrator running. Ctrl+C to exit.");
+
+  // Park forever — SIGINT handler exits the process.
+  await new Promise<void>(() => undefined);
+}
+
+main().catch((err) => {
+  console.error("[live-bot-listen] FATAL", err);
+  process.exit(2);
+});

@@ -403,6 +403,78 @@ describe("sanitize()", () => {
   });
 });
 
+describe("DiscordNotifier — CW-3 messageContext recording", () => {
+  function senderWithIdReturn(messageId: string | null) {
+    const sent: Array<{ channel: string; content: string; method: "plain" | "withId" }> = [];
+    const sender: DiscordSender = {
+      async sendToChannel(channel, content) {
+        sent.push({ channel, content, method: "plain" });
+      },
+      async sendToChannelAndReturnId(channel, content) {
+        sent.push({ channel, content, method: "withId" });
+        return { messageId };
+      },
+      async addReaction() {
+        /* no-op */
+      },
+    };
+    return { sender, sent };
+  }
+
+  function makeMessageContext() {
+    const records: Array<{ messageId: string; projectId: string }> = [];
+    return {
+      ctx: {
+        recordAgentMessage(messageId: string, projectId: string) {
+          records.push({ messageId, projectId });
+        },
+        resolveProjectIdForMessage() {
+          return null;
+        },
+      },
+      records,
+    };
+  }
+
+  it("task-keyed event with stateManager + task has projectId → records via sendToChannelAndReturnId", async () => {
+    const { sender, sent } = senderWithIdReturn("disc-msg-99");
+    const { ctx, records } = makeMessageContext();
+    const fakeState = {
+      getTask(taskId: string) {
+        if (taskId === "task-1") return { id: "task-1", projectId: "proj-77" };
+        return undefined;
+      },
+    } as unknown as import("../../src/lib/state.js").StateManager;
+
+    const n = new DiscordNotifier(sender, baseConfig(), { messageContext: ctx, stateManager: fakeState });
+    n.handleEvent({ type: "task_done", taskId: "task-1" });
+    await flush();
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0].method).toBe("withId");
+    expect(records).toEqual([{ messageId: "disc-msg-99", projectId: "proj-77" }]);
+  });
+
+  it("task-keyed event with stateManager but task missing → falls back to sendToChannel, no record", async () => {
+    const { sender, sent } = senderWithIdReturn("ignored");
+    const { ctx, records } = makeMessageContext();
+    const fakeState = {
+      getTask() {
+        return undefined; // task not in state
+      },
+    } as unknown as import("../../src/lib/state.js").StateManager;
+
+    const n = new DiscordNotifier(sender, baseConfig(), { messageContext: ctx, stateManager: fakeState });
+    n.handleEvent({ type: "task_done", taskId: "task-missing" });
+    await flush();
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0].method).toBe("plain");
+    expect(records).toEqual([]);
+  });
+
+});
+
 describe("redactSecrets()", () => {
   it("redacts Anthropic/OpenAI-style sk- keys", () => {
     expect(redactSecrets("use key sk-live-abc123DEF456ghi789jkl"))
