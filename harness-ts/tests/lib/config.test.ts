@@ -177,6 +177,20 @@ max_tier1_escalations = 3
     expect(config.pipeline.auto_escalate_on_max_retries).toBeUndefined();
     expect(config.pipeline.max_tier1_escalations).toBeUndefined();
   });
+
+  it("CW-1 parses [discord.webhooks] with optional dev/ops/escalation URLs", () => {
+    const toml = VALID_TOML + `
+[discord.webhooks]
+dev = "https://discord.com/api/webhooks/111/dev-tok"
+ops = "https://discord.com/api/webhooks/222/ops-tok"
+`;
+    const path = writeTempToml(toml);
+    const config = loadConfig(path);
+
+    expect(config.discord.webhooks?.dev).toBe("https://discord.com/api/webhooks/111/dev-tok");
+    expect(config.discord.webhooks?.ops).toBe("https://discord.com/api/webhooks/222/ops-tok");
+    expect(config.discord.webhooks?.escalation).toBeUndefined();
+  });
 });
 
 describe("loadSystemPrompt", () => {

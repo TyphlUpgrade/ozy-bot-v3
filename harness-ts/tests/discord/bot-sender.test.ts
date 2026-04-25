@@ -89,6 +89,34 @@ describe("BotSender", () => {
     warnSpy.mockRestore();
   });
 
+  it("sendToChannelAndReturnId extracts id from response JSON", async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => ({ id: "msg-7777" }),
+    });
+    const sender = new BotSender("t", { fetch, minSpacingMs: 0 });
+    const p = sender.sendToChannelAndReturnId("123", "hi");
+    await vi.runAllTimersAsync();
+    const result = await p;
+    expect(result.messageId).toBe("msg-7777");
+  });
+
+  it("sendToChannelAndReturnId returns null when response body has no id", async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => ({}),
+    });
+    const sender = new BotSender("t", { fetch, minSpacingMs: 0 });
+    const p = sender.sendToChannelAndReturnId("123", "hi");
+    await vi.runAllTimersAsync();
+    const result = await p;
+    expect(result.messageId).toBeNull();
+  });
+
   it("addReaction PUTs to the reactions endpoint with url-encoded emoji", async () => {
     const fetch = mockFetchOK();
     const sender = new BotSender("t", { fetch });

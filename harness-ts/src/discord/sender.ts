@@ -33,7 +33,8 @@ interface QueuedMessage {
   channel: string;
   content: string;
   identity?: AgentIdentity;
-  resolve: () => void;
+  /** CW-1 — settle with `{messageId}`; senders that ignore id pass () => undefined. */
+  resolve: (messageId: string | null) => void;
 }
 
 export interface WebhookSenderOptions {
@@ -65,12 +66,39 @@ export class WebhookSender implements DiscordSender {
     // forget and the console.warn is the observable signal of drop.
     if (this.queue.length >= this.maxQueueSize) {
       const dropped = this.queue.shift();
-      dropped?.resolve();
+      dropped?.resolve(null);
       console.warn(`[WebhookSender] queue full, dropping oldest message (queue=${this.queue.length})`);
     }
 
     return new Promise<void>((resolve) => {
-      this.queue.push({ channel, content, identity, resolve });
+      this.queue.push({ channel, content, identity, resolve: () => resolve() });
+      void this.drain();
+    });
+  }
+
+  /**
+   * CW-1 — same delivery contract as `sendToChannel` but resolves with the
+   * Discord-assigned message id when the underlying WebhookClient returns a
+   * payload with `.id` (discord.js + `wait: true`). Returns `{messageId: null}`
+   * when the client returns nothing parseable, on overflow drop, or send failure.
+   */
+  async sendToChannelAndReturnId(
+    channel: string,
+    content: string,
+    identity?: AgentIdentity,
+  ): Promise<{ messageId: string | null }> {
+    if (this.queue.length >= this.maxQueueSize) {
+      const dropped = this.queue.shift();
+      dropped?.resolve(null);
+      console.warn(`[WebhookSender] queue full, dropping oldest message (queue=${this.queue.length})`);
+    }
+    return new Promise<{ messageId: string | null }>((resolve) => {
+      this.queue.push({
+        channel,
+        content,
+        identity,
+        resolve: (messageId) => resolve({ messageId }),
+      });
       void this.drain();
     });
   }
@@ -91,20 +119,29 @@ export class WebhookSender implements DiscordSender {
         }
         const next = this.queue.shift();
         if (!next) break;
+        let messageId: string | null = null;
         try {
-          await this.webhook.send({
+          // CW-1 — `wait: true` asks Discord to return the created message
+          // object so we can extract `.id`. discord.js WebhookClient.send
+          // surfaces this as a `Message` instance whose `.id` is the message id.
+          const result = await this.webhook.send({
             content: next.content,
             username: next.identity?.username,
             avatarURL: next.identity?.avatarURL,
             allowedMentions: NO_MENTIONS,
+            wait: true,
           });
+          if (result && typeof result === "object" && "id" in result) {
+            const id = (result as { id?: unknown }).id;
+            if (typeof id === "string") messageId = id;
+          }
         } catch (err) {
           // Log only .message — avoid echoing request content (incl. any
           // secrets that slipped through redaction) into the error stream.
           console.error(`[WebhookSender] send failed for channel=${next.channel}: ${errMessage(err)}`);
         }
         this.lastSendTime = Date.now();
-        next.resolve();
+        next.resolve(messageId);
       }
     } finally {
       this.draining = false;

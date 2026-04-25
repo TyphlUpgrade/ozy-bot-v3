@@ -2,12 +2,18 @@ import { describe, it, expect, vi } from "vitest";
 import { WebhookSender } from "../../src/discord/sender.js";
 import type { AllowedMentions, WebhookClient } from "../../src/discord/types.js";
 
-function makeWebhook(opts: { fail?: boolean } = {}) {
-  const calls: Array<{ content: string; username?: string; avatarURL?: string; allowedMentions?: AllowedMentions }> = [];
+function makeWebhook(opts: { fail?: boolean; returnId?: string | null } = {}) {
+  const calls: Array<{ content: string; username?: string; avatarURL?: string; allowedMentions?: AllowedMentions; wait?: boolean }> = [];
   const client: WebhookClient = {
     async send(options) {
       calls.push(options);
       if (opts.fail) throw new Error("webhook 500");
+      // CW-1 — when `returnId` is set return a fake message object so
+      // `sendToChannelAndReturnId` can extract `.id`. `null` simulates a
+      // client that doesn't return the id.
+      if (opts.returnId !== undefined) {
+        return opts.returnId === null ? undefined : { id: opts.returnId };
+      }
       return undefined;
     },
   };
@@ -73,6 +79,20 @@ describe("WebhookSender", () => {
     expect(calls).toHaveLength(3);
     // 3 sends with 50ms spacing between = at least ~90ms total (timer jitter tolerance)
     expect(elapsed).toBeGreaterThanOrEqual(80);
+  });
+
+  it("sendToChannelAndReturnId captures id from webhook client response", async () => {
+    const { client } = makeWebhook({ returnId: "wm-42" });
+    const s = new WebhookSender(client, { minSpacingMs: 0 });
+    const result = await s.sendToChannelAndReturnId("dev", "hi");
+    expect(result.messageId).toBe("wm-42");
+  });
+
+  it("sendToChannelAndReturnId returns null when webhook client returns no payload", async () => {
+    const { client } = makeWebhook({ returnId: null });
+    const s = new WebhookSender(client, { minSpacingMs: 0 });
+    const result = await s.sendToChannelAndReturnId("dev", "hi");
+    expect(result.messageId).toBeNull();
   });
 
   it("queue overflow drops OLDEST (not newest) when maxQueueSize exceeded", async () => {

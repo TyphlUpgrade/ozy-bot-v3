@@ -42,12 +42,25 @@ export interface DiscordAgentIdentity {
   avatar_url: string;
 }
 
+/**
+ * CW-1 — per-channel webhook URLs. Optional; when present they upgrade the
+ * given channel from BotSender to WebhookSender so per-agent avatars render
+ * natively. Runtime-only — populated from env (DISCORD_WEBHOOK_DEV/OPS/...) at
+ * script startup, never embedded in TOML.
+ */
+export interface DiscordWebhookUrls {
+  dev?: string;
+  ops?: string;
+  escalation?: string;
+}
+
 export interface DiscordConfig {
   bot_token_env: string;
   dev_channel: string;
   ops_channel: string;
   escalation_channel: string;
   webhook_url?: string;
+  webhooks?: DiscordWebhookUrls;
   agents: Record<string, DiscordAgentIdentity>;
 }
 
@@ -189,13 +202,29 @@ function parseDiscordAgent(raw: Record<string, unknown>, agentName: string): Dis
 /**
  * Config-free Discord agent identity defaults. Any agent key missing from
  * `[discord.agents.*]` in project.toml resolves to these. Wave 2 establishes
- * the three conventional keys; new agent tiers should add their default here.
+ * the three conventional keys; CW-1 adds `executor` and `operator` so the
+ * conversational pipeline can route per-agent identity without forcing every
+ * deployment to declare them. New agent tiers should add their default here.
  */
 export const DISCORD_AGENT_DEFAULTS: Readonly<Record<string, DiscordAgentIdentity>> = {
   orchestrator: { name: "Harness", avatar_url: "" },
   architect: { name: "Architect", avatar_url: "" },
   reviewer: { name: "Reviewer", avatar_url: "" },
+  executor: { name: "Executor", avatar_url: "" },
+  operator: { name: "Operator", avatar_url: "" },
 };
+
+function parseDiscordWebhooks(raw: unknown): DiscordWebhookUrls | undefined {
+  // CW-1 — `[discord.webhooks]` is optional. URL values themselves usually come
+  // from env at runtime; TOML support exists for completeness/local dev.
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const obj = raw as Record<string, unknown>;
+  const out: DiscordWebhookUrls = {};
+  if (typeof obj.dev === "string") out.dev = obj.dev;
+  if (typeof obj.ops === "string") out.ops = obj.ops;
+  if (typeof obj.escalation === "string") out.escalation = obj.escalation;
+  return out;
+}
 
 function parseDiscord(raw: Record<string, unknown>): DiscordConfig {
   const section = "discord";
@@ -206,7 +235,7 @@ function parseDiscord(raw: Record<string, unknown>): DiscordConfig {
   }
   // Project config overrides defaults; unknown agent keys pass through.
   const agents: Record<string, DiscordAgentIdentity> = { ...DISCORD_AGENT_DEFAULTS, ...parsed };
-  return {
+  const cfg: DiscordConfig = {
     bot_token_env: requireString(raw, "bot_token_env", section),
     dev_channel: requireString(raw, "dev_channel", section),
     ops_channel: requireString(raw, "ops_channel", section),
@@ -214,6 +243,9 @@ function parseDiscord(raw: Record<string, unknown>): DiscordConfig {
     webhook_url: optionalString(raw, "webhook_url"),
     agents,
   };
+  const webhooks = parseDiscordWebhooks(raw.webhooks);
+  if (webhooks) cfg.webhooks = webhooks;
+  return cfg;
 }
 
 export function loadConfig(configPath: string): HarnessConfig {

@@ -29,7 +29,8 @@ interface QueuedMessage {
   channelId: string;
   content: string;
   identity?: AgentIdentity;
-  resolve: () => void;
+  /** CW-1 — settle with `{messageId}` for `sendToChannelAndReturnId`; senders that ignore id pass () => undefined. */
+  resolve: (messageId: string | null) => void;
 }
 
 export interface BotSenderOptions {
@@ -65,11 +66,37 @@ export class BotSender implements DiscordSender {
   async sendToChannel(channelId: string, content: string, identity?: AgentIdentity): Promise<void> {
     if (this.queue.length >= this.maxQueueSize) {
       const dropped = this.queue.shift();
-      dropped?.resolve();
+      dropped?.resolve(null);
       console.warn(`[BotSender] queue full, dropping oldest message (queue=${this.queue.length})`);
     }
     return new Promise<void>((resolve) => {
-      this.queue.push({ channelId, content, identity, resolve });
+      this.queue.push({ channelId, content, identity, resolve: () => resolve() });
+      void this.drain();
+    });
+  }
+
+  /**
+   * CW-1 — same delivery contract as `sendToChannel` but resolves with the
+   * Discord-assigned message id (extracted from POST response JSON). Returns
+   * `{messageId: null}` on overflow drop, network error, or non-2xx response.
+   */
+  async sendToChannelAndReturnId(
+    channelId: string,
+    content: string,
+    identity?: AgentIdentity,
+  ): Promise<{ messageId: string | null }> {
+    if (this.queue.length >= this.maxQueueSize) {
+      const dropped = this.queue.shift();
+      dropped?.resolve(null);
+      console.warn(`[BotSender] queue full, dropping oldest message (queue=${this.queue.length})`);
+    }
+    return new Promise<{ messageId: string | null }>((resolve) => {
+      this.queue.push({
+        channelId,
+        content,
+        identity,
+        resolve: (messageId) => resolve({ messageId }),
+      });
       void this.drain();
     });
   }
@@ -114,6 +141,7 @@ export class BotSender implements DiscordSender {
         }
         const next = this.queue.shift();
         if (!next) break;
+        let messageId: string | null = null;
         try {
           const res = await this.fetchImpl(
             `${DISCORD_API_BASE}/channels/${next.channelId}/messages`,
@@ -128,12 +156,20 @@ export class BotSender implements DiscordSender {
           );
           if (!res.ok) {
             console.error(`[BotSender] send to ${next.channelId} -> ${res.status} ${res.statusText}`);
+          } else {
+            // CW-1 — Discord returns the created message object on 200/201; capture id.
+            try {
+              const body = (await res.json()) as { id?: unknown };
+              if (body && typeof body.id === "string") messageId = body.id;
+            } catch {
+              // Body parse failure shouldn't abort the send — leave messageId null.
+            }
           }
         } catch (err) {
           console.error(`[BotSender] send failed for channel=${next.channelId}: ${errMessage(err)}`);
         }
         this.lastSendTime = Date.now();
-        next.resolve();
+        next.resolve(messageId);
       }
     } finally {
       this.draining = false;

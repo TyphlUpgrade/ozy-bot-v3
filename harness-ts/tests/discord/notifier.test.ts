@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { DiscordNotifier, sanitize, redactSecrets } from "../../src/discord/notifier.js";
-import type { DiscordSender, AgentIdentity } from "../../src/discord/types.js";
+import { sendToChannelAndReturnIdDefault, type DiscordSender, type AgentIdentity } from "../../src/discord/types.js";
 import type { DiscordConfig } from "../../src/lib/config.js";
 import type { OrchestratorEvent } from "../../src/orchestrator.js";
 
@@ -18,6 +18,9 @@ function makeFakeSender(failSend = false) {
     async sendToChannel(channel, content, identity) {
       if (failSend) throw new Error("discord down");
       sent.push({ channel, content, identity });
+    },
+    async sendToChannelAndReturnId(channel, content, identity) {
+      return sendToChannelAndReturnIdDefault(this, channel, content, identity);
     },
     async addReaction() {
       /* no-op */

@@ -27,10 +27,37 @@ export interface AllowedMentions {
  * This is intentional: Wave 2 notifier is fire-and-forget, so a resolved
  * promise keeps it cheap; Wave 3+ bot-client dialogue flows should not route
  * through this sender.
+ *
+ * **CW-1 — sendToChannelAndReturnId:** identical contract to `sendToChannel`
+ * but returns the resulting Discord message id (or `null` if not available —
+ * e.g., dropped on overflow, fake sender, or webhook send without `wait=true`).
+ * Conversational flows (CW-3+) need the id to wire reply ↔ task linkage; the
+ * fire-and-forget notifier does not.
  */
 export interface DiscordSender {
   sendToChannel(channel: string, content: string, identity?: AgentIdentity): Promise<void>;
+  sendToChannelAndReturnId(
+    channel: string,
+    content: string,
+    identity?: AgentIdentity,
+  ): Promise<{ messageId: string | null }>;
   addReaction(channelId: string, messageId: string, emoji: string): Promise<void>;
+}
+
+/**
+ * CW-1 default helper for test fakes / minimal senders that only implement
+ * `sendToChannel`. Delegates to `sendToChannel` and returns `{messageId: null}`.
+ * Real senders (BotSender, WebhookSender) implement `sendToChannelAndReturnId`
+ * natively to capture the Discord-assigned message id.
+ */
+export async function sendToChannelAndReturnIdDefault(
+  sender: { sendToChannel: (channel: string, content: string, identity?: AgentIdentity) => Promise<void> },
+  channel: string,
+  content: string,
+  identity?: AgentIdentity,
+): Promise<{ messageId: string | null }> {
+  await sender.sendToChannel(channel, content, identity);
+  return { messageId: null };
 }
 
 /** Minimal contract the discord.js WebhookClient satisfies. Keeps us decoupled from the SDK. */
@@ -40,5 +67,7 @@ export interface WebhookClient {
     username?: string;
     avatarURL?: string;
     allowedMentions?: AllowedMentions;
+    /** CW-1 — request the message object back (Discord `?wait=true` semantics). */
+    wait?: boolean;
   }): Promise<unknown>;
 }

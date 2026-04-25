@@ -29,7 +29,8 @@ import { ProjectStore } from "../src/lib/project.js";
 import { ReviewGate } from "../src/gates/review.js";
 import { ArchitectManager } from "../src/session/architect.js";
 import { DiscordNotifier } from "../src/discord/notifier.js";
-import type { DiscordSender, AgentIdentity } from "../src/discord/types.js";
+import { buildSendersForChannels } from "../src/discord/sender-factory.js";
+import { sendToChannelAndReturnIdDefault, type DiscordSender, type AgentIdentity } from "../src/discord/types.js";
 import type { HarnessConfig } from "../src/lib/config.js";
 import {
   initScratchRepo,
@@ -100,15 +101,23 @@ async function main(): Promise<void> {
     config,
   });
 
+  // CW-1 — real senders when DISCORD_BOT_TOKEN is in env; stdout fake otherwise.
   const sent: Array<{ channel: string; content: string; identity?: AgentIdentity }> = [];
-  const sender: DiscordSender = {
+  const stdoutFake: DiscordSender = {
     async sendToChannel(channel, content, identity) {
       sent.push({ channel, content, identity });
       console.log(`  [discord:${channel}] ${content.slice(0, 160)}`);
     },
+    async sendToChannelAndReturnId(channel, content, identity) {
+      return sendToChannelAndReturnIdDefault(this, channel, content, identity);
+    },
     async addReaction() { /* noop */ },
   };
-  const notifier = new DiscordNotifier(sender, config.discord);
+  const discordToken = process.env.DISCORD_BOT_TOKEN;
+  const senders = discordToken
+    ? buildSendersForChannels(config.discord, discordToken)
+    : stdoutFake;
+  const notifier = new DiscordNotifier(senders, config.discord);
 
   const orch = new Orchestrator({
     sessionManager: sessions,

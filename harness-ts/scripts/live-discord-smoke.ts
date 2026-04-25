@@ -2,12 +2,22 @@
  * Discord live-delivery smoke test.
  *
  * Sends one message per agent identity (Architect / Reviewer / Executor /
- * Operator) to the dev channel via the bot REST API. Confirms BotSender wiring
- * + bot-token authorization + per-message identity prefix work end-to-end.
+ * Operator) to the dev channel and one routed event through DiscordNotifier.
+ * CW-1: routes via `buildSendersForChannels` so channels with a webhook URL
+ * get per-agent username AND avatar; channels without fall back to bot REST
+ * (identity rendered as `**[Name]**` prefix).
  *
  * Reads `.env` (or already-exported env) for:
- *   - DISCORD_BOT_TOKEN — required, bot token from Discord developer portal
- *   - DEV_CHANNEL       — required, channel ID (snowflake)
+ *   - DISCORD_BOT_TOKEN          — required, bot token from Discord dev portal
+ *   - DEV_CHANNEL                — required, channel ID (snowflake)
+ *   - AGENT_CHANNEL              — optional, defaults to DEV_CHANNEL
+ *   - ALERTS_CHANNEL             — optional, defaults to DEV_CHANNEL
+ *   - DISCORD_WEBHOOK_DEV        — optional; per-channel webhook for #dev
+ *   - DISCORD_WEBHOOK_OPS        — optional; per-channel webhook for #ops
+ *   - DISCORD_WEBHOOK_ESCALATION — optional; per-channel webhook for #escalation
+ *
+ * Webhook URLs upgrade the channel from BotSender to WebhookSender so per-
+ * agent avatars render natively. Provision via `scripts/provision-webhooks.ts`.
  *
  * Usage:
  *   set -a && source ../.env && set +a    # if .env not auto-loaded
@@ -17,8 +27,8 @@
 import { readFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { BotSender } from "../src/discord/bot-sender.js";
 import { DiscordNotifier } from "../src/discord/notifier.js";
+import { buildSendersForChannels } from "../src/discord/sender-factory.js";
 import type { DiscordConfig } from "../src/lib/config.js";
 
 function loadDotEnv(path: string): void {
@@ -56,17 +66,36 @@ async function main(): Promise<void> {
   }
 
   console.log(`[discord-smoke] sending 4 messages to dev channel ${dev}`);
-  const sender = new BotSender(token, { minSpacingMs: 2000 });
+  const config: DiscordConfig = {
+    bot_token_env: "DISCORD_BOT_TOKEN",
+    dev_channel: dev,
+    ops_channel: ops!,
+    escalation_channel: escalation!,
+    webhooks: {
+      dev: process.env.DISCORD_WEBHOOK_DEV,
+      ops: process.env.DISCORD_WEBHOOK_OPS,
+      escalation: process.env.DISCORD_WEBHOOK_ESCALATION,
+    },
+    agents: {},
+  };
+  // CW-1 — per-channel sender map. Channels with webhook URL get WebhookSender
+  // (native per-agent avatar); others fall back to BotSender.
+  const senders = buildSendersForChannels(config, token);
+  const devSender = senders[dev];
+  if (!devSender) {
+    console.error(`[discord-smoke] no sender constructed for channel ${dev}`);
+    process.exit(2);
+  }
 
   const identities = [
-    { username: "Architect", avatarURL: undefined },
-    { username: "Reviewer", avatarURL: undefined },
-    { username: "Executor", avatarURL: undefined },
-    { username: "Operator", avatarURL: undefined },
+    { username: "Architect", avatarURL: "" },
+    { username: "Reviewer", avatarURL: "" },
+    { username: "Executor", avatarURL: "" },
+    { username: "Operator", avatarURL: "" },
   ];
 
   for (const id of identities) {
-    await sender.sendToChannel(
+    await devSender.sendToChannel(
       dev,
       `harness-ts smoke test — ${id.username} reporting in (${new Date().toISOString()})`,
       id,
@@ -75,14 +104,7 @@ async function main(): Promise<void> {
 
   // Wire DiscordNotifier so we know the routing layer also works end-to-end.
   // Fake event: project_declared maps to dev channel by default.
-  const config: DiscordConfig = {
-    bot_token_env: "DISCORD_BOT_TOKEN",
-    dev_channel: dev,
-    ops_channel: ops!,
-    escalation_channel: escalation!,
-    agents: {},
-  };
-  const notifier = new DiscordNotifier(sender, config);
+  const notifier = new DiscordNotifier(senders, config);
   notifier.handleEvent({
     type: "project_declared",
     projectId: "smoke-test-fake-id",

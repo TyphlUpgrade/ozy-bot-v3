@@ -23,6 +23,7 @@ import type { OrchestratorEvent } from "../orchestrator.js";
 import { DISCORD_AGENT_DEFAULTS, type DiscordConfig, type DiscordAgentIdentity } from "../lib/config.js";
 import { sanitize, redactSecrets } from "../lib/text.js";
 import type { AgentIdentity, DiscordSender } from "./types.js";
+import type { StateManager } from "../lib/state.js";
 
 // Re-export for backward-compat — Wave 3 moved these to src/lib/text.ts.
 export { sanitize, redactSecrets } from "../lib/text.js";
@@ -213,23 +214,75 @@ export interface DiscordNotifierOptions {
    * seam; in production leave undefined.
    */
   agents?: Record<string, DiscordAgentIdentity>;
+  /**
+   * CW-1 — optional MessageContext store. CW-3 will record outbound message
+   * ids here so reply chains can resolve back to taskId / projectId. Wired now
+   * but unused (no-op) until CW-3 introduces the MessageContext class.
+   */
+  messageContext?: MessageContextLike;
+  /**
+   * CW-1 — optional state manager for projectId resolution on task-keyed
+   * events. Wired now, used by CW-3.
+   */
+  stateManager?: StateManager;
+}
+
+/**
+ * Forward-compatible shape for CW-3's MessageContext. Empty for CW-1; CW-3
+ * extends with `record(messageId, taskId | projectId, ...)` etc. Defined
+ * inline so CW-1 doesn't depend on CW-3 source files.
+ */
+export interface MessageContextLike {
+  // CW-3 will add methods here; CW-1 only wires the dependency.
 }
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/**
+ * CW-1 — sender input shape: either a single sender (legacy / single-channel
+ * tests) or a per-channel map keyed by Discord channel id. Notifier resolves
+ * the channel id from `config.<dev|ops|escalation>_channel`, looks it up in
+ * the map, and falls back to a default sender when the map has no entry.
+ */
+export type SenderInput = DiscordSender | Record<string, DiscordSender>;
+
+function isSenderMap(input: SenderInput): input is Record<string, DiscordSender> {
+  // Heuristic: a DiscordSender has `sendToChannel` as a function on itself.
+  // A map is a plain object whose values have that method.
+  return (
+    typeof input === "object" &&
+    input !== null &&
+    typeof (input as Partial<DiscordSender>).sendToChannel !== "function"
+  );
+}
+
 export class DiscordNotifier {
-  private readonly sender: DiscordSender;
+  private readonly senders: Record<string, DiscordSender> | null;
+  private readonly defaultSender: DiscordSender | null;
   private readonly config: DiscordConfig;
   private readonly agents: Record<string, DiscordAgentIdentity>;
+  // CW-1 wiring — unused until CW-3 lands MessageContext.
+  private readonly messageContext: MessageContextLike | undefined;
+  private readonly stateManager: StateManager | undefined;
 
-  constructor(sender: DiscordSender, config: DiscordConfig, options: DiscordNotifierOptions = {}) {
-    this.sender = sender;
+  constructor(senders: SenderInput, config: DiscordConfig, options: DiscordNotifierOptions = {}) {
     this.config = config;
+    if (isSenderMap(senders)) {
+      this.senders = senders;
+      // Pick any entry as the fallback for channels not in the map.
+      const first = Object.values(senders)[0];
+      this.defaultSender = first ?? null;
+    } else {
+      this.senders = null;
+      this.defaultSender = senders;
+    }
     // Precedence: config > options > defaults. Config is trusted production
     // value; options is a test seam that should not override prod config.
     this.agents = { ...DISCORD_AGENT_DEFAULTS, ...options.agents, ...config.agents };
+    this.messageContext = options.messageContext;
+    this.stateManager = options.stateManager;
   }
 
   /** Register with orchestrator: `orch.on((ev) => notifier.handleEvent(ev));` */
@@ -251,10 +304,12 @@ export class DiscordNotifier {
 
     const channel = this.resolveChannel(entry.channel);
     const identity = this.resolveIdentity(entry.identity);
+    const sender = this.resolveSender(channel);
+    if (!sender) return;
 
     // Swallow sender failures — Discord hiccups never crash the pipeline.
     // Log only .message to avoid echoing request bodies back into logs.
-    void this.sender.sendToChannel(channel, body, identity).catch((err) => {
+    void sender.sendToChannel(channel, body, identity).catch((err) => {
       console.error(`[DiscordNotifier] sender failed for ${event.type} -> ${entry.channel}: ${errMessage(err)}`);
     });
   }
@@ -266,5 +321,12 @@ export class DiscordNotifier {
   private resolveIdentity(key: IdentityKey): AgentIdentity {
     const cfg = this.agents[key] ?? DISCORD_AGENT_DEFAULTS[key];
     return { username: cfg.name, avatarURL: cfg.avatar_url };
+  }
+
+  private resolveSender(channelId: string): DiscordSender | null {
+    if (this.senders) {
+      return this.senders[channelId] ?? this.defaultSender;
+    }
+    return this.defaultSender;
   }
 }

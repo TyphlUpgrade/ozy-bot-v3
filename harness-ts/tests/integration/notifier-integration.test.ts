@@ -23,7 +23,7 @@ import { MergeGate, type MergeGitOps } from "../../src/gates/merge.js";
 import { StateManager } from "../../src/lib/state.js";
 import type { HarnessConfig } from "../../src/lib/config.js";
 import { DiscordNotifier } from "../../src/discord/notifier.js";
-import type { DiscordSender, AgentIdentity } from "../../src/discord/types.js";
+import { sendToChannelAndReturnIdDefault, type DiscordSender, type AgentIdentity } from "../../src/discord/types.js";
 import type { Query, SDKMessage, SDKResultSuccess } from "@anthropic-ai/claude-agent-sdk";
 
 let tmpDir: string;
@@ -189,6 +189,9 @@ function setupHarness(
   const sender: DiscordSender = {
     async sendToChannel(channel, content, identity) {
       sent.push({ channel, content, identity });
+    },
+    async sendToChannelAndReturnId(channel, content, identity) {
+      return sendToChannelAndReturnIdDefault(this, channel, content, identity);
     },
     async addReaction() {
       /* no-op */
