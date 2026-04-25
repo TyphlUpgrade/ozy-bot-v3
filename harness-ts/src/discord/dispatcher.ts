@@ -122,9 +122,8 @@ export function extractMentions(
     // Else: unresolved — leave intact in cleanedContent.
   }
 
-  if (mentions.length > 1) {
-    console.warn("[InboundDispatcher] multi-mention detected; dispatching first only");
-  }
+  // Security LOW-1 — multi-mention is no longer warned here; the dispatcher
+  // sends an operator-visible instructive reply in `tryMentionRoute`.
 
   // Build cleanedContent by removing strip spans (sorted by start, no overlaps
   // expected since matches are non-overlapping).
@@ -148,7 +147,7 @@ export function extractMentions(
 
 type ResolveProjectResult =
   | { projectId: string; reason: "affinity_hint" | "single_active" }
-  | { projectId: null; reason: "no_active" | "multi_active_no_hint" | "no_project_store" };
+  | { projectId: null; reason: "no_active" | "multi_active_no_hint" | "no_project_store" | "no_channel_buffer" };
 
 export type RelayFailureKind =
   | "no_session"
@@ -296,6 +295,18 @@ export class InboundDispatcher {
     if (extracted.mentions.length === 0 && !extracted.botMentioned) return false;
 
     if (extracted.mentions.length > 0) {
+      // Security LOW-1 — multi-mention: send an operator-visible instructive
+      // reply, then continue dispatching the FIRST mention (existing v1
+      // behavior). Auditable so the operator knows the others were ignored.
+      // Uses `raw` (the verbatim `@<name>` the operator typed) so the reply
+      // echoes their input rather than the resolved agent key.
+      if (extracted.mentions.length > 1) {
+        const first = extracted.mentions[0];
+        this.sendToChannel(
+          msg.channelId,
+          `Multiple agent mentions detected — only the first (\`${first.raw}\`) is being routed. Re-send with one mention per message for the others.`,
+        );
+      }
       // Agent mention — try to resolve a project for this channel.
       const resolved = this.resolveProjectForChannel(msg.channelId);
       if (resolved.projectId === null) {
@@ -320,6 +331,12 @@ export class InboundDispatcher {
       return true;
     }
 
+    // Security MED Q5 — bare bot ping with no agent mention falls through to
+    // NL parser. Log so operator-visible bot pings are auditable.
+    console.info("[dispatcher] bot mention without agent — falling through to NL parser", {
+      channelId: msg.channelId,
+      contentLength: msg.content.length,
+    });
     // botMentioned only (no agent) — fall through to existing rules.
     // The `directAddress` flag is plumbed through ClassifyContext for future
     // CW-4.6 consumption; v1 records but doesn't change behavior.
@@ -332,7 +349,7 @@ export class InboundDispatcher {
    */
   private resolveProjectForChannel(channelId: string): ResolveProjectResult {
     if (!this.projectStore) return { projectId: null, reason: "no_project_store" };
-    if (!this.channelBuffer) return { projectId: null, reason: "no_project_store" };
+    if (!this.channelBuffer) return { projectId: null, reason: "no_channel_buffer" };
 
     // Step A — affinity hint from recent buffer.
     const recent = this.channelBuffer.recent(channelId, 10);

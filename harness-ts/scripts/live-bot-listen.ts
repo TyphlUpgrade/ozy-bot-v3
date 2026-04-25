@@ -210,7 +210,31 @@ async function main(): Promise<void> {
   // CW-4.5 — single shared per-channel ring buffer feeding both the LLM
   // classifier (via `recentMessagesProvider`) and the dispatcher's mention
   // resolution (via `channelBuffer`).
-  const channelBuffer = new ChannelContextBuffer({ perChannelCap: 10, maxChannels: 50 });
+  //
+  // Security MED Q4 — buffer memory bound is implicitly capped by the gateway
+  // channel allowlist: the gateway filters inbound messages to
+  // `allowedChannelIds`, so only messages from those channels ever reach
+  // `channelBuffer.append`. As long as `maxChannels >= allowedChannelIds.size`,
+  // no LRU eviction can occur due to operator traffic alone — the buffer's
+  // total memory ceiling is `maxChannels × perChannelCap × ~500B ≈ 250KB`.
+  // We assert the invariant at construction so a future config change that
+  // adds channels without bumping `maxChannels` fails fast and loud.
+  const allowedChannelIds = new Set<string>([
+    config.discord.dev_channel,
+    config.discord.ops_channel,
+    config.discord.escalation_channel,
+  ]);
+  const CHANNEL_BUFFER_MAX_CHANNELS = 50;
+  if (CHANNEL_BUFFER_MAX_CHANNELS < allowedChannelIds.size) {
+    fatal(
+      `ChannelContextBuffer.maxChannels (${CHANNEL_BUFFER_MAX_CHANNELS}) < allowedChannelIds.size ` +
+        `(${allowedChannelIds.size}) — bump maxChannels so the implicit memory bound holds.`,
+    );
+  }
+  const channelBuffer = new ChannelContextBuffer({
+    perChannelCap: 10,
+    maxChannels: CHANNEL_BUFFER_MAX_CHANNELS,
+  });
 
   const commandRouter = new CommandRouter({
     state,
@@ -235,11 +259,7 @@ async function main(): Promise<void> {
 
   const gateway = new RawWsBotGateway({
     token,
-    allowedChannelIds: [
-      config.discord.dev_channel,
-      config.discord.ops_channel,
-      config.discord.escalation_channel,
-    ],
+    allowedChannelIds: Array.from(allowedChannelIds),
   });
   gateway.registerSelfWebhookIds(Object.values(webhookIdsByChannel));
 

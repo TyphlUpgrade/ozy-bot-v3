@@ -802,6 +802,45 @@ describe("InboundDispatcher", () => {
     expect(handleNaturalLanguage).toHaveBeenCalledWith("@ozy abort it", "dev", "user-1");
   });
 
+  // ----- Security LOW-1 — multi-mention instructive reply -----
+
+  it("CW-4.5 LOW-1 multi-mention: sends instructive reply AND dispatches first mention", async () => {
+    const { am, calls } = makeArchitectManager();
+    const ctx = makeMessageContext();
+    const idmap = makeIdentityMap({
+      "architect-x": "architect",
+      "reviewer-y": "reviewer",
+    });
+    const { router } = makeCommandRouter();
+    const projectStore = makeProjectStore([{ id: "proj-A", state: "executing" }]);
+    const channelBuffer = makeChannelBuffer();
+
+    const d = new InboundDispatcher({
+      commandRouter: router,
+      architectManager: am,
+      identityMap: idmap,
+      senders,
+      config: baseConfig(),
+      messageContext: ctx,
+      projectStore,
+      channelBuffer,
+      getBotUsername: () => null,
+    });
+
+    await d.dispatch(
+      inboundMessage({ content: "@architect-x and @reviewer-y please coordinate" }),
+    );
+
+    // Instructive reply sent first.
+    expect(sentDev.length).toBeGreaterThanOrEqual(1);
+    expect(sentDev[0].content).toMatch(/Multiple agent mentions detected/);
+    expect(sentDev[0].content).toMatch(/@architect-x/);
+    // First mention is still dispatched.
+    expect(calls).toEqual([
+      { projectId: "proj-A", message: "and please coordinate" },
+    ]);
+  });
+
   it("dispatch never throws even if handler.handleNaturalLanguage rejects", async () => {
     const { am } = makeArchitectManager();
     const ctx = makeMessageContext();
