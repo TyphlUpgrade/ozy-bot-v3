@@ -405,6 +405,25 @@ describe("SessionManager", () => {
       rmSync(dir, { recursive: true, force: true });
     });
 
+    it("accepts completion.json without commitSha (WA-1 propose-then-commit)", () => {
+      const dir = makeTmpDir();
+      mkdirSync(join(dir, ".harness"), { recursive: true });
+      writeFileSync(
+        join(dir, ".harness", "completion.json"),
+        JSON.stringify({
+          status: "success",
+          summary: "test without sha",
+          filesChanged: ["a.ts"],
+        }),
+      );
+      const { mgr } = makeManager();
+      const completion = mgr.readCompletion(dir);
+      expect(completion).toBeTruthy();
+      expect(completion!.commitSha).toBeUndefined();
+      expect(completion!.summary).toBe("test without sha");
+      rmSync(dir, { recursive: true, force: true });
+    });
+
     it("accepts completion with all enrichment fields", () => {
       const dir = makeTmpDir();
       mkdirSync(join(dir, ".harness"), { recursive: true });

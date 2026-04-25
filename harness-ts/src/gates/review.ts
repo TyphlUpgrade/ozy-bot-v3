@@ -288,7 +288,7 @@ export class ReviewGate {
       "```",
       `</untrusted:completion-summary>`,
       ``,
-      `**Commit SHA:** ${completion.commitSha.replace(/[^a-f0-9]/gi, "").slice(0, 40)}`,
+      `**Commit SHA:** ${(completion.commitSha ?? "").replace(/[^a-f0-9]/gi, "").slice(0, 40)}`,
       `**Files changed:**`,
       files || "(none)",
       ``,

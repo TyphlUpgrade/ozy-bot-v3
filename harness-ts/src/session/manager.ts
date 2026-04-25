@@ -20,7 +20,15 @@ import type { ConfidenceAssessment } from "../lib/types.js";
 
 export interface CompletionSignal {
   status: "success" | "failure";
-  commitSha: string;
+  /**
+   * Propose-then-commit (WA-1): commitSha is now optional.
+   * Historically the Executor committed its own work and reported the sha here.
+   * Under propose-then-commit the orchestrator commits after Reviewer approval,
+   * and the trunk-merge sha surfaces on `MergeResult.commitSha` instead.
+   * Legacy Executor output that still carries a sha is accepted but ignored
+   * downstream.
+   */
+  commitSha?: string;
   summary: string;
   filesChanged: string[];
   // Phase 2A enrichment (optional — backward compatible)
@@ -58,16 +66,19 @@ function validateCompletion(raw: unknown): CompletionSignal | null {
   const obj = raw as Record<string, unknown>;
   // Required fields
   if (typeof obj.status !== "string" || !["success", "failure"].includes(obj.status)) return null;
-  if (typeof obj.commitSha !== "string" || obj.commitSha.length === 0) return null;
   if (typeof obj.summary !== "string") return null;
   if (!Array.isArray(obj.filesChanged)) return null;
 
   const signal: CompletionSignal = {
     status: obj.status as "success" | "failure",
-    commitSha: obj.commitSha as string,
     summary: obj.summary as string,
     filesChanged: obj.filesChanged as string[],
   };
+  // commitSha is optional (WA-1): accept only non-empty strings.
+  if (obj.commitSha !== undefined) {
+    if (typeof obj.commitSha !== "string" || obj.commitSha.length === 0) return null;
+    signal.commitSha = obj.commitSha;
+  }
 
   // Optional enrichment fields — strip malformed, keep valid (B7 pattern)
   if (typeof obj.understanding === "string") signal.understanding = obj.understanding;
