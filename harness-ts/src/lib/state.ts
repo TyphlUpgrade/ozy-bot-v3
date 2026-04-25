@@ -31,7 +31,7 @@ const VALID_TRANSITIONS: Record<TaskState, readonly TaskState[]> = {
   active: ["reviewing", "merging", "done", "failed", "shelved", "escalation_wait", "paused"],
   // Wave 1.5b: reviewing can route to review_arbitration on Reviewer reject (Wave A wires the state,
   // Wave C wires the Architect listener that consumes it).
-  reviewing: ["active", "merging", "done", "failed", "escalation_wait", "review_arbitration"],
+  reviewing: ["active", "merging", "done", "failed", "escalation_wait", "review_arbitration", "shelved"],
   merging: ["done", "failed", "shelved"],
   done: [],
   failed: ["pending"], // can retry

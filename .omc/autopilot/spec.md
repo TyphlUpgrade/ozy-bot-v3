@@ -1,53 +1,46 @@
-# Autopilot Spec — Harness-TS Validator Follow-up Refactors
+# Autopilot Spec — P3 Mass-Phase Stress
 
 ## Goal
-Close the 11 validator-flagged follow-ups accumulated from P1 + P2 multi-perspective reviews. All items are mechanical refactors / small hardening; no API spend; tests grow modestly.
+Validate the three-tier pipeline under 7-phase real-SDK load. Expose contention in state.json writes, poll-loop throughput, worktree branch pileup, ProjectStore persistence ordering, merge-gate FIFO under bursts, and Architect decomposition when N is larger than any prior run.
 
-## Scope — 11 items
+## Scope anchor
+Exercises every module wired during Waves 1–C + P1/P2 on a larger scale than the 3-phase stress did. Primary targets: `src/orchestrator.ts` poll loop, `src/lib/state.ts` atomic writes under parallel transitions, `src/lib/project.ts` persist ordering, `src/gates/merge.ts` FIFO under 7 phases, `src/session/architect.ts` decompose with `phaseCount ≥ 7`, `src/session/manager.ts` branch-name pileup, `src/gates/review.ts` mandatory-review on every project phase.
 
-### Medium severity (5)
-
-1. **Cascade symmetry extraction** — `src/orchestrator.ts`: `applyArchitectVerdict::escalate_operator` and `handleMergeResult::merged` both follow `phase.markX → maybe-project.X → emit-project-event`. Extract a private helper `finalizePhaseOutcome(task, "done"|"failed", rationale?)` that returns the project event to emit (or null). Both call sites collapse.
-
-2. **Scratch-repo helper** — `scripts/live-project.ts`, `scripts/live-project-3phase.ts`, `scripts/live-project-arbitration.ts` duplicate `initScratchRepo` + `buildConfig` (~120 lines × 3). Extract `scripts/lib/scratch-repo.ts` with `initScratchRepo({ prefix })` and `buildBaseConfig({ root, name, overrides })`. Retrofit all 3 scripts.
-
-3. **InjectedReviewGate shared fixture** — move from inline in `scripts/live-project-arbitration.ts` to `scripts/lib/stub-review-gate.ts`. Constructor accepts `verdicts: ReviewVerdict[]` queue; falls back to `approve` when exhausted. Callers can program any sequence.
-
-4. **Cascade test gaps** — `tests/orchestrator.test.ts`: add tests for (a) escalate_operator with no `projectStore` injected (orchestrator legacy mode), (b) multiple pending phases where sibling is in `active` state, (c) standalone task (no projectId/phaseId) hits the guard and no-ops.
-
-5. **CR M1 `buildSessionConfig` helper** — `SessionManager.spawnTask`, `ReviewGate.runReview`, `ArchitectManager.spawnSessionWithPrompt` all hand-assemble `SessionConfig`. Extract `buildSessionConfig(opts)` in `src/session/sdk.ts` or new `src/session/config.ts`. Four+ callers after stub-gate extraction.
-
-### Low severity (6)
-
-6. **Scratch dir mkdtempSync** — 3 live scripts use `join(tmpdir(), \`harness-*-${Date.now()}\`)` + `mkdirSync({recursive:true})` → symlink-race-able. Swap for `mkdtempSync(join(tmpdir(), "harness-*-"))`. Addressed alongside item 2.
-
-7. **Rationale length-cap** — `orchestrator.ts` applyArchitectVerdict escalate_operator embeds `verdict.rationale` unbounded in `lastError` + `task_failed.reason` + `project_failed.reason`. Cap at 1KB + strip ANSI/control chars before embedding. New helper `truncateRationale(s)` in `src/lib/text.ts`.
-
-8. **Fence-escape parity** — `src/session/architect.ts::buildReviewArbitrationPrompt` + `buildEscalationPrompt` embed operator text inside `<untrusted:*>` XML + triple-backtick text blocks but don't neutralize triple-backticks in the data. `relayOperatorMessage` already does this with `.replace(/\`\`\`/g, "​\`\`\`")`. Apply same escape to both builders.
-
-9. **Script SIGINT cleanup** — live scripts rely on `main().catch` for top-level only. Add `process.on("SIGINT", () => orch.shutdown())` + try/finally around wait loop in the shared scratch-repo helper. Addressed alongside item 2.
-
-10. **Magic numbers in live scripts** — `25 * 60 * 1000`, `2000` poll cadence, `30 * 60 * 1000`. Extract to named consts at top of each script (or, if item 2 ships, in the shared helper).
-
-11. **Unified terminal predicate** — 3 scripts have 3 slightly different project-done checks. Unify in shared helper (addressed alongside item 2).
-
-## Out of scope
-- P3 mass stress (separate autopilot)
-- Live crash-recovery + OMC re-measure (separate autopilots)
-- Wave B.5 Architect smoke (separate autopilot)
-- Wave 6-split + Wave D (need ralplan first)
-- Discord live (blocked on bot token)
+## Constraints
+- Target cost ≤ $5 total. Worst-case cap (budgets × tiers) $20.
+- Architect $6 single session. Executor $1 × 7 = $7 worst. Reviewer $1 × 7 = $7 worst. Expected realistic ~$4 (≈ $0.16/phase executor + $0.05/phase reviewer + ~$2 architect).
+- Trivial per-phase work (one file each) so we measure pipeline scaling, not Executor work time.
+- Tasks chosen so Architect cleanly decomposes into ≥ 7 independent phases.
 
 ## PASS criteria
-- All 518 existing tests still pass.
-- +≥6 new tests (cascade edge-cases + shared-helper smoke + stub-gate queue).
-- `npm run lint` clean.
-- `npm run build` clean.
-- No net API cost (mock-only).
-- Multi-perspective Phase 4 validation: architect + security + code-reviewer all APPROVE.
-- 3 live scripts still typecheck.
+1. `architect_spawned` fires.
+2. `project_decomposed` fires with `phaseCount ≥ 7`.
+3. ≥ 7 `task_picked_up` events.
+4. ≥ 7 `session_complete` events with `success=true`.
+5. 0 `task_failed` events (every phase must land).
+6. ≥ 7 `task_done` events (one per phase merged).
+7. `project_completed` fires exactly once with `phaseCount ≥ 7`.
+8. Project state → `completed`.
+9. All 7+ expected files present on trunk.
+10. Trunk commit log shows ≥ 7 merge commits — FIFO didn't drop any phase.
+11. Total wall < 30 minutes.
+
+## FAIL modes we want to surface
+- state.json corruption when 2+ phases transition simultaneously.
+- Merge-gate FIFO dropping a phase when burst arrival.
+- Branch-name collision (`harness/task-project-{id}-phase-NN`).
+- Architect hitting its $6 cap mid-decomposition of a larger project.
+- ProjectStore persistence lag where `hasActivePhases` returns stale `false` → premature project_completed.
+- Reviewer timeouts piling up during burst.
+- Worktree directory leak (fail to cleanup on a subset of phases).
+
+## Deliverable
+- `harness-ts/scripts/live-project-mass-phase.ts` using the shared `scratch-repo` helper + real Architect + real Executor + real Reviewer.
+- Project: "Build 7 arithmetic utility files", one per operation (add/sub/mul/div/mod/pow/abs). Expect Architect to decompose 1-per-phase.
+- Exit 0 on all 11 checks; exit 1 on any failure with full diagnostics dumped.
 
 ## Non-goals
-- Behavior changes (pure refactor + small hardening).
-- New features.
-- Re-running any existing live script.
+- Not validating arbitration (P1 + P2 already cover).
+- Not validating crash recovery (autopilot #3).
+- Not measuring token cost differences (no spike comparisons here).
+- Not hitting 10+ phases — 7 is enough to stress every dimension; the marginal cost of 10 vs 7 doesn't buy much signal.

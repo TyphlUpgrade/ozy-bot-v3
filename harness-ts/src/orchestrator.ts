@@ -616,15 +616,19 @@ export class Orchestrator {
       return;
     }
 
-    // Below threshold — retry: transition reviewing → active.
-    // Wave B wires the re-spawn-with-directive flow; Wave A only moves state.
-    this.state.transition(task.id, "active");
+    // Below threshold — retry: cleanup worktree + shelve for scheduleRetry
+    // to re-spawn the Executor. Previously this transitioned to `active` with
+    // no re-spawn trigger — tasks sat in active forever. Mass-phase stress
+    // (7 phases × threshold=2) surfaced the hang.
+    this.sessions.cleanupWorktree(task.id);
+    this.state.transition(task.id, "shelved");
     this.emit({
       type: "retry_scheduled",
       taskId: task.id,
       attempt: newCount,
       maxRetries: threshold,
     });
+    this.scheduleRetry(task.id, this.config.pipeline.retry_delay_ms);
   }
 
   /** Drive an Architect arbitration round. Standalone tasks or orchestrators without an architectManager fail permanently. */

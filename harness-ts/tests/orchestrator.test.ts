@@ -1260,7 +1260,7 @@ describe("Orchestrator — Wave A review gate + arbitration wiring", () => {
     expect(events.some((e) => e.type === "retry_scheduled")).toBe(false);
   });
 
-  it("review reject + project + count 0 → retry (reviewerRejectionCount becomes 1, transition to active)", async () => {
+  it("review reject + project + count 0 → retry (reviewerRejectionCount becomes 1, shelved for scheduleRetry)", async () => {
     const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 2 });
     const { orch, state, events } = setupWithReview({ reviewGate: gate, withCompletion: true });
     const task = state.createTask("test", "t-retry");
@@ -1268,7 +1268,7 @@ describe("Orchestrator — Wave A review gate + arbitration wiring", () => {
     await orch.processTask(state.getTask("t-retry")!);
     const updated = state.getTask("t-retry")!;
     expect(updated.reviewerRejectionCount).toBe(1);
-    expect(updated.state).toBe("active");
+    expect(updated.state).toBe("shelved");
     expect(events.some((e) => e.type === "retry_scheduled")).toBe(true);
     // Did NOT enter review_arbitration yet
     expect(events.some((e) => e.type === "review_arbitration_entered")).toBe(false);
@@ -1316,7 +1316,7 @@ describe("Orchestrator — Wave A review gate + arbitration wiring", () => {
     state.updateTask("t-rc", { projectId: "proj" });
     await orch.processTask(state.getTask("t-rc")!);
     expect(state.getTask("t-rc")!.reviewerRejectionCount).toBe(1);
-    expect(state.getTask("t-rc")!.state).toBe("active");
+    expect(state.getTask("t-rc")!.state).toBe("shelved");
     expect(events.some((e) => e.type === "retry_scheduled")).toBe(true);
   });
 

@@ -293,10 +293,10 @@ function parseArchitect(raw: Record<string, unknown>): ArchitectFileConfig {
  */
 export const DEFAULT_EXECUTOR_SYSTEM_PROMPT = `You are working inside a harness-managed git worktree.
 
-When you finish your task, you MUST:
-1. Commit your changes with a short message.
-2. Create directory \`.harness/\` if missing.
-3. Write \`.harness/completion.json\` with this JSON shape (all fields required):
+When you finish your task, you MUST follow this order EXACTLY:
+1. Commit your CODE CHANGES only. Do NOT include anything under \`.harness/\` in any commit — it is a per-worktree signal file, not a project artifact. (It is also gitignored; do not force-add.)
+2. After the commit succeeds, create directory \`.harness/\` if missing.
+3. Write \`.harness/completion.json\` with this JSON shape (all fields required). Do NOT make a second commit for this file.
 
 \`\`\`
 {

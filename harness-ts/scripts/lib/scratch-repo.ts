@@ -68,9 +68,14 @@ export function initScratchRepo(opts: InitScratchRepoOpts): string {
     stdio: "ignore",
   });
   writeFileSync(join(root, "README.md"), `# scratch ${opts.prefix}\n`);
+  // `.harness/` MUST be gitignored. Executors commit `.harness/completion.json`
+  // via `git add -A`; without the ignore rule the signal file gets included
+  // in the phase commit and collides on rebase when subsequent phases'
+  // completion.json files land on trunk. Mass-phase stress surfaced this
+  // defect: 6 of 7 phases rebase-conflicted on completion.json.
   writeFileSync(
     join(root, ".gitignore"),
-    "tasks/\nworktrees/\nsessions/\nstate.json\nprojects.json\nstate.log.jsonl\n",
+    "tasks/\nworktrees/\nsessions/\nstate.json\nprojects.json\nstate.log.jsonl\n.harness/\n",
   );
   execFileSync("git", ["add", "-A"], { cwd: root, stdio: "ignore" });
   execFileSync("git", ["commit", "-m", "init"], { cwd: root, stdio: "ignore" });
