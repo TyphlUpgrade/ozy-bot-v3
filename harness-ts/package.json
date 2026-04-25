@@ -16,7 +16,9 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "latest",
-    "smol-toml": "^1.6.1"
+    "@types/ws": "^8.18.1",
+    "smol-toml": "^1.6.1",
+    "ws": "^8.20.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
