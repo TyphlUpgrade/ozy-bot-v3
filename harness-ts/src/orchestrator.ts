@@ -523,21 +523,26 @@ export class Orchestrator {
     const projectTask = task.projectId !== undefined;
     const standaloneTriggered = this.shouldReview(task, completion, result, responseResult.level);
     if (this.reviewGate && (projectTask || standaloneTriggered)) {
-      await this.routeReview(task, completion);
+      await this.routeReview(task, completion, result);
       return;
     }
 
-    await this.routeDirectMerge(task, completion);
+    await this.routeDirectMerge(task, completion, result);
   }
 
   /** Direct merge path — no review gate. Extracted so routeReview can share it on approve. */
-  private async routeDirectMerge(task: TaskRecord, completion: CompletionSignal): Promise<void> {
+  private async routeDirectMerge(
+    task: TaskRecord,
+    completion: CompletionSignal,
+    sessionResult: SessionResult,
+  ): Promise<void> {
     this.state.transition(task.id, "merging");
     const updatedTask = this.state.getTask(task.id)!;
-    const mergeResult = await this.mergeGate.enqueue(
+    const mergeResult = await this.mergeGate.enqueueProposed(
       task.id,
       updatedTask.worktreePath!,
       updatedTask.branchName!,
+      this.formatCommitMessage(task, completion, sessionResult),
     );
 
     this.emit({ type: "merge_result", taskId: task.id, result: mergeResult });
@@ -545,7 +550,11 @@ export class Orchestrator {
   }
 
   /** Route through the Reviewer gate. On approve → merge; on reject → retry or review_arbitration. */
-  private async routeReview(task: TaskRecord, completion: CompletionSignal): Promise<void> {
+  private async routeReview(
+    task: TaskRecord,
+    completion: CompletionSignal,
+    sessionResult: SessionResult,
+  ): Promise<void> {
     if (!this.reviewGate) return; // defensive — routeByResponseLevel already gated
 
     this.state.transition(task.id, "reviewing");
@@ -567,10 +576,11 @@ export class Orchestrator {
     if (review.verdict === "approve") {
       this.state.transition(task.id, "merging");
       const updatedTask = this.state.getTask(task.id)!;
-      const mergeResult = await this.mergeGate.enqueue(
+      const mergeResult = await this.mergeGate.enqueueProposed(
         task.id,
         updatedTask.worktreePath!,
         updatedTask.branchName!,
+        this.formatCommitMessage(task, completion, sessionResult),
       );
 
       this.emit({ type: "merge_result", taskId: task.id, result: mergeResult });
@@ -579,6 +589,28 @@ export class Orchestrator {
     }
 
     await this.handleReviewReject(task, review);
+  }
+
+  /**
+   * Deterministic orchestrator commit message for propose-then-commit merges.
+   * Subject ≤ ~100 chars so `git log --oneline` stays readable; trailers
+   * record model / session / phase provenance for forensic audit.
+   */
+  private formatCommitMessage(
+    task: TaskRecord,
+    completion: CompletionSignal,
+    sessionResult: SessionResult,
+  ): string {
+    const summary = completion.summary.length > 72
+      ? `${completion.summary.slice(0, 72)}…`
+      : completion.summary;
+    const subject = `harness: ${task.id} — ${summary}`;
+    const trailers = [
+      `Model: ${sessionResult.modelName ?? "unknown"}`,
+      `Session: ${sessionResult.sessionId}`,
+      `Phase: ${task.phaseId ?? "standalone"}`,
+    ].join("\n");
+    return `${subject}\n\n${trailers}`;
   }
 
   /** Handle reject / request_changes verdict. Standalone → failed; project → retry or arbitration. */

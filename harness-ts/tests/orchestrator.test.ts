@@ -1957,3 +1957,69 @@ describe("Orchestrator — Wave B declareProject + Architect crash recovery", ()
     expect((architectManager.respawn as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
   });
 });
+
+describe("Orchestrator — WA-5 formatCommitMessage + enqueueProposed wiring", () => {
+  beforeEach(() => {
+    tmpDir = makeTmpDir();
+  });
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("routeDirectMerge passes formatted commit message with Model/Session/Phase trailers to enqueueProposed", async () => {
+    const { orch, state, mergeGitOps } = setupHarness({
+      withCompletion: true,
+      mergeGitOverrides: { hasUncommittedChanges: vi.fn().mockReturnValue(true) },
+    });
+    const task = state.createTask("fix the thing", "t-fmt-1");
+    await orch.processTask(task);
+    const autoCommit = mergeGitOps.autoCommit as ReturnType<typeof vi.fn>;
+    expect(autoCommit).toHaveBeenCalled();
+    const [, message] = autoCommit.mock.calls[0];
+    expect(message).toMatch(/^harness: t-fmt-1 — /);
+    expect(message).toMatch(/\nSession: /);
+    expect(message).toMatch(/\nPhase: standalone/);
+    expect(message).toMatch(/\nModel: /);
+  });
+
+  it("formatCommitMessage subject stays under 100 chars even with long summary", async () => {
+    const longSummary = "x".repeat(300);
+    const { orch, state, mergeGitOps, gitOps } = setupHarness({
+      withCompletion: false,
+      mergeGitOverrides: { hasUncommittedChanges: vi.fn().mockReturnValue(true) },
+    });
+    (gitOps.createWorktree as ReturnType<typeof vi.fn>).mockImplementation(
+      (_base: string, _branch: string, wtPath: string) => {
+        mkdirSync(join(wtPath, ".harness"), { recursive: true });
+        writeFileSync(
+          join(wtPath, ".harness", "completion.json"),
+          JSON.stringify({
+            status: "success",
+            commitSha: "abc",
+            summary: longSummary,
+            filesChanged: ["x.ts"],
+          }),
+        );
+      },
+    );
+    const task = state.createTask("do", "t-long");
+    await orch.processTask(task);
+    const autoCommit = mergeGitOps.autoCommit as ReturnType<typeof vi.fn>;
+    const [, message] = autoCommit.mock.calls[0];
+    const subject = (message as string).split("\n")[0];
+    expect(subject.length).toBeLessThanOrEqual(100);
+  });
+
+  it("records phaseId in the Phase trailer when task is a project phase", async () => {
+    const { orch, state, mergeGitOps } = setupHarness({
+      withCompletion: true,
+      mergeGitOverrides: { hasUncommittedChanges: vi.fn().mockReturnValue(true) },
+    });
+    state.createTask("phase work", "t-phase");
+    state.updateTask("t-phase", { projectId: "p-1", phaseId: "ph-42" });
+    await orch.processTask(state.getTask("t-phase")!);
+    const autoCommit = mergeGitOps.autoCommit as ReturnType<typeof vi.fn>;
+    const [, message] = autoCommit.mock.calls[0];
+    expect(message).toMatch(/\nPhase: ph-42/);
+  });
+});

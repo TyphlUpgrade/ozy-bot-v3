@@ -252,6 +252,14 @@ describe("SDKClient", () => {
       expect(seen).toEqual(["system", "result"]);
     });
 
+    it("captures model from system_init message into SessionResult.modelName (WA-5)", async () => {
+      const messages: SDKMessage[] = [makeSystemInit(), makeResultSuccess()];
+      const client = makeClient(() => mockQuery(messages));
+      const { query } = client.spawnSession({ prompt: "test", cwd: "/tmp" });
+      const result = await client.consumeStream(query);
+      expect(result.modelName).toBe("claude-sonnet-4-6");
+    });
+
     it("returns error result when stream has error", async () => {
       const messages: SDKMessage[] = [makeResultError()];
       const client = makeClient(() => mockQuery(messages));

@@ -44,6 +44,12 @@ export interface SessionResult {
   numTurns: number;
   usage: { input_tokens: number; output_tokens: number };
   terminalReason?: string;
+  /**
+   * WA-5: resolved model name captured from the SDK system_init message.
+   * Used by the orchestrator's formatCommitMessage to produce a
+   * `Model: <name>` trailer on every phase commit for forensic provenance.
+   */
+  modelName?: string;
 }
 
 export type MessageHandler = (msg: SDKMessage) => void;
@@ -169,6 +175,9 @@ export class SDKClient {
   ): Promise<SessionResult> {
     let result: SessionResult | undefined;
     let sessionId = "";
+    // WA-5: capture the resolved model from the SDK system_init message so
+    // `formatCommitMessage` can record `Model: <name>` as a commit trailer.
+    let initModel: string | undefined;
 
     for await (const msg of q) {
       onMessage?.(msg);
@@ -176,6 +185,11 @@ export class SDKClient {
       // Track session ID from any message that has it
       if ("session_id" in msg && typeof msg.session_id === "string") {
         sessionId = msg.session_id;
+      }
+
+      if (classifyMessage(msg) === "system_init") {
+        const m = (msg as unknown as { model?: unknown }).model;
+        if (typeof m === "string" && m.length > 0) initModel = m;
       }
 
       if (msg.type === "result") {
@@ -191,10 +205,11 @@ export class SDKClient {
         totalCostUsd: 0,
         numTurns: 0,
         usage: { input_tokens: 0, output_tokens: 0 },
+        modelName: initModel,
       };
     }
 
-    return result;
+    return { ...result, modelName: initModel };
   }
 
   /** Register an abort controller for a session (for external abort) */
