@@ -866,4 +866,110 @@ describe("InboundDispatcher", () => {
     expect(errSpy).toHaveBeenCalled();
     errSpy.mockRestore();
   });
+
+  // ============================================================
+  // CW-5 — reaction acknowledgments (reactionClient dep)
+  // ============================================================
+
+  function makeReactionClient(): { client: DiscordSender; reactions: Array<{ channelId: string; messageId: string; emoji: string }> } {
+    const reactions: Array<{ channelId: string; messageId: string; emoji: string }> = [];
+    const client: DiscordSender = {
+      async sendToChannel() { /* unused */ },
+      async sendToChannelAndReturnId() { return { messageId: null }; },
+      async addReaction(channelId, messageId, emoji) {
+        reactions.push({ channelId, messageId, emoji });
+      },
+    };
+    return { client, reactions };
+  }
+
+  it("CW-5: reaction `👀` fires on inbound entry (every dispatch)", async () => {
+    const { am } = makeArchitectManager();
+    const ctx = makeMessageContext();
+    const idmap = makeIdentityMap({});
+    const { router } = makeCommandRouter();
+    const { client: reactionClient, reactions } = makeReactionClient();
+
+    const d = new InboundDispatcher({
+      commandRouter: router,
+      architectManager: am,
+      identityMap: idmap,
+      senders,
+      config: baseConfig(),
+      messageContext: ctx,
+      reactionClient,
+    });
+
+    await d.dispatch(inboundMessage({ messageId: "m-7", content: "hello" }));
+
+    // First reaction is the receipt acknowledgment; subsequent ones may be
+    // status (e.g., 🤔 on unknown intent) — only the first emoji is asserted.
+    expect(reactions.length).toBeGreaterThanOrEqual(1);
+    expect(reactions[0]).toEqual({ channelId: "dev", messageId: "m-7", emoji: "👀" });
+  });
+
+  it("CW-5: reaction `✅` fires on rule 1 mention success", async () => {
+    const { am } = makeArchitectManager();
+    const ctx = makeMessageContext();
+    const idmap = makeIdentityMap({ "architect-x": "architect" });
+    const { router } = makeCommandRouter();
+    const { client: reactionClient, reactions } = makeReactionClient();
+    const projectStore = {
+      getAllProjects: () => [{ id: "proj-A", state: "executing" as const }] as never,
+      getProject: (id: string) => (id === "proj-A" ? ({ id: "proj-A", state: "executing" } as never) : undefined),
+    };
+    const channelBuffer = { recent: () => [] };
+
+    const d = new InboundDispatcher({
+      commandRouter: router,
+      architectManager: am,
+      identityMap: idmap,
+      senders,
+      config: baseConfig(),
+      messageContext: ctx,
+      projectStore,
+      channelBuffer,
+      getBotUsername: () => null,
+      reactionClient,
+    });
+
+    await d.dispatch(inboundMessage({ messageId: "m-8", content: "@architect-x ping" }));
+
+    // Receipt 👀 then success ✅.
+    expect(reactions.map((r) => r.emoji)).toContain("✅");
+    expect(reactions[0].emoji).toBe("👀");
+  });
+
+  it("CW-5: reaction `❌` fires on rule 1 mention error path", async () => {
+    const { am } = makeArchitectManager(async () => {
+      throw new Error("No Architect session for proj-A");
+    });
+    const ctx = makeMessageContext();
+    const idmap = makeIdentityMap({ "architect-x": "architect" });
+    const { router } = makeCommandRouter();
+    const { client: reactionClient, reactions } = makeReactionClient();
+    const projectStore = {
+      getAllProjects: () => [{ id: "proj-A", state: "executing" as const }] as never,
+      getProject: (id: string) => (id === "proj-A" ? ({ id: "proj-A", state: "executing" } as never) : undefined),
+    };
+    const channelBuffer = { recent: () => [] };
+
+    const d = new InboundDispatcher({
+      commandRouter: router,
+      architectManager: am,
+      identityMap: idmap,
+      senders,
+      config: baseConfig(),
+      messageContext: ctx,
+      projectStore,
+      channelBuffer,
+      getBotUsername: () => null,
+      reactionClient,
+    });
+
+    await d.dispatch(inboundMessage({ messageId: "m-9", content: "@architect-x ping" }));
+
+    expect(reactions.map((r) => r.emoji)).toContain("❌");
+    expect(reactions[0].emoji).toBe("👀");
+  });
 });

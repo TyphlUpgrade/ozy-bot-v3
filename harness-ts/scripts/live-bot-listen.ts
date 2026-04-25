@@ -53,6 +53,8 @@ import {
   type AbortHook,
 } from "../src/discord/commands.js";
 import { LlmIntentClassifier } from "../src/discord/intent-classifier.js";
+import { LlmResponseGenerator } from "../src/discord/response-generator.js";
+import { BotSender } from "../src/discord/bot-sender.js";
 import { installSigintHandler } from "./lib/scratch-repo.js";
 
 function loadDotEnv(path: string): void {
@@ -272,6 +274,19 @@ async function main(): Promise<void> {
     );
   });
 
+  // CW-5 — reaction acknowledgments need a bot REST client (webhooks can't
+  // react). Construct a dedicated BotSender separate from the per-channel
+  // content senders so reactions work even on webhook-routed channels.
+  const reactionClient = new BotSender(token);
+
+  // CW-5 — LlmResponseGenerator turns dispatcher signals into conversational
+  // prose; falls back to StaticResponseGenerator on SDK / budget / timeout.
+  const responseGenerator = new LlmResponseGenerator({
+    sdk,
+    systemPromptPath: join(harnessRoot, "config", "harness", "response-generator-prompt.md"),
+    cwd: harnessRepoRoot,
+  });
+
   const dispatcher = new InboundDispatcher({
     commandRouter,
     architectManager,
@@ -283,6 +298,9 @@ async function main(): Promise<void> {
     projectStore,
     channelBuffer,
     getBotUsername: () => gateway.getBotUsername(),
+    // CW-5 — UX polish: reactions + conversational responses.
+    reactionClient,
+    responseGenerator,
   });
   // CW-4.5 §8 — explicit single-handler swap. The wrapper appends to the
   // shared ChannelContextBuffer BEFORE invoking the dispatcher so the message

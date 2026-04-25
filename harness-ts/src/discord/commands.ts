@@ -418,7 +418,14 @@ export class CommandRouter {
         return this.cmdProjectAbort(intent.projectId, intent.confirmed);
       case "unknown":
         if (this.isDialogueChannel(channelId) && this.hasNoActiveContext()) {
-          return "No active project or dialogue. Use `!task`, `!project`, or `!dialogue` to start one.";
+          // CW-5 — friendlier prose. "No active project or dialogue" substring
+          // preserved so existing commands.test.ts assertions still match.
+          return (
+            "Hmm, looks like there's nothing going on right now — No active " +
+            "project or dialogue. Want to start one? Try something like " +
+            "*'start a project to add hello.ts, no tests'* and I'll set it up " +
+            "— or use `!task`, `!project`, or `!dialogue` directly."
+          );
         }
         return "Could not understand the message. Try `!task <prompt>` or `!status`.";
     }

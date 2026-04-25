@@ -33,6 +33,14 @@ export interface AllowedMentions {
  * e.g., dropped on overflow, fake sender, or webhook send without `wait=true`).
  * Conversational flows (CW-3+) need the id to wire reply ↔ task linkage; the
  * fire-and-forget notifier does not.
+ *
+ * **CW-5 — addReaction:** Discord webhooks cannot post reactions; reactions
+ * require an authenticated bot REST call. `BotSender.addReaction` POSTs the
+ * `PUT /channels/{c}/messages/{m}/reactions/{e}/@me` route, while
+ * `WebhookSender.addReaction` is intentionally a no-op. Callers that need
+ * reactions cross-cutting all channels (e.g., the inbound dispatcher) should
+ * inject a separate `reactionClient: DiscordSender` — typically a `BotSender`
+ * instance — independent of the per-channel content senders.
  */
 export interface DiscordSender {
   sendToChannel(channel: string, content: string, identity?: AgentIdentity): Promise<void>;

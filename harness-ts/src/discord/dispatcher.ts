@@ -20,7 +20,18 @@ import type { ChannelContextBuffer } from "./channel-context.js";
 import type { CommandRouter } from "./commands.js";
 import type { IdentityMap } from "./identity-map.js";
 import type { MessageContext } from "./message-context.js";
+import {
+  StaticResponseGenerator,
+  type ResponseGenerator,
+  type ResponseInput,
+} from "./response-generator.js";
 import type { DiscordSender, InboundMessage } from "./types.js";
+
+// CW-5 — emoji acknowledgments. Defined as constants so tests can match them.
+const REACTION_RECEIVED = "👀";
+const REACTION_OK = "✅";
+const REACTION_ERROR = "❌";
+const REACTION_PUZZLED = "🤔";
 
 // --- CW-4.5 mention extraction (exported for unit test) ---
 
@@ -170,6 +181,20 @@ export interface InboundDispatcherDeps {
   channelBuffer?: Pick<ChannelContextBuffer, "recent">;
   /** Iteration 2 change #2 — narrow seam, no full BotGateway dep. */
   getBotUsername?: () => string | null;
+  /**
+   * CW-5 — cross-channel sender used for reaction acknowledgments. Reactions
+   * require a bot REST call (webhooks can't react), so this is typically a
+   * `BotSender` instance distinct from the per-channel content senders. When
+   * absent, reactions are silently skipped.
+   */
+  reactionClient?: DiscordSender;
+  /**
+   * CW-5 — optional generator that turns dispatcher-emitted `ResponseInput`s
+   * into operator-visible prose. Defaults to `StaticResponseGenerator`
+   * (hand-crafted templates). Live bootstrap can swap in `LlmResponseGenerator`
+   * for fully-conversational replies.
+   */
+  responseGenerator?: ResponseGenerator;
 }
 
 /**
@@ -197,7 +222,12 @@ export function classifyRelayError(err: Error): RelayFailureKind {
   return "generic";
 }
 
-/** Operator-visible reply for each relay failure kind. */
+/**
+ * Operator-visible reply for each relay failure kind. CW-5 rewrote these as
+ * friendlier conversational prose; existing dispatcher tests pin specific
+ * substrings (`no live Architect session`, `was terminated`, `queue is full`,
+ * ``Reply to `${projectId}` failed``) which are preserved verbatim below.
+ */
 export function relayFailureMessage(
   kind: RelayFailureKind,
   projectId: string,
@@ -205,13 +235,47 @@ export function relayFailureMessage(
 ): string {
   switch (kind) {
     case "no_session":
-      return `Project \`${projectId}\` has no live Architect session — it may have completed or been aborted. Use \`!project ${projectId} status\`.`;
+      return (
+        `The Architect for \`${projectId}\` has no live Architect session — it ` +
+        `may have completed or been aborted. Want me to start a fresh one? ` +
+        `You can also check with \`!project ${projectId} status\`.`
+      );
     case "session_terminated":
-      return `Architect session for \`${projectId}\` was terminated. Re-issue via \`!project <name>\` to spawn a new one.`;
+      return (
+        `Looks like the Architect session for \`${projectId}\` was terminated. ` +
+        `Re-issue the request via \`!project <name>\` and I'll spin up a fresh ` +
+        `one for you.`
+      );
     case "queue_full":
-      return `Discord send queue is full — your reply was dropped. Try again in 30 seconds.`;
+      return (
+        "Discord send queue is full right now — your reply was dropped on the " +
+        "floor. Give it about 30 seconds and try again."
+      );
     case "generic":
-      return `Reply to \`${projectId}\` failed: ${raw.slice(0, 200)}`;
+      return (
+        `Reply to \`${projectId}\` failed: ${raw.slice(0, 200)}. Mind giving ` +
+        `it another shot? If it keeps failing, run \`!project ${projectId} status\`.`
+      );
+  }
+}
+
+/**
+ * CW-5 — map a `RelayFailureKind` to the corresponding `ResponseInput.kind`
+ * so dispatcher callers can request the LLM-backed (or static) generator
+ * uniformly. The "generic" relay failure surfaces as `relay_generic_error`.
+ */
+function relayKindToResponseKind(
+  kind: RelayFailureKind,
+): "no_session" | "session_terminated" | "queue_full" | "relay_generic_error" {
+  switch (kind) {
+    case "no_session":
+      return "no_session";
+    case "session_terminated":
+      return "session_terminated";
+    case "queue_full":
+      return "queue_full";
+    case "generic":
+      return "relay_generic_error";
   }
 }
 
@@ -226,6 +290,9 @@ export class InboundDispatcher {
   private readonly projectStore?: Pick<ProjectStore, "getAllProjects" | "getProject">;
   private readonly channelBuffer?: Pick<ChannelContextBuffer, "recent">;
   private readonly getBotUsername?: () => string | null;
+  // CW-5 — reaction acknowledgments + conversational responses.
+  private readonly reactionClient?: DiscordSender;
+  private readonly responseGenerator: ResponseGenerator;
 
   constructor(deps: InboundDispatcherDeps) {
     this.commandRouter = deps.commandRouter;
@@ -237,6 +304,29 @@ export class InboundDispatcher {
     this.projectStore = deps.projectStore;
     this.channelBuffer = deps.channelBuffer;
     this.getBotUsername = deps.getBotUsername;
+    this.reactionClient = deps.reactionClient;
+    // Default to static templates so existing test setups (which don't pass
+    // a generator) get the same friendlier prose without wiring an LLM.
+    this.responseGenerator = deps.responseGenerator ?? new StaticResponseGenerator();
+  }
+
+  /**
+   * CW-5 — fire-and-forget reaction. Never throws, never blocks dispatch.
+   * Silently skips when no `reactionClient` is wired (most test setups).
+   */
+  private react(channelId: string, messageId: string, emoji: string): void {
+    if (!this.reactionClient) return;
+    void this.reactionClient.addReaction(channelId, messageId, emoji).catch(() => undefined);
+  }
+
+  /** CW-5 — render an operator-visible reply through the configured generator. */
+  private async renderResponse(input: ResponseInput): Promise<string> {
+    try {
+      return await this.responseGenerator.generate(input);
+    } catch {
+      // Last-resort fallback — never let a generator error swallow operator feedback.
+      return new StaticResponseGenerator().generate(input);
+    }
   }
 
   /**
@@ -250,6 +340,10 @@ export class InboundDispatcher {
    */
   async dispatch(msg: InboundMessage): Promise<void> {
     try {
+      // CW-5 — eager receipt acknowledgment. Operator sees this before any
+      // text reply lands, even when downstream processing takes a while.
+      this.react(msg.channelId, msg.messageId, REACTION_RECEIVED);
+
       // CW-4.5 rule 1 — mention detection. Runs BEFORE reply-UI so an operator
       // who clicks reply AND types a mention has the mention path win.
       const mentionHandled = await this.tryMentionRoute(msg);
@@ -298,35 +392,44 @@ export class InboundDispatcher {
       // Security LOW-1 — multi-mention: send an operator-visible instructive
       // reply, then continue dispatching the FIRST mention (existing v1
       // behavior). Auditable so the operator knows the others were ignored.
-      // Uses `raw` (the verbatim `@<name>` the operator typed) so the reply
-      // echoes their input rather than the resolved agent key.
+      // CW-5 — Multiple agent mentions detected (substring preserved for
+      // dispatcher.test.ts) — friendlier prose with conversational tone.
       if (extracted.mentions.length > 1) {
         const first = extracted.mentions[0];
-        this.sendToChannel(
-          msg.channelId,
-          `Multiple agent mentions detected — only the first (\`${first.raw}\`) is being routed. Re-send with one mention per message for the others.`,
-        );
+        const text = await this.renderResponse({
+          kind: "multiple_mentions",
+          operatorMessage: msg.content,
+          fields: { firstMention: first.raw },
+        });
+        this.sendToChannel(msg.channelId, text);
       }
       // Agent mention — try to resolve a project for this channel.
       const resolved = this.resolveProjectForChannel(msg.channelId);
       if (resolved.projectId === null) {
         // 0/multi-active without coherent hint — instructive reply.
-        this.sendToChannel(
-          msg.channelId,
-          "Multiple/no active projects — reply to a specific agent's message or use `!project` commands.",
-        );
+        // Substring "Multiple/no active projects" preserved for back-compat.
+        const text = await this.renderResponse({
+          kind: "ambiguous_resolution",
+          operatorMessage: msg.content,
+        });
+        this.sendToChannel(msg.channelId, text);
+        this.react(msg.channelId, msg.messageId, REACTION_PUZZLED);
         return true;
       }
       // Relay the cleaned content (mentions stripped) into the architect.
       try {
         await this.architectManager.relayOperatorInput(resolved.projectId, extracted.cleanedContent);
+        this.react(msg.channelId, msg.messageId, REACTION_OK);
       } catch (err) {
         const error = err instanceof Error ? err : new Error(String(err));
         const kind = classifyRelayError(error);
-        this.sendToChannel(
-          msg.channelId,
-          relayFailureMessage(kind, resolved.projectId, error.message),
-        );
+        const text = await this.renderResponse({
+          kind: relayKindToResponseKind(kind),
+          operatorMessage: msg.content,
+          fields: { projectId: resolved.projectId, rawError: error.message },
+        });
+        this.sendToChannel(msg.channelId, text);
+        this.react(msg.channelId, msg.messageId, REACTION_ERROR);
       }
       return true;
     }
@@ -393,25 +496,33 @@ export class InboundDispatcher {
 
     const projectId = this.messageContext.resolveProjectIdForMessage(repliedId);
     if (!projectId) {
-      // Rule 2b — known agent, no record of the message.
-      this.sendToChannel(
-        msg.channelId,
-        `I recognized this as a reply to **${username}**, but I have no record of that message — re-issue your command directly via \`!project\` or by replying to a fresh agent message.`,
-      );
+      // Rule 2b — known agent, no record of the message. CW-5: friendlier prose.
+      // Substring "no record of that message" preserved for dispatcher.test.ts.
+      const text = await this.renderResponse({
+        kind: "no_record_of_message",
+        operatorMessage: msg.content,
+        fields: { agentName: username },
+      });
+      this.sendToChannel(msg.channelId, text);
+      this.react(msg.channelId, msg.messageId, REACTION_PUZZLED);
       return true;
     }
 
     // Rule 2a — relay into the Architect session. Errors fall through to Rule 3.
     try {
       await this.architectManager.relayOperatorInput(projectId, msg.content);
+      this.react(msg.channelId, msg.messageId, REACTION_OK);
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
       const kind = classifyRelayError(error);
       // Rule 3 — operator-visible reply describing the failure.
-      this.sendToChannel(
-        msg.channelId,
-        relayFailureMessage(kind, projectId, error.message),
-      );
+      const text = await this.renderResponse({
+        kind: relayKindToResponseKind(kind),
+        operatorMessage: msg.content,
+        fields: { projectId, rawError: error.message },
+      });
+      this.sendToChannel(msg.channelId, text);
+      this.react(msg.channelId, msg.messageId, REACTION_ERROR);
     }
     return true;
   }
@@ -419,6 +530,11 @@ export class InboundDispatcher {
   /**
    * Rule 5 — `!cmd` → handleCommand; otherwise → handleNaturalLanguage. Reply
    * (if any) goes to the channel sender via `sendToChannel`.
+   *
+   * CW-5 — when the command router returns its unknown-intent fallback string
+   * (matched by substring presence of `Could not understand` or `No active
+   * project or dialogue`), react with the puzzled emoji so the operator can
+   * tell at-a-glance that the harness didn't comprehend their message.
    */
   private async routeCommand(msg: InboundMessage): Promise<void> {
     const text = msg.content;
@@ -435,6 +551,13 @@ export class InboundDispatcher {
     }
     if (reply && reply.length > 0) {
       this.sendToChannel(msg.channelId, reply);
+      // CW-5 — distinguishable reactions for "didn't understand" vs. success.
+      if (
+        reply.includes("Could not understand") ||
+        reply.includes("No active project or dialogue")
+      ) {
+        this.react(msg.channelId, msg.messageId, REACTION_PUZZLED);
+      }
     }
   }
 
