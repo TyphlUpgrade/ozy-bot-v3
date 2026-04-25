@@ -1016,7 +1016,6 @@ describe("Orchestrator", () => {
       state.transition("m-noWt", "active");
       state.transition("m-noWt", "reviewing");
       state.transition("m-noWt", "merging");
-      // No worktreePath set.
       orch.start();
       expect(state.getTask("m-noWt")!.state).toBe("failed");
       expect(state.getTask("m-noWt")!.lastError).toBe("merging_recovery_worktree_missing");
@@ -1055,7 +1054,6 @@ describe("Orchestrator", () => {
       const wt = join(tmpDir, "worktrees", "task-m-incr");
       mkdirSync(wt, { recursive: true });
       seedMerging(state, "m-incr", wt);
-      // Start once → 1, but the recovery path takes sub-case (a) which calls processTask; await settle.
       orch.start();
       orch.shutdown();
       expect(state.getTask("m-incr")!.recoveryAttempts).toBe(1);
@@ -1072,9 +1070,8 @@ describe("Orchestrator", () => {
       mkdirSync(wt, { recursive: true });
       seedMerging(state, "m-b", wt);
       orch.start();
-      // Cleanup NOT called because orchestrator-recovered path re-enqueues.
+      // Recovered path re-enqueues; rebase fires, cleanup does not.
       const rebase = mergeGitOps.rebase as ReturnType<typeof vi.fn>;
-      // Rebase should fire as part of re-enqueued merge processing.
       expect(rebase).toHaveBeenCalled();
       orch.shutdown();
     });
@@ -1090,7 +1087,6 @@ describe("Orchestrator", () => {
       mkdirSync(wt, { recursive: true });
       seedMerging(state, "m-a", wt);
       orch.start();
-      // Sub-case (a) cleans the worktree + transitions failed → pending + re-runs processTask.
       expect(gitOps.removeWorktree).toHaveBeenCalled();
       orch.shutdown();
     });

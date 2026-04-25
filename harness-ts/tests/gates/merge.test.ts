@@ -357,10 +357,9 @@ describe("MergeGate", () => {
       const r1 = await gate.enqueueProposed("t-probe1", "/wt", "br", "msg");
       expect(r1.status).toBe("error");
       if (r1.status === "error") expect(r1.error).toMatch(/user\.email/);
-      // Subsequent call succeeds (probe re-runs because it wasn't marked probed).
+      // Probe re-runs until first success, then caches.
       const r2 = await gate.enqueueProposed("t-probe2", "/wt", "br", "msg");
       expect(r2.status).toBe("merged");
-      // After first success probe is cached — third call skips probe check.
       await gate.enqueueProposed("t-probe3", "/wt", "br", "msg");
       expect(email).toHaveBeenCalledTimes(2);
     });

@@ -30,7 +30,10 @@ function createRepo(dir: string): void {
 }
 
 function createWorktree(mainDir: string, branchName: string): string {
-  const wtDir = join(tmpdir(), `harness-test-wt-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  // mkdtempSync creates the parent atomically; git worktree add wants a
+  // non-existent path, so we point it at a child of the race-free parent.
+  const parent = mkdtempSync(join(tmpdir(), "harness-test-wt-"));
+  const wtDir = join(parent, "wt");
   execSync(`git worktree add -b ${branchName} ${wtDir}`, {
     cwd: mainDir,
     stdio: "pipe",
@@ -154,7 +157,8 @@ describe("Merge Pipeline — Real Git", () => {
     const initialSha = execSync("git rev-list --max-parents=0 HEAD", {
       cwd: mainDir, encoding: "utf-8", stdio: "pipe",
     }).trim();
-    const wtDir = join(tmpdir(), `harness-test-conflict-${Date.now()}`);
+    const wtParent = mkdtempSync(join(tmpdir(), "harness-test-conflict-"));
+    const wtDir = join(wtParent, "wt");
     execSync(`git worktree add -b ${branch} ${wtDir} ${initialSha}`, {
       cwd: mainDir, stdio: "pipe",
     });
