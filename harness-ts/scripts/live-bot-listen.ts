@@ -47,9 +47,9 @@ import { RawWsBotGateway } from "../src/discord/bot-gateway.js";
 import {
   CommandRouter,
   FileTaskSink,
-  UnknownIntentClassifier,
   type AbortHook,
 } from "../src/discord/commands.js";
+import { LlmIntentClassifier } from "../src/discord/intent-classifier.js";
 import { installSigintHandler } from "./lib/scratch-repo.js";
 
 function loadDotEnv(path: string): void {
@@ -184,7 +184,12 @@ async function main(): Promise<void> {
     },
   };
   const taskSink = new FileTaskSink(config.project.task_dir);
-  const classifier = new UnknownIntentClassifier();
+  // CW-4 — LLM-backed intent classifier (regex→LLM cascade final stage).
+  const classifier = new LlmIntentClassifier({
+    sdk,
+    systemPromptPath: join(harnessRoot, "config", "harness", "intent-classifier-prompt.md"),
+    cwd: harnessRepoRoot,
+  });
   const commandRouter = new CommandRouter({
     state,
     config,

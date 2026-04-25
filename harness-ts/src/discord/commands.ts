@@ -44,6 +44,14 @@ export interface ClassifyContext {
   activeTaskIds: string[];
   escalatedTaskIds: string[];
   activeProjectIds: string[];
+  /**
+   * CW-4: optional structural recent-messages array for LLM-backed
+   * classifiers. Declared here so future CW-4.5 can wire ChannelContextBuffer
+   * without touching this type again. v2 always passes undefined; classifier
+   * handles missing gracefully. Plain shape — does NOT import InboundMessage
+   * to keep commands.ts Discord-agnostic.
+   */
+  recentMessages?: ReadonlyArray<{ author: string; content: string; timestamp: string }>;
 }
 
 export interface IntentClassifier {
