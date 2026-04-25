@@ -67,6 +67,7 @@ export interface ClassifierLogLine {
   reason?:
     | "low_confidence"
     | "parse_error"
+    | "sdk_error"
     | "timeout"
     | "budget_exceeded"
     | "missing_field"
@@ -106,6 +107,15 @@ const defaultLogger = (line: ClassifierLogLine): void => {
 // --- Prompt assembly (security-critical fencing) ---
 
 /**
+ * Strip fence tokens that an operator could inject to break out of the
+ * `<user_message>` / `<recent_context>` envelope and inject system-level
+ * instructions (CW-4 M1 fix). Applied to all interpolated operator data.
+ */
+function stripFenceTokens(s: string): string {
+  return s.replace(/<\/?(?:user_message|recent_context|system)>/gi, "");
+}
+
+/**
  * Build the user-side prompt with fenced operator content. The system prompt
  * (loaded eagerly in the constructor) classifies the fenced content as DATA,
  * not instruction. NEVER concat operator text outside `<user_message>`.
@@ -113,10 +123,12 @@ const defaultLogger = (line: ClassifierLogLine): void => {
 function buildUserPrompt(text: string, recentMessages: ClassifyContext["recentMessages"]): string {
   const parts: string[] = [];
   if (recentMessages && recentMessages.length > 0) {
-    const ctxLines = recentMessages.map((m) => `${m.author}: ${m.content}`).join("\n");
+    const ctxLines = recentMessages
+      .map((m) => `${stripFenceTokens(m.author)}: ${stripFenceTokens(m.content)}`)
+      .join("\n");
     parts.push(`<recent_context>\n${ctxLines}\n</recent_context>`);
   }
-  parts.push(`<user_message>\n${text}\n</user_message>`);
+  parts.push(`<user_message>\n${stripFenceTokens(text)}\n</user_message>`);
   parts.push("Respond with JSON only.");
   return parts.join("\n\n");
 }
@@ -280,6 +292,17 @@ export class LlmIntentClassifier implements IntentClassifier {
     const timeoutHandle = setTimeout(() => ac.abort(), this.timeoutMs);
 
     let timedOut = false;
+    type TimeoutResolver = (v: "timeout" | "settled") => void;
+    const timeoutResolverHolder: { resolve: TimeoutResolver | null } = { resolve: null };
+    // CW-4 code-review HIGH fix: register the abort listener with `{once: true}`
+    // so it auto-detaches on first invocation, and resolve the timeout promise
+    // manually in `finally` on the success path so it does not stay pending.
+    const onAbort = (): void => {
+      timedOut = true;
+      timeoutResolverHolder.resolve?.("timeout");
+    };
+    ac.signal.addEventListener("abort", onAbort, { once: true });
+
     let sessionResult:
       | Awaited<ReturnType<SDKClient["consumeStream"]>>
       | null = null;
@@ -306,11 +329,8 @@ export class LlmIntentClassifier implements IntentClassifier {
         abortController: ac,
       });
 
-      const timeoutPromise = new Promise<"timeout">((resolve) => {
-        ac.signal.addEventListener("abort", () => {
-          timedOut = true;
-          resolve("timeout");
-        });
+      const timeoutPromise = new Promise<"timeout" | "settled">((resolve) => {
+        timeoutResolverHolder.resolve = resolve;
       });
 
       const consumePromise = this.sdk.consumeStream(query);
@@ -325,18 +345,24 @@ export class LlmIntentClassifier implements IntentClassifier {
         });
         return { type: "unknown" };
       }
-      sessionResult = raced;
+      // raced is the SDK result here ("settled" never appears via Promise.race
+      // because we only resolve it after consumePromise wins, in `finally`).
+      sessionResult = raced as Awaited<ReturnType<SDKClient["consumeStream"]>>;
     } catch {
       this.logger({
         event: "intent_classifier_unknown",
         channelId: ctx.channel,
-        reason: timedOut ? "timeout" : "parse_error",
+        reason: timedOut ? "timeout" : "sdk_error",
         durationMs: Date.now() - startedAt,
         costUsd: 0,
       });
       return { type: "unknown" };
     } finally {
       clearTimeout(timeoutHandle);
+      // Detach abort listener and settle the timeout promise on success path
+      // so the abort listener and unsettled promise don't leak.
+      ac.signal.removeEventListener("abort", onAbort);
+      timeoutResolverHolder.resolve?.("settled");
     }
 
     if (!sessionResult) {
