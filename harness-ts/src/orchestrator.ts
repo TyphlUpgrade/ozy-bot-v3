@@ -210,6 +210,10 @@ export class Orchestrator {
     // Scan for new task files
     this.scanForTasks();
 
+    // Wave B: respawn crashed architects so a dead session in `decomposing`
+    // or `executing` doesn't wedge the whole project indefinitely.
+    await this.checkArchitectHealth();
+
     // Schedule next poll
     if (this.running) {
       this.pollTimer = setTimeout(
@@ -933,6 +937,13 @@ export class Orchestrator {
           sessionId: respawn.sessionId,
           reason: "crash_recovery",
         });
+        // Recovery prompt drives the Architect to (re)write phase files in
+        // its stream. Register them with the projectStore so markPhaseDone
+        // doesn't fail with "Phase not found" once the executors land.
+        const phases = this.architectManager.persistDecomposedPhases(project.id);
+        if (phases.length > 0 && project.state === "decomposing") {
+          this.emit({ type: "project_decomposed", projectId: project.id, phaseCount: phases.length });
+        }
       }
     }
   }

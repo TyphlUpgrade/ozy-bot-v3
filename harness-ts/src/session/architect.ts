@@ -316,16 +316,28 @@ export class ArchitectManager {
       this.abortControllers.delete(projectId);
     }
 
-    // Scan task_dir for phase files matching this project.
-    const phases = this.readDecomposedPhaseFiles(projectId);
+    const phases = this.persistDecomposedPhases(projectId);
     if (phases.length === 0) {
       return { status: "failure", error: "Architect produced no phase files" };
     }
-    // Persist phases into project record for Wave C+ tracking.
+    return { status: "success", phases };
+  }
+
+  /**
+   * Read phase files from `task_dir` and register any not-yet-known phases
+   * with the projectStore. Idempotent — `addPhase` checks for duplicates so
+   * repeat calls (e.g. crash-recovery respawn) don't double-add.
+   * Returns the full list of phase metadata for callers that want it.
+   */
+  persistDecomposedPhases(projectId: string): Array<{ phaseId: string; taskFilePath: string }> {
+    const phases = this.readDecomposedPhaseFiles(projectId);
+    const project = this.projectStore.getProject(projectId);
+    const knownIds = new Set((project?.phases ?? []).map((p) => p.id));
     for (const p of phases) {
+      if (knownIds.has(p.phaseId)) continue;
       this.projectStore.addPhase(projectId, `phase-${p.phaseId}`, p.phaseId);
     }
-    return { status: "success", phases };
+    return phases;
   }
 
   private readDecomposedPhaseFiles(projectId: string): Array<{ phaseId: string; taskFilePath: string }> {

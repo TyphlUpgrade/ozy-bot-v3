@@ -1648,6 +1648,7 @@ function makeFakeArchitectManager(opts: {
     requestSummary: vi.fn().mockResolvedValue({}),
     relayOperatorInput: vi.fn().mockResolvedValue(undefined),
     shouldCompact: vi.fn().mockReturnValue(false),
+    persistDecomposedPhases: vi.fn().mockReturnValue([]),
   } as unknown as ArchitectManager;
 }
 
