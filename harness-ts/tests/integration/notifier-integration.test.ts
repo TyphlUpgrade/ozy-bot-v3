@@ -165,6 +165,10 @@ function setupHarness(
     revertLastMerge: vi.fn(),
     runTests: vi.fn().mockReturnValue({ success: true, output: "ok" }),
     getTrunkBranch: vi.fn().mockReturnValue("master"),
+    branchHasCommitsAheadOfTrunk: vi.fn().mockReturnValue(false),
+    diffNameOnly: vi.fn().mockReturnValue(["src/x.ts"]),
+    scrubHarnessFromHead: vi.fn().mockReturnValue(false),
+    getUserEmail: vi.fn().mockReturnValue("test@example"),
     ...opts.mergeOverrides,
   };
 

@@ -104,7 +104,7 @@ function mockGitOps(): GitOps {
 function mockMergeGitOps(): MergeGitOps {
   return {
     hasUncommittedChanges: vi.fn().mockReturnValue(false),
-    autoCommit: vi.fn().mockReturnValue("sha1"),
+    autoCommit: vi.fn((_cwd, _msg, _opts) => "sha1"),
     getHeadSha: vi.fn().mockReturnValue("sha1"),
     rebase: vi.fn().mockReturnValue({ success: true, conflictFiles: [] }),
     rebaseAbort: vi.fn(),
@@ -112,6 +112,10 @@ function mockMergeGitOps(): MergeGitOps {
     revertLastMerge: vi.fn(),
     runTests: vi.fn().mockReturnValue({ success: true, output: "ok" }),
     getTrunkBranch: vi.fn().mockReturnValue("master"),
+    branchHasCommitsAheadOfTrunk: vi.fn().mockReturnValue(false),
+    diffNameOnly: vi.fn().mockReturnValue(["src/x.ts"]),
+    scrubHarnessFromHead: vi.fn().mockReturnValue(false),
+    getUserEmail: vi.fn().mockReturnValue("test@example"),
   };
 }
 

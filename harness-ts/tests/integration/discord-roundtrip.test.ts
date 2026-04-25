@@ -166,6 +166,10 @@ function setup(): RoundtripHarness {
     revertLastMerge: vi.fn(),
     runTests: vi.fn().mockReturnValue({ success: true, output: "ok" }),
     getTrunkBranch: vi.fn().mockReturnValue("master"),
+    branchHasCommitsAheadOfTrunk: vi.fn().mockReturnValue(false),
+    diffNameOnly: vi.fn().mockReturnValue(["src/x.ts"]),
+    scrubHarnessFromHead: vi.fn().mockReturnValue(false),
+    getUserEmail: vi.fn().mockReturnValue("test@example"),
   };
   const mergeGate = new MergeGate(config.pipeline, tmpDir, mergeGitOps);
   const orch = new Orchestrator({ sessionManager: sessions, mergeGate, stateManager: state, config });

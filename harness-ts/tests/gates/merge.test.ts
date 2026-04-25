@@ -19,7 +19,7 @@ function makeConfig(overrides?: Partial<PipelineConfig>): PipelineConfig {
 function mockGitOps(overrides?: Partial<MergeGitOps>): MergeGitOps {
   return {
     hasUncommittedChanges: vi.fn().mockReturnValue(false),
-    autoCommit: vi.fn().mockReturnValue("abc123"),
+    autoCommit: vi.fn((_cwd: string, _msg: string, _opts?: { amend?: boolean }) => "abc123"),
     getHeadSha: vi.fn().mockReturnValue("abc123"),
     rebase: vi.fn().mockReturnValue({ success: true, conflictFiles: [] }),
     rebaseAbort: vi.fn(),
@@ -27,6 +27,10 @@ function mockGitOps(overrides?: Partial<MergeGitOps>): MergeGitOps {
     revertLastMerge: vi.fn(),
     runTests: vi.fn().mockReturnValue({ success: true, output: "all tests passed" }),
     getTrunkBranch: vi.fn().mockReturnValue("master"),
+    branchHasCommitsAheadOfTrunk: vi.fn().mockReturnValue(false),
+    diffNameOnly: vi.fn().mockReturnValue(["src/x.ts"]),
+    scrubHarnessFromHead: vi.fn().mockReturnValue(false),
+    getUserEmail: vi.fn().mockReturnValue("test@example"),
     ...overrides,
   };
 }
@@ -69,7 +73,7 @@ describe("MergeGate", () => {
       const result = await gate.enqueue("task-1", "/worktree", "branch-1");
 
       expect(result.status).toBe("merged");
-      expect(git.autoCommit).toHaveBeenCalledWith("/worktree");
+      expect(git.autoCommit).toHaveBeenCalledWith("/worktree", "harness: auto-commit agent work");
     });
 
     it("skips auto-commit when worktree is clean", async () => {
@@ -267,6 +271,98 @@ describe("MergeGate", () => {
       const [r1, r2] = await Promise.all([p1, p2]);
       expect(r1.status).toBe("error");
       expect(r2.status).toBe("merged");
+    });
+  });
+
+  // --- WA-4 propose-then-commit ---
+
+  describe("WA-4 enqueueProposed", () => {
+    it("stages + commits with the supplied message then merges (canonical path)", async () => {
+      const git = mockGitOps({ hasUncommittedChanges: vi.fn().mockReturnValue(true) });
+      const gate = new MergeGate(config, "/repo", git);
+      const r = await gate.enqueueProposed("t-cp", "/wt", "br-cp", "harness: t-cp — add foo");
+      expect(r.status).toBe("merged");
+      expect(git.autoCommit).toHaveBeenCalledWith("/wt", "harness: t-cp — add foo");
+    });
+
+    it("returns empty_executor_commit when branch and working tree are empty", async () => {
+      const git = mockGitOps({
+        hasUncommittedChanges: vi.fn().mockReturnValue(false),
+        branchHasCommitsAheadOfTrunk: vi.fn().mockReturnValue(false),
+        diffNameOnly: vi.fn().mockReturnValue([]),
+      });
+      const gate = new MergeGate(config, "/repo", git);
+      const r = await gate.enqueueProposed("t-empty", "/wt", "br", "msg");
+      expect(r.status).toBe("error");
+      if (r.status === "error") expect(r.error).toBe("empty_executor_commit");
+    });
+
+    it("sub-case (b): already-committed-clean branch skips stage and scrubs .harness/", async () => {
+      const git = mockGitOps({
+        hasUncommittedChanges: vi.fn().mockReturnValue(false),
+        branchHasCommitsAheadOfTrunk: vi.fn().mockReturnValue(true),
+      });
+      const gate = new MergeGate(config, "/repo", git);
+      const r = await gate.enqueueProposed("t-legacy", "/wt", "br-legacy", "msg");
+      expect(r.status).toBe("merged");
+      expect(git.autoCommit).not.toHaveBeenCalled();
+      expect(git.scrubHarnessFromHead).toHaveBeenCalledWith("/wt");
+    });
+
+    it("sub-case (a): legacy commit + uncommitted changes amends the existing commit", async () => {
+      const git = mockGitOps({
+        hasUncommittedChanges: vi.fn().mockReturnValue(true),
+        branchHasCommitsAheadOfTrunk: vi.fn().mockReturnValue(true),
+      });
+      const gate = new MergeGate(config, "/repo", git);
+      const r = await gate.enqueueProposed("t-mix", "/wt", "br-mix", "msg-mix");
+      expect(r.status).toBe("merged");
+      expect(git.autoCommit).toHaveBeenCalledWith("/wt", "msg-mix", { amend: true });
+    });
+
+    it("alreadyCommitted=true skips detection and proceeds to rebase", async () => {
+      const git = mockGitOps({
+        hasUncommittedChanges: vi.fn().mockReturnValue(false),
+        branchHasCommitsAheadOfTrunk: vi.fn().mockReturnValue(true),
+      });
+      const gate = new MergeGate(config, "/repo", git);
+      const r = await gate.enqueueProposed("t-rec", "/wt", "br-rec", "msg", { alreadyCommitted: true });
+      expect(r.status).toBe("merged");
+      expect(git.autoCommit).not.toHaveBeenCalled();
+      expect(git.scrubHarnessFromHead).not.toHaveBeenCalled();
+    });
+
+    it("legacy enqueue wrapper still works with default commit message", async () => {
+      const git = mockGitOps({ hasUncommittedChanges: vi.fn().mockReturnValue(true) });
+      const gate = new MergeGate(config, "/repo", git);
+      const r = await gate.enqueue("t-leg", "/wt", "br-leg");
+      expect(r.status).toBe("merged");
+      expect(git.autoCommit).toHaveBeenCalledWith("/wt", "harness: auto-commit agent work");
+    });
+
+    it("passes shell-metachars through to autoCommit verbatim (argv form)", async () => {
+      const git = mockGitOps({ hasUncommittedChanges: vi.fn().mockReturnValue(true) });
+      const gate = new MergeGate(config, "/repo", git);
+      const danger = "harness: t — `rm -rf /`; $(echo pwned)";
+      await gate.enqueueProposed("t-sh", "/wt", "br-sh", danger);
+      expect(git.autoCommit).toHaveBeenCalledWith("/wt", danger);
+    });
+
+    it("lazy probe (M3): first call fails when getUserEmail returns undefined", async () => {
+      const email = vi.fn()
+        .mockReturnValueOnce(undefined)
+        .mockReturnValueOnce("test@example");
+      const git = mockGitOps({ getUserEmail: email });
+      const gate = new MergeGate(config, "/repo", git);
+      const r1 = await gate.enqueueProposed("t-probe1", "/wt", "br", "msg");
+      expect(r1.status).toBe("error");
+      if (r1.status === "error") expect(r1.error).toMatch(/user\.email/);
+      // Subsequent call succeeds (probe re-runs because it wasn't marked probed).
+      const r2 = await gate.enqueueProposed("t-probe2", "/wt", "br", "msg");
+      expect(r2.status).toBe("merged");
+      // After first success probe is cached — third call skips probe check.
+      await gate.enqueueProposed("t-probe3", "/wt", "br", "msg");
+      expect(email).toHaveBeenCalledTimes(2);
     });
   });
 });

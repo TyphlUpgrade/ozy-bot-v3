@@ -321,4 +321,71 @@ describe("realMergeGitOps — validation against real git", () => {
       expect(realMergeGitOps.getTrunkBranch(tmpDir)).toBe("master");
     });
   });
+
+  // -------------------------------------------------------------------------
+  // WA-4 propose-then-commit helpers
+
+  describe("branchHasCommitsAheadOfTrunk (WA-4)", () => {
+    it("returns true for branch with one commit ahead of trunk", () => {
+      initRepo(tmpDir);
+      const trunk = git(tmpDir, "git rev-parse --abbrev-ref HEAD");
+      git(tmpDir, "git checkout -b feat");
+      writeFileSync(join(tmpDir, "x.ts"), "export const X = 1;\n");
+      git(tmpDir, "git add x.ts");
+      git(tmpDir, "git commit -m add-x");
+      expect(realMergeGitOps.branchHasCommitsAheadOfTrunk(tmpDir, trunk)).toBe(true);
+    });
+
+    it("returns false when branch is at trunk parity", () => {
+      initRepo(tmpDir);
+      const trunk = git(tmpDir, "git rev-parse --abbrev-ref HEAD");
+      git(tmpDir, "git checkout -b feat");
+      expect(realMergeGitOps.branchHasCommitsAheadOfTrunk(tmpDir, trunk)).toBe(false);
+    });
+  });
+
+  describe("diffNameOnly (WA-4)", () => {
+    it("returns files changed vs trunk (three-dot syntax)", () => {
+      initRepo(tmpDir);
+      const trunk = git(tmpDir, "git rev-parse --abbrev-ref HEAD");
+      git(tmpDir, "git checkout -b feat");
+      writeFileSync(join(tmpDir, "a.ts"), "a\n");
+      writeFileSync(join(tmpDir, "b.ts"), "b\n");
+      git(tmpDir, "git add -A");
+      git(tmpDir, "git commit -m add-a-b");
+      expect(realMergeGitOps.diffNameOnly(tmpDir, trunk).sort()).toEqual(["a.ts", "b.ts"]);
+    });
+  });
+
+  describe("scrubHarnessFromHead (WA-4)", () => {
+    it("removes .harness/ from HEAD via amend when present", () => {
+      initRepo(tmpDir);
+      git(tmpDir, "git checkout -b feat");
+      mkdirSync(join(tmpDir, ".harness"), { recursive: true });
+      writeFileSync(join(tmpDir, ".harness", "completion.json"), "{}\n");
+      writeFileSync(join(tmpDir, "a.ts"), "a\n");
+      git(tmpDir, "git add -A");
+      git(tmpDir, "git commit -m bad-commit");
+      expect(realMergeGitOps.scrubHarnessFromHead(tmpDir)).toBe(true);
+      const files = git(tmpDir, "git ls-tree -r --name-only HEAD").split("\n");
+      expect(files).not.toContain(".harness/completion.json");
+      expect(files).toContain("a.ts");
+    });
+
+    it("returns false when .harness/ is not tracked", () => {
+      initRepo(tmpDir);
+      git(tmpDir, "git checkout -b feat");
+      writeFileSync(join(tmpDir, "a.ts"), "a\n");
+      git(tmpDir, "git add -A");
+      git(tmpDir, "git commit -m clean-commit");
+      expect(realMergeGitOps.scrubHarnessFromHead(tmpDir)).toBe(false);
+    });
+  });
+
+  describe("getUserEmail (WA-4)", () => {
+    it("returns configured email", () => {
+      initRepo(tmpDir);
+      expect(realMergeGitOps.getUserEmail(tmpDir)).toBe("test@harness.local");
+    });
+  });
 });
