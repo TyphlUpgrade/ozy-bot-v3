@@ -591,21 +591,14 @@ export class Orchestrator {
     await this.handleReviewReject(task, review);
   }
 
-  /**
-   * Deterministic orchestrator commit message for propose-then-commit merges.
-   * Subject ≤ ~100 chars so `git log --oneline` stays readable; trailers
-   * record model / session / phase provenance for forensic audit.
-   */
+  /** Subject ≤100 chars; trailers record model/session/phase for forensic audit. */
   private formatCommitMessage(
     task: TaskRecord,
     completion: CompletionSignal,
     sessionResult: SessionResult,
   ): string {
-    // Strip CR/LF from any interpolated field so trailers can't be forged via
-    // a summary or model name that contains "\n\nModel: attacker".
+    // sanitize: prevent trailer forgery via "\n\nModel: attacker" in any field.
     const sanitize = (s: string): string => s.replace(/[\r\n]+/g, " ");
-    // Budget summary against the full subject (≤100 chars) so a long taskId
-    // doesn't push the line past git's readable-log width.
     const SUBJECT_BUDGET = 100;
     const overhead = `harness: ${task.id} — `.length;
     const summaryBudget = Math.max(20, SUBJECT_BUDGET - overhead - 1);
@@ -990,12 +983,11 @@ export class Orchestrator {
       if (task.state === "failed" && task.worktreePath) {
         this.sessions.cleanupWorktree(task.id);
       }
-      // WA-6: merging-state recovery. Crash points:
-      //   (a) before orchestrator stage → branch empty + worktree dirty → re-run
-      //   (b) after stage, before merge → branch has 1 commit → re-enqueue with alreadyCommitted
+      // WA-6: merging-state recovery.
+      //   (a) branch empty + worktree dirty → re-run from scratch
+      //   (b) branch has orchestrator commit, merge incomplete → re-enqueue alreadyCommitted
       if (task.state === "merging") {
         const updated = this.state.getTask(task.id)!;
-        // Guard 1+2: worktreePath defined AND present on disk.
         if (!updated.worktreePath || !existsSync(updated.worktreePath)) {
           this.state.updateTask(task.id, { lastError: "merging_recovery_worktree_missing" });
           this.state.transition(task.id, "failed");
@@ -1006,8 +998,7 @@ export class Orchestrator {
           });
           continue;
         }
-        // Guard 3 (Fresh-2): bound recovery depth. `>` so MAX=3 grants 3
-        // actual attempts; the 4th tip-over fails fast.
+        // Fresh-2: MAX_RECOVERY_ATTEMPTS=3 → 3 attempts succeed, 4th fails fast.
         const attempts = (updated.recoveryAttempts ?? 0) + 1;
         this.state.setRecoveryAttempts(task.id, attempts);
         if (attempts > MAX_RECOVERY_ATTEMPTS) {
@@ -1021,9 +1012,8 @@ export class Orchestrator {
           continue;
         }
         if (this.mergeGate.branchHasCommitsAheadOfTrunk(updated.worktreePath)) {
-          // (b): orchestrator commit exists; re-enqueue. Mark the synthetic
-          // completion as recovered so downstream consumers (Discord, state
-          // log) can distinguish it from an Executor-reported success.
+          // (b): re-enqueue. `[recovered]` prefix lets Discord/state-log
+          // distinguish synthetic completion from real Executor success.
           const recoveredSummary = `[recovered] ${updated.summary ?? updated.prompt.slice(0, 60)}`;
           void this.mergeGate
             .enqueueProposed(

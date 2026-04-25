@@ -68,11 +68,8 @@ export function initScratchRepo(opts: InitScratchRepoOpts): string {
     stdio: "ignore",
   });
   writeFileSync(join(root, "README.md"), `# scratch ${opts.prefix}\n`);
-  // `.harness/` MUST be gitignored — Executors land `.harness/completion.json`
-  // in the worktree as the propose-then-commit signal; without the ignore rule
-  // it would get committed and rebase-conflict across phases. `.omc/` is the
-  // OMC plugin's per-session state directory (project-memory, plans, etc.) —
-  // it must also be ignored or it lands on trunk and collides phase-to-phase.
+  // `.harness/` (completion-signal dir) and `.omc/` (OMC plugin state) must
+  // be gitignored — without it both rebase-conflict across phases on trunk.
   writeFileSync(
     join(root, ".gitignore"),
     "tasks/\nworktrees/\nsessions/\nstate.json\nprojects.json\nstate.log.jsonl\n.harness/\n.omc/\n",

@@ -75,10 +75,8 @@ export const realMergeGitOps: MergeGitOps = {
   },
 
   autoCommit(cwd: string, message: string, opts?: { amend?: boolean }): string {
-    // `git add --all` (no pathspec) stages tracked changes + untracked
-    // non-ignored. `.omc/` and `.harness/` are gitignored at the trunk level
-    // so they never reach the index — pathspec excludes here would fatal-out
-    // on the "paths are ignored by gitignore" check.
+    // No pathspec: trunk-level gitignore filters `.omc/` and `.harness/`.
+    // Adding excludes here would fatal against gitignored paths.
     execFileSync("git", ["add", "--all"], { cwd, stdio: "pipe" });
     const commitArgs = ["commit", "-m", message];
     if (opts?.amend) commitArgs.push("--amend", "--no-edit");
@@ -195,9 +193,7 @@ export const realMergeGitOps: MergeGitOps = {
       return false;
     }
     if (tracked.trim().length === 0) return false;
-    // Two-step scrub. If `git rm` succeeds but `commit --amend` fails the
-    // index is half-modified — surface that as a thrown error rather than a
-    // silent `false` so the caller can abort the merge.
+    // Throw on partial failure (rm ok, amend fails) so caller aborts the merge.
     execFileSync("git", ["rm", "-r", "--cached", ".harness"], { cwd, stdio: "pipe" });
     execFileSync("git", ["commit", "--amend", "--no-edit"], { cwd, stdio: "pipe" });
     return true;

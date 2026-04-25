@@ -175,8 +175,7 @@ export class SDKClient {
   ): Promise<SessionResult> {
     let result: SessionResult | undefined;
     let sessionId = "";
-    // WA-5: capture the resolved model from the SDK system_init message so
-    // `formatCommitMessage` can record `Model: <name>` as a commit trailer.
+    // WA-5: model name from system_init feeds the `Model:` commit trailer.
     let initModel: string | undefined;
 
     for await (const msg of q) {

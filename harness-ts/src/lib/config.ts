@@ -299,10 +299,7 @@ function parseArchitect(raw: Record<string, unknown>): ArchitectFileConfig {
  */
 export const DEFAULT_TRUNK_BRANCH = "master";
 
-/**
- * WA-6 / Fresh-2: `recoverFromCrash` hard-caps retry recursion after this many
- * attempts. Protects against wedge loops where recovery itself crashes.
- */
+/** WA-6 / Fresh-2: caps `recoverFromCrash` recursion to prevent wedge loops. */
 export const MAX_RECOVERY_ATTEMPTS = 3;
 
 export const DEFAULT_EXECUTOR_SYSTEM_PROMPT = `You are working inside a harness-managed git worktree.
