@@ -291,6 +291,14 @@ function parseArchitect(raw: Record<string, unknown>): ArchitectFileConfig {
  * completion silently lands at response_level 1. Body kept identical to
  * `scripts/live-run.ts` SYSTEM_PROMPT_ENRICHED (validated 4/4 compliance).
  */
+/**
+ * Canonical default trunk branch name used when no explicit override is
+ * configured. Single source of truth referenced by both MergeGate and
+ * ReviewGate so construction order is symmetric and `git grep "master"`
+ * returns one canonical hit.
+ */
+export const DEFAULT_TRUNK_BRANCH = "master";
+
 export const DEFAULT_EXECUTOR_SYSTEM_PROMPT = `You are working inside a harness-managed git worktree.
 
 When you finish your task, you MUST:

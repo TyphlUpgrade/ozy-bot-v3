@@ -211,4 +211,15 @@ describe("loadSystemPrompt", () => {
     expect(content).toContain("completion.json");
     expect(content.length).toBeGreaterThan(100);
   });
+
+  it("review-prompt.md carries the WA-3 propose-then-commit instructions", () => {
+    const realPath = join(process.cwd(), "config", "harness", "review-prompt.md");
+    const content = loadSystemPrompt(realPath);
+    // New "Reading the proposal" section
+    expect(content).toContain("git status --porcelain");
+    expect(content).toContain("git diff");
+    expect(content).toMatch(/agent has written files.*NOT committed/s);
+    // Ground-truth section framing updated
+    expect(content).toContain("proposed diff");
+  });
 });

@@ -132,6 +132,13 @@ export interface ReviewGateDeps {
   config: HarnessConfig;
   /** Absolute path to the Reviewer prompt file. Falls back to inline if missing. */
   promptPath?: string;
+  /**
+   * Canonical trunk-branch source. Orchestrator wires `() => mergeGate.getTrunkBranch()`
+   * once MergeGate is constructed; test harnesses can pass `() => "test-trunk"`.
+   * Required — no `"master"` default — so the Reviewer prompt always cites the
+   * correct trunk for the `git diff trunk...HEAD` legacy fallback.
+   */
+  getTrunkBranch: () => string;
 }
 
 export class ReviewGate {
@@ -139,11 +146,16 @@ export class ReviewGate {
   private readonly config: HarnessConfig;
   private readonly reviewer: Required<Omit<ReviewerConfig, "model">> & { model: string };
   private readonly promptPath?: string;
+  private readonly getTrunkBranch: () => string;
 
   constructor(deps: ReviewGateDeps) {
+    if (typeof deps.getTrunkBranch !== "function") {
+      throw new Error("ReviewGate requires getTrunkBranch dep");
+    }
     this.sdk = deps.sdk;
     this.config = deps.config;
     this.promptPath = deps.promptPath;
+    this.getTrunkBranch = deps.getTrunkBranch;
     // Merge config overrides onto defaults — explicit set wins.
     const over = deps.config.reviewer ?? {};
     this.reviewer = {
@@ -288,7 +300,8 @@ export class ReviewGate {
       "```",
       `</untrusted:completion-summary>`,
       ``,
-      `**Commit SHA:** ${(completion.commitSha ?? "").replace(/[^a-f0-9]/gi, "").slice(0, 40)}`,
+      `**Branch:** ${task.branchName ?? "(unknown)"} (uncommitted proposal — see system prompt step 1).`,
+      `**Trunk:** ${this.getTrunkBranch()}`,
       `**Files changed:**`,
       files || "(none)",
       ``,

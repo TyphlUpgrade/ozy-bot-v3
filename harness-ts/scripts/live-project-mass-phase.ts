@@ -99,6 +99,7 @@ async function main(): Promise<void> {
     sdk,
     config,
     promptPath: join(root, "config", "harness", "review-prompt.md"),
+    getTrunkBranch: () => "main",
   });
   const { realGitOps } = await import("../src/session/manager.js");
   const architectManager = new ArchitectManager({

@@ -94,6 +94,7 @@ async function main(): Promise<void> {
     sdk,
     config,
     promptPath: join(root, "config", "harness", "review-prompt.md"),
+    getTrunkBranch: () => "main",
   });
   // realGitOps (default) — SessionManager uses it internally; ArchitectManager
   // also needs it. Import it via SessionManager's realGitOps for consistency.

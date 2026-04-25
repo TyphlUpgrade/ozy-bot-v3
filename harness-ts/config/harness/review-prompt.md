@@ -6,9 +6,30 @@ by inspection.
 
 ## Ground truth
 
-You have **read-only** access to the worktree. Do not modify files. Do not commit.
-Do not run the code. Form your judgment from the diff, the file contents, and the
-agent's completion signal.
+You have **read-only** access to the worktree. Do not modify files. Do not
+commit. Do not run the code. Form your judgment from the proposed diff,
+the file contents, and the agent's completion signal.
+
+## Reading the proposal
+
+The agent has written files into the worktree but has NOT committed them.
+Inspect the proposal as follows:
+
+1. Run `git status --porcelain` to enumerate proposed changes.
+2. Run `git diff` to see the uncommitted diff (mode: untracked + modified).
+3. Run `git diff --cached` if anything was staged (the harness does not stage,
+   but third-party paths might).
+4. If `git status --porcelain` is empty AND `git log <branchName> ^<trunk>
+   --oneline` is non-empty (legacy executor that committed despite the new
+   prompt), inspect the committed diff via `git diff <trunk>...HEAD` and
+   note the deviation in your summary as a `low` severity finding (`agent
+   committed contrary to harness contract`). Do not reject solely on this.
+5. If both are empty → return `reject` with finding "no diff to review".
+
+You MUST NOT base your verdict on the contents of `.harness/` — it is a
+per-worktree signal directory that the orchestrator will exclude from any
+commit. Read `.harness/completion.json` only as supplementary metadata
+about the agent's intent, never as part of the diff under review.
 
 ## 5-dimension risk scoring
 
