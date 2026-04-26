@@ -88,7 +88,7 @@ const NOTIFIER_MAP: NotifierMap = {
     identity: "orchestrator",
     format: (e) => {
       if (e.success) {
-        return truncateBody(`Session complete for \`${shortTaskId(e.taskId)}\`: success`, 1900);
+        return truncateBody(`Session complete for \`${shortTaskId(e.taskId)}\`: success`);
       }
       const errors = e.errors ?? [];
       const errSummary = errors.length > 0
@@ -96,9 +96,7 @@ const NOTIFIER_MAP: NotifierMap = {
         : "(no error detail)";
       const tr = e.terminalReason ? ` [${sanitize(e.terminalReason, 64)}]` : "";
       return truncateBody(
-        `Session complete for \`${shortTaskId(e.taskId)}\`: failure — ${errSummary}${tr}`,
-        1900,
-      );
+        `Session complete for \`${shortTaskId(e.taskId)}\`: failure — ${errSummary}${tr}`,      );
     },
   },
   merge_result: {
@@ -122,7 +120,7 @@ const NOTIFIER_MAP: NotifierMap = {
         tail = ` — ${n} files: ${first3}`;
       }
       // status === "test_timeout" → no tail (Row 6 unchanged)
-      return truncateBody(head + tail, 1900);
+      return truncateBody(head + tail);
     },
   },
   task_done: {
@@ -132,7 +130,7 @@ const NOTIFIER_MAP: NotifierMap = {
       const lvl = e.responseLevelName
         ? ` (response level: ${sanitize(e.responseLevelName, 40)})`
         : "";
-      return truncateBody(`Task \`${shortTaskId(e.taskId)}\` complete${lvl}`, 1900);
+      return truncateBody(`Task \`${shortTaskId(e.taskId)}\` complete${lvl}`);
     },
   },
   task_shelved: {
@@ -146,9 +144,7 @@ const NOTIFIER_MAP: NotifierMap = {
     format: (e) => {
       const attempt = e.attempt ?? 0;
       return truncateBody(
-        `Task \`${shortTaskId(e.taskId)}\` **FAILED** (attempt ${attempt}): ${sanitize(e.reason)}`,
-        1900,
-      );
+        `Task \`${shortTaskId(e.taskId)}\` **FAILED** (attempt ${attempt}): ${sanitize(e.reason)}`,      );
     },
   },
   escalation_needed: {
@@ -164,7 +160,7 @@ const NOTIFIER_MAP: NotifierMap = {
       const ctx = e.escalation.context
         ? `\nContext: ${sanitize(e.escalation.context, 300)}`
         : "";
-      return truncateBody(`**ESCALATION** \`${id}\` (${t}): ${q}${opts}${ctx}`, 1900);
+      return truncateBody(`**ESCALATION** \`${id}\` (${t}): ${q}${opts}${ctx}`);
     },
   },
   budget_exhausted: {
@@ -214,9 +210,7 @@ const NOTIFIER_MAP: NotifierMap = {
         : "";
       const reason = truncateRationale(e.reason, 1024);
       return truncateBody(
-        `Project \`${shortProjectId(e.projectId)}\` **FAILED**${phase}: ${sanitize(reason)}`,
-        1900,
-      );
+        `Project \`${shortProjectId(e.projectId)}\` **FAILED**${phase}: ${sanitize(reason)}`,      );
     },
   },
   project_aborted: {
@@ -247,9 +241,7 @@ const NOTIFIER_MAP: NotifierMap = {
     identity: "architect",
     format: (e) =>
       truncateBody(
-        `Arbitration verdict for \`${shortTaskId(e.taskId)}\` in \`${shortProjectId(e.projectId)}\`: **${e.verdict}** — ${sanitize(truncateRationale(e.rationale, 1024))}`,
-        1900,
-      ),
+        `Arbitration verdict for \`${shortTaskId(e.taskId)}\` in \`${shortProjectId(e.projectId)}\`: **${e.verdict}** — ${sanitize(truncateRationale(e.rationale, 1024))}`,      ),
   },
   review_arbitration_entered: {
     channel: "escalation_channel",

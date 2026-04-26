@@ -2,7 +2,7 @@
  * Discord live-delivery smoke test.
  *
  * Sends one message per agent identity (Architect / Reviewer / Executor /
- * Operator) to the dev channel, then fires 15 fixtures through DiscordNotifier
+ * Operator) to the dev channel, then fires 16 fixtures through DiscordNotifier
  * covering every row in the Phase B.1 renderer table.
  *
  * CW-1: routes via `buildSendersForChannels` so channels with a webhook URL
