@@ -91,6 +91,7 @@ export interface TaskRecord {
   reviewerRejectionCount?: number; // per-task Reviewer rejections on THIS phase
   lastDirective?: string;          // most recent Architect retry_with_directive verdict text
   recoveryAttempts?: number;       // WA-6 / Fresh-2: recoverFromCrash depth bound (max 3)
+  lastResponseLevelName?: string;  // most recent ResponseLevel.name; persisted at response_level emit
 }
 
 // Known keys for defensive deserialization (B7). Unknown keys are silently dropped on load.
@@ -105,6 +106,8 @@ const KNOWN_KEYS: ReadonlySet<string> = new Set([
   // Three-tier (Wave 1.5b)
   "projectId", "phaseId", "arbitrationCount", "reviewerRejectionCount", "lastDirective",
   "recoveryAttempts",
+  // Phase A (discord conversational output)
+  "lastResponseLevelName",
 ]);
 
 // --- Event Log (O9: write-only) ---

@@ -106,11 +106,11 @@ export type ArbitrationCause = "escalation" | "review_disagreement";
 
 export type OrchestratorEvent =
   | { type: "task_picked_up"; taskId: string; prompt: string }
-  | { type: "session_complete"; taskId: string; success: boolean }
+  | { type: "session_complete"; taskId: string; success: boolean; errors: string[]; terminalReason?: string }
   | { type: "merge_result"; taskId: string; result: MergeResult }
   | { type: "task_shelved"; taskId: string; reason: string }
-  | { type: "task_failed"; taskId: string; reason: string }
-  | { type: "task_done"; taskId: string }
+  | { type: "task_failed"; taskId: string; reason: string; attempt: number }
+  | { type: "task_done"; taskId: string; responseLevelName?: string }
   | { type: "poll_tick" }
   | { type: "shutdown" }
   // Phase 2A events
@@ -124,7 +124,7 @@ export type OrchestratorEvent =
   | { type: "project_declared"; projectId: string; name: string }
   | { type: "project_decomposed"; projectId: string; phaseCount: number }
   | { type: "project_completed"; projectId: string; phaseCount: number; totalCostUsd: number }
-  | { type: "project_failed"; projectId: string; reason: string }
+  | { type: "project_failed"; projectId: string; reason: string; failedPhase?: string }
   | { type: "project_aborted"; projectId: string; operatorId: string }
   | { type: "architect_spawned"; projectId: string; sessionId: string }
   | { type: "architect_respawned"; projectId: string; sessionId: string; reason: ArchitectRespawnReason }
@@ -321,6 +321,8 @@ export class Orchestrator {
         type: "session_complete",
         taskId: task.id,
         success: result.success,
+        errors: result.errors ?? [],
+        terminalReason: result.terminalReason,
       });
 
       this.emitInformationalEvents(task, completion);
@@ -362,7 +364,7 @@ export class Orchestrator {
       } catch {
         // State transition may also fail if task is in incompatible state
       }
-      this.emit({ type: "task_failed", taskId: task.id, reason });
+      this.emit({ type: "task_failed", taskId: task.id, reason, attempt: this.state.getTask(task.id)?.retryCount ?? 0 });
     }
   }
 
@@ -435,7 +437,7 @@ export class Orchestrator {
       this.state.transition(task.id, "failed");
       this.state.updateTask(task.id, { lastError: `Budget exhausted ($${result.totalCostUsd.toFixed(2)})` });
       this.emit({ type: "budget_exhausted", taskId: task.id, totalCostUsd: result.totalCostUsd });
-      this.emit({ type: "task_failed", taskId: task.id, reason: "Budget exhausted" });
+      this.emit({ type: "task_failed", taskId: task.id, reason: "Budget exhausted", attempt: this.state.getTask(task.id)?.retryCount ?? 0 });
       return;
     }
 
@@ -486,7 +488,7 @@ export class Orchestrator {
         ? `Circuit breaker: exhausted ${maxSessionRetries} retries × ${maxEscalations} escalation cycles`
         : reason,
     });
-    this.emit({ type: "task_failed", taskId: task.id, reason });
+    this.emit({ type: "task_failed", taskId: task.id, reason, attempt: this.state.getTask(task.id)?.retryCount ?? 0 });
   }
 
   /**
@@ -516,6 +518,7 @@ export class Orchestrator {
     result: SessionResult,
   ): Promise<void> {
     const responseResult = evaluateResponseLevel(completion, result);
+    this.state.updateTask(task.id, { lastResponseLevelName: responseResult.name });
     this.emit({
       type: "response_level",
       taskId: task.id,
@@ -631,6 +634,7 @@ export class Orchestrator {
         type: "task_failed",
         taskId: task.id,
         reason: `Review ${review.verdict}`,
+        attempt: this.state.getTask(task.id)?.retryCount ?? 0,
       });
       this.sessions.cleanupWorktree(task.id);
       return;
@@ -678,7 +682,7 @@ export class Orchestrator {
   ): Promise<void> {
     if (!task.projectId) {
       this.state.transition(task.id, "failed");
-      this.emit({ type: "task_failed", taskId: task.id, reason: "arbitration_without_projectId" });
+      this.emit({ type: "task_failed", taskId: task.id, reason: "arbitration_without_projectId", attempt: this.state.getTask(task.id)?.retryCount ?? 0 });
       return;
     }
     if (!this.architectManager) {
@@ -687,6 +691,7 @@ export class Orchestrator {
         type: "task_failed",
         taskId: task.id,
         reason: "arbitration_fired_without_architectManager",
+        attempt: this.state.getTask(task.id)?.retryCount ?? 0,
       });
       return;
     }
@@ -765,6 +770,7 @@ export class Orchestrator {
           type: "task_failed",
           taskId: task.id,
           reason: `architect escalation: ${safeRationale}`,
+          attempt: this.state.getTask(task.id)?.retryCount ?? 0,
         });
         this.sessions.cleanupWorktree(task.id);
         this.cascadePhaseOutcome(task, "failed", safeRationale);
@@ -809,6 +815,7 @@ export class Orchestrator {
         type: "project_failed",
         projectId: task.projectId,
         reason: `architect escalation: ${reason}`,
+        failedPhase: task.phaseId,
       });
     }
   }
@@ -826,7 +833,7 @@ export class Orchestrator {
           summary: completion.summary,
           filesChanged: completion.filesChanged,
         });
-        this.emit({ type: "task_done", taskId: task.id });
+        this.emit({ type: "task_done", taskId: task.id, responseLevelName: this.state.getTask(task.id)?.lastResponseLevelName });
         this.sessions.cleanupWorktree(task.id);
         this.cascadePhaseOutcome(task, "done");
         break;
@@ -843,6 +850,7 @@ export class Orchestrator {
             type: "task_failed",
             taskId: task.id,
             reason: `Rebase conflict persists (${attempts} attempts)`,
+            attempt: this.state.getTask(task.id)?.retryCount ?? 0,
           });
         } else {
           this.state.transition(task.id, "shelved");
@@ -861,21 +869,21 @@ export class Orchestrator {
         this.state.updateTask(task.id, {
           lastError: `Tests failed: ${mergeResult.error}`,
         });
-        this.emit({ type: "task_failed", taskId: task.id, reason: `Tests failed` });
+        this.emit({ type: "task_failed", taskId: task.id, reason: `Tests failed`, attempt: this.state.getTask(task.id)?.retryCount ?? 0 });
         this.sessions.cleanupWorktree(task.id);
         break;
 
       case "test_timeout":
         this.state.transition(task.id, "failed");
         this.state.updateTask(task.id, { lastError: "Test timeout" });
-        this.emit({ type: "task_failed", taskId: task.id, reason: "Test timeout" });
+        this.emit({ type: "task_failed", taskId: task.id, reason: "Test timeout", attempt: this.state.getTask(task.id)?.retryCount ?? 0 });
         this.sessions.cleanupWorktree(task.id);
         break;
 
       case "error":
         this.state.transition(task.id, "failed");
         this.state.updateTask(task.id, { lastError: mergeResult.error });
-        this.emit({ type: "task_failed", taskId: task.id, reason: mergeResult.error });
+        this.emit({ type: "task_failed", taskId: task.id, reason: mergeResult.error, attempt: this.state.getTask(task.id)?.retryCount ?? 0 });
         this.sessions.cleanupWorktree(task.id);
         break;
     }
@@ -984,6 +992,7 @@ export class Orchestrator {
           type: "task_failed",
           taskId: task.id,
           reason: "review_arbitration_resumed_after_crash — operator must restart the phase",
+          attempt: this.state.getTask(task.id)?.retryCount ?? 0,
         });
       }
       // Shelved tasks get retried (worktree already cleaned on shelve path)
@@ -1006,6 +1015,7 @@ export class Orchestrator {
             type: "task_failed",
             taskId: task.id,
             reason: "merging_recovery_worktree_missing",
+            attempt: this.state.getTask(task.id)?.retryCount ?? 0,
           });
           continue;
         }
@@ -1019,6 +1029,7 @@ export class Orchestrator {
             type: "task_failed",
             taskId: task.id,
             reason: "max_recovery_attempts_exceeded",
+            attempt: this.state.getTask(task.id)?.retryCount ?? 0,
           });
           continue;
         }
