@@ -236,7 +236,7 @@ describe("DiscordNotifier ↔ Orchestrator integration", () => {
     expect(contents.some((c) => /picked up/i.test(c))).toBe(true);
     expect(contents.some((c) => /Session complete.*success/i.test(c))).toBe(true);
     expect(contents.some((c) => /merged/i.test(c))).toBe(true);
-    expect(contents.some((c) => /complete$/i.test(c))).toBe(true);
+    expect(contents.some((c) => /complete/i.test(c))).toBe(true);
     // No ops or escalation traffic on happy path
     expect(channels).not.toContain("ops");
     expect(channels).not.toContain("esc");

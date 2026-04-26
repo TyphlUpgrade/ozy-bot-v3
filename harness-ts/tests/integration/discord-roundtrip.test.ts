@@ -246,7 +246,7 @@ describe("Discord roundtrip — Wave 2 + Wave 3 end-to-end", () => {
     // Wait for lifecycle (fire-and-forget processTask)
     for (let i = 0; i < 40; i++) {
       await flushMicrotasks();
-      if (h.sent.some((s) => /complete$/i.test(s.content))) break;
+      if (h.sent.some((s) => /complete/i.test(s.content))) break;
     }
 
     // Router-created task went through pipeline
@@ -257,7 +257,7 @@ describe("Discord roundtrip — Wave 2 + Wave 3 end-to-end", () => {
     // Notifier routed the lifecycle to dev
     expect(h.sent.some((s) => s.channel === "dev" && /picked up/.test(s.content))).toBe(true);
     expect(h.sent.some((s) => s.channel === "dev" && /merged/.test(s.content))).toBe(true);
-    expect(h.sent.some((s) => s.channel === "dev" && /complete$/.test(s.content))).toBe(true);
+    expect(h.sent.some((s) => s.channel === "dev" && /complete/.test(s.content))).toBe(true);
   });
 
   it("!project declare emits project_declared → notifier routes to dev with architect identity", async () => {

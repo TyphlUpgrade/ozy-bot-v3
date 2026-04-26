@@ -2,7 +2,9 @@
  * Discord live-delivery smoke test.
  *
  * Sends one message per agent identity (Architect / Reviewer / Executor /
- * Operator) to the dev channel and one routed event through DiscordNotifier.
+ * Operator) to the dev channel, then fires 15 fixtures through DiscordNotifier
+ * covering every row in the Phase B.1 renderer table.
+ *
  * CW-1: routes via `buildSendersForChannels` so channels with a webhook URL
  * get per-agent username AND avatar; channels without fall back to bot REST
  * (identity rendered as `**[Name]**` prefix).
@@ -18,6 +20,23 @@
  *
  * Webhook URLs upgrade the channel from BotSender to WebhookSender so per-
  * agent avatars render natively. Provision via `scripts/provision-webhooks.ts`.
+ *
+ * Phase B.2 fixture matrix (one per Phase B.1 renderer row):
+ *   Row  1 — task_picked_up
+ *   Row  2 — session_complete (success)
+ *   Row  3 — session_complete (failure, errors + terminalReason)
+ *   Row  9 — task_done (with responseLevelName)
+ *   Row  9 — task_done (without responseLevelName)
+ *   Row  4 — merge_result (merged, sha7)
+ *   Row  5 — merge_result (test_failed, error)
+ *   Row  6 — merge_result (test_timeout)
+ *   Row  7 — merge_result (rebase_conflict, 4 files → shows first 3)
+ *   Row  8 — merge_result (error)
+ *   Row 10 — task_failed (with attempt)
+ *   Row 11 — escalation_needed (with options + context)
+ *   Row 14 — arbitration_verdict
+ *   Row 13 — budget_ceiling_reached
+ *   Row 12 — project_failed (with failedPhase)
  *
  * Usage:
  *   set -a && source ../.env && set +a    # if .env not auto-loaded
@@ -103,19 +122,55 @@ async function main(): Promise<void> {
   }
 
   // Wire DiscordNotifier so we know the routing layer also works end-to-end.
-  // Fake event: project_declared maps to dev channel by default.
   const notifier = new DiscordNotifier(senders, config);
-  notifier.handleEvent({
-    type: "project_declared",
-    projectId: "smoke-test-fake-id",
-    name: "discord-smoke-test",
-  });
+
+  // Phase B.2 fixture matrix — one event per renderer row in Phase B.1 table.
+  const fixtures: Parameters<typeof notifier.handleEvent>[0][] = [
+    // Row 1 — task_picked_up
+    { type: "task_picked_up", taskId: "task-smoke-1", prompt: "demo prompt for url parser" },
+    // Row 2 — session_complete success
+    { type: "session_complete", taskId: "task-smoke-1", success: true, errors: [] },
+    // Row 3 — session_complete failure with errors + terminalReason
+    { type: "session_complete", taskId: "task-smoke-1f", success: false, errors: ["build broke", "lint fail"], terminalReason: "max_iterations" },
+    // Row 9 — task_done with responseLevelName
+    { type: "task_done", taskId: "task-smoke-1", responseLevelName: "reviewed" },
+    // Row 9 — task_done without responseLevelName
+    { type: "task_done", taskId: "task-smoke-2" },
+    // Row 4 — merge_result merged (sha7)
+    { type: "merge_result", taskId: "task-smoke-1", result: { status: "merged", commitSha: "abc1234567890" } },
+    // Row 5 — merge_result test_failed
+    { type: "merge_result", taskId: "task-smoke-1", result: { status: "test_failed", error: "FAIL: src/url/parser.test.ts > parses scheme\nExpected 'http' got undefined" } },
+    // Row 6 — merge_result test_timeout
+    { type: "merge_result", taskId: "task-smoke-1", result: { status: "test_timeout" } },
+    // Row 7 — merge_result rebase_conflict (4 files → shows first 3)
+    { type: "merge_result", taskId: "task-smoke-1", result: { status: "rebase_conflict", conflictFiles: ["src/url/parser.ts", "src/url/scheme.ts", "src/url/host.ts", "tests/url.test.ts"] } },
+    // Row 8 — merge_result error
+    { type: "merge_result", taskId: "task-smoke-1", result: { status: "error", error: "git push rejected: non-fast-forward" } },
+    // Row 10 — task_failed with attempt
+    { type: "task_failed", taskId: "task-smoke-1", reason: "executor stack trace overflow", attempt: 3 },
+    // Row 11 — escalation_needed with options + context
+    { type: "escalation_needed", taskId: "task-smoke-1", escalation: { type: "scope_unclear", question: "Should the parser handle file:// URLs?", options: ["yes — extend grammar", "no — out of scope"], context: "Found file:// URL in test fixture but spec doesn't mention it." } },
+    // Row 14 — arbitration_verdict
+    { type: "arbitration_verdict", taskId: "task-smoke-1", projectId: "proj-smoke", verdict: "retry_with_directive", rationale: "Reviewer concern is valid: add the missing test." },
+    // Row 13 — budget_ceiling_reached
+    { type: "budget_ceiling_reached", projectId: "proj-smoke", currentCostUsd: 9.80, ceilingUsd: 10.00 },
+    // Row 12 — project_failed with failedPhase
+    { type: "project_failed", projectId: "proj-smoke", reason: "Architect issued escalate_operator after 3 retry cycles", failedPhase: "phase-2-implement-parser" },
+    // Row 12b — project_failed without failedPhase (spawn-time)
+    { type: "project_failed", projectId: "proj-smoke-2", reason: "architect spawn failed" },
+  ];
+
+  for (const fx of fixtures) {
+    notifier.handleEvent(fx);
+    // Small gap so the rate-limit queue can drain between sends.
+    await new Promise((r) => setTimeout(r, 100));
+  }
 
   // Drain queue: wait long enough for the sender's rate limit to flush all
-  // 5 messages (4 direct + 1 from notifier). Default 2 s spacing × 5 = 10 s.
-  await new Promise((r) => setTimeout(r, 12_000));
+  // 20 messages (4 direct + 16 from notifier). Default 2 s spacing × 20 = 40 s.
+  await new Promise((r) => setTimeout(r, 40_000));
 
-  console.log("[discord-smoke] done — check Discord for 5 messages in #dev");
+  console.log("[discord-smoke] done — check Discord for 16 notifier messages across #dev / #ops / #esc");
   process.exit(0);
 }
 
