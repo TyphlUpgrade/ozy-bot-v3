@@ -295,6 +295,90 @@ describe("DiscordNotifier", () => {
     expect(sent[0].content).toMatch(/generation 3/);
   });
 
+  // --- Phase B rich rendering (skipped until Commit 2 lands renderer) ---
+
+  it.skip("session_complete failure with errors and terminalReason", async () => {
+    notifier.handleEvent({
+      type: "session_complete",
+      taskId: "t1",
+      success: false,
+      errors: ["boom1", "boom2"],
+      terminalReason: "budget_exceeded",
+    });
+    await flush();
+    expect(sent[0].content).toMatch(/failure — boom1; boom2 \[budget_exceeded\]/);
+  });
+
+  it.skip("task_failed renders attempt N from event.attempt", async () => {
+    notifier.handleEvent({ type: "task_failed", taskId: "t1", reason: "boom", attempt: 2 });
+    await flush();
+    expect(sent[0].content).toMatch(/attempt 2/);
+    expect(sent[0].content).toMatch(/FAILED/);
+    expect(sent[0].content).toMatch(/boom/);
+  });
+
+  it.skip("task_done renders response level name when present", async () => {
+    notifier.handleEvent({ type: "task_done", taskId: "t1", responseLevelName: "reviewed" });
+    await flush();
+    expect(sent[0].content).toMatch(/response level: reviewed/);
+  });
+
+  it.skip("task_done omits response level when absent", async () => {
+    notifier.handleEvent({ type: "task_done", taskId: "t1" });
+    await flush();
+    expect(sent[0].content).not.toContain("response level:");
+  });
+
+  it.skip("escalation_needed renders options + context", async () => {
+    notifier.handleEvent({
+      type: "escalation_needed",
+      taskId: "t1",
+      escalation: {
+        type: "scope_unclear",
+        question: "what scope",
+        options: ["a", "b"],
+        context: "background details",
+      },
+    });
+    await flush();
+    expect(sent[0].content).toContain("Options:");
+    expect(sent[0].content).toContain("Context:");
+    expect(sent[0].content).toContain("a");
+    expect(sent[0].content).toContain("b");
+    expect(sent[0].content).toContain("background details");
+  });
+
+  it.skip("merge_result rebase_conflict shows file count + first3", async () => {
+    notifier.handleEvent({
+      type: "merge_result",
+      taskId: "t1",
+      result: { status: "rebase_conflict", conflictFiles: ["a", "b", "c"] },
+    });
+    await flush();
+    expect(sent[0].content).toMatch(/3 files: a, b, c/);
+  });
+
+  it.skip("project_failed renders failedPhase when set", async () => {
+    notifier.handleEvent({
+      type: "project_failed",
+      projectId: "proj-xyz",
+      reason: "boom",
+      failedPhase: "phase-1",
+    });
+    await flush();
+    expect(sent[0].content).toMatch(String.raw`at phase \`phase-1\``);
+  });
+
+  it.skip("project_failed without failedPhase (spawn-time)", async () => {
+    notifier.handleEvent({
+      type: "project_failed",
+      projectId: "proj-xyz",
+      reason: "spawn failed",
+    });
+    await flush();
+    expect(sent[0].content).not.toContain("at phase");
+  });
+
   // --- Identity + defaults ---
 
   it("falls back to config-free defaults when agents section is empty", async () => {
