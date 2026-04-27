@@ -299,12 +299,10 @@ export class ArchitectManager {
     const ac = new AbortController();
     this.abortControllers.set(projectId, ac);
     try {
-      const { query } = this.sdk.resumeSession(session.sessionId, {
-        prompt,
-        cwd: session.worktreePath,
-        abortController: ac,
-        persistSession: true,
-      });
+      const { query } = this.sdk.resumeSession(
+        session.sessionId,
+        this.buildResumeConfig(prompt, session, ac),
+      );
       const result = await this.sdk.consumeStream(query);
       session.totalCostUsd += result.totalCostUsd;
       session.lastActivityAt = new Date().toISOString();
@@ -387,12 +385,10 @@ export class ArchitectManager {
       `</untrusted:operator-message>`,
     ].join("\n");
     try {
-      const { query } = this.sdk.resumeSession(session.sessionId, {
-        prompt: fenced,
-        cwd: session.worktreePath,
-        abortController: ac,
-        persistSession: true,
-      });
+      const { query } = this.sdk.resumeSession(
+        session.sessionId,
+        this.buildResumeConfig(fenced, session, ac),
+      );
       const result = await this.sdk.consumeStream(query);
       session.totalCostUsd += result.totalCostUsd;
       session.lastActivityAt = new Date().toISOString();
@@ -490,12 +486,10 @@ Write your verdict to \`.harness/architect-verdict.json\` per the schema in §5 
     }, this.architect.arbitrationTimeoutMs);
 
     try {
-      const { query } = this.sdk.resumeSession(session.sessionId, {
-        prompt,
-        cwd: session.worktreePath,
-        abortController: ac,
-        persistSession: true,
-      });
+      const { query } = this.sdk.resumeSession(
+        session.sessionId,
+        this.buildResumeConfig(prompt, session, ac),
+      );
       const result = await this.sdk.consumeStream(query);
       session.totalCostUsd += result.totalCostUsd;
       session.lastActivityAt = new Date().toISOString();
@@ -585,12 +579,14 @@ Write your verdict to \`.harness/architect-verdict.json\` per the schema in §5 
     const ac = new AbortController();
     this.abortControllers.set(projectId, ac);
     try {
-      const { query } = this.sdk.resumeSession(session.sessionId, {
-        prompt: `Produce .harness/architect-summary.json per system prompt §9.`,
-        cwd: session.worktreePath,
-        abortController: ac,
-        persistSession: true,
-      });
+      const { query } = this.sdk.resumeSession(
+        session.sessionId,
+        this.buildResumeConfig(
+          `Produce .harness/architect-summary.json per system prompt §9.`,
+          session,
+          ac,
+        ),
+      );
       const result = await this.sdk.consumeStream(query);
       session.totalCostUsd += result.totalCostUsd;
       this.projectStore.incrementCost(projectId, result.totalCostUsd);
@@ -696,6 +692,30 @@ Write your verdict to \`.harness/architect-verdict.json\` per the schema in §5 
   }
 
   // --- Internal ---
+
+  /**
+   * Build a SessionConfig for resuming the Architect session. SDK `resume` only
+   * restores conversation history — tool restrictions, plugins, settingSources,
+   * permissionMode, and hooks must be re-supplied on every call. Drift between
+   * the 4 resume sites would breach I-1 (Discord opaque) on the resumed turn.
+   */
+  private buildResumeConfig(
+    prompt: string,
+    session: ArchitectSession,
+    abortController: AbortController,
+  ): Omit<SessionConfig, "resume"> & { prompt: string } {
+    return {
+      prompt,
+      cwd: session.worktreePath,
+      abortController,
+      persistSession: true,
+      permissionMode: "bypassPermissions",
+      settingSources: ["project"],
+      enabledPlugins: this.architect.plugins,
+      hooks: {},
+      disallowedTools: [...ARCHITECT_DISALLOWED_TOOLS],
+    };
+  }
 
   private async spawnSessionWithPrompt(
     projectId: string,
