@@ -109,8 +109,8 @@ export const SMOKE_FIXTURES: Parameters<typeof DiscordNotifier.prototype.handleE
   { type: "merge_result", taskId: "task-smoke-1", result: { status: "rebase_conflict", conflictFiles: ["src/url/parser.ts", "src/url/scheme.ts", "src/url/host.ts", "tests/url.test.ts"] } },
   // Row 8 — merge_result error
   { type: "merge_result", taskId: "task-smoke-1", result: { status: "error", error: "git push rejected: non-fast-forward" } },
-  // Row 10 — task_failed with attempt
-  { type: "task_failed", taskId: "task-smoke-1", reason: "executor stack trace overflow", attempt: 3 },
+  // Row 10 — task_failed with attempt (terminal: true so M7 mention path is exercised)
+  { type: "task_failed", taskId: "task-smoke-1", reason: "executor stack trace overflow", attempt: 3, terminal: true },
   // Row 11 — escalation_needed with options + context
   { type: "escalation_needed", taskId: "task-smoke-1", escalation: { type: "scope_unclear", question: "Should the parser handle file:// URLs?", options: ["yes — extend grammar", "no — out of scope"], context: "Found file:// URL in test fixture but spec doesn't mention it." } },
   // Row 14 — arbitration_verdict

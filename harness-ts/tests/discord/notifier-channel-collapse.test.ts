@@ -153,10 +153,10 @@ describe("channel-collapse — operator-mention prepend", () => {
     expect(sent[0].allowedMentions).toBeUndefined();
   });
 
-  it("task_failed with attempt=1 → no mention (non-terminal)", async () => {
+  it("task_failed with terminal=false → no mention (non-terminal)", async () => {
     const { sender, sent } = makeRecordingSender();
     const notifier = new DiscordNotifier(sender, baseConfig({ operator_user_id: OPERATOR_ID }));
-    notifier.handleEvent({ type: "task_failed", taskId: "t1", reason: "boom", attempt: 1 });
+    notifier.handleEvent({ type: "task_failed", taskId: "t1", reason: "boom", attempt: 1, terminal: false });
     await flush();
 
     expect(sent).toHaveLength(1);
@@ -164,15 +164,26 @@ describe("channel-collapse — operator-mention prepend", () => {
     expect(sent[0].allowedMentions).toBeUndefined();
   });
 
-  it("task_failed with attempt=3 → mention applied (terminal)", async () => {
+  it("task_failed with terminal=true → mention applied (terminal)", async () => {
+    const { sender, sent } = makeRecordingSender();
+    const notifier = new DiscordNotifier(sender, baseConfig({ operator_user_id: OPERATOR_ID }));
+    notifier.handleEvent({ type: "task_failed", taskId: "t1", reason: "boom", attempt: 3, terminal: true });
+    await flush();
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0].content.startsWith(`<@${OPERATOR_ID}> `)).toBe(true);
+    expect(sent[0].allowedMentions).toEqual({ users: [OPERATOR_ID] });
+  });
+
+  it("task_failed with terminal undefined → no mention (defaults to non-terminal)", async () => {
     const { sender, sent } = makeRecordingSender();
     const notifier = new DiscordNotifier(sender, baseConfig({ operator_user_id: OPERATOR_ID }));
     notifier.handleEvent({ type: "task_failed", taskId: "t1", reason: "boom", attempt: 3 });
     await flush();
 
     expect(sent).toHaveLength(1);
-    expect(sent[0].content.startsWith(`<@${OPERATOR_ID}> `)).toBe(true);
-    expect(sent[0].allowedMentions).toEqual({ users: [OPERATOR_ID] });
+    expect(sent[0].content.startsWith("<@")).toBe(false);
+    expect(sent[0].allowedMentions).toBeUndefined();
   });
 
   // Each ALWAYS_OPERATOR_ATTENTION event type tested individually so

@@ -109,7 +109,7 @@ export type OrchestratorEvent =
   | { type: "session_complete"; taskId: string; success: boolean; errors: string[]; terminalReason?: string }
   | { type: "merge_result"; taskId: string; result: MergeResult }
   | { type: "task_shelved"; taskId: string; reason: string }
-  | { type: "task_failed"; taskId: string; reason: string; attempt: number }
+  | { type: "task_failed"; taskId: string; reason: string; attempt: number; terminal?: boolean }
   | { type: "task_done"; taskId: string; responseLevelName?: string; summary?: string; filesChanged?: string[] }
   | { type: "poll_tick" }
   | { type: "shutdown" }
@@ -476,7 +476,7 @@ export class Orchestrator {
       } catch {
         // State transition may also fail if task is in incompatible state
       }
-      this.emit({ type: "task_failed", taskId: task.id, reason, attempt: this.state.getTask(task.id)?.retryCount ?? 0 });
+      this.emit({ type: "task_failed", taskId: task.id, reason, attempt: this.state.getTask(task.id)?.retryCount ?? 0, terminal: true });
     }
   }
 
@@ -549,7 +549,7 @@ export class Orchestrator {
       this.state.transition(task.id, "failed");
       this.state.updateTask(task.id, { lastError: `Budget exhausted ($${result.totalCostUsd.toFixed(2)})` });
       this.emit({ type: "budget_exhausted", taskId: task.id, totalCostUsd: result.totalCostUsd });
-      this.emit({ type: "task_failed", taskId: task.id, reason: "Budget exhausted", attempt: this.state.getTask(task.id)?.retryCount ?? 0 });
+      this.emit({ type: "task_failed", taskId: task.id, reason: "Budget exhausted", attempt: this.state.getTask(task.id)?.retryCount ?? 0, terminal: true });
       return;
     }
 
@@ -600,7 +600,7 @@ export class Orchestrator {
         ? `Circuit breaker: exhausted ${maxSessionRetries} retries × ${maxEscalations} escalation cycles`
         : reason,
     });
-    this.emit({ type: "task_failed", taskId: task.id, reason, attempt: this.state.getTask(task.id)?.retryCount ?? 0 });
+    this.emit({ type: "task_failed", taskId: task.id, reason, attempt: this.state.getTask(task.id)?.retryCount ?? 0, terminal: true });
   }
 
   /**
@@ -747,6 +747,7 @@ export class Orchestrator {
         taskId: task.id,
         reason: `Review ${review.verdict}`,
         attempt: this.state.getTask(task.id)?.retryCount ?? 0,
+        terminal: true,
       });
       this.sessions.cleanupWorktree(task.id);
       return;
@@ -794,7 +795,7 @@ export class Orchestrator {
   ): Promise<void> {
     if (!task.projectId) {
       this.state.transition(task.id, "failed");
-      this.emit({ type: "task_failed", taskId: task.id, reason: "arbitration_without_projectId", attempt: this.state.getTask(task.id)?.retryCount ?? 0 });
+      this.emit({ type: "task_failed", taskId: task.id, reason: "arbitration_without_projectId", attempt: this.state.getTask(task.id)?.retryCount ?? 0, terminal: true });
       return;
     }
     if (!this.architectManager) {
@@ -804,6 +805,7 @@ export class Orchestrator {
         taskId: task.id,
         reason: "arbitration_fired_without_architectManager",
         attempt: this.state.getTask(task.id)?.retryCount ?? 0,
+        terminal: true,
       });
       return;
     }
@@ -883,6 +885,7 @@ export class Orchestrator {
           taskId: task.id,
           reason: `architect escalation: ${safeRationale}`,
           attempt: this.state.getTask(task.id)?.retryCount ?? 0,
+          terminal: true,
         });
         this.sessions.cleanupWorktree(task.id);
         this.cascadePhaseOutcome(task, "failed", safeRationale);
@@ -972,6 +975,7 @@ export class Orchestrator {
             taskId: task.id,
             reason: `Rebase conflict persists (${attempts} attempts)`,
             attempt: this.state.getTask(task.id)?.retryCount ?? 0,
+            terminal: true,
           });
         } else {
           this.state.transition(task.id, "shelved");
@@ -990,21 +994,21 @@ export class Orchestrator {
         this.state.updateTask(task.id, {
           lastError: `Tests failed: ${mergeResult.error}`,
         });
-        this.emit({ type: "task_failed", taskId: task.id, reason: `Tests failed`, attempt: this.state.getTask(task.id)?.retryCount ?? 0 });
+        this.emit({ type: "task_failed", taskId: task.id, reason: `Tests failed`, attempt: this.state.getTask(task.id)?.retryCount ?? 0, terminal: true });
         this.sessions.cleanupWorktree(task.id);
         break;
 
       case "test_timeout":
         this.state.transition(task.id, "failed");
         this.state.updateTask(task.id, { lastError: "Test timeout" });
-        this.emit({ type: "task_failed", taskId: task.id, reason: "Test timeout", attempt: this.state.getTask(task.id)?.retryCount ?? 0 });
+        this.emit({ type: "task_failed", taskId: task.id, reason: "Test timeout", attempt: this.state.getTask(task.id)?.retryCount ?? 0, terminal: true });
         this.sessions.cleanupWorktree(task.id);
         break;
 
       case "error":
         this.state.transition(task.id, "failed");
         this.state.updateTask(task.id, { lastError: mergeResult.error });
-        this.emit({ type: "task_failed", taskId: task.id, reason: mergeResult.error, attempt: this.state.getTask(task.id)?.retryCount ?? 0 });
+        this.emit({ type: "task_failed", taskId: task.id, reason: mergeResult.error, attempt: this.state.getTask(task.id)?.retryCount ?? 0, terminal: true });
         this.sessions.cleanupWorktree(task.id);
         break;
     }
@@ -1114,6 +1118,7 @@ export class Orchestrator {
           taskId: task.id,
           reason: "review_arbitration_resumed_after_crash — operator must restart the phase",
           attempt: this.state.getTask(task.id)?.retryCount ?? 0,
+          terminal: true,
         });
       }
       // Shelved tasks get retried (worktree already cleaned on shelve path)
@@ -1137,6 +1142,7 @@ export class Orchestrator {
             taskId: task.id,
             reason: "merging_recovery_worktree_missing",
             attempt: this.state.getTask(task.id)?.retryCount ?? 0,
+            terminal: true,
           });
           continue;
         }
@@ -1151,6 +1157,7 @@ export class Orchestrator {
             taskId: task.id,
             reason: "max_recovery_attempts_exceeded",
             attempt: this.state.getTask(task.id)?.retryCount ?? 0,
+            terminal: true,
           });
           continue;
         }

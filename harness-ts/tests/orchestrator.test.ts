@@ -389,7 +389,13 @@ describe("Orchestrator", () => {
       await orch.processTask(task);
 
       expect(state.getTask("fail-1")!.state).toBe("failed");
-      expect(events.some((e) => e.type === "task_failed")).toBe(true);
+      const failedEvent = events.find((e) => e.type === "task_failed");
+      expect(failedEvent).toBeTruthy();
+      // M7 fix: retry-exhaustion path must mark terminal: true so notifier
+      // pings the operator regardless of operator-overridden max_session_retries.
+      if (failedEvent && failedEvent.type === "task_failed") {
+        expect(failedEvent.terminal).toBe(true);
+      }
     });
 
     it("fails task when no completion signal (after retries exhausted)", async () => {

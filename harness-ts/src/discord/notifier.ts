@@ -269,10 +269,10 @@ const CHAIN_RULES: Partial<Record<EventType, ChainRule>> = {
 // ping. Without `operator_user_id` configured on DiscordConfig, behavior
 // degrades silently (no prepend, no ping; body unchanged).
 //
-// `task_failed` is conditionally included based on `attempt` — see
-// `needsOperatorMention` helper. Earlier attempts are followed by
-// `retry_scheduled` (suppressed) — operator doesn't need to act until the
-// terminal attempt fires.
+// `task_failed` is conditionally included based on the optional `terminal`
+// field — see `needsOperatorMention` helper. Non-terminal mid-retry failures
+// (followed by `retry_scheduled`, suppressed) omit the flag — operator
+// doesn't need to act until the terminal attempt fires.
 const ALWAYS_OPERATOR_ATTENTION: ReadonlySet<OrchestratorEvent["type"]> = new Set([
   "escalation_needed",
   "review_arbitration_entered",
@@ -284,11 +284,14 @@ const ALWAYS_OPERATOR_ATTENTION: ReadonlySet<OrchestratorEvent["type"]> = new Se
 
 function needsOperatorMention(event: OrchestratorEvent): boolean {
   if (ALWAYS_OPERATOR_ATTENTION.has(event.type)) return true;
-  // task_failed with attempt >= 3 (terminal) gets ping; earlier attempts are
-  // followed by retry_scheduled (now suppressed) — operator doesn't need to act.
+  // task_failed pings only on terminal failure. Orchestrator sets terminal: true
+  // when emitting at retry exhaustion / crash-recovery exhaustion / circuit
+  // breaker — non-terminal mid-retry failures (followed by retry_scheduled)
+  // omit the field. Reading the field directly avoids the previous hardcoded
+  // `attempt >= 3` threshold which broke when operators overrode
+  // `pipeline.max_session_retries`.
   if (event.type === "task_failed") {
-    const attempt = (event as { attempt?: number }).attempt;
-    return typeof attempt === "number" && attempt >= 3;
+    return event.terminal === true;
   }
   return false;
 }
