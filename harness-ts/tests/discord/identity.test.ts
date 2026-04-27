@@ -68,6 +68,23 @@ function makeEvent(type: OrchestratorEvent["type"]): OrchestratorEvent {
       return { type, projectId: "p1", currentCostUsd: 9.0, ceilingUsd: 10.0 };
     case "compaction_fired":
       return { type, projectId: "p1", generation: 1 };
+    case "session_stalled":
+      return {
+        type,
+        taskId: "t1",
+        tier: "executor",
+        lastActivityAt: 0,
+        stalledForMs: 0,
+        aborted: false,
+      };
+    case "nudge_check":
+      return {
+        type,
+        projectId: "p1",
+        sourceAgent: "orchestrator",
+        status: "stagnant",
+        observations: [],
+      };
   }
 }
 
@@ -100,6 +117,11 @@ const CASES: Array<[OrchestratorEvent["type"], IdentityRole]> = [
   ["review_mandatory", "reviewer"],
   ["budget_ceiling_reached", "orchestrator"],
   ["compaction_fired", "architect"],
+  ["session_stalled", "orchestrator"],
+  // Wave E-δ commit-1 — placeholder arm returns "orchestrator". Commit-2a
+  // wires `event.sourceAgent` so each of the four sourceAgent variants
+  // resolves to its matching role.
+  ["nudge_check", "orchestrator"],
 ];
 
 describe("resolveIdentity", () => {

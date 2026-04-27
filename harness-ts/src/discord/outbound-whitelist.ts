@@ -1,12 +1,14 @@
 /**
  * Wave E-γ — outbound LLM whitelist.
  *
- * 9 (event.type, role) tuples eligible for LLM voice transformation. Strict
- * subset of the 27-event allow-list × 4 roles. Per harness-ts I-4 (verbatim
+ * 13 (event.type, role) tuples eligible for LLM voice transformation. Strict
+ * subset of the 28-event allow-list × 4 roles. Per harness-ts I-4 (verbatim
  * source-of-truth), keys are taken verbatim from the OrchestratorEvent union
- * at `src/orchestrator.ts:107-137`. The plan document mentioned
+ * at `src/orchestrator.ts:107-140`. The plan document mentioned
  * `architect_decomposed`, but no such event exists — the verbatim name is
  * `project_decomposed` (with `architect` as the speaking role).
+ *
+ * Wave E-δ extension: +4 `nudge_check::*` tuples (one per sourceAgent value).
  */
 
 import type { OrchestratorEvent } from "../orchestrator.js";
@@ -27,6 +29,11 @@ export const OUTBOUND_LLM_WHITELIST: ReadonlySet<string> = new Set([
   // Orchestrator identity
   "escalation_needed::orchestrator",
   "merge_result::orchestrator",
+  // Wave E-δ — periodic nudge_check, one tuple per sourceAgent value
+  "nudge_check::architect",
+  "nudge_check::reviewer",
+  "nudge_check::executor",
+  "nudge_check::orchestrator",
 ]);
 
 export function isOutboundLlmEligible(

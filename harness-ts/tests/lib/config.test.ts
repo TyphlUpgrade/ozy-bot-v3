@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { loadConfig, loadSystemPrompt, DISCORD_REPLY_THREADING_DEFAULTS, OUTBOUND_EPISTLE_DEFAULTS, DISCORD_AGENT_DEFAULTS } from "../../src/lib/config.js";
+import { loadConfig, loadSystemPrompt, DISCORD_REPLY_THREADING_DEFAULTS, OUTBOUND_EPISTLE_DEFAULTS, DISCORD_AGENT_DEFAULTS, NUDGE_DEFAULTS } from "../../src/lib/config.js";
 
 const VALID_TOML = `
 [project]
@@ -259,6 +259,49 @@ avatar_url = "https://example.com/avatar.png"
   it("Wave E-γ OUTBOUND_EPISTLE_DEFAULTS exports documented values", () => {
     expect(OUTBOUND_EPISTLE_DEFAULTS.outbound_epistle_enabled).toBe(false);
     expect(OUTBOUND_EPISTLE_DEFAULTS.llm_daily_cap_usd).toBe(5.0);
+  });
+
+  it("Wave E-δ parses [discord] nudge_enabled + nudge_interval_ms", () => {
+    const toml = `
+[project]
+name = "test-project"
+root = "."
+task_dir = "state/tasks"
+state_file = "state/pipeline.json"
+worktree_base = "/tmp/worktrees"
+session_dir = "/tmp/sessions"
+
+[pipeline]
+test_command = "npm test"
+
+[discord]
+bot_token_env = "DISCORD_TOKEN"
+dev_channel = "dev"
+ops_channel = "ops"
+escalation_channel = "escalations"
+nudge_enabled = true
+nudge_interval_ms = 300000
+
+[discord.agents.executor]
+name = "test-bot"
+avatar_url = "https://example.com/avatar.png"
+`;
+    const path = writeTempToml(toml);
+    const config = loadConfig(path);
+    expect(config.discord.nudge_enabled).toBe(true);
+    expect(config.discord.nudge_interval_ms).toBe(300_000);
+  });
+
+  it("Wave E-δ leaves nudge_enabled + nudge_interval_ms undefined when absent", () => {
+    const path = writeTempToml(VALID_TOML);
+    const config = loadConfig(path);
+    expect(config.discord.nudge_enabled).toBeUndefined();
+    expect(config.discord.nudge_interval_ms).toBeUndefined();
+  });
+
+  it("Wave E-δ NUDGE_DEFAULTS exports documented values (off + 10 min)", () => {
+    expect(NUDGE_DEFAULTS.nudge_enabled).toBe(false);
+    expect(NUDGE_DEFAULTS.nudge_interval_ms).toBe(600_000);
   });
 
   // Channel-collapse plumbing (2026-04-27).

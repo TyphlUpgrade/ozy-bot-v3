@@ -34,7 +34,11 @@ export type ResponseKind =
   | "relay_generic_error"
   | "no_record_of_message"
   | "unknown_intent"
-  | "ambiguous_resolution";
+  | "ambiguous_resolution"
+  // Wave E-δ MR3 / H3 fix — distinct from `no_session` (architect-relay
+  // failure). Used by reviewer/executor mention branches where there is no
+  // long-running session to relay to in the first place.
+  | "no_active_role";
 
 export interface ResponseInput {
   /** What kind of action just took place (intent type, error reason, etc). */
@@ -125,6 +129,17 @@ export function renderStaticTemplate(input: ResponseInput): string {
         "Multiple/no active projects — reply to a specific agent's message or " +
         "use `!project` commands to disambiguate."
       );
+    case "no_active_role": {
+      const pid = f.projectId ?? "<unknown>";
+      const agentName = f.agentName ?? "agent";
+      // Wave E-δ — distinct from `no_session` (Architect-relay-failure).
+      // Used by reviewer/executor mention branches where no long-running
+      // session exists to relay to in the first place.
+      return (
+        `No active ${agentName} session for project \`${pid}\` — operator ` +
+        `input dropped.`
+      );
+    }
   }
 }
 

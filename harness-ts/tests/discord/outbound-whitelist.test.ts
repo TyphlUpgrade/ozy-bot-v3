@@ -1,9 +1,9 @@
 /**
- * Wave E-γ — outbound-whitelist tests.
+ * Wave E-γ + E-δ — outbound-whitelist tests.
  *
- * AC3 hard assertion: exactly 9 tuples. Verified that no tuple references
- * `architect_decomposed` (a non-existent event type — the verbatim source-of-
- * truth is `project_decomposed`).
+ * AC3 hard assertion: exactly 13 tuples (9 baseline + 4 nudge_check::*).
+ * Verified that no tuple references `architect_decomposed` (a non-existent
+ * event type — the verbatim source-of-truth is `project_decomposed`).
  */
 
 import { describe, it, expect } from "vitest";
@@ -21,7 +21,7 @@ const ALL_ROLES: readonly OutboundRole[] = [
   "orchestrator",
 ];
 
-// Verbatim event types from src/orchestrator.ts:107-137 — used for shape checks.
+// Verbatim event types from src/orchestrator.ts:107-140 — used for shape checks.
 const KNOWN_EVENT_TYPES = new Set<string>([
   "task_picked_up",
   "session_complete",
@@ -51,11 +51,12 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "review_mandatory",
   "budget_ceiling_reached",
   "compaction_fired",
+  "nudge_check",
 ]);
 
 describe("OUTBOUND_LLM_WHITELIST", () => {
-  it("AC3 hard assertion: contains exactly 9 tuples", () => {
-    expect(OUTBOUND_LLM_WHITELIST.size).toBe(9);
+  it("Wave E-δ assertion: contains exactly 13 tuples (9 + 4 nudge_check)", () => {
+    expect(OUTBOUND_LLM_WHITELIST.size).toBe(13);
   });
 
   it("every key is `<eventType>::<role>` with both halves verbatim", () => {
@@ -78,7 +79,7 @@ describe("OUTBOUND_LLM_WHITELIST", () => {
     expect(OUTBOUND_LLM_WHITELIST.has("project_decomposed::architect")).toBe(true);
   });
 
-  it("includes the 9 documented tuples per plan D5 (with project_decomposed correction)", () => {
+  it("includes the 13 documented tuples per plan D5 + E-δ N5 (project_decomposed correction)", () => {
     const expected = [
       "session_complete::executor",
       "task_done::executor",
@@ -89,10 +90,22 @@ describe("OUTBOUND_LLM_WHITELIST", () => {
       "arbitration_verdict::architect",
       "escalation_needed::orchestrator",
       "merge_result::orchestrator",
+      // Wave E-δ N5 — periodic nudge_check, one per sourceAgent value
+      "nudge_check::architect",
+      "nudge_check::reviewer",
+      "nudge_check::executor",
+      "nudge_check::orchestrator",
     ];
     for (const tuple of expected) {
       expect(OUTBOUND_LLM_WHITELIST.has(tuple)).toBe(true);
     }
+  });
+
+  it("Wave E-δ N5: includes one nudge_check tuple per sourceAgent value", () => {
+    expect(OUTBOUND_LLM_WHITELIST.has("nudge_check::architect")).toBe(true);
+    expect(OUTBOUND_LLM_WHITELIST.has("nudge_check::reviewer")).toBe(true);
+    expect(OUTBOUND_LLM_WHITELIST.has("nudge_check::executor")).toBe(true);
+    expect(OUTBOUND_LLM_WHITELIST.has("nudge_check::orchestrator")).toBe(true);
   });
 });
 

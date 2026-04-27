@@ -134,7 +134,10 @@ export type OrchestratorEvent =
   | { type: "review_arbitration_entered"; taskId: string; projectId: string; reviewerRejectionCount: number }
   | { type: "review_mandatory"; taskId: string; projectId: string; reviewSummary?: string; reviewFindings?: import("./gates/review.js").ReviewFinding[] }
   | { type: "budget_ceiling_reached"; projectId: string; currentCostUsd: number; ceilingUsd: number }
-  | { type: "compaction_fired"; projectId: string; generation: number };
+  | { type: "compaction_fired"; projectId: string; generation: number }
+  // Wave E-δ — periodic introspection event emitted by NudgeIntrospector. Additive
+  // optional `projectId` (orchestrator-perspective nudges may be project-agnostic).
+  | { type: "nudge_check"; projectId?: string; sourceAgent: "architect" | "reviewer" | "executor" | "orchestrator"; status: "stagnant" | "progressing" | "blocked"; observations: string[]; nextAction?: string };
 
 export class Orchestrator {
   private readonly sessions: SessionManager;

@@ -84,6 +84,16 @@ export const OUTBOUND_EPISTLE_DEFAULTS = {
   llm_daily_cap_usd: 5.0,
 } as const;
 
+/**
+ * Wave E-δ — NudgeIntrospector defaults. The flag is OFF by default; commit
+ * 2b wires the consumer at bootstrap. `nudge_interval_ms` is the periodic
+ * timer interval (default 10 min).
+ */
+export const NUDGE_DEFAULTS = {
+  nudge_enabled: false,
+  nudge_interval_ms: 600_000,
+} as const;
+
 export interface DiscordConfig {
   bot_token_env: string;
   dev_channel: string;
@@ -118,6 +128,16 @@ export interface DiscordConfig {
    * operator ping for attention rather than separate escalation_channel.
    */
   operator_user_id?: string;
+  /**
+   * Wave E-δ N7 — when true, NudgeIntrospector is constructed and started at
+   * bootstrap. Default false — operator opts in. Commit 2b wires consumer.
+   */
+  nudge_enabled?: boolean;
+  /**
+   * Wave E-δ N7 — periodic timer interval. Default 600_000 (10 min). Min
+   * 60_000 enforced at construction (commit 2b).
+   */
+  nudge_interval_ms?: number;
 }
 
 export interface ReviewerConfig {
@@ -349,6 +369,14 @@ function parseDiscord(raw: Record<string, unknown>): DiscordConfig {
   // wires the per-event mention prepend + allowedMentions override.
   const operatorUserId = optionalString(raw, "operator_user_id");
   if (operatorUserId) cfg.operator_user_id = operatorUserId;
+  // Wave E-δ — flat optional fields under [discord]. Block absent → undefined
+  // (consumer applies NUDGE_DEFAULTS). Snake_case to match TOML convention.
+  if (typeof raw.nudge_enabled === "boolean") {
+    cfg.nudge_enabled = raw.nudge_enabled;
+  }
+  if (typeof raw.nudge_interval_ms === "number") {
+    cfg.nudge_interval_ms = raw.nudge_interval_ms;
+  }
   return cfg;
 }
 

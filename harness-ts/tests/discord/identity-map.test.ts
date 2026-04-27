@@ -71,3 +71,48 @@ describe("buildIdentityMap", () => {
     expect(a.lookup("Executor")).toBe(b.lookup("Executor"));
   });
 });
+
+// Wave E-δ MR3 — IdentityMap.lookupRole.
+describe("IdentityMap.lookupRole (Wave E-δ MR3)", () => {
+  const map = buildIdentityMap(
+    configWithAgents({
+      architect: { name: "Architect", avatar_url: "" },
+    }),
+  );
+
+  it("returns the matching IdentityRole for each of the four role literals", () => {
+    expect(map.lookupRole("architect")).toBe("architect");
+    expect(map.lookupRole("reviewer")).toBe("reviewer");
+    expect(map.lookupRole("executor")).toBe("executor");
+    expect(map.lookupRole("orchestrator")).toBe("orchestrator");
+  });
+
+  it("is case-insensitive", () => {
+    expect(map.lookupRole("Architect")).toBe("architect");
+    expect(map.lookupRole("REVIEWER")).toBe("reviewer");
+    expect(map.lookupRole("eXeCuToR")).toBe("executor");
+  });
+
+  it("trims whitespace before comparing", () => {
+    expect(map.lookupRole("  architect  ")).toBe("architect");
+  });
+
+  it("returns null for unknown / mistyped names", () => {
+    expect(map.lookupRole("reviewr")).toBeNull(); // common typo
+    expect(map.lookupRole("operator")).toBeNull(); // not a role per IdentityRole
+    expect(map.lookupRole("")).toBeNull();
+    expect(map.lookupRole("random")).toBeNull();
+  });
+
+  it("does not consult DiscordConfig.agents — the agent KEY itself is the role", () => {
+    // Even with a custom-named agent, lookupRole still maps from the role
+    // literal itself, not the agent's display name.
+    const m = buildIdentityMap(
+      configWithAgents({
+        architect: { name: "GandalfTheGrey", avatar_url: "" },
+      }),
+    );
+    expect(m.lookupRole("architect")).toBe("architect");
+    expect(m.lookupRole("GandalfTheGrey")).toBeNull();
+  });
+});

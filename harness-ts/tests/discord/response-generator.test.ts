@@ -110,6 +110,7 @@ describe("StaticResponseGenerator", () => {
     "no_record_of_message",
     "unknown_intent",
     "ambiguous_resolution",
+    "no_active_role",
   ];
 
   it("returns a non-empty string for every kind", async () => {
@@ -136,6 +137,30 @@ describe("StaticResponseGenerator", () => {
     expect(renderStaticTemplate({ kind: "queue_full", operatorMessage: "" })).toMatch(/queue is full/);
     expect(renderStaticTemplate({ kind: "ambiguous_resolution", operatorMessage: "" })).toMatch(/Multiple\/no active projects/);
     expect(renderStaticTemplate({ kind: "no_record_of_message", operatorMessage: "" })).toMatch(/no record of that message/);
+  });
+
+  // Wave E-δ MR3 / H3 — `no_active_role` distinct from `no_session` (the
+  // latter is Architect-relay-failure specific copy).
+  it("Wave E-δ no_active_role: renders agentName + projectId with operator-input-dropped phrasing", () => {
+    const out = renderStaticTemplate({
+      kind: "no_active_role",
+      operatorMessage: "ping",
+      fields: { projectId: "proj-Z", agentName: "reviewer" },
+    });
+    expect(out).toContain("reviewer");
+    expect(out).toContain("`proj-Z`");
+    expect(out).toContain("operator input dropped");
+    // Not the architect-relay-failure copy.
+    expect(out).not.toMatch(/no live Architect session/);
+  });
+
+  it("Wave E-δ no_active_role: handles missing fields with sane fallbacks", () => {
+    const out = renderStaticTemplate({
+      kind: "no_active_role",
+      operatorMessage: "",
+    });
+    expect(out).toContain("agent");
+    expect(out).toContain("<unknown>");
   });
 });
 
@@ -205,6 +230,7 @@ describe("LlmResponseGenerator runtime", () => {
         "no_record_of_message",
         "unknown_intent",
         "ambiguous_resolution",
+        "no_active_role",
       ];
       const { sdk } = makeMockSdk(
         kinds.map((k) => ({ result: `friendly reply for ${k}`, success: true, totalCostUsd: 0.001 })),
