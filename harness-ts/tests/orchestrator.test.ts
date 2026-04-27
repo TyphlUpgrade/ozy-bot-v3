@@ -1593,7 +1593,12 @@ describe("Orchestrator — Wave A review gate + arbitration wiring", () => {
     state.updateTask("t-warn-no", { projectId: "proj" }); // count 0 → becomes 1, below threshold 3
     const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     await orch.processTask(state.getTask("t-warn-no")!);
-    expect(consoleSpy).not.toHaveBeenCalled(); // no arbitration yet
+    // Filter out unrelated enrichment-missing warnings from readCompletion (test
+    // fixtures intentionally omit Phase 2A enrichment); assert no arbitration warn.
+    const arbitrationCalls = consoleSpy.mock.calls.filter((c) =>
+      typeof c[0] === "string" && /arbitration/i.test(c[0]),
+    );
+    expect(arbitrationCalls).toHaveLength(0);
     consoleSpy.mockRestore();
   });
 });

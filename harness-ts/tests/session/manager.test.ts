@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync, utimesSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { SessionManager, type GitOps, type TmuxOps, type CompletionSignal } from "../../src/session/manager.js";
@@ -575,6 +575,83 @@ describe("SessionManager", () => {
       expect(result!.assumptions).toEqual(["valid string", "another valid"]);
       rmSync(dir, { recursive: true, force: true });
     });
+
+    it("U3: warns when success completion missing enrichment fields (caveman drop guard)", () => {
+      const dir = makeTmpDir();
+      mkdirSync(join(dir, ".harness"), { recursive: true });
+      writeFileSync(
+        join(dir, ".harness", "completion.json"),
+        JSON.stringify({
+          status: "success",
+          summary: "no enrichment",
+          filesChanged: ["a.ts"],
+          // missing: commitSha, understanding, assumptions, nonGoals, confidence
+        }),
+      );
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const { mgr } = makeManager();
+      const result = mgr.readCompletion(dir);
+      expect(result).not.toBeNull();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const msg = warnSpy.mock.calls[0][0] as string;
+      expect(msg).toMatch(/missing enrichment fields:/);
+      expect(msg).toMatch(/commitSha/);
+      expect(msg).toMatch(/understanding/);
+      expect(msg).toMatch(/assumptions/);
+      expect(msg).toMatch(/nonGoals/);
+      expect(msg).toMatch(/confidence/);
+      warnSpy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("U3: does NOT warn when failure completion missing enrichment", () => {
+      const dir = makeTmpDir();
+      mkdirSync(join(dir, ".harness"), { recursive: true });
+      writeFileSync(
+        join(dir, ".harness", "completion.json"),
+        JSON.stringify({
+          status: "failure",
+          summary: "build broken",
+          filesChanged: [],
+        }),
+      );
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const { mgr } = makeManager();
+      mgr.readCompletion(dir);
+      expect(warnSpy).not.toHaveBeenCalled();
+      warnSpy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("U3: does NOT warn when all enrichment fields present", () => {
+      const dir = makeTmpDir();
+      mkdirSync(join(dir, ".harness"), { recursive: true });
+      writeFileSync(
+        join(dir, ".harness", "completion.json"),
+        JSON.stringify({
+          status: "success",
+          commitSha: "abc123",
+          summary: "full",
+          filesChanged: ["a.ts"],
+          understanding: "...",
+          assumptions: ["x"],
+          nonGoals: ["y"],
+          confidence: {
+            scopeClarity: "clear",
+            designCertainty: "obvious",
+            assumptions: [],
+            openQuestions: [],
+            testCoverage: "verifiable",
+          },
+        }),
+      );
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const { mgr } = makeManager();
+      mgr.readCompletion(dir);
+      expect(warnSpy).not.toHaveBeenCalled();
+      warnSpy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    });
   });
 
   describe("abort", () => {
@@ -669,11 +746,12 @@ describe("SessionManager", () => {
       expect(opts.persistSession).toBe(true);
       // hooks defense: always empty object
       expect(opts.hooks).toEqual({});
-      // default plugins merged
+      // default plugins merged — both default OFF on Executor per spike-caveman-json (U1)
+      // and spike-omc-overhead (U2). See manager.ts DEFAULT_PLUGINS comment block.
       expect(opts.settings).toBeDefined();
       const plugins = (opts.settings as { enabledPlugins: Record<string, boolean> }).enabledPlugins;
-      expect(plugins["oh-my-claudecode@omc"]).toBe(true);
-      expect(plugins["caveman@caveman"]).toBe(true);
+      expect(plugins["oh-my-claudecode@omc"]).toBe(false);
+      expect(plugins["caveman@caveman"]).toBe(false);
     });
 
     it("Item 1: config plugins override defaults per-entry", async () => {
@@ -684,8 +762,8 @@ describe("SessionManager", () => {
       const state = new StateManager(join(tmpDir, "state.json"));
       const config = makeConfig();
       config.pipeline.plugins = {
-        "caveman@caveman": false, // override default
-        "custom-plugin@scope": true, // add new
+        "caveman@caveman": true,      // override default OFF → ON
+        "custom-plugin@scope": true,  // add new
       };
       const mgr = new SessionManager(sdk, state, config, mockGitOps());
 
@@ -694,8 +772,8 @@ describe("SessionManager", () => {
 
       const opts = (queryFn as ReturnType<typeof vi.fn>).mock.calls[0][0].options;
       const plugins = (opts.settings as { enabledPlugins: Record<string, boolean> }).enabledPlugins;
-      expect(plugins["oh-my-claudecode@omc"]).toBe(true);      // default preserved
-      expect(plugins["caveman@caveman"]).toBe(false);           // overridden
+      expect(plugins["oh-my-claudecode@omc"]).toBe(false);     // default OFF preserved
+      expect(plugins["caveman@caveman"]).toBe(true);            // overridden ON
       expect(plugins["custom-plugin@scope"]).toBe(true);        // added
     });
 
@@ -937,6 +1015,51 @@ describe("SessionManager", () => {
       }
       expect(warnSpy.mock.calls.filter((c) => /persistent-session count/.test(c[0] as string))).toHaveLength(0);
       warnSpy.mockRestore();
+    });
+
+    it("pruneSessionDir: silent no-op when session_dir missing", () => {
+      const { mgr } = makeManager();
+      // Default tmpDir has no sessions/ subdir.
+      expect(mgr.pruneSessionDir()).toBe(0);
+    });
+
+    it("pruneSessionDir: deletes files older than maxAgeMs, keeps newer", () => {
+      const { mgr, config } = makeManager();
+      mkdirSync(config.project.session_dir, { recursive: true });
+      const oldPath = join(config.project.session_dir, "old.json");
+      const newPath = join(config.project.session_dir, "new.json");
+      writeFileSync(oldPath, "{}");
+      writeFileSync(newPath, "{}");
+      // Backdate old.json to 10 days ago.
+      const tenDaysAgo = Date.now() - 10 * 24 * 60 * 60 * 1000;
+      utimesSync(oldPath, tenDaysAgo / 1000, tenDaysAgo / 1000);
+
+      const deleted = mgr.pruneSessionDir({ maxAgeMs: 7 * 24 * 60 * 60 * 1000 });
+      expect(deleted).toBe(1);
+      expect(existsSync(oldPath)).toBe(false);
+      expect(existsSync(newPath)).toBe(true);
+    });
+
+    it("pruneSessionDir: maxRecords keeps only N most recent", () => {
+      const { mgr, config } = makeManager();
+      mkdirSync(config.project.session_dir, { recursive: true });
+      const paths: string[] = [];
+      for (let i = 0; i < 5; i++) {
+        const p = join(config.project.session_dir, `s${i}.json`);
+        writeFileSync(p, "{}");
+        // Stagger mtime so order is deterministic.
+        const ts = (Date.now() - (5 - i) * 1000) / 1000;
+        utimesSync(p, ts, ts);
+        paths.push(p);
+      }
+      const deleted = mgr.pruneSessionDir({ maxRecords: 2, maxAgeMs: 24 * 60 * 60 * 1000 });
+      // Keeps 2 newest (s4, s3); deletes s0, s1, s2.
+      expect(deleted).toBe(3);
+      expect(existsSync(paths[0])).toBe(false);
+      expect(existsSync(paths[1])).toBe(false);
+      expect(existsSync(paths[2])).toBe(false);
+      expect(existsSync(paths[3])).toBe(true);
+      expect(existsSync(paths[4])).toBe(true);
     });
   });
 });

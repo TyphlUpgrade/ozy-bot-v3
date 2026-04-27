@@ -3,7 +3,7 @@
  * Delegates SDK interaction to SDKClient.
  */
 
-import { existsSync, readFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 import type { Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -99,6 +99,18 @@ function validateCompletion(raw: unknown): CompletionSignal | null {
   return signal;
 }
 
+/** Phase 2A enrichment fields the Executor should populate on success.
+ * Used by `readCompletion` to surface silent omission via console.warn. */
+function listMissingEnrichment(signal: CompletionSignal): string[] {
+  const missing: string[] = [];
+  if (signal.commitSha === undefined) missing.push("commitSha");
+  if (signal.understanding === undefined) missing.push("understanding");
+  if (signal.assumptions === undefined) missing.push("assumptions");
+  if (signal.nonGoals === undefined) missing.push("nonGoals");
+  if (signal.confidence === undefined) missing.push("confidence");
+  return missing;
+}
+
 // --- Git helpers (injectable for testing) ---
 
 export interface GitOps {
@@ -176,13 +188,20 @@ const DEFAULT_DISALLOWED_TOOLS: readonly string[] = [
   "ScheduleWakeup",
 ];
 
-/** Plugins loaded by default for every session. Operator overrides via config.pipeline.plugins.
+/** Plugins loaded by default for every Executor session. Operator overrides via config.pipeline.plugins.
  * Key format: `plugin-name@marketplace` (Claude Code plugin registry convention).
- * `oh-my-claudecode@omc` loads OMC agents/skills; `caveman@caveman` applies cost-compression.
+ *
+ * Both default OFF based on spike-caveman-json (U1) + spike-omc-overhead (U2):
+ * - `caveman@caveman: false` — caveman drops "filler" JSON fields; spike showed 87.5%
+ *   top-field preservation (5/5 runs missed `commitSha`). Threshold ≥95% failed.
+ * - `oh-my-claudecode@omc: false` — OMC adds ~25% spawn wall-time without specialist
+ *   invocation on single-mode Executors. Spike showed 25% wall reduction OFF.
+ *
+ * Architect retains OMC+caveman via ARCHITECT_DEFAULTS.plugins (decomposer uses subagents).
  */
 const DEFAULT_PLUGINS: Readonly<Record<string, boolean>> = {
-  "oh-my-claudecode@omc": true,
-  "caveman@caveman": true,
+  "oh-my-claudecode@omc": false,
+  "caveman@caveman": false,
 };
 
 // --- Active session tracking ---
@@ -294,6 +313,60 @@ export class SessionManager {
   }
 
   /**
+   * Prune SDK session records under `config.project.session_dir`.
+   *
+   * Per M.15.2 U4: every Executor + Architect spawn writes a `persistSession: true`
+   * record. Across a 100-phase project the dir grows unbounded — there is no SDK-side
+   * rotation. Operator should call this on `project_completed` or via cron.
+   *
+   * Default: delete top-level files older than 7 days. Caller may override with
+   * `maxAgeMs` (drop files older than N ms) or `maxRecords` (keep N most recent,
+   * delete rest). Both filters compose: a file matching either trigger is deleted.
+   *
+   * Returns the number of files deleted. Silent no-op when session_dir missing.
+   */
+  pruneSessionDir(opts: { maxAgeMs?: number; maxRecords?: number } = {}): number {
+    const dir = this.config.project.session_dir;
+    if (!existsSync(dir)) return 0;
+    const maxAgeMs = opts.maxAgeMs ?? 7 * 24 * 60 * 60 * 1000;
+    const maxRecords = opts.maxRecords;
+    const now = Date.now();
+
+    let entries: { path: string; mtimeMs: number }[];
+    try {
+      entries = readdirSync(dir)
+        .map((name) => ({
+          path: join(dir, name),
+          mtimeMs: statSync(join(dir, name)).mtimeMs,
+        }))
+        .filter((e) => statSync(e.path).isFile());
+    } catch {
+      return 0;
+    }
+
+    // Newest first so maxRecords keeps the most recent N.
+    entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+    const toDelete = new Set<string>();
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i];
+      if (now - e.mtimeMs > maxAgeMs) toDelete.add(e.path);
+      if (maxRecords !== undefined && i >= maxRecords) toDelete.add(e.path);
+    }
+
+    let deleted = 0;
+    for (const p of toDelete) {
+      try {
+        unlinkSync(p);
+        deleted++;
+      } catch {
+        // best-effort
+      }
+    }
+    return deleted;
+  }
+
+  /**
    * Spawn a task: create worktree, start SDK session, track it.
    * Returns the SessionResult when the session completes.
    */
@@ -398,14 +471,33 @@ export class SessionManager {
     return { result, completion };
   }
 
-  /** Read completion signal from worktree */
+  /** Read completion signal from worktree.
+   *
+   * On success, surfaces missing Phase 2A enrichment fields via console.warn so
+   * silent Executor omission is observable. Per spike-caveman-json (U1), the
+   * Executor under caveman dropped `commitSha` in 5/5 runs without surfacing.
+   * This warning is observability — the parser still accepts the completion
+   * because enrichment is technically optional in the schema.
+   */
   readCompletion(worktreePath: string): CompletionSignal | null {
     const completionPath = join(worktreePath, ".harness", "completion.json");
     if (!existsSync(completionPath)) return null;
 
     try {
       const raw = JSON.parse(readFileSync(completionPath, "utf-8"));
-      return validateCompletion(raw);
+      const signal = validateCompletion(raw);
+      if (signal && signal.status === "success") {
+        const missing = listMissingEnrichment(signal);
+        if (missing.length > 0) {
+          console.warn(
+            `WARN Executor completion at ${completionPath} missing enrichment ` +
+              `fields: ${missing.join(", ")}. ` +
+              `Phase 2A graduated response routing degrades without these. ` +
+              `Check Executor systemPrompt + plugin defaults (caveman drops "filler" fields).`,
+          );
+        }
+      }
+      return signal;
     } catch {
       return null;
     }
