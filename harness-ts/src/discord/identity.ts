@@ -62,10 +62,11 @@ export function resolveIdentity(event: OrchestratorEvent): IdentityRole {
     case "session_stalled":
       return "orchestrator";
 
-    // Wave E-δ commit-1 mechanical scope: placeholder arm for the new
-    // nudge_check variant so the exhaustive switch compiles. Commit-2a wires
-    // sourceAgent-derived identity (`return event.sourceAgent`).
+    // Wave E-δ commit 2a: identity is derived from `event.sourceAgent`. The
+    // sourceAgent literal union (`architect | reviewer | executor |
+    // orchestrator`) is co-extensive with `IdentityRole`, so the assignment is
+    // direct; no per-value mapping needed.
     case "nudge_check":
-      return "orchestrator";
+      return event.sourceAgent;
   }
 }

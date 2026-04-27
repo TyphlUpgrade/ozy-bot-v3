@@ -471,5 +471,42 @@ describe("NudgeIntrospector", () => {
     expect(e.type).toBe("nudge_check");
   });
 
-  it.todo("orchestrator integration — commit 2a wires emit + session_stalled forwarding");
+  // Wave E-δ commit 2a — integration: NudgeIntrospector → DiscordNotifier.
+  // Confirms the routing chain works end-to-end via a stub notifier (the
+  // introspector itself never imports discord — I-1 preserved).
+  it("integrates with notifier via emit callback (NudgeIntrospector → notifier.handleEvent)", async () => {
+    const FIXED_NOW = 1_000_000_000_000;
+    const dispatched: OrchestratorEvent[] = [];
+    // Stub notifier: matches the orchestrator wiring contract — introspector
+    // emits to a callback the orchestrator hands to it; the orchestrator
+    // forwards to notifier.handleEvent in production.
+    const stubNotifier = {
+      handleEvent(event: OrchestratorEvent) {
+        dispatched.push(event);
+      },
+    };
+    const projects = [
+      makeProject("P1", [{ id: "ph-1", state: "active", taskId: "t1" }]),
+    ];
+    const tasks = [makeTask("t1", "active", FIXED_NOW)];
+    const introspector = new NudgeIntrospector({
+      state: {
+        getTask: (id) => tasks.find((t) => t.id === id),
+        getAllTasks: () => tasks.slice(),
+      },
+      projectStore: {
+        getAllProjects: () => projects.slice(),
+        getProject: (id) => projects.find((p) => p.id === id),
+      },
+      emit: (e) => stubNotifier.handleEvent(e),
+      now: () => FIXED_NOW,
+    });
+    introspector.tick();
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]).toMatchObject({
+      type: "nudge_check",
+      projectId: "P1",
+      sourceAgent: "executor",
+    });
+  });
 });

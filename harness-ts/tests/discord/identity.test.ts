@@ -118,9 +118,10 @@ const CASES: Array<[OrchestratorEvent["type"], IdentityRole]> = [
   ["budget_ceiling_reached", "orchestrator"],
   ["compaction_fired", "architect"],
   ["session_stalled", "orchestrator"],
-  // Wave E-δ commit-1 — placeholder arm returns "orchestrator". Commit-2a
-  // wires `event.sourceAgent` so each of the four sourceAgent variants
-  // resolves to its matching role.
+  // Wave E-δ commit 2a — identity now derives from event.sourceAgent.
+  // The default `makeEvent("nudge_check")` factory uses sourceAgent="orchestrator"
+  // so the row-level fixture asserts that case here. The four-variant
+  // sourceAgent matrix is asserted in the dedicated describe block below.
   ["nudge_check", "orchestrator"],
 ];
 
@@ -128,5 +129,20 @@ describe("resolveIdentity", () => {
   it.each(CASES)("resolveIdentity(%s) = %s", (type, expected) => {
     const event = makeEvent(type);
     expect(resolveIdentity(event)).toBe(expected);
+  });
+});
+
+// Wave E-δ commit 2a — exhaustive sourceAgent matrix for nudge_check.
+describe("resolveIdentity(nudge_check) — sourceAgent passthrough", () => {
+  const SOURCE_AGENTS: Array<IdentityRole> = ["architect", "reviewer", "executor", "orchestrator"];
+  it.each(SOURCE_AGENTS)("nudge_check + sourceAgent=%s → returns %s", (sa) => {
+    const event: OrchestratorEvent = {
+      type: "nudge_check",
+      projectId: "p1",
+      sourceAgent: sa,
+      status: "stagnant",
+      observations: [],
+    };
+    expect(resolveIdentity(event)).toBe(sa);
   });
 });

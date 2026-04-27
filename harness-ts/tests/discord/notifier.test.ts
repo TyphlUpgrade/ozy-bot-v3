@@ -464,6 +464,150 @@ describe("DiscordNotifier", () => {
     // Every emission references the shortened projectId prefix "proj-xyz"
     for (const s of sent) expect(s.content).toMatch(/proj-xyz/);
   });
+
+  // --- Wave E-δ commit 2a — nudge_check routing + sourceAgent identity ---
+
+  it("nudge_check → dev_channel (channel-collapse)", async () => {
+    notifier.handleEvent({
+      type: "nudge_check",
+      projectId: "p-nudge",
+      sourceAgent: "executor",
+      status: "stagnant",
+      observations: ["no events in 12 min"],
+    });
+    await flush();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].channel).toBe("dev");
+  });
+
+  it("nudge_check renders Nudge Check header + per-status opener (stagnant)", async () => {
+    notifier.handleEvent({
+      type: "nudge_check",
+      projectId: "p-nudge",
+      sourceAgent: "executor",
+      status: "stagnant",
+      observations: ["no events in 12 min"],
+    });
+    await flush();
+    expect(sent[0].content).toContain("**Nudge Check**");
+    expect(sent[0].content).toMatch(/No progress on this in 12 min/);
+  });
+
+  it("nudge_check progressing opener absorbs 'last task' observation", async () => {
+    notifier.handleEvent({
+      type: "nudge_check",
+      projectId: "p-nudge",
+      sourceAgent: "executor",
+      status: "progressing",
+      observations: ["last task t1 done 4 min ago", "2 phases remaining"],
+    });
+    await flush();
+    expect(sent[0].content).toMatch(/Things are moving — last task t1 completed 4 min ago/);
+    // Two observations → also rendered as bullets
+    expect(sent[0].content).toContain("**Observations:**");
+    expect(sent[0].content).toContain("2 phases remaining");
+  });
+
+  it("nudge_check blocked opener uses nextAction when provided", async () => {
+    notifier.handleEvent({
+      type: "nudge_check",
+      projectId: "p-nudge",
+      sourceAgent: "reviewer",
+      status: "blocked",
+      observations: ["stuck in escalation_wait"],
+      nextAction: "operator must answer scope_unclear",
+    });
+    await flush();
+    expect(sent[0].content).toMatch(/Stuck — operator must answer scope_unclear/);
+  });
+
+  it("nudge_check blocked opener falls back to 'awaiting input' without nextAction", async () => {
+    notifier.handleEvent({
+      type: "nudge_check",
+      projectId: "p-nudge",
+      sourceAgent: "executor",
+      status: "blocked",
+      observations: ["stuck in escalation_wait"],
+    });
+    await flush();
+    expect(sent[0].content).toMatch(/Stuck — awaiting input/);
+  });
+
+  it("nudge_check identity reflects sourceAgent (architect)", async () => {
+    notifier.handleEvent({
+      type: "nudge_check",
+      projectId: "p",
+      sourceAgent: "architect",
+      status: "stagnant",
+      observations: [],
+    });
+    await flush();
+    expect(sent[0].identity?.username).toBe("Architect");
+  });
+
+  it("nudge_check identity reflects sourceAgent (reviewer)", async () => {
+    notifier.handleEvent({
+      type: "nudge_check",
+      projectId: "p",
+      sourceAgent: "reviewer",
+      status: "stagnant",
+      observations: [],
+    });
+    await flush();
+    expect(sent[0].identity?.username).toBe("Reviewer");
+  });
+
+  it("nudge_check identity reflects sourceAgent (executor)", async () => {
+    notifier.handleEvent({
+      type: "nudge_check",
+      projectId: "p",
+      sourceAgent: "executor",
+      status: "stagnant",
+      observations: [],
+    });
+    await flush();
+    expect(sent[0].identity?.username).toBe("Executor");
+  });
+
+  it("nudge_check identity reflects sourceAgent (orchestrator)", async () => {
+    notifier.handleEvent({
+      type: "nudge_check",
+      projectId: "p",
+      sourceAgent: "orchestrator",
+      status: "stagnant",
+      observations: [],
+    });
+    await flush();
+    expect(sent[0].identity?.username).toBe("Harness"); // DISCORD_AGENT_DEFAULTS.orchestrator.name
+  });
+
+  it("nudge_check section-header emoji matches sourceAgent (architect → 🏛️)", async () => {
+    notifier.handleEvent({
+      type: "nudge_check",
+      projectId: "p",
+      sourceAgent: "architect",
+      status: "stagnant",
+      observations: [],
+    });
+    await flush();
+    expect(sent[0].content).toContain("🏛️");
+    expect(sent[0].content).toContain("**Nudge Check**");
+  });
+
+  it("nudge_check does NOT prepend operator mention even when operator_user_id set", async () => {
+    const cfgWithOp: DiscordConfig = { ...baseConfig(), operator_user_id: "111" };
+    const f = makeFakeSender();
+    const n = new DiscordNotifier(f.sender, cfgWithOp);
+    n.handleEvent({
+      type: "nudge_check",
+      projectId: "p",
+      sourceAgent: "executor",
+      status: "stagnant",
+      observations: ["no events in 5 min"],
+    });
+    await flush();
+    expect(f.sent[0].content).not.toContain("<@111>");
+  });
 });
 
 // --- Sanitization helpers (unit-level) ---

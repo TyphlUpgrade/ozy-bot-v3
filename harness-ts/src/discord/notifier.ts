@@ -43,7 +43,11 @@ function truncateBody(body: string, max = 1900): string {
 }
 
 type ChannelKey = "dev_channel" | "ops_channel" | "escalation_channel";
-type IdentityKey = "orchestrator" | "architect" | "reviewer" | "executor";
+// `"dynamic"` (Wave E-δ commit 2a) is a sentinel used by NOTIFIER_MAP entries
+// whose identity must be resolved per-event from event-internal data (e.g.
+// nudge_check reads `event.sourceAgent`) instead of a static role. The dispatch
+// path detects the sentinel and falls through to `resolveIdentityRole(event)`.
+type IdentityKey = "orchestrator" | "architect" | "reviewer" | "executor" | "dynamic";
 type EventType = OrchestratorEvent["type"];
 type EventByType<K extends EventType> = Extract<OrchestratorEvent, { type: K }>;
 
@@ -219,6 +223,17 @@ const NOTIFIER_MAP: NotifierMap = {
     format: (e) =>
       `Session stalled (${e.tier}) on \`${shortTaskId(e.taskId)}\` after ${Math.round(e.stalledForMs / 1000)}s — ${e.aborted ? "aborted" : "still running"}`,
   },
+
+  // --- Wave E-δ — periodic introspection (commit 2a) ---
+  // nudge_check routes to dev_channel (channel-collapse policy). Identity uses
+  // the `"dynamic"` sentinel because the visible role/avatar must reflect
+  // `event.sourceAgent`, not a fixed role; `dispatch()` calls
+  // `resolveIdentityRole(event)` when it sees the sentinel.
+  nudge_check: {
+    channel: "dev_channel",
+    identity: "dynamic",
+    format: (e, ctx?) => renderEpistle(e, resolveIdentityRole(e), ctx ?? defaultCtx()),
+  },
 };
 
 // --- Wave E-β chain rules ---
@@ -259,6 +274,10 @@ const CHAIN_RULES: Partial<Record<EventType, ChainRule>> = {
   // Reviewer chain under executor head.
   review_mandatory: { replyToRole: "executor", registerRole: "reviewer" },
   review_arbitration_entered: { replyToRole: "executor", registerRole: "reviewer" },
+
+  // Wave E-δ commit 2a — nudge_check is standalone per E-δ plan §N6 / E-β
+  // §B5: informational self-narration, no reply chain, no role-head register.
+  nudge_check: { replyToRole: null, registerRole: null },
 };
 
 // --- Channel-collapse — operator-attention routing ---
@@ -442,7 +461,7 @@ export class DiscordNotifier {
     if (body === null) return;
 
     const channel = this.resolveChannel(entry.channel);
-    const identity = this.resolveIdentity(entry.identity);
+    const identity = this.resolveIdentityForEvent(entry.identity, event);
     const sender = this.resolveSender(channel);
     if (!sender) return;
 
@@ -650,7 +669,24 @@ export class DiscordNotifier {
   }
 
   private resolveIdentity(key: IdentityKey): AgentIdentity {
-    const cfg = this.agents[key] ?? DISCORD_AGENT_DEFAULTS[key];
+    // The `"dynamic"` sentinel must never reach this static lookup — callers
+    // must dispatch via `resolveIdentityForEvent`. Defensive fallback: behave
+    // as orchestrator if a future refactor regresses, so the bot doesn't crash.
+    const lookupKey = key === "dynamic" ? "orchestrator" : key;
+    const cfg = this.agents[lookupKey] ?? DISCORD_AGENT_DEFAULTS[lookupKey];
+    return { username: cfg.name, avatarURL: cfg.avatar_url };
+  }
+
+  /**
+   * Wave E-δ commit 2a — identity resolver that honors the `"dynamic"`
+   * IdentityKey sentinel. For static keys, delegates to `resolveIdentity`.
+   * For `"dynamic"`, calls `resolveIdentityRole(event)` (whose `nudge_check`
+   * arm reads `event.sourceAgent`) and looks up the resulting role.
+   */
+  private resolveIdentityForEvent(key: IdentityKey, event: OrchestratorEvent): AgentIdentity {
+    if (key !== "dynamic") return this.resolveIdentity(key);
+    const role = resolveIdentityRole(event);
+    const cfg = this.agents[role] ?? DISCORD_AGENT_DEFAULTS[role];
     return { username: cfg.name, avatarURL: cfg.avatar_url };
   }
 

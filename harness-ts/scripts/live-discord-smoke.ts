@@ -147,6 +147,18 @@ export const SMOKE_FIXTURES: Parameters<typeof DiscordNotifier.prototype.handleE
   { type: "review_arbitration_entered", taskId: "task-eg-revarb", projectId: "proj-eg-5", reviewerRejectionCount: 2 },
   // escalation_needed::orchestrator
   { type: "escalation_needed", taskId: "task-eg-esc", escalation: { type: "scope_unclear", question: "Should this parser handle file:// URLs?", options: ["yes — extend grammar", "no — out of scope"], context: "Found file:// URL in test fixture but spec doesn't mention it." } },
+  // --- Wave E-δ smoke fixtures — nudge_check × 4 sourceAgent values ---
+  // Operator visually validates per-role nudge identity + emoji + N4 deterministic
+  // openers in dev_channel. With --llm, the LLM transformer voices each through
+  // the matching role-specific prompt (4 new whitelist tuples, all eligible).
+  // nudge_check::architect — stagnant
+  { type: "nudge_check", projectId: "proj-eg-nudge-1", sourceAgent: "architect", status: "stagnant", observations: ["no events in 12 min"] },
+  // nudge_check::reviewer — blocked + nextAction
+  { type: "nudge_check", projectId: "proj-eg-nudge-2", sourceAgent: "reviewer", status: "blocked", observations: ["stuck in escalation_wait"], nextAction: "operator must answer scope_unclear" },
+  // nudge_check::executor — progressing with two observations (exercises bullet rendering)
+  { type: "nudge_check", projectId: "proj-eg-nudge-3", sourceAgent: "executor", status: "progressing", observations: ["last task t1 done 4 min ago", "2 phases remaining"] },
+  // nudge_check::orchestrator — stagnant project-agnostic (no projectId)
+  { type: "nudge_check", sourceAgent: "orchestrator", status: "stagnant", observations: ["No active projects."] },
 ];
 
 async function main(): Promise<void> {

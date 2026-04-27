@@ -186,6 +186,66 @@ export function renderEpistle(
       return truncateBody(lines.join("\n"));
     }
 
+    case "nudge_check": {
+      // Wave E-δ §N4 — deterministic opener strings per status; observations
+      // rendered as bullets when 2+, otherwise inline; closing defaults to
+      // `nextAction` or "I'll check again at the next interval."
+      // Section header emoji uses ROLE_EMOJI[identity] which already reflects
+      // sourceAgent (resolveIdentity reads sourceAgent for nudge_check).
+      const observations = (event.observations ?? []).slice(0, 5);
+      let opener: string;
+      switch (event.status) {
+        case "stagnant": {
+          // Inline duration when we have a single observation matching the
+          // §N4 form "no events in {duration}"; otherwise fall back to bare
+          // opener and let observations carry the detail.
+          const inline = observations.length === 1 ? observations[0] : null;
+          opener = inline
+            ? `No progress on this in ${sanitize(inline.replace(/^no events in /, ""), 80)}.`
+            : `No progress on this in some time.`;
+          break;
+        }
+        case "progressing": {
+          // Try to surface "last task {id} done {duration} ago" from the
+          // observations (introspector emits it as obs[0] when present).
+          const recent = observations.find((o) => o.startsWith("last task "));
+          if (recent) {
+            // recent = "last task {id} done {duration} ago"
+            // Reformat as §N4 opener: "Things are moving — last task {id} completed {duration} ago."
+            opener = `Things are moving — ${sanitize(recent.replace(/ done /, " completed "), 200)}.`;
+          } else {
+            opener = `Things are moving.`;
+          }
+          break;
+        }
+        case "blocked": {
+          const detail = event.nextAction
+            ? sanitize(event.nextAction, 200)
+            : "awaiting input";
+          opener = `Stuck — ${detail}.`;
+          break;
+        }
+      }
+      const closing = event.nextAction
+        ? sanitize(event.nextAction, 200)
+        : "I'll check again at the next interval.";
+      const lines = [`${emoji} **Nudge Check** — \`${ts}\``, ""];
+      lines.push(opener);
+      // Observations: render as bullets when 2+; for stagnant/progressing the
+      // single observation is already absorbed into the opener so we skip the
+      // duplicate inline render. blocked uses observations only when no
+      // nextAction is provided.
+      const showAsBullets = observations.length >= 2;
+      if (showAsBullets) {
+        lines.push("", "**Observations:**");
+        for (const obs of observations) {
+          lines.push(`- ${sanitize(obs, 200)}`);
+        }
+      }
+      lines.push("", closing);
+      return truncateBody(lines.join("\n"));
+    }
+
     default: {
       // Compact single-line fallback for non-epistle-eligible events.
       // This path is not called by NOTIFIER_MAP for these events (they keep
