@@ -18,6 +18,7 @@ import { sanitizeTaskId, truncateRationale } from "./lib/text.js";
 import type { ReviewGate, ReviewResult } from "./gates/review.js";
 import type { ArchitectManager, ArchitectVerdict } from "./session/architect.js";
 import type { ProjectStore } from "./lib/project.js";
+import type { NudgeIntrospector } from "./lib/nudge-introspector.js";
 
 // --- Task file schema ---
 
@@ -98,6 +99,11 @@ export interface OrchestratorDeps {
   architectManager?: ArchitectManager;
   /** Wave B: optional ProjectStore. Required alongside architectManager for declareProject. */
   projectStore?: ProjectStore;
+  /** Wave E-δ N8: optional NudgeIntrospector. When present, Orchestrator.shutdown()
+   *  calls .stop() BEFORE sessions.abortAll() and the shutdown emit so a final
+   *  tick cannot race with teardown. Construction + start() live at bootstrap
+   *  (live-bot-listen.ts) — orchestrator owns lifecycle teardown only. */
+  nudgeIntrospector?: NudgeIntrospector;
 }
 
 export type ArbitrationVerdict = "retry_with_directive" | "plan_amendment" | "escalate_operator";
@@ -147,6 +153,7 @@ export class Orchestrator {
   private readonly reviewGate?: ReviewGate;
   private readonly architectManager?: ArchitectManager;
   private readonly projectStore?: ProjectStore;
+  private readonly nudgeIntrospector?: NudgeIntrospector;
   private running = false;
   private pollTimer?: ReturnType<typeof setTimeout>;
   private stallWatchdogTimer?: ReturnType<typeof setInterval>;
@@ -167,6 +174,7 @@ export class Orchestrator {
     this.reviewGate = deps.reviewGate;
     this.architectManager = deps.architectManager;
     this.projectStore = deps.projectStore;
+    this.nudgeIntrospector = deps.nudgeIntrospector;
   }
 
   /** Register event listener */
@@ -207,6 +215,13 @@ export class Orchestrator {
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);
       this.pollTimer = undefined;
+    }
+    // Wave E-δ §H4 — stop nudge timer BEFORE abortAll() AND before the
+    // shutdown emit so a final NudgeIntrospector tick cannot race with
+    // teardown (would otherwise emit nudge_check for a session being aborted).
+    // Co-located with the watchdog teardown — same race-prevention rationale.
+    if (this.nudgeIntrospector) {
+      this.nudgeIntrospector.stop();
     }
     // Stop watchdog BEFORE abortAll so a final tick cannot race with shutdown teardown.
     if (this.stallWatchdogTimer) {

@@ -532,6 +532,51 @@ describe("Orchestrator", () => {
       await orch.shutdown();
       expect(events.some((e) => e.type === "shutdown")).toBe(true);
     });
+
+    // Wave E-δ N8 / H4 — shutdown ordering: nudgeIntrospector.stop() must run
+    // BEFORE sessions.abortAll() AND BEFORE the shutdown emit so a final
+    // periodic tick cannot race with teardown.
+    it("E-δ: calls nudgeIntrospector.stop() before sessions.abortAll() and before emit({type:shutdown})", async () => {
+      const callOrder: string[] = [];
+      const { orch, events } = setupHarness();
+      // Inject a stub introspector via deps mutation through reflection —
+      // setupHarness doesn't expose the dep, so build a fresh orchestrator
+      // instance with the same deps + nudgeIntrospector.
+      const stubIntrospector = {
+        start() { /* no-op */ },
+        stop() { callOrder.push("nudge.stop"); },
+        tick() { /* no-op */ },
+        noteStall() { /* no-op */ },
+      };
+      // Spy on sessions.abortAll
+      const sessions = (orch as unknown as { sessions: { abortAll: () => void } }).sessions;
+      const origAbort = sessions.abortAll.bind(sessions);
+      sessions.abortAll = () => {
+        callOrder.push("sessions.abortAll");
+        origAbort();
+      };
+      // Inject the introspector via the private field (test-only).
+      (orch as unknown as { nudgeIntrospector: typeof stubIntrospector }).nudgeIntrospector = stubIntrospector;
+      // Capture emit order via a listener.
+      orch.on((e) => {
+        if (e.type === "shutdown") callOrder.push("emit.shutdown");
+      });
+
+      orch.start();
+      await orch.shutdown();
+
+      // Order: nudge.stop → sessions.abortAll → emit.shutdown
+      expect(callOrder).toEqual(["nudge.stop", "sessions.abortAll", "emit.shutdown"]);
+      // shutdown event still fires (back-compat).
+      expect(events.some((e) => e.type === "shutdown")).toBe(true);
+    });
+
+    it("E-δ: shutdown is a no-op for nudgeIntrospector when dep is not provided", async () => {
+      // Just confirms no crash when introspector is undefined (the default).
+      const { orch } = setupHarness();
+      orch.start();
+      await expect(orch.shutdown()).resolves.toBeUndefined();
+    });
   });
 
   describe("crash recovery", () => {

@@ -306,6 +306,29 @@ export class InboundDispatcher {
   }
 
   /**
+   * Wave E-δ MR2/MR4 — emit the `no_active_role` notice for a non-Architect
+   * mention (reviewer / executor / orchestrator). Permanent NO-OP path
+   * because Reviewer sessions are ephemeral, the Executor dialogue session
+   * pending Wave 6-split, and the orchestrator has no agent face. Posts via
+   * the existing per-channel sender so the response routes through the same
+   * notifier path as every other operator-visible reply (I-1 preserved —
+   * no agent ever sees the mention or the notice).
+   */
+  private async emitNoActiveRole(
+    msg: InboundMessage,
+    projectId: string,
+    role: string,
+  ): Promise<void> {
+    const text = await this.renderResponse({
+      kind: "no_active_role",
+      operatorMessage: msg.content,
+      fields: { projectId, agentName: role },
+    });
+    this.sendToChannel(msg.channelId, text);
+    this.react(msg.channelId, msg.messageId, REACTION_PUZZLED);
+  }
+
+  /**
    * Top-level dispatch. Caller is `gateway.on((msg) => void dispatcher.dispatch(msg))`.
    * Errors are caught here so a single bad message never tears down the gateway.
    *
@@ -401,6 +424,17 @@ export class InboundDispatcher {
         });
         this.sendToChannel(msg.channelId, text);
       }
+      // Wave E-δ MR1 — per-role routing via IdentityMap.lookupRole. The
+      // first mention's agent key is mapped to a canonical IdentityRole; the
+      // four-way switch routes architect to relayOperatorInput as before and
+      // emits no_active_role notice for the rest. Preserves CW-4.5
+      // first-mention-only behavior at line :396.
+      const firstMention = extracted.mentions[0];
+      const role = this.identityMap.lookupRole(firstMention.agentKey);
+      if (role === null) {
+        // Unrecognized role mention — fall through to existing rules.
+        return false;
+      }
       // Agent mention — try to resolve a project for this channel.
       const resolved = this.resolveProjectForChannel(msg.channelId);
       if (resolved.projectId === null) {
@@ -414,20 +448,34 @@ export class InboundDispatcher {
         this.react(msg.channelId, msg.messageId, REACTION_PUZZLED);
         return true;
       }
-      // Relay the cleaned content (mentions stripped) into the architect.
-      try {
-        await this.architectManager.relayOperatorInput(resolved.projectId, extracted.cleanedContent);
-        this.react(msg.channelId, msg.messageId, REACTION_OK);
-      } catch (err) {
-        const error = err instanceof Error ? err : new Error(String(err));
-        const kind = classifyRelayError(error);
-        const text = await this.renderResponse({
-          kind: relayKindToResponseKind(kind),
-          operatorMessage: msg.content,
-          fields: { projectId: resolved.projectId, rawError: error.message },
-        });
-        this.sendToChannel(msg.channelId, text);
-        this.react(msg.channelId, msg.messageId, REACTION_ERROR);
+      switch (role) {
+        case "architect":
+          // Relay the cleaned content (mentions stripped) into the architect.
+          try {
+            await this.architectManager.relayOperatorInput(resolved.projectId, extracted.cleanedContent);
+            this.react(msg.channelId, msg.messageId, REACTION_OK);
+          } catch (err) {
+            const error = err instanceof Error ? err : new Error(String(err));
+            const kind = classifyRelayError(error);
+            const text = await this.renderResponse({
+              kind: relayKindToResponseKind(kind),
+              operatorMessage: msg.content,
+              fields: { projectId: resolved.projectId, rawError: error.message },
+            });
+            this.sendToChannel(msg.channelId, text);
+            this.react(msg.channelId, msg.messageId, REACTION_ERROR);
+          }
+          break;
+        case "reviewer":
+        case "executor":
+        case "orchestrator":
+          // Wave E-δ MR2/MR4 — Reviewer is ephemeral (persistSession: false in
+          // review.ts:249), so there is no long-running session to relay to.
+          // Executor dialogue session pending Wave 6-split. Orchestrator-as-
+          // mention-target has no meaningful flow. All three emit a
+          // no_active_role notice so the operator gets visible feedback.
+          await this.emitNoActiveRole(msg, resolved.projectId, role);
+          break;
       }
       return true;
     }

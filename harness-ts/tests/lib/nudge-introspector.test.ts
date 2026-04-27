@@ -471,6 +471,26 @@ describe("NudgeIntrospector", () => {
     expect(e.type).toBe("nudge_check");
   });
 
+  // Wave E-δ commit 2b — bootstrap-style integration: when an orchestrator
+  // is constructed with a NudgeIntrospector dep, .shutdown() must call .stop()
+  // before the rest of teardown. The full ordering assertion lives in
+  // tests/orchestrator.test.ts; this asserts the introspector itself honors
+  // the start()/stop() contract used by the bootstrap.
+  it("bootstrap contract: start() then stop() leaves no pending timer", () => {
+    vi.useFakeTimers();
+    const FIXED_NOW = 1_000_000_000_000;
+    const { introspector, emitted } = setup({
+      projects: [makeProject("P1", [{ id: "ph-1", state: "active", taskId: "t1" }])],
+      tasks: [makeTask("t1", "active", FIXED_NOW)],
+      intervalMs: 1_000,
+      nowMs: FIXED_NOW,
+    });
+    introspector.start();
+    introspector.stop();
+    vi.advanceTimersByTime(60_000);
+    expect(emitted).toHaveLength(0);
+  });
+
   // Wave E-δ commit 2a — integration: NudgeIntrospector → DiscordNotifier.
   // Confirms the routing chain works end-to-end via a stub notifier (the
   // introspector itself never imports discord — I-1 preserved).

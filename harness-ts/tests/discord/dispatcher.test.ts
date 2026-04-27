@@ -75,6 +75,18 @@ function makeIdentityMap(known: Record<string, string>): IdentityMap {
       if (typeof username !== "string") return null;
       return entries.get(username.trim().toLowerCase()) ?? null;
     },
+    // Wave E-δ MR3 — lookupRole maps the four canonical IdentityRole literals
+    // case-insensitively. Test helper mirrors the production allow-list at
+    // src/discord/identity-map.ts:76 (case-insensitive switch on the four
+    // literals; unknown returns null).
+    lookupRole(name: string) {
+      if (typeof name !== "string") return null;
+      const k = name.trim().toLowerCase();
+      if (k === "architect" || k === "reviewer" || k === "executor" || k === "orchestrator") {
+        return k;
+      }
+      return null;
+    },
     entries,
   };
 }
@@ -839,6 +851,189 @@ describe("InboundDispatcher", () => {
     expect(calls).toEqual([
       { projectId: "proj-A", message: "and please coordinate" },
     ]);
+  });
+
+  // ============================================================
+  // Wave E-δ MR1 — per-role mention routing
+  // ============================================================
+
+  it("E-δ MR1: @architect mention routes to relayOperatorInput (cleanedContent)", async () => {
+    const { am, fn, calls } = makeArchitectManager();
+    const ctx = makeMessageContext();
+    const idmap = makeIdentityMap({ Architect: "architect" });
+    const { router } = makeCommandRouter();
+    const projectStore = makeProjectStore([{ id: "proj-A", state: "executing" }]);
+    const channelBuffer = makeChannelBuffer();
+
+    const d = new InboundDispatcher({
+      commandRouter: router,
+      architectManager: am,
+      identityMap: idmap,
+      senders,
+      config: baseConfig(),
+      messageContext: ctx,
+      projectStore,
+      channelBuffer,
+      getBotUsername: () => null,
+    });
+
+    await d.dispatch(inboundMessage({ content: "@Architect ship it" }));
+
+    expect(fn).toHaveBeenCalledOnce();
+    expect(calls).toEqual([{ projectId: "proj-A", message: "ship it" }]);
+    // No no_active_role notice on the architect path.
+    expect(sentDev.filter((s) => s.content.includes("No active"))).toHaveLength(0);
+  });
+
+  it("E-δ MR2: @reviewer mention emits no_active_role notice (no relay)", async () => {
+    const { am, fn } = makeArchitectManager();
+    const ctx = makeMessageContext();
+    const idmap = makeIdentityMap({ Reviewer: "reviewer" });
+    const { router } = makeCommandRouter();
+    const projectStore = makeProjectStore([{ id: "proj-A", state: "executing" }]);
+    const channelBuffer = makeChannelBuffer();
+
+    const d = new InboundDispatcher({
+      commandRouter: router,
+      architectManager: am,
+      identityMap: idmap,
+      senders,
+      config: baseConfig(),
+      messageContext: ctx,
+      projectStore,
+      channelBuffer,
+      getBotUsername: () => null,
+    });
+
+    await d.dispatch(inboundMessage({ content: "@Reviewer please look" }));
+
+    // I-1 reverse direction: relay NEVER called for reviewer.
+    expect(fn).not.toHaveBeenCalled();
+    // Operator gets a visible notice via no_active_role static template.
+    expect(sentDev).toHaveLength(1);
+    expect(sentDev[0].content).toMatch(/No active reviewer session/);
+    expect(sentDev[0].content).toMatch(/proj-A/);
+  });
+
+  it("E-δ MR4: @executor mention emits no_active_role notice (no relay)", async () => {
+    const { am, fn } = makeArchitectManager();
+    const ctx = makeMessageContext();
+    const idmap = makeIdentityMap({ Executor: "executor" });
+    const { router } = makeCommandRouter();
+    const projectStore = makeProjectStore([{ id: "proj-A", state: "executing" }]);
+    const channelBuffer = makeChannelBuffer();
+
+    const d = new InboundDispatcher({
+      commandRouter: router,
+      architectManager: am,
+      identityMap: idmap,
+      senders,
+      config: baseConfig(),
+      messageContext: ctx,
+      projectStore,
+      channelBuffer,
+      getBotUsername: () => null,
+    });
+
+    await d.dispatch(inboundMessage({ content: "@Executor go faster" }));
+
+    expect(fn).not.toHaveBeenCalled();
+    expect(sentDev).toHaveLength(1);
+    expect(sentDev[0].content).toMatch(/No active executor session/);
+    expect(sentDev[0].content).toMatch(/proj-A/);
+  });
+
+  it("E-δ MR1: @orchestrator mention emits no_active_role notice (no relay)", async () => {
+    const { am, fn } = makeArchitectManager();
+    const ctx = makeMessageContext();
+    const idmap = makeIdentityMap({ Harness: "orchestrator" });
+    const { router } = makeCommandRouter();
+    const projectStore = makeProjectStore([{ id: "proj-A", state: "executing" }]);
+    const channelBuffer = makeChannelBuffer();
+
+    const d = new InboundDispatcher({
+      commandRouter: router,
+      architectManager: am,
+      identityMap: idmap,
+      senders,
+      config: baseConfig(),
+      messageContext: ctx,
+      projectStore,
+      channelBuffer,
+      getBotUsername: () => null,
+    });
+
+    await d.dispatch(inboundMessage({ content: "@Harness status" }));
+
+    expect(fn).not.toHaveBeenCalled();
+    expect(sentDev).toHaveLength(1);
+    expect(sentDev[0].content).toMatch(/No active orchestrator session/);
+  });
+
+  it("E-δ MR1: unknown agent (lookupRole returns null) falls through to NL", async () => {
+    // Construct an IdentityMap whose agentKey resolves to a non-canonical
+    // string (e.g. legacy / typo) so lookupRole returns null. Dispatcher
+    // should fall through to the existing rules (NL parser).
+    const { am, fn } = makeArchitectManager();
+    const ctx = makeMessageContext();
+    const idmap = makeIdentityMap({ Stranger: "stranger" });
+    const { router, handleNaturalLanguage } = makeCommandRouter();
+    const projectStore = makeProjectStore([{ id: "proj-A", state: "executing" }]);
+    const channelBuffer = makeChannelBuffer();
+
+    const d = new InboundDispatcher({
+      commandRouter: router,
+      architectManager: am,
+      identityMap: idmap,
+      senders,
+      config: baseConfig(),
+      messageContext: ctx,
+      projectStore,
+      channelBuffer,
+      getBotUsername: () => null,
+    });
+
+    await d.dispatch(inboundMessage({ content: "@Stranger hello" }));
+
+    expect(fn).not.toHaveBeenCalled();
+    // Stranger resolves via IdentityMap.lookup but lookupRole returns null
+    // → fall through to NL parser.
+    expect(handleNaturalLanguage).toHaveBeenCalled();
+  });
+
+  it("E-δ MR1: multi-mention with @reviewer first → reviewer NO-OP, architect skipped (CW-4.5 first-mention precedence)", async () => {
+    const { am, fn } = makeArchitectManager();
+    const ctx = makeMessageContext();
+    const idmap = makeIdentityMap({
+      Reviewer: "reviewer",
+      Architect: "architect",
+    });
+    const { router } = makeCommandRouter();
+    const projectStore = makeProjectStore([{ id: "proj-A", state: "executing" }]);
+    const channelBuffer = makeChannelBuffer();
+
+    const d = new InboundDispatcher({
+      commandRouter: router,
+      architectManager: am,
+      identityMap: idmap,
+      senders,
+      config: baseConfig(),
+      messageContext: ctx,
+      projectStore,
+      channelBuffer,
+      getBotUsername: () => null,
+    });
+
+    await d.dispatch(
+      inboundMessage({ content: "@Reviewer @Architect coordinate" }),
+    );
+
+    // First mention wins: @Reviewer routed to NO-OP notice; @Architect
+    // skipped (relay never called) — preserves CW-4.5 v1 behavior.
+    expect(fn).not.toHaveBeenCalled();
+    // Two messages sent: multi-mention notice + no_active_role notice.
+    const noActiveRole = sentDev.filter((s) => /No active reviewer session/.test(s.content));
+    expect(noActiveRole).toHaveLength(1);
   });
 
   it("dispatch never throws even if handler.handleNaturalLanguage rejects", async () => {

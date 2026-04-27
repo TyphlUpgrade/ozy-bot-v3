@@ -59,9 +59,10 @@ import { BotSender } from "../src/discord/bot-sender.js";
 import { OutboundResponseGenerator } from "../src/discord/outbound-response-generator.js";
 import { OUTBOUND_LLM_WHITELIST } from "../src/discord/outbound-whitelist.js";
 import { LlmBudgetTracker, PerRoleCircuitBreaker } from "../src/discord/llm-budget.js";
-import { OUTBOUND_EPISTLE_DEFAULTS } from "../src/lib/config.js";
+import { OUTBOUND_EPISTLE_DEFAULTS, NUDGE_DEFAULTS } from "../src/lib/config.js";
 import { TranscriptWriter, wrapWithRecording } from "../src/discord/transcript.js";
 import type { DiscordSender } from "../src/discord/types.js";
+import { NudgeIntrospector } from "../src/lib/nudge-introspector.js";
 import { installSigintHandler } from "./lib/scratch-repo.js";
 
 function loadDotEnv(path: string): void {
@@ -265,6 +266,25 @@ async function main(): Promise<void> {
     outboundGenerator,
   });
 
+  // Wave E-δ N8 — construct NudgeIntrospector when operator opts in via
+  // `[discord] nudge_enabled = true`. Default off → introspector stays
+  // undefined; zero timers, zero overhead. The introspector emits
+  // nudge_check events to the orchestrator's notifier path via the same
+  // callback shape orchestrator.emit uses internally.
+  let nudgeIntrospector: NudgeIntrospector | undefined;
+  if (config.discord.nudge_enabled === true) {
+    const intervalMs = config.discord.nudge_interval_ms ?? NUDGE_DEFAULTS.nudge_interval_ms;
+    nudgeIntrospector = new NudgeIntrospector({
+      state,
+      projectStore,
+      // Route nudge_check events through the same notifier path every other
+      // OrchestratorEvent uses. I-1 preserved — introspector never sees
+      // discord, only emits.
+      emit: (ev) => notifier.handleEvent(ev),
+      intervalMs,
+    });
+  }
+
   const orch = new Orchestrator({
     sessionManager: sessions,
     mergeGate,
@@ -273,8 +293,24 @@ async function main(): Promise<void> {
     reviewGate,
     architectManager,
     projectStore,
+    nudgeIntrospector,
   });
   orch.on((ev) => notifier.handleEvent(ev));
+
+  // Wave E-δ N3.5 — forward session_stalled events into the introspector's
+  // suppression map so a stall doesn't trigger a redundant nudge_check on the
+  // next tick (the stall event itself already pings the operator). Resolution
+  // of taskId → projectId via stateManager.getTask; project-less stalls (e.g.
+  // standalone tasks) are silently skipped.
+  if (nudgeIntrospector) {
+    const introspector = nudgeIntrospector;
+    orch.on((ev) => {
+      if (ev.type === "session_stalled") {
+        const task = state.getTask(ev.taskId);
+        if (task?.projectId) introspector.noteStall(task.projectId);
+      }
+    });
+  }
 
   // --- CommandRouter wiring ---
 
@@ -417,6 +453,13 @@ async function main(): Promise<void> {
 
   await gateway.start();
   orch.start();
+  // Wave E-δ N8 — start the periodic nudge timer AFTER orchestrator startup
+  // so the first tick has a fully-initialized state/projectStore to inspect.
+  // Idempotent — second start() is a no-op (defensive against future
+  // bootstrap re-entry paths). Orchestrator.shutdown() owns the .stop() call.
+  if (nudgeIntrospector) {
+    nudgeIntrospector.start();
+  }
 
   console.log("[live-bot-listen] gateway + orchestrator running. Ctrl+C to exit.");
 
