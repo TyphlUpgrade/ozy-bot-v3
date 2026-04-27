@@ -110,7 +110,7 @@ export type OrchestratorEvent =
   | { type: "merge_result"; taskId: string; result: MergeResult }
   | { type: "task_shelved"; taskId: string; reason: string }
   | { type: "task_failed"; taskId: string; reason: string; attempt: number }
-  | { type: "task_done"; taskId: string; responseLevelName?: string }
+  | { type: "task_done"; taskId: string; responseLevelName?: string; summary?: string; filesChanged?: string[] }
   | { type: "poll_tick" }
   | { type: "shutdown" }
   // Phase 2A events
@@ -828,14 +828,23 @@ export class Orchestrator {
   ): void {
     switch (mergeResult.status) {
       case "merged":
-        this.state.transition(task.id, "done");
-        this.state.updateTask(task.id, {
+        this.state.markPhaseSuccess(task.id, {
           summary: completion.summary,
           filesChanged: completion.filesChanged,
         });
-        this.emit({ type: "task_done", taskId: task.id, responseLevelName: this.state.getTask(task.id)?.lastResponseLevelName });
-        this.sessions.cleanupWorktree(task.id);
-        this.cascadePhaseOutcome(task, "done");
+        {
+          // R-IT5-6: single re-read; result passed to both emit and cascade.
+          const refreshed = this.state.getTask(task.id);
+          this.emit({
+            type: "task_done",
+            taskId: task.id,
+            responseLevelName: refreshed?.lastResponseLevelName,
+            summary: refreshed?.summary,
+            filesChanged: refreshed?.filesChanged,
+          });
+          this.sessions.cleanupWorktree(task.id);
+          this.cascadePhaseOutcome(refreshed ?? task, "done");
+        }
         break;
 
       case "rebase_conflict": {

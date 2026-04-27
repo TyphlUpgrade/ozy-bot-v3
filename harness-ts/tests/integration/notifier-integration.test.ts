@@ -292,15 +292,18 @@ describe("DiscordNotifier ↔ Orchestrator integration", () => {
     expect(events.length).toBeGreaterThanOrEqual(sent.length);
   });
 
-  it("notifier identity is set per event (orchestrator for task events, not architect)", async () => {
+  it("notifier identity is set per event (orchestrator or executor for task events, not architect)", async () => {
     const { orch, state, sent } = setupHarness({ completionStatus: "success" });
     const task = state.createTask("test", "id-1");
     await orch.processTask(task);
     await flushMicrotasks();
 
-    // Every task-lifecycle message should use the orchestrator identity
+    // Wave E-α D2: task-lifecycle events use orchestrator (Harness) or executor (Executor) identity.
+    // session_complete and task_done now use Executor; remaining task events use Harness.
+    // No task-lifecycle event should use Architect or Reviewer identity.
     const identities = sent.map((s) => s.identity?.username).filter(Boolean);
     expect(identities.length).toBeGreaterThan(0);
-    for (const u of identities) expect(u).toBe("Harness");
+    const allowedTaskIdentities = new Set(["Harness", "Executor"]);
+    for (const u of identities) expect(allowedTaskIdentities.has(u as string)).toBe(true);
   });
 });

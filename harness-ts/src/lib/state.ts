@@ -342,6 +342,24 @@ export class StateManager {
     this.persist();
   }
 
+  /**
+   * Wave E-α D1 — collapse pattern. Asserts merging precondition → transitions
+   * to done → writes summary+filesChanged atomically. State-write only; caller
+   * (orchestrator handleMergeResult merged path) does the single re-read then
+   * cascadePhaseOutcome + emit task_done.
+   */
+  markPhaseSuccess(
+    taskId: string,
+    completion: { summary: string; filesChanged: string[] },
+  ): void {
+    const task = this.getTask(taskId);
+    if (task?.state !== "merging") {
+      throw new Error(`markPhaseSuccess requires merging state, got ${task?.state}`);
+    }
+    this.transition(taskId, "done");
+    this.updateTask(taskId, { summary: completion.summary, filesChanged: completion.filesChanged });
+  }
+
   /** Reload from disk (for crash recovery) */
   reload(): void {
     this.store = this.load();

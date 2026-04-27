@@ -95,8 +95,27 @@ export function renderEpistle(
       const lvl = event.responseLevelName
         ? ` (response level: ${sanitize(event.responseLevelName, 40)})`
         : "";
-      // Wave E-α commit 1: compact form preserves existing /response level: reviewed/ pin (:323).
-      // Commit 2 will extend with structured summary + filesChanged when union+emit gain those fields.
+      // Wave E-α commit 2: structured form when summary or filesChanged present (D1 R-IT5-5).
+      // Compact form preserved for backward compat — existing /response level: reviewed/ pin (:323)
+      // is satisfied by `lvl` appearing in both branches.
+      if (event.summary || (event.filesChanged && event.filesChanged.length > 0)) {
+        const lines = [`${emoji} **Task Complete** — \`${ts}\``, ""];
+        lines.push(`Task \`${id}\` completed${lvl}.`);
+        if (event.summary) {
+          lines.push("", `**Summary:** ${sanitize(event.summary, 500)}`);
+        }
+        if (event.filesChanged && event.filesChanged.length > 0) {
+          lines.push("", "**Files changed:**");
+          for (const f of event.filesChanged.slice(0, 10)) {
+            lines.push(`- \`${sanitize(f, 200)}\``);
+          }
+          if (event.filesChanged.length > 10) {
+            lines.push(`- *+${event.filesChanged.length - 10} more*`);
+          }
+        }
+        return truncateBody(lines.join("\n"));
+      }
+      // Compact form when no structured data.
       return truncateBody(`Task \`${id}\` complete${lvl}`);
     }
 

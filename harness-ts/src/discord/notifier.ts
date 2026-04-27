@@ -41,7 +41,7 @@ function truncateBody(body: string, max = 1900): string {
 }
 
 type ChannelKey = "dev_channel" | "ops_channel" | "escalation_channel";
-type IdentityKey = "orchestrator" | "architect" | "reviewer";
+type IdentityKey = "orchestrator" | "architect" | "reviewer" | "executor";
 type EventType = OrchestratorEvent["type"];
 type EventByType<K extends EventType> = Extract<OrchestratorEvent, { type: K }>;
 
@@ -89,7 +89,7 @@ const NOTIFIER_MAP: NotifierMap = {
   },
   session_complete: {
     channel: "dev_channel",
-    identity: "orchestrator",
+    identity: "executor",
     format: (e, ctx?) => renderEpistle(e, resolveIdentityRole(e), ctx ?? defaultCtx()),
   },
   merge_result: {
@@ -99,7 +99,7 @@ const NOTIFIER_MAP: NotifierMap = {
   },
   task_done: {
     channel: "dev_channel",
-    identity: "orchestrator",
+    identity: "executor",
     format: (e, ctx?) => renderEpistle(e, resolveIdentityRole(e), ctx ?? defaultCtx()),
   },
   task_shelved: {

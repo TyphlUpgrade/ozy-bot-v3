@@ -77,7 +77,9 @@ describe("DiscordNotifier", () => {
     await flush();
     expect(sent).toHaveLength(2);
     expect(sent[0].channel).toBe("dev");
+    expect(sent[0].identity?.username).toBe("Executor");
     expect(sent[0].content).toMatch(/success/);
+    expect(sent[1].identity?.username).toBe("Executor");
     expect(sent[1].content).toMatch(/failure/);
   });
 
@@ -96,6 +98,7 @@ describe("DiscordNotifier", () => {
     notifier.handleEvent({ type: "task_done", taskId: "t1" });
     await flush();
     expect(sent[0].channel).toBe("dev");
+    expect(sent[0].identity?.username).toBe("Executor");
   });
 
   it("task_failed → ops_channel", async () => {

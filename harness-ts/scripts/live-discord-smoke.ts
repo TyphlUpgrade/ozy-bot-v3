@@ -101,6 +101,10 @@ export const SMOKE_FIXTURES: Parameters<typeof DiscordNotifier.prototype.handleE
   { type: "project_failed", projectId: "proj-smoke", reason: "Architect issued escalate_operator after 3 retry cycles", failedPhase: "phase-2-implement-parser" },
   // Row 12b — project_failed without failedPhase (spawn-time)
   { type: "project_failed", projectId: "proj-smoke-2", reason: "architect spawn failed" },
+  // Wave E-α audit coverage: escalation_needed with "background details" context pin (notifier.test.ts:351)
+  { type: "escalation_needed", taskId: "task-smoke-esc2", escalation: { type: "scope_unclear", question: "what scope", options: ["a", "b"], context: "background details" } },
+  // Wave E-α audit coverage: task_failed with backtick in reason → sanitize escapes to \` (notifier.test.ts:436)
+  { type: "task_failed", taskId: "task-smoke-fail2", reason: "error: `unclosed backtick injection", attempt: 1 },
 ];
 
 async function main(): Promise<void> {
