@@ -45,7 +45,7 @@
 
 import { readFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { DiscordNotifier } from "../src/discord/notifier.js";
 import { buildSendersForChannels } from "../src/discord/sender-factory.js";
 import type { DiscordConfig } from "../src/lib/config.js";
@@ -65,6 +65,43 @@ function loadDotEnv(path: string): void {
     if (!process.env[key]) process.env[key] = value;
   }
 }
+
+// Phase B.2 + Wave E-α fixture matrix — exported for audit-epistle-pins.ts (AC1 §2, R-IT5-4).
+// To add Wave E-α fixtures (F1-F6), append entries here; audit script picks them up automatically.
+export const SMOKE_FIXTURES: Parameters<typeof DiscordNotifier.prototype.handleEvent>[0][] = [
+  // Row 1 — task_picked_up
+  { type: "task_picked_up", taskId: "task-smoke-1", prompt: "demo prompt for url parser" },
+  // Row 2 — session_complete success
+  { type: "session_complete", taskId: "task-smoke-1", success: true, errors: [] },
+  // Row 3 — session_complete failure with errors + terminalReason
+  { type: "session_complete", taskId: "task-smoke-1f", success: false, errors: ["build broke", "lint fail"], terminalReason: "max_iterations" },
+  // Row 9 — task_done with responseLevelName
+  { type: "task_done", taskId: "task-smoke-1", responseLevelName: "reviewed" },
+  // Row 9 — task_done without responseLevelName
+  { type: "task_done", taskId: "task-smoke-2" },
+  // Row 4 — merge_result merged (sha7)
+  { type: "merge_result", taskId: "task-smoke-1", result: { status: "merged", commitSha: "abc1234567890" } },
+  // Row 5 — merge_result test_failed
+  { type: "merge_result", taskId: "task-smoke-1", result: { status: "test_failed", error: "FAIL: src/url/parser.test.ts > parses scheme\nExpected 'http' got undefined" } },
+  // Row 6 — merge_result test_timeout
+  { type: "merge_result", taskId: "task-smoke-1", result: { status: "test_timeout" } },
+  // Row 7 — merge_result rebase_conflict (4 files → shows first 3)
+  { type: "merge_result", taskId: "task-smoke-1", result: { status: "rebase_conflict", conflictFiles: ["src/url/parser.ts", "src/url/scheme.ts", "src/url/host.ts", "tests/url.test.ts"] } },
+  // Row 8 — merge_result error
+  { type: "merge_result", taskId: "task-smoke-1", result: { status: "error", error: "git push rejected: non-fast-forward" } },
+  // Row 10 — task_failed with attempt
+  { type: "task_failed", taskId: "task-smoke-1", reason: "executor stack trace overflow", attempt: 3 },
+  // Row 11 — escalation_needed with options + context
+  { type: "escalation_needed", taskId: "task-smoke-1", escalation: { type: "scope_unclear", question: "Should the parser handle file:// URLs?", options: ["yes — extend grammar", "no — out of scope"], context: "Found file:// URL in test fixture but spec doesn't mention it." } },
+  // Row 14 — arbitration_verdict
+  { type: "arbitration_verdict", taskId: "task-smoke-1", projectId: "proj-smoke", verdict: "retry_with_directive", rationale: "Reviewer concern is valid: add the missing test." },
+  // Row 13 — budget_ceiling_reached
+  { type: "budget_ceiling_reached", projectId: "proj-smoke", currentCostUsd: 9.80, ceilingUsd: 10.00 },
+  // Row 12 — project_failed with failedPhase
+  { type: "project_failed", projectId: "proj-smoke", reason: "Architect issued escalate_operator after 3 retry cycles", failedPhase: "phase-2-implement-parser" },
+  // Row 12b — project_failed without failedPhase (spawn-time)
+  { type: "project_failed", projectId: "proj-smoke-2", reason: "architect spawn failed" },
+];
 
 async function main(): Promise<void> {
   const harnessRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -124,43 +161,7 @@ async function main(): Promise<void> {
   // Wire DiscordNotifier so we know the routing layer also works end-to-end.
   const notifier = new DiscordNotifier(senders, config);
 
-  // Phase B.2 fixture matrix — one event per renderer row in Phase B.1 table.
-  const fixtures: Parameters<typeof notifier.handleEvent>[0][] = [
-    // Row 1 — task_picked_up
-    { type: "task_picked_up", taskId: "task-smoke-1", prompt: "demo prompt for url parser" },
-    // Row 2 — session_complete success
-    { type: "session_complete", taskId: "task-smoke-1", success: true, errors: [] },
-    // Row 3 — session_complete failure with errors + terminalReason
-    { type: "session_complete", taskId: "task-smoke-1f", success: false, errors: ["build broke", "lint fail"], terminalReason: "max_iterations" },
-    // Row 9 — task_done with responseLevelName
-    { type: "task_done", taskId: "task-smoke-1", responseLevelName: "reviewed" },
-    // Row 9 — task_done without responseLevelName
-    { type: "task_done", taskId: "task-smoke-2" },
-    // Row 4 — merge_result merged (sha7)
-    { type: "merge_result", taskId: "task-smoke-1", result: { status: "merged", commitSha: "abc1234567890" } },
-    // Row 5 — merge_result test_failed
-    { type: "merge_result", taskId: "task-smoke-1", result: { status: "test_failed", error: "FAIL: src/url/parser.test.ts > parses scheme\nExpected 'http' got undefined" } },
-    // Row 6 — merge_result test_timeout
-    { type: "merge_result", taskId: "task-smoke-1", result: { status: "test_timeout" } },
-    // Row 7 — merge_result rebase_conflict (4 files → shows first 3)
-    { type: "merge_result", taskId: "task-smoke-1", result: { status: "rebase_conflict", conflictFiles: ["src/url/parser.ts", "src/url/scheme.ts", "src/url/host.ts", "tests/url.test.ts"] } },
-    // Row 8 — merge_result error
-    { type: "merge_result", taskId: "task-smoke-1", result: { status: "error", error: "git push rejected: non-fast-forward" } },
-    // Row 10 — task_failed with attempt
-    { type: "task_failed", taskId: "task-smoke-1", reason: "executor stack trace overflow", attempt: 3 },
-    // Row 11 — escalation_needed with options + context
-    { type: "escalation_needed", taskId: "task-smoke-1", escalation: { type: "scope_unclear", question: "Should the parser handle file:// URLs?", options: ["yes — extend grammar", "no — out of scope"], context: "Found file:// URL in test fixture but spec doesn't mention it." } },
-    // Row 14 — arbitration_verdict
-    { type: "arbitration_verdict", taskId: "task-smoke-1", projectId: "proj-smoke", verdict: "retry_with_directive", rationale: "Reviewer concern is valid: add the missing test." },
-    // Row 13 — budget_ceiling_reached
-    { type: "budget_ceiling_reached", projectId: "proj-smoke", currentCostUsd: 9.80, ceilingUsd: 10.00 },
-    // Row 12 — project_failed with failedPhase
-    { type: "project_failed", projectId: "proj-smoke", reason: "Architect issued escalate_operator after 3 retry cycles", failedPhase: "phase-2-implement-parser" },
-    // Row 12b — project_failed without failedPhase (spawn-time)
-    { type: "project_failed", projectId: "proj-smoke-2", reason: "architect spawn failed" },
-  ];
-
-  for (const fx of fixtures) {
+  for (const fx of SMOKE_FIXTURES) {
     notifier.handleEvent(fx);
     // Small gap so the rate-limit queue can drain between sends.
     await new Promise((r) => setTimeout(r, 100));
@@ -174,7 +175,9 @@ async function main(): Promise<void> {
   process.exit(0);
 }
 
-main().catch((err) => {
-  console.error("[discord-smoke] FATAL", err);
-  process.exit(2);
-});
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((err) => {
+    console.error("[discord-smoke] FATAL", err);
+    process.exit(2);
+  });
+}

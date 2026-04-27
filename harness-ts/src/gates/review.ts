@@ -22,6 +22,9 @@ import type { HarnessConfig, ReviewerConfig } from "../lib/config.js";
 import type { CompletionSignal } from "../session/manager.js";
 import type { TaskRecord } from "../lib/state.js";
 
+// Re-export helper for back-compat — original lives in src/lib/review-format.ts (Wave E-α D0).
+export { formatFindingForOps } from "../lib/review-format.js";
+
 // --- Types ---
 
 export type ReviewVerdict = "approve" | "reject" | "request_changes";

@@ -12,7 +12,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "audit:epistle-pins": "tsx scripts/audit-epistle-pins.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "latest",

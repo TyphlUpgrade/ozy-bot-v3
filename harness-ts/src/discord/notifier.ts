@@ -25,6 +25,8 @@ import { sanitize, redactSecrets, truncateRationale } from "../lib/text.js";
 import type { AgentIdentity, DiscordSender } from "./types.js";
 import type { StateManager } from "../lib/state.js";
 import type { MessageContext } from "./message-context.js";
+import { renderEpistle, defaultCtx, type EpistleContext } from "./epistle-templates.js";
+import { resolveIdentity as resolveIdentityRole } from "./identity.js";
 
 // Re-export for backward-compat — Wave 3 moved these to src/lib/text.ts.
 export { sanitize, redactSecrets } from "../lib/text.js";
@@ -46,8 +48,10 @@ type EventByType<K extends EventType> = Extract<OrchestratorEvent, { type: K }>;
 interface NotifierEntry<K extends EventType> {
   channel: ChannelKey;
   identity: IdentityKey;
-  /** Build the Discord message body from the event. Null → skip emission. */
-  format: (event: EventByType<K>) => string | null;
+  /** Build the Discord message body from the event. Null → skip emission.
+   *  ctx is optional — epistle-wrapped entries use it for deterministic timestamps;
+   *  all other entries ignore it. */
+  format: (event: EventByType<K>, ctx?: EpistleContext) => string | null;
 }
 
 function shortTaskId(id: string): string {
@@ -86,52 +90,17 @@ const NOTIFIER_MAP: NotifierMap = {
   session_complete: {
     channel: "dev_channel",
     identity: "orchestrator",
-    format: (e) => {
-      if (e.success) {
-        return truncateBody(`Session complete for \`${shortTaskId(e.taskId)}\`: success`);
-      }
-      const errors = e.errors ?? [];
-      const errSummary = errors.length > 0
-        ? sanitize(errors.join("; "), 200)
-        : "(no error detail)";
-      const tr = e.terminalReason ? ` [${sanitize(e.terminalReason, 64)}]` : "";
-      return truncateBody(
-        `Session complete for \`${shortTaskId(e.taskId)}\`: failure — ${errSummary}${tr}`,      );
-    },
+    format: (e, ctx?) => renderEpistle(e, resolveIdentityRole(e), ctx ?? defaultCtx()),
   },
   merge_result: {
     channel: "dev_channel",
     identity: "orchestrator",
-    format: (e) => {
-      const id = shortTaskId(e.taskId);
-      const status = e.result.status;
-      const head = `Merge result for \`${id}\`: **${sanitize(status, 40)}**`;
-      let tail = "";
-      if (status === "merged") {
-        const sha = e.result.commitSha;
-        if (sha) tail = ` (${sha.slice(0, 7)})`;
-      } else if (status === "test_failed" || status === "error") {
-        const err = e.result.error;
-        if (err) tail = ` — ${sanitize(err, 200)}`;
-      } else if (status === "rebase_conflict") {
-        const files = e.result.conflictFiles ?? [];
-        const n = files.length;
-        const first3 = files.slice(0, 3).map((f) => sanitize(f, 80)).join(", ");
-        tail = ` — ${n} files: ${first3}`;
-      }
-      // status === "test_timeout" → no tail (Row 6 unchanged)
-      return truncateBody(head + tail);
-    },
+    format: (e, ctx?) => renderEpistle(e, resolveIdentityRole(e), ctx ?? defaultCtx()),
   },
   task_done: {
     channel: "dev_channel",
     identity: "orchestrator",
-    format: (e) => {
-      const lvl = e.responseLevelName
-        ? ` (response level: ${sanitize(e.responseLevelName, 40)})`
-        : "";
-      return truncateBody(`Task \`${shortTaskId(e.taskId)}\` complete${lvl}`);
-    },
+    format: (e, ctx?) => renderEpistle(e, resolveIdentityRole(e), ctx ?? defaultCtx()),
   },
   task_shelved: {
     channel: "dev_channel",
@@ -141,27 +110,12 @@ const NOTIFIER_MAP: NotifierMap = {
   task_failed: {
     channel: "ops_channel",
     identity: "orchestrator",
-    format: (e) => {
-      const attempt = e.attempt ?? 0;
-      return truncateBody(
-        `Task \`${shortTaskId(e.taskId)}\` **FAILED** (attempt ${attempt}): ${sanitize(e.reason)}`,      );
-    },
+    format: (e, ctx?) => renderEpistle(e, resolveIdentityRole(e), ctx ?? defaultCtx()),
   },
   escalation_needed: {
     channel: "escalation_channel",
     identity: "orchestrator",
-    format: (e) => {
-      const id = shortTaskId(e.taskId);
-      const t = sanitize(e.escalation.type, 40);
-      const q = sanitize(e.escalation.question ?? e.escalation.type);
-      const opts = e.escalation.options && e.escalation.options.length > 0
-        ? `\nOptions: ${e.escalation.options.map((o) => sanitize(o, 80)).join(" | ")}`
-        : "";
-      const ctx = e.escalation.context
-        ? `\nContext: ${sanitize(e.escalation.context, 300)}`
-        : "";
-      return truncateBody(`**ESCALATION** \`${id}\` (${t}): ${q}${opts}${ctx}`);
-    },
+    format: (e, ctx?) => renderEpistle(e, resolveIdentityRole(e), ctx ?? defaultCtx()),
   },
   budget_exhausted: {
     channel: "ops_channel",
@@ -204,14 +158,7 @@ const NOTIFIER_MAP: NotifierMap = {
   project_failed: {
     channel: "ops_channel",
     identity: "architect",
-    format: (e) => {
-      const phase = e.failedPhase
-        ? ` at phase \`${sanitize(e.failedPhase, 40)}\``
-        : "";
-      const reason = truncateRationale(e.reason, 1024);
-      return truncateBody(
-        `Project \`${shortProjectId(e.projectId)}\` **FAILED**${phase}: ${sanitize(reason)}`,      );
-    },
+    format: (e, ctx?) => renderEpistle(e, resolveIdentityRole(e), ctx ?? defaultCtx()),
   },
   project_aborted: {
     // Architect owns project lifecycle narrative, including operator-abort (Architect review finding LOW-2).
@@ -252,7 +199,7 @@ const NOTIFIER_MAP: NotifierMap = {
   review_mandatory: {
     channel: "dev_channel",
     identity: "reviewer",
-    format: (e) => `Mandatory review firing for \`${shortTaskId(e.taskId)}\` in project \`${shortProjectId(e.projectId)}\``,
+    format: (e, ctx?) => renderEpistle(e, resolveIdentityRole(e), ctx ?? defaultCtx()),
   },
   budget_ceiling_reached: {
     channel: "escalation_channel",
