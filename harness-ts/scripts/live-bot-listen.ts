@@ -60,6 +60,8 @@ import { OutboundResponseGenerator } from "../src/discord/outbound-response-gene
 import { OUTBOUND_LLM_WHITELIST } from "../src/discord/outbound-whitelist.js";
 import { LlmBudgetTracker, PerRoleCircuitBreaker } from "../src/discord/llm-budget.js";
 import { OUTBOUND_EPISTLE_DEFAULTS } from "../src/lib/config.js";
+import { TranscriptWriter, wrapWithRecording } from "../src/discord/transcript.js";
+import type { DiscordSender } from "../src/discord/types.js";
 import { installSigintHandler } from "./lib/scratch-repo.js";
 
 function loadDotEnv(path: string): void {
@@ -197,7 +199,28 @@ async function main(): Promise<void> {
 
   // --- Discord wiring ---
 
-  const senders = buildSendersForChannels(config.discord, token);
+  const rawSenders = buildSendersForChannels(config.discord, token);
+
+  // Universal transcript — wrap every per-channel sender + plumb the writer
+  // into the inbound dispatcher. live-bot-listen runs long and may be
+  // restarted by the operator, so APPEND mode preserves history across
+  // restarts. Operator can rotate manually (move/truncate the file) when
+  // needed.
+  const transcriptDir = join(harnessRepoRoot, ".harness");
+  const transcriptJsonl = join(transcriptDir, "discord-transcript.jsonl");
+  const transcriptMd = join(transcriptDir, "discord-transcript.md");
+  const transcriptWriter = new TranscriptWriter({
+    jsonlPath: transcriptJsonl,
+    mdPath: transcriptMd,
+    append: true,
+  });
+  const senders: Record<string, DiscordSender> = {};
+  for (const [channelId, inner] of Object.entries(rawSenders)) {
+    senders[channelId] = wrapWithRecording(inner, channelId, transcriptWriter);
+  }
+  console.log(`[live-bot-listen] transcript jsonl: ${transcriptJsonl}`);
+  console.log(`[live-bot-listen] transcript md:    ${transcriptMd}`);
+
   const messageContext = new InMemoryMessageContext({ maxEntries: 1000 });
   const identityMap = buildIdentityMap(config.discord);
 
@@ -361,6 +384,9 @@ async function main(): Promise<void> {
     // CW-5 — UX polish: reactions + conversational responses.
     reactionClient,
     responseGenerator,
+    // Universal transcript — record every inbound message to the same file
+    // pair the per-channel sender wrappers write to.
+    transcriptWriter,
   });
   // CW-4.5 §8 — explicit single-handler swap. The wrapper appends to the
   // shared ChannelContextBuffer BEFORE invoking the dispatcher so the message

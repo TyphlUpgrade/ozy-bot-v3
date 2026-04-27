@@ -25,6 +25,7 @@ import {
   type ResponseGenerator,
   type ResponseInput,
 } from "./response-generator.js";
+import { recordInbound, type TranscriptWriter } from "./transcript.js";
 import type { DiscordSender, InboundMessage } from "./types.js";
 
 // CW-5 — emoji acknowledgments. Defined as constants so tests can match them.
@@ -195,6 +196,14 @@ export interface InboundDispatcherDeps {
    * for fully-conversational replies.
    */
   responseGenerator?: ResponseGenerator;
+  /**
+   * Universal transcript recorder. When set, every inbound message that
+   * reaches `dispatch()` is recorded BEFORE classification — including
+   * messages the precedence rules later drop or fall through. When undefined,
+   * inbound recording is silently disabled (most test setups). Outbound
+   * recording is wired separately at the sender layer via `wrapWithRecording`.
+   */
+  transcriptWriter?: TranscriptWriter;
 }
 
 /**
@@ -256,6 +265,9 @@ export class InboundDispatcher {
   // CW-5 — reaction acknowledgments + conversational responses.
   private readonly reactionClient?: DiscordSender;
   private readonly responseGenerator: ResponseGenerator;
+  // Universal transcript recorder (optional). When set, every inbound message
+  // is recorded at the top of `dispatch()`.
+  private readonly transcriptWriter?: TranscriptWriter;
 
   constructor(deps: InboundDispatcherDeps) {
     this.commandRouter = deps.commandRouter;
@@ -271,6 +283,7 @@ export class InboundDispatcher {
     // Default to static templates so existing test setups (which don't pass
     // a generator) get the same friendlier prose without wiring an LLM.
     this.responseGenerator = deps.responseGenerator ?? new StaticResponseGenerator();
+    this.transcriptWriter = deps.transcriptWriter;
   }
 
   /**
@@ -303,6 +316,28 @@ export class InboundDispatcher {
    */
   async dispatch(msg: InboundMessage): Promise<void> {
     try {
+      // Universal transcript — record the inbound message before any
+      // classification / fall-through logic decides what to do with it.
+      // Captures everything the gateway accepts (already filtered for
+      // self-messages and channel allowlist), so the transcript matches the
+      // operator's view of the conversation.
+      if (this.transcriptWriter) {
+        const operatorId = this.config.operator_user_id;
+        const isOperatorMention =
+          operatorId !== undefined &&
+          (msg.content.includes(`<@${operatorId}>`) || msg.content.includes(`<@!${operatorId}>`));
+        recordInbound(this.transcriptWriter, {
+          ts: msg.timestamp || new Date().toISOString(),
+          channelId: msg.channelId,
+          authorUsername: msg.authorUsername,
+          authorId: msg.authorId,
+          content: msg.content,
+          isBot: msg.isBot,
+          isOperatorMention,
+          messageId: msg.messageId,
+        });
+      }
+
       // CW-5 — eager receipt acknowledgment. Operator sees this before any
       // text reply lands, even when downstream processing takes a while.
       this.react(msg.channelId, msg.messageId, REACTION_RECEIVED);

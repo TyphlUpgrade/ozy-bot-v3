@@ -56,6 +56,8 @@ import { LlmBudgetTracker, PerRoleCircuitBreaker } from "../src/discord/llm-budg
 import { OUTBOUND_EPISTLE_DEFAULTS } from "../src/lib/config.js";
 import { InMemoryMessageContext } from "../src/discord/message-context.js";
 import { StateManager } from "../src/lib/state.js";
+import { TranscriptWriter, wrapWithRecording } from "../src/discord/transcript.js";
+import type { DiscordSender } from "../src/discord/types.js";
 
 /**
  * Channel-collapse plumbing (2026-04-27) — extract the bare snowflake from
@@ -209,7 +211,25 @@ async function main(): Promise<void> {
   };
   // CW-1 — per-channel sender map. Channels with webhook URL get WebhookSender
   // (native per-agent avatar); others fall back to BotSender.
-  const senders = buildSendersForChannels(config, token);
+  const rawSenders = buildSendersForChannels(config, token);
+
+  // Universal transcript — every outbound send routed through this script gets
+  // recorded to `.harness/discord-transcript.{jsonl,md}`. Smoke truncates on
+  // each run (default `append: false`) so each smoke produces a fresh file
+  // pair operators can grep / diff against the prior baseline.
+  const transcriptDir = join(harnessRoot, ".harness");
+  const transcriptJsonl = join(transcriptDir, "discord-transcript.jsonl");
+  const transcriptMd = join(transcriptDir, "discord-transcript.md");
+  const runHeader = `smoke ${new Date().toISOString()} llm=${llmMode}`;
+  const transcriptWriter = new TranscriptWriter({
+    jsonlPath: transcriptJsonl,
+    mdPath: transcriptMd,
+    runHeader,
+  });
+  const senders: Record<string, DiscordSender> = {};
+  for (const [channelId, inner] of Object.entries(rawSenders)) {
+    senders[channelId] = wrapWithRecording(inner, channelId, transcriptWriter);
+  }
   const devSender = senders[dev];
   if (!devSender) {
     console.error(`[discord-smoke] no sender constructed for channel ${dev}`);
@@ -310,6 +330,8 @@ async function main(): Promise<void> {
   await new Promise((r) => setTimeout(r, 60_000));
 
   console.log(`[discord-smoke] done — check Discord for ${SMOKE_FIXTURES.length} notifier messages across #dev / #ops / #esc`);
+  console.log(`[discord-smoke] transcript jsonl: ${transcriptJsonl}`);
+  console.log(`[discord-smoke] transcript md:    ${transcriptMd}`);
   process.exit(0);
 }
 
