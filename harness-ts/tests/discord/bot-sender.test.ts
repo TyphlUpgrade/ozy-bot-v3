@@ -5,7 +5,11 @@ function mockFetchOK(): ReturnType<typeof vi.fn> {
   return vi.fn().mockResolvedValue({ ok: true, status: 200, statusText: "OK" });
 }
 
-function readBody(call: unknown): { content: string; allowed_mentions?: { parse: string[] } } {
+function readBody(call: unknown): {
+  content: string;
+  allowed_mentions?: { parse: string[] };
+  message_reference?: { message_id: string; fail_if_not_exists: boolean };
+} {
   const arg = (call as unknown[])[1] as { body: string };
   return JSON.parse(arg.body);
 }
@@ -181,6 +185,43 @@ describe("BotSender", () => {
     const result = await p;
     expect(result.messageId).toBeNull();
   });
+
+  it("Wave E-β replyToMessageId set → POST body carries message_reference with fail_if_not_exists:false", async () => {
+    const fetch = mockFetchOK();
+    const sender = new BotSender("t", { fetch, minSpacingMs: 0 });
+    await sender.sendToChannel("123", "reply body", undefined, "head-msg-77");
+    await vi.runAllTimersAsync();
+    const body = readBody(fetch.mock.calls[0]);
+    expect(body.message_reference).toEqual({ message_id: "head-msg-77", fail_if_not_exists: false });
+  });
+
+  it("Wave E-β replyToMessageId unset → POST body omits message_reference field entirely", async () => {
+    const fetch = mockFetchOK();
+    const sender = new BotSender("t", { fetch, minSpacingMs: 0 });
+    await sender.sendToChannel("123", "standalone");
+    await vi.runAllTimersAsync();
+    const body = readBody(fetch.mock.calls[0]);
+    expect(body.message_reference).toBeUndefined();
+    expect("message_reference" in body).toBe(false);
+  });
+
+  it("Wave E-β sendToChannelAndReturnId forwards replyToMessageId into POST body", async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => ({ id: "msg-9999" }),
+    });
+    const sender = new BotSender("t", { fetch, minSpacingMs: 0 });
+    const p = sender.sendToChannelAndReturnId("123", "threaded", undefined, "head-x");
+    await vi.runAllTimersAsync();
+    const result = await p;
+    expect(result.messageId).toBe("msg-9999");
+    const body = readBody(fetch.mock.calls[0]);
+    expect(body.message_reference).toEqual({ message_id: "head-x", fail_if_not_exists: false });
+  });
+
+  it.todo("notifier replyToMessageId routing — commit 2");
 
   it("addReaction PUTs to the reactions endpoint with url-encoded emoji", async () => {
     const fetch = mockFetchOK();

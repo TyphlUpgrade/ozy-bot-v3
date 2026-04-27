@@ -33,6 +33,8 @@ interface QueuedMessage {
   channel: string;
   content: string;
   identity?: AgentIdentity;
+  /** Wave E-β — when set, sent as Discord `message_reference` for reply threading. */
+  replyToMessageId?: string;
   /** CW-1 — settle with `{messageId}`; senders that ignore id pass () => undefined. */
   resolve: (messageId: string | null) => void;
 }
@@ -60,7 +62,12 @@ export class WebhookSender implements DiscordSender {
     this.maxQueueSize = options.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE;
   }
 
-  async sendToChannel(channel: string, content: string, identity?: AgentIdentity): Promise<void> {
+  async sendToChannel(
+    channel: string,
+    content: string,
+    identity?: AgentIdentity,
+    replyToMessageId?: string,
+  ): Promise<void> {
     // Queue overflow: drop oldest (FIFO cap). The dropped caller's promise
     // resolves, matching the DiscordSender contract — callers are fire-and-
     // forget and the console.warn is the observable signal of drop.
@@ -71,7 +78,7 @@ export class WebhookSender implements DiscordSender {
     }
 
     return new Promise<void>((resolve) => {
-      this.queue.push({ channel, content, identity, resolve: () => resolve() });
+      this.queue.push({ channel, content, identity, replyToMessageId, resolve: () => resolve() });
       void this.drain();
     });
   }
@@ -81,11 +88,15 @@ export class WebhookSender implements DiscordSender {
    * Discord-assigned message id when the underlying WebhookClient returns a
    * payload with `.id` (discord.js + `wait: true`). Returns `{messageId: null}`
    * when the client returns nothing parseable, on overflow drop, or send failure.
+   *
+   * Wave E-β — accepts optional `replyToMessageId` to thread the send as a
+   * reply to a prior message in the same channel.
    */
   async sendToChannelAndReturnId(
     channel: string,
     content: string,
     identity?: AgentIdentity,
+    replyToMessageId?: string,
   ): Promise<{ messageId: string | null }> {
     if (this.queue.length >= this.maxQueueSize) {
       const dropped = this.queue.shift();
@@ -97,6 +108,7 @@ export class WebhookSender implements DiscordSender {
         channel,
         content,
         identity,
+        replyToMessageId,
         resolve: (messageId) => resolve({ messageId }),
       });
       void this.drain();
@@ -130,6 +142,12 @@ export class WebhookSender implements DiscordSender {
             avatarURL: next.identity?.avatarURL,
             allowedMentions: NO_MENTIONS,
             wait: true,
+            // Wave E-β — `failIfNotExists: false` is mandatory: Discord
+            // renders without a quote-card if head was deleted instead of
+            // 4xx-rejecting the send. discord.js v14+ accepts `messageReference`.
+            ...(next.replyToMessageId
+              ? { messageReference: { messageId: next.replyToMessageId, failIfNotExists: false } }
+              : {}),
           });
           if (result && typeof result === "object" && "id" in result) {
             const id = (result as { id?: unknown }).id;

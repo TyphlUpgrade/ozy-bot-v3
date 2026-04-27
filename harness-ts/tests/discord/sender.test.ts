@@ -3,7 +3,14 @@ import { WebhookSender } from "../../src/discord/sender.js";
 import type { AllowedMentions, WebhookClient } from "../../src/discord/types.js";
 
 function makeWebhook(opts: { fail?: boolean; returnId?: string | null } = {}) {
-  const calls: Array<{ content: string; username?: string; avatarURL?: string; allowedMentions?: AllowedMentions; wait?: boolean }> = [];
+  const calls: Array<{
+    content: string;
+    username?: string;
+    avatarURL?: string;
+    allowedMentions?: AllowedMentions;
+    wait?: boolean;
+    messageReference?: { messageId: string; failIfNotExists: boolean };
+  }> = [];
   const client: WebhookClient = {
     async send(options) {
       calls.push(options);
@@ -94,6 +101,33 @@ describe("WebhookSender", () => {
     const result = await s.sendToChannelAndReturnId("dev", "hi");
     expect(result.messageId).toBeNull();
   });
+
+  it("Wave E-β replyToMessageId set → payload carries messageReference with failIfNotExists:false", async () => {
+    const { client, calls } = makeWebhook();
+    const s = new WebhookSender(client, { minSpacingMs: 0 });
+    await s.sendToChannel("dev", "reply body", undefined, "head-msg-42");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].messageReference).toEqual({ messageId: "head-msg-42", failIfNotExists: false });
+  });
+
+  it("Wave E-β replyToMessageId unset → payload omits messageReference field entirely", async () => {
+    const { client, calls } = makeWebhook();
+    const s = new WebhookSender(client, { minSpacingMs: 0 });
+    await s.sendToChannel("dev", "standalone");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].messageReference).toBeUndefined();
+    expect("messageReference" in calls[0]).toBe(false);
+  });
+
+  it("Wave E-β sendToChannelAndReturnId forwards replyToMessageId into messageReference", async () => {
+    const { client, calls } = makeWebhook({ returnId: "wm-99" });
+    const s = new WebhookSender(client, { minSpacingMs: 0 });
+    const result = await s.sendToChannelAndReturnId("dev", "threaded", undefined, "head-1");
+    expect(result.messageId).toBe("wm-99");
+    expect(calls[0].messageReference).toEqual({ messageId: "head-1", failIfNotExists: false });
+  });
+
+  it.todo("notifier replyToMessageId routing — commit 2");
 
   it("queue overflow drops OLDEST (not newest) when maxQueueSize exceeded", async () => {
     const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);

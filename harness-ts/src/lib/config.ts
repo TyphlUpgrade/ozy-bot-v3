@@ -54,6 +54,25 @@ export interface DiscordWebhookUrls {
   escalation?: string;
 }
 
+/**
+ * Wave E-β — `[discord.reply_threading]` block. Optional. Controls Discord
+ * `message_reference` synthesis for multi-event project chains in the
+ * orchestrator. `enabled` defaults to TRUE because chain rendering is pure
+ * UX (no LLM, no $ cost) and operators have already requested it. See
+ * `.omc/plans/2026-04-27-discord-wave-e-beta.md`.
+ */
+export interface DiscordReplyThreadingConfig {
+  /** Default true — chains are pure UX, no cost. Set false to fall back to Wave E-α flat output. */
+  enabled?: boolean;
+  /** Default 600_000 (10 min). Lookups for role heads older than this evict + return null. */
+  stale_chain_ms?: number;
+}
+
+export const DISCORD_REPLY_THREADING_DEFAULTS = {
+  enabled: true,
+  stale_chain_ms: 600_000,
+} as const;
+
 export interface DiscordConfig {
   bot_token_env: string;
   dev_channel: string;
@@ -62,6 +81,11 @@ export interface DiscordConfig {
   webhook_url?: string;
   webhooks?: DiscordWebhookUrls;
   agents: Record<string, DiscordAgentIdentity>;
+  /**
+   * Wave E-β — opt-in/opt-out of reply-chain rendering. Block absent →
+   * `undefined`; consumer applies `DISCORD_REPLY_THREADING_DEFAULTS`.
+   */
+  reply_threading?: DiscordReplyThreadingConfig;
 }
 
 export interface ReviewerConfig {
@@ -248,6 +272,16 @@ function parseDiscordWebhooks(raw: unknown): DiscordWebhookUrls | undefined {
   return out;
 }
 
+function parseDiscordReplyThreading(raw: unknown): DiscordReplyThreadingConfig | undefined {
+  // Wave E-β — block absent → undefined (consumer applies defaults).
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const obj = raw as Record<string, unknown>;
+  const out: DiscordReplyThreadingConfig = {};
+  if (typeof obj.enabled === "boolean") out.enabled = obj.enabled;
+  if (typeof obj.stale_chain_ms === "number") out.stale_chain_ms = obj.stale_chain_ms;
+  return out;
+}
+
 function parseDiscord(raw: Record<string, unknown>): DiscordConfig {
   const section = "discord";
   const agentsRaw = (raw.agents ?? {}) as Record<string, Record<string, unknown>>;
@@ -267,6 +301,8 @@ function parseDiscord(raw: Record<string, unknown>): DiscordConfig {
   };
   const webhooks = parseDiscordWebhooks(raw.webhooks);
   if (webhooks) cfg.webhooks = webhooks;
+  const replyThreading = parseDiscordReplyThreading(raw.reply_threading);
+  if (replyThreading) cfg.reply_threading = replyThreading;
   return cfg;
 }
 

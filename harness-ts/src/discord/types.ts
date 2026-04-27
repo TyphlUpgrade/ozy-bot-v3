@@ -43,11 +43,24 @@ export interface AllowedMentions {
  * instance — independent of the per-channel content senders.
  */
 export interface DiscordSender {
-  sendToChannel(channel: string, content: string, identity?: AgentIdentity): Promise<void>;
+  /**
+   * Wave E-β — `replyToMessageId` is optional. When set, the underlying
+   * Discord send carries `message_reference: { message_id, fail_if_not_exists: false }`
+   * so the post renders as an in-channel reply. `fail_if_not_exists: false` is
+   * mandatory: if the head message was deleted, Discord renders without the
+   * quote-card instead of 4xx-rejecting the send.
+   */
+  sendToChannel(
+    channel: string,
+    content: string,
+    identity?: AgentIdentity,
+    replyToMessageId?: string,
+  ): Promise<void>;
   sendToChannelAndReturnId(
     channel: string,
     content: string,
     identity?: AgentIdentity,
+    replyToMessageId?: string,
   ): Promise<{ messageId: string | null }>;
   addReaction(channelId: string, messageId: string, emoji: string): Promise<void>;
 }
@@ -57,14 +70,24 @@ export interface DiscordSender {
  * `sendToChannel`. Delegates to `sendToChannel` and returns `{messageId: null}`.
  * Real senders (BotSender, WebhookSender) implement `sendToChannelAndReturnId`
  * natively to capture the Discord-assigned message id.
+ *
+ * Wave E-β — forwards optional `replyToMessageId` to inner `sendToChannel`.
  */
 export async function sendToChannelAndReturnIdDefault(
-  sender: { sendToChannel: (channel: string, content: string, identity?: AgentIdentity) => Promise<void> },
+  sender: {
+    sendToChannel: (
+      channel: string,
+      content: string,
+      identity?: AgentIdentity,
+      replyToMessageId?: string,
+    ) => Promise<void>;
+  },
   channel: string,
   content: string,
   identity?: AgentIdentity,
+  replyToMessageId?: string,
 ): Promise<{ messageId: string | null }> {
-  await sender.sendToChannel(channel, content, identity);
+  await sender.sendToChannel(channel, content, identity, replyToMessageId);
   return { messageId: null };
 }
 
@@ -77,6 +100,18 @@ export interface WebhookClient {
     allowedMentions?: AllowedMentions;
     /** CW-1 — request the message object back (Discord `?wait=true` semantics). */
     wait?: boolean;
+    /**
+     * Wave E-β — Discord `message_reference` payload for reply chains. When
+     * present, the new message renders as a reply to `messageId` in the same
+     * channel. `failIfNotExists: false` mirrors the wire field
+     * `fail_if_not_exists: false` so a deleted head doesn't 4xx the send.
+     * discord.js v14+ surfaces this field as `messageReference` on the
+     * WebhookClient.send options.
+     */
+    messageReference?: {
+      messageId: string;
+      failIfNotExists: boolean;
+    };
   }): Promise<unknown>;
 }
 

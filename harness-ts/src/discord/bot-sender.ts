@@ -29,6 +29,8 @@ interface QueuedMessage {
   channelId: string;
   content: string;
   identity?: AgentIdentity;
+  /** Wave E-β — when set, sent as Discord `message_reference` for reply threading. */
+  replyToMessageId?: string;
   /** CW-1 — settle with `{messageId}` for `sendToChannelAndReturnId`; senders that ignore id pass () => undefined. */
   resolve: (messageId: string | null) => void;
 }
@@ -80,14 +82,19 @@ export class BotSender implements DiscordSender {
     this.fetchImpl = options.fetch ?? globalThis.fetch;
   }
 
-  async sendToChannel(channelId: string, content: string, identity?: AgentIdentity): Promise<void> {
+  async sendToChannel(
+    channelId: string,
+    content: string,
+    identity?: AgentIdentity,
+    replyToMessageId?: string,
+  ): Promise<void> {
     if (this.queue.length >= this.maxQueueSize) {
       const dropped = this.queue.shift();
       dropped?.resolve(null);
       console.warn(`[BotSender] queue full, dropping oldest message (queue=${this.queue.length})`);
     }
     return new Promise<void>((resolve) => {
-      this.queue.push({ channelId, content, identity, resolve: () => resolve() });
+      this.queue.push({ channelId, content, identity, replyToMessageId, resolve: () => resolve() });
       void this.drain();
     });
   }
@@ -96,11 +103,16 @@ export class BotSender implements DiscordSender {
    * CW-1 — same delivery contract as `sendToChannel` but resolves with the
    * Discord-assigned message id (extracted from POST response JSON). Returns
    * `{messageId: null}` on overflow drop, network error, or non-2xx response.
+   *
+   * Wave E-β — accepts optional `replyToMessageId`; when set the REST POST
+   * body carries `message_reference: { message_id, fail_if_not_exists: false }`
+   * so the post renders as a reply.
    */
   async sendToChannelAndReturnId(
     channelId: string,
     content: string,
     identity?: AgentIdentity,
+    replyToMessageId?: string,
   ): Promise<{ messageId: string | null }> {
     if (this.queue.length >= this.maxQueueSize) {
       const dropped = this.queue.shift();
@@ -112,6 +124,7 @@ export class BotSender implements DiscordSender {
         channelId,
         content,
         identity,
+        replyToMessageId,
         resolve: (messageId) => resolve({ messageId }),
       });
       void this.drain();
@@ -168,6 +181,17 @@ export class BotSender implements DiscordSender {
               body: JSON.stringify({
                 content: this.renderBody(next.content, next.identity),
                 allowed_mentions: { parse: [] },
+                // Wave E-β — `fail_if_not_exists: false` is mandatory: Discord
+                // renders without a quote-card if head was deleted instead of
+                // 4xx-rejecting the entire send.
+                ...(next.replyToMessageId
+                  ? {
+                      message_reference: {
+                        message_id: next.replyToMessageId,
+                        fail_if_not_exists: false,
+                      },
+                    }
+                  : {}),
               }),
             },
           );

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { loadConfig, loadSystemPrompt } from "../../src/lib/config.js";
+import { loadConfig, loadSystemPrompt, DISCORD_REPLY_THREADING_DEFAULTS } from "../../src/lib/config.js";
 
 const VALID_TOML = `
 [project]
@@ -191,6 +191,32 @@ ops = "https://discord.com/api/webhooks/222/ops-tok"
     expect(config.discord.webhooks?.ops).toBe("https://discord.com/api/webhooks/222/ops-tok");
     expect(config.discord.webhooks?.escalation).toBeUndefined();
   });
+
+  it("Wave E-β parses [discord.reply_threading] with explicit enabled + stale_chain_ms", () => {
+    const toml = VALID_TOML + `
+[discord.reply_threading]
+enabled = false
+stale_chain_ms = 90000
+`;
+    const path = writeTempToml(toml);
+    const config = loadConfig(path);
+
+    expect(config.discord.reply_threading?.enabled).toBe(false);
+    expect(config.discord.reply_threading?.stale_chain_ms).toBe(90000);
+  });
+
+  it("Wave E-β leaves discord.reply_threading undefined when block absent", () => {
+    const path = writeTempToml(VALID_TOML);
+    const config = loadConfig(path);
+    expect(config.discord.reply_threading).toBeUndefined();
+  });
+
+  it("Wave E-β DISCORD_REPLY_THREADING_DEFAULTS exports documented values", () => {
+    expect(DISCORD_REPLY_THREADING_DEFAULTS.enabled).toBe(true);
+    expect(DISCORD_REPLY_THREADING_DEFAULTS.stale_chain_ms).toBe(600_000);
+  });
+
+  it.todo("notifier consults config flag — commit 2");
 });
 
 describe("loadSystemPrompt", () => {
