@@ -73,6 +73,17 @@ export const DISCORD_REPLY_THREADING_DEFAULTS = {
   stale_chain_ms: 600_000,
 } as const;
 
+/**
+ * Wave E-γ — outbound LLM-voice scaffolding defaults. The flag is OFF by
+ * default; commit 2 wires the consumer behind this flag. The daily cap is the
+ * soft ceiling on per-project LLM-rewrite spend; per-call is bounded
+ * separately by `OutboundResponseGenerator.maxBudgetUsd` (default $0.02).
+ */
+export const OUTBOUND_EPISTLE_DEFAULTS = {
+  outbound_epistle_enabled: false,
+  llm_daily_cap_usd: 5.0,
+} as const;
+
 export interface DiscordConfig {
   bot_token_env: string;
   dev_channel: string;
@@ -86,6 +97,18 @@ export interface DiscordConfig {
    * `undefined`; consumer applies `DISCORD_REPLY_THREADING_DEFAULTS`.
    */
   reply_threading?: DiscordReplyThreadingConfig;
+  /**
+   * Wave E-γ — when true, eligible (event, role) tuples route through
+   * `OutboundResponseGenerator` for first-person LLM voice. Default false
+   * until 48h Batch-1 smoke window completes + operator visual sign-off.
+   * Commit 1 (scaffolding) only adds the field; commit 2 wires the consumer.
+   */
+  outbound_epistle_enabled?: boolean;
+  /**
+   * Wave E-γ — daily LLM spend cap (USD) for outbound rewrites. Default 5.0.
+   * Tracked in `<project.root>/.harness/llm-budget.json` (atomic temp+rename).
+   */
+  llm_daily_cap_usd?: number;
 }
 
 export interface ReviewerConfig {
@@ -303,6 +326,15 @@ function parseDiscord(raw: Record<string, unknown>): DiscordConfig {
   if (webhooks) cfg.webhooks = webhooks;
   const replyThreading = parseDiscordReplyThreading(raw.reply_threading);
   if (replyThreading) cfg.reply_threading = replyThreading;
+  // Wave E-γ — flat optional fields under [discord]. Block absent → undefined
+  // (consumer applies OUTBOUND_EPISTLE_DEFAULTS). Snake_case to match TOML
+  // convention used elsewhere in DiscordConfig.
+  if (typeof raw.outbound_epistle_enabled === "boolean") {
+    cfg.outbound_epistle_enabled = raw.outbound_epistle_enabled;
+  }
+  if (typeof raw.llm_daily_cap_usd === "number") {
+    cfg.llm_daily_cap_usd = raw.llm_daily_cap_usd;
+  }
   return cfg;
 }
 

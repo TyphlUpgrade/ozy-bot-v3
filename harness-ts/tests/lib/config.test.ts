@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { loadConfig, loadSystemPrompt, DISCORD_REPLY_THREADING_DEFAULTS } from "../../src/lib/config.js";
+import { loadConfig, loadSystemPrompt, DISCORD_REPLY_THREADING_DEFAULTS, OUTBOUND_EPISTLE_DEFAULTS } from "../../src/lib/config.js";
 
 const VALID_TOML = `
 [project]
@@ -214,6 +214,51 @@ stale_chain_ms = 90000
   it("Wave E-β DISCORD_REPLY_THREADING_DEFAULTS exports documented values", () => {
     expect(DISCORD_REPLY_THREADING_DEFAULTS.enabled).toBe(true);
     expect(DISCORD_REPLY_THREADING_DEFAULTS.stale_chain_ms).toBe(600_000);
+  });
+
+  it("Wave E-γ parses [discord] outbound_epistle_enabled + llm_daily_cap_usd", () => {
+    // VALID_TOML ends inside [discord.agents.executor], so re-open [discord]
+    // explicitly before adding the flat E-γ fields.
+    const toml = `
+[project]
+name = "test-project"
+root = "."
+task_dir = "state/tasks"
+state_file = "state/pipeline.json"
+worktree_base = "/tmp/worktrees"
+session_dir = "/tmp/sessions"
+
+[pipeline]
+test_command = "npm test"
+
+[discord]
+bot_token_env = "DISCORD_TOKEN"
+dev_channel = "dev"
+ops_channel = "ops"
+escalation_channel = "escalations"
+outbound_epistle_enabled = true
+llm_daily_cap_usd = 3.0
+
+[discord.agents.executor]
+name = "test-bot"
+avatar_url = "https://example.com/avatar.png"
+`;
+    const path = writeTempToml(toml);
+    const config = loadConfig(path);
+    expect(config.discord.outbound_epistle_enabled).toBe(true);
+    expect(config.discord.llm_daily_cap_usd).toBe(3.0);
+  });
+
+  it("Wave E-γ leaves outbound_epistle_enabled + llm_daily_cap_usd undefined when absent", () => {
+    const path = writeTempToml(VALID_TOML);
+    const config = loadConfig(path);
+    expect(config.discord.outbound_epistle_enabled).toBeUndefined();
+    expect(config.discord.llm_daily_cap_usd).toBeUndefined();
+  });
+
+  it("Wave E-γ OUTBOUND_EPISTLE_DEFAULTS exports documented values", () => {
+    expect(OUTBOUND_EPISTLE_DEFAULTS.outbound_epistle_enabled).toBe(false);
+    expect(OUTBOUND_EPISTLE_DEFAULTS.llm_daily_cap_usd).toBe(5.0);
   });
 
   it("Wave E-β notifier consults config flag — commit 2: reply_threading.enabled=false skips lookupRoleHead and never sets replyToMessageId", async () => {
