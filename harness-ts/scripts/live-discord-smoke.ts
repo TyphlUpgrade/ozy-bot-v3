@@ -253,6 +253,27 @@ async function main(): Promise<void> {
     outboundGenerator,
   });
 
+  // Wave E-γ — seed stateManager so taskId-only fixtures resolve a projectId.
+  // Notifier's recording-path (and therefore LLM voice transform) only fires
+  // when resolveProjectId(event) returns non-null. For events whose union type
+  // doesn't carry projectId (session_complete, task_done, merge_result,
+  // escalation_needed) the notifier looks up via stateManager.getTask(taskId).
+  // Without seeding, those events bypass the LLM path entirely.
+  for (const fx of SMOKE_FIXTURES) {
+    const hasProjectId = "projectId" in fx && typeof fx.projectId === "string";
+    const hasTaskId = "taskId" in fx && typeof fx.taskId === "string";
+    if (!hasProjectId && hasTaskId) {
+      const taskId = (fx as { taskId: string }).taskId;
+      // Only seed D7 / E-γ fixtures (taskId starts with "task-eg-"); leave the
+      // legacy Phase B fixtures (task-smoke-*) unseeded so they exercise the
+      // plain sendToChannel fallback path.
+      if (taskId.startsWith("task-eg-") && !stateManager.getTask(taskId)) {
+        const task = stateManager.createTask("smoke seed prompt", taskId);
+        stateManager.updateTask(task.id, { projectId: `proj-${taskId}` });
+      }
+    }
+  }
+
   console.log(
     `[discord-smoke] dispatching ${SMOKE_FIXTURES.length} fixtures via notifier (llmMode=${llmMode})`,
   );
