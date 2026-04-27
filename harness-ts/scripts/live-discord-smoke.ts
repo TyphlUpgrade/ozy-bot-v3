@@ -217,10 +217,10 @@ async function main(): Promise<void> {
   }
 
   const identities = [
-    { username: "Architect", avatarURL: "" },
-    { username: "Reviewer", avatarURL: "" },
-    { username: "Executor", avatarURL: "" },
-    { username: "Operator", avatarURL: "" },
+    { username: "Architect", avatarURL: "https://api.dicebear.com/9.x/bottts-neutral/svg?seed=harness-architect" },
+    { username: "Reviewer", avatarURL: "https://api.dicebear.com/9.x/bottts-neutral/svg?seed=harness-reviewer" },
+    { username: "Executor", avatarURL: "https://api.dicebear.com/9.x/bottts-neutral/svg?seed=harness-executor" },
+    { username: "Operator", avatarURL: "https://api.dicebear.com/9.x/bottts-neutral/svg?seed=harness-operator" },
   ];
 
   for (const id of identities) {

@@ -79,10 +79,10 @@ describe("outbound-response v2 prompt files", () => {
         expect(text).toContain("<event_payload>");
       });
 
-      it("is ≤120 lines (epistle structure + emoji + backtick discipline)", () => {
+      it("is ≤150 lines (epistle structure + emoji + backtick + timestamp + allowed-emojis)", () => {
         const text = readFileSync(path, "utf-8");
         const lines = text.split("\n").length;
-        expect(lines).toBeLessThanOrEqual(120);
+        expect(lines).toBeLessThanOrEqual(150);
       });
 
       it("references the role identity in voice section", () => {
@@ -102,6 +102,19 @@ describe("outbound-response v2 prompt files", () => {
         const hasBacktick = text.includes("backtick");
         const hasCodeStyled = text.includes("code-styled");
         expect(hasBacktick || hasCodeStyled).toBe(true);
+      });
+
+      it("contains the 'Current UTC time' instruction so the LLM uses the injected value", () => {
+        const text = readFileSync(path, "utf-8");
+        expect(text).toContain("Current UTC time");
+      });
+
+      it("contains an 'Allowed emojis' section heading binding the role's emoji", () => {
+        const text = readFileSync(path, "utf-8");
+        expect(text.toLowerCase()).toContain("allowed emojis");
+        // The role's emoji must appear inside the allowed list (already
+        // asserted broadly above, but anchor it specifically to this section).
+        expect(text).toContain(V2_ROLE_EMOJI[role]);
       });
     });
   }

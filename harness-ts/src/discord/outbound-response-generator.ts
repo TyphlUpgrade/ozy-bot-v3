@@ -149,9 +149,15 @@ function buildUserPrompt(input: OutboundGenerateInput): string {
   const safePayload = stripFenceTokens(payloadJson);
   const safeBody = stripFenceTokens(input.deterministicBody);
 
+  // Inject current UTC time so v2 prompts can render the section-header
+  // pattern verbatim instead of fabricating placeholders. Format HH:MM
+  // (model has no realtime clock without tool access).
+  const utcHHMM = new Date().toISOString().slice(11, 16);
+
   const parts: string[] = [];
   parts.push(`<event_payload>\n${safePayload}\n</event_payload>`);
   parts.push(`<operator_input>\n${safeBody}\n</operator_input>`);
+  parts.push(`Current UTC time: ${utcHHMM} UTC`);
   parts.push("Rewrite the deterministic body in your first-person voice. Plain prose only.");
   return parts.join("\n\n");
 }

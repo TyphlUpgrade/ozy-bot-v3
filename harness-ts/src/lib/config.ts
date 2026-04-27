@@ -285,11 +285,11 @@ function parseDiscordAgent(raw: Record<string, unknown>, agentName: string): Dis
  * deployment to declare them. New agent tiers should add their default here.
  */
 export const DISCORD_AGENT_DEFAULTS: Readonly<Record<string, DiscordAgentIdentity>> = {
-  orchestrator: { name: "Harness", avatar_url: "" },
-  architect: { name: "Architect", avatar_url: "" },
-  reviewer: { name: "Reviewer", avatar_url: "" },
-  executor: { name: "Executor", avatar_url: "" },
-  operator: { name: "Operator", avatar_url: "" },
+  orchestrator: { name: "Harness", avatar_url: "https://api.dicebear.com/9.x/bottts-neutral/svg?seed=harness-orchestrator" },
+  architect: { name: "Architect", avatar_url: "https://api.dicebear.com/9.x/bottts-neutral/svg?seed=harness-architect" },
+  reviewer: { name: "Reviewer", avatar_url: "https://api.dicebear.com/9.x/bottts-neutral/svg?seed=harness-reviewer" },
+  executor: { name: "Executor", avatar_url: "https://api.dicebear.com/9.x/bottts-neutral/svg?seed=harness-executor" },
+  operator: { name: "Operator", avatar_url: "https://api.dicebear.com/9.x/bottts-neutral/svg?seed=harness-operator" },
 };
 
 function parseDiscordWebhooks(raw: unknown): DiscordWebhookUrls | undefined {

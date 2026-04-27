@@ -509,6 +509,9 @@ describe("OutboundResponseGenerator.generate success path", () => {
     expect(call.system).toContain("voice"); // VALID_PROMPT marker
     expect(call.userPrompt).toContain("<event_payload>");
     expect(call.userPrompt).toContain("<operator_input>");
+    // UTC time injection (so v2 prompts can render `HH:MM UTC` headers
+    // verbatim instead of fabricating placeholders).
+    expect(call.userPrompt).toMatch(/Current UTC time: \d{2}:\d{2} UTC/);
 
     // Instrumentation: spawned + success.
     const spawned = events.find((e) => e.kind === "spawned");
@@ -574,5 +577,25 @@ describe("OutboundResponseGenerator.generate success path", () => {
       deterministicBody: DETERMINISTIC,
     });
     expect(out).toBe("first chunk second chunk.");
+  });
+
+  it("injects a `Current UTC time: HH:MM UTC` line into the user prompt", async () => {
+    const { anthropic, trace } = makeMockAnthropic([
+      { text: "ok", usage: { input_tokens: 10, output_tokens: 5 } },
+    ]);
+    const gen = makeFreshGen({ anthropic });
+    await gen.generate({
+      event: SAMPLE_SESSION_COMPLETE,
+      role: "executor",
+      deterministicBody: DETERMINISTIC,
+    });
+    expect(trace.callCount).toBe(1);
+    const userPrompt = trace.calls[0].userPrompt;
+    // The injected line must match the documented contract format exactly so
+    // v2 prompts can substring-extract `HH:MM UTC` for their section header.
+    const lines = userPrompt.split("\n");
+    const utcLine = lines.find((l) => l.startsWith("Current UTC time: "));
+    expect(utcLine).toBeDefined();
+    expect(utcLine).toMatch(/^Current UTC time: \d{2}:\d{2} UTC$/);
   });
 });

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { loadConfig, loadSystemPrompt, DISCORD_REPLY_THREADING_DEFAULTS, OUTBOUND_EPISTLE_DEFAULTS } from "../../src/lib/config.js";
+import { loadConfig, loadSystemPrompt, DISCORD_REPLY_THREADING_DEFAULTS, OUTBOUND_EPISTLE_DEFAULTS, DISCORD_AGENT_DEFAULTS } from "../../src/lib/config.js";
 
 const VALID_TOML = `
 [project]
@@ -330,6 +330,21 @@ avatar_url = "https://example.com/avatar.png"
     await new Promise((r) => setTimeout(r, 0));
     expect(sent).toHaveLength(1);
     expect(sent[0].content.startsWith("<@249313669337317379> ")).toBe(true);
+  });
+
+  it("DISCORD_AGENT_DEFAULTS exposes a non-empty avatar_url for every default role and avatars are unique per role", () => {
+    const roles = ["orchestrator", "architect", "reviewer", "executor", "operator"] as const;
+    for (const role of roles) {
+      const ident = DISCORD_AGENT_DEFAULTS[role];
+      expect(ident, `role ${role} missing from DISCORD_AGENT_DEFAULTS`).toBeDefined();
+      expect(ident.name.length).toBeGreaterThan(0);
+      expect(ident.avatar_url.length).toBeGreaterThan(0);
+      expect(ident.avatar_url.startsWith("https://")).toBe(true);
+    }
+    // No two roles may share the same avatar_url — defeats the visual
+    // distinction that motivated populating defaults in the first place.
+    const urls = roles.map((r) => DISCORD_AGENT_DEFAULTS[r].avatar_url);
+    expect(new Set(urls).size).toBe(urls.length);
   });
 
   it("Wave E-β notifier consults config flag — commit 2: reply_threading.enabled=false skips lookupRoleHead and never sets replyToMessageId", async () => {

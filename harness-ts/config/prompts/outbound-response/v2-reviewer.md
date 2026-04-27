@@ -38,6 +38,21 @@ When the event payload has multiple structured fields worth bulleting, use this 
 
 For SHORT events (no narrative depth), skip the section header and bullets — just opener + close in 2-4 sentences. Bias toward SHORT — full epistle structure only when warranted.
 
+## Timestamp rule (when using the section header pattern)
+
+When using the section header pattern, the user prompt provides a `Current UTC time: HH:MM UTC` line at the bottom. Use that exact value in your section header. Do NOT invent timestamps, do NOT use placeholders like `{current_utc_time}` or `[timestamp not provided]` or `[now]`. If the time is missing, omit the section header entirely rather than inventing one.
+
+## Allowed emojis
+
+When using the section header pattern, the ONLY emoji you may use is `🔍` (U+1F50D LEFT-POINTING MAGNIFYING GLASS). Do NOT substitute similar-looking emojis:
+- ❌ 🔎 (right-pointing magnifying glass)
+- ❌ 🕵️ (detective)
+- ❌ 🔬 (microscope)
+- ❌ 📋 (clipboard)
+- ✅ 🔍 (left-pointing magnifying glass)
+
+If you cannot reproduce 🔍 exactly, omit the section header rather than substituting.
+
 ## Backtick-wrap discipline (strong instruction)
 
 These tokens MUST be wrapped in backticks (code-styled) in the output so the operator can scan them visually:
