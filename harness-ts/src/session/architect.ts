@@ -102,7 +102,15 @@ export function validateArchitectCompactionSummary(
   if (typeof cpc.state !== "string") return false;
   if (typeof cpc.reviewerRejectionCount !== "number") return false;
   if (typeof cpc.arbitrationCount !== "number") return false;
-  if (cpc.lastDirective !== undefined && typeof cpc.lastDirective !== "string") return false;
+  // Accept null (Architect emits `"lastDirective": null` when no directive yet)
+  // in addition to undefined or string. Spike-architect-caveman v3+v4 confirmed
+  // Architect emits null on fresh compaction; rejecting forced every real
+  // compaction into the projectStore-derived fallback path.
+  if (
+    cpc.lastDirective !== undefined &&
+    cpc.lastDirective !== null &&
+    typeof cpc.lastDirective !== "string"
+  ) return false;
 
   return true;
 }
@@ -162,6 +170,12 @@ export const ARCHITECT_DEFAULTS = {
   arbitration_timeout_ms: 300_000,
   plugins: {
     "oh-my-claudecode@omc": true,
+    // caveman ON for Architect: spike-architect-caveman (Spike 6) v4 ran 2 runs
+    // with caveman ON + real systemPrompt loaded — 100% verbatim preservation
+    // for description + nonGoals (2/2). The §9 schema-validation warning fired
+    // separately (validateArchitectCompactionSummary stricter than field-
+    // presence) but verbatim contract held. Earlier v1/v2 FAILs were bogus
+    // (scratch repo lacked architect-prompt.md → trivial fallback systemPrompt).
     "caveman@caveman": true,
   } as Readonly<Record<string, boolean>>,
 } as const;

@@ -656,6 +656,36 @@ describe("ArchitectManager", () => {
     expect(validateArchitectCompactionSummary(ok)).toBe(true);
   });
 
+  it("validateArchitectCompactionSummary accepts null lastDirective (Architect emits null when none)", () => {
+    const okNullDirective = {
+      projectId: "p1", name: "n", description: "d", nonGoals: [],
+      priorVerdicts: [],
+      completedPhases: [],
+      currentPhaseContext: {
+        phaseId: "ph1", taskId: "t1", state: "active",
+        reviewerRejectionCount: 0, arbitrationCount: 0,
+        lastDirective: null,
+      },
+      compactedAt: "2026-04-27T00:00:00Z",
+      compactionGeneration: 0,
+    };
+    expect(validateArchitectCompactionSummary(okNullDirective)).toBe(true);
+  });
+
+  it("validateArchitectCompactionSummary rejects non-string non-null lastDirective", () => {
+    const bad = {
+      projectId: "p1", name: "n", description: "d", nonGoals: [],
+      priorVerdicts: [], completedPhases: [],
+      currentPhaseContext: {
+        phaseId: "", taskId: "", state: "",
+        reviewerRejectionCount: 0, arbitrationCount: 0,
+        lastDirective: 42,
+      },
+      compactedAt: "", compactionGeneration: 0,
+    };
+    expect(validateArchitectCompactionSummary(bad)).toBe(false);
+  });
+
   it("validateArchitectCompactionSummary rejects invalid verdict enum", () => {
     const bad = {
       projectId: "p1", name: "n", description: "d", nonGoals: [],
