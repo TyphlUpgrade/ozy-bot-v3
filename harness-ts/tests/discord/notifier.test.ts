@@ -581,7 +581,7 @@ describe("DiscordNotifier", () => {
     expect(sent[0].identity?.username).toBe("Harness"); // DISCORD_AGENT_DEFAULTS.orchestrator.name
   });
 
-  it("nudge_check section-header emoji matches sourceAgent (architect → 🏛️)", async () => {
+  it("nudge_check section-header emoji matches sourceAgent (architect → 🏗️)", async () => {
     notifier.handleEvent({
       type: "nudge_check",
       projectId: "p",
@@ -590,7 +590,7 @@ describe("DiscordNotifier", () => {
       observations: [],
     });
     await flush();
-    expect(sent[0].content).toContain("🏛️");
+    expect(sent[0].content).toContain("🏗️");
     expect(sent[0].content).toContain("**Nudge Check**");
   });
 

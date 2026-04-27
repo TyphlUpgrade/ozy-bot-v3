@@ -44,12 +44,19 @@ function shortProjectId(id: string): string {
 
 // --- Role emoji map ---
 
+// Match v2 outbound-response prompt convention (config/prompts/outbound-response/v2-*.md).
+// Section header emoji per role; LLM voice transformer uses the same map per role.
 const ROLE_EMOJI: Record<IdentityRole, string> = {
-  executor: "⚙️",
+  executor: "🛠️",
   reviewer: "🔍",
-  architect: "🏛️",
-  orchestrator: "🎛️",
+  architect: "🏗️",
+  orchestrator: "⚙️",
 };
+
+/** Format an ISO timestamp to "HH:MM UTC" for section headers. */
+function formatTs(iso: string): string {
+  return `${iso.slice(11, 16)} UTC`;
+}
 
 // --- Epistle renderer ---
 
@@ -99,7 +106,7 @@ export function renderEpistle(
       // Compact form preserved for backward compat — existing /response level: reviewed/ pin (:323)
       // is satisfied by `lvl` appearing in both branches.
       if (event.summary || (event.filesChanged && event.filesChanged.length > 0)) {
-        const lines = [`${emoji} **Task Complete** — \`${ts}\``, ""];
+        const lines = [`${emoji} **Task Complete** — ${formatTs(ts)}`, ""];
         lines.push(`Task \`${id}\` completed${lvl}.`);
         if (event.summary) {
           lines.push("", `**Summary:** ${sanitize(event.summary, 500)}`);
@@ -172,7 +179,7 @@ export function renderEpistle(
     case "review_mandatory": {
       const id = shortTaskId(event.taskId);
       const projId = shortProjectId(event.projectId);
-      const lines = [`${emoji} **Review Required** — \`${ts}\``, ""];
+      const lines = [`${emoji} **Review Required** — ${formatTs(ts)}`, ""];
       lines.push(`Mandatory review firing for \`${id}\` in project \`${projId}\`.`);
       if (event.reviewSummary) {
         lines.push("", `- **Summary:** ${sanitize(event.reviewSummary, 400)}`);
@@ -229,7 +236,7 @@ export function renderEpistle(
       const closing = event.nextAction
         ? sanitize(event.nextAction, 200)
         : "I'll check again at the next interval.";
-      const lines = [`${emoji} **Nudge Check** — \`${ts}\``, ""];
+      const lines = [`${emoji} **Nudge Check** — ${formatTs(ts)}`, ""];
       lines.push(opener);
       // Observations: render as bullets when 2+; for stagnant/progressing the
       // single observation is already absorbed into the opener so we skip the

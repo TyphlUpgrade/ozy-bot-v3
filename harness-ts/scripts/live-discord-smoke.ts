@@ -158,7 +158,7 @@ export const SMOKE_FIXTURES: Parameters<typeof DiscordNotifier.prototype.handleE
   // nudge_check::executor — progressing with two observations (exercises bullet rendering)
   { type: "nudge_check", projectId: "proj-eg-nudge-3", sourceAgent: "executor", status: "progressing", observations: ["last task t1 done 4 min ago", "2 phases remaining"] },
   // nudge_check::orchestrator — stagnant project-agnostic (no projectId)
-  { type: "nudge_check", sourceAgent: "orchestrator", status: "stagnant", observations: ["No active projects."] },
+  { type: "nudge_check", sourceAgent: "orchestrator", status: "stagnant", observations: ["no events in 5 minutes"] },
 ];
 
 async function main(): Promise<void> {
