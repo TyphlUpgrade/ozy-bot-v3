@@ -1,3 +1,8 @@
+// TODO[F-future]: queue + drain + overflow logic is duplicated between
+// WebhookSender and BotSender. Extract a shared RateLimitedQueue<T> with
+// hooks for transmit() and (BotSender-only) 429 retry. ~140 LOC saved.
+// Deferred from 2026-04-27 review per scope bound; see Phase F.10 backlog.
+
 /**
  * Webhook-based Discord sender — implements DiscordSender via an injectable
  * WebhookClient.

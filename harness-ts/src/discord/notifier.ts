@@ -532,13 +532,23 @@ export class DiscordNotifier {
     if (this.outboundGenerator && this.config.outbound_epistle_enabled === true) {
       const outboundRole = identityToOutboundRole(resolveIdentityRole(args.event));
       if (outboundRole !== null && isOutboundLlmEligible(args.event.type, outboundRole)) {
-        // Generator swallows all failures internally and returns
-        // `deterministicBody` on any miss/error — no try/catch needed here.
-        body = await this.outboundGenerator.generate({
-          event: args.event,
-          role: outboundRole,
-          deterministicBody: args.deterministicBody,
-        });
+        // Generator's contract is "never throws" (outer try/catch in
+        // generate()), but `dispatch()` invokes us via `void` — a future
+        // refactor that breaks the contract would silently lose the throw.
+        // Belt-and-braces: surface a contract violation here and fall back
+        // to the deterministic body explicitly.
+        try {
+          body = await this.outboundGenerator.generate({
+            event: args.event,
+            role: outboundRole,
+            deterministicBody: args.deterministicBody,
+          });
+        } catch (err) {
+          console.error(
+            `[DiscordNotifier] OutboundResponseGenerator threw (contract violation): ${errMessage(err)} — falling back to deterministic body`,
+          );
+          // body stays as deterministicBody — already initialized above.
+        }
       }
     }
     // Channel-collapse (2026-04-27) — apply operator-mention prepend +

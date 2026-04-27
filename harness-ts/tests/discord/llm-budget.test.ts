@@ -89,6 +89,23 @@ describe("LlmBudgetTracker", () => {
     expect(onDisk.spentUsd).toBe(0);
   });
 
+  it("UTC rollover emits console.warn with previous-day spend so accounting is inspectable", () => {
+    const day1 = new Date("2026-04-27T23:59:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(day1);
+    const t = new LlmBudgetTracker({ rootDir, dailyCapUsd: 5.0 });
+    t.charge(2.5);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Cross UTC midnight; next public call must fire the rollover warn with
+    // the previous-day total ($2.5000) embedded.
+    vi.setSystemTime(new Date("2026-04-28T00:01:00.000Z"));
+    expect(t.todaySpentUsd()).toBe(0);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const msg = warnSpy.mock.calls[0]?.[0];
+    expect(msg).toMatch(/UTC rollover: 2026-04-27 → 2026-04-28/);
+    expect(msg).toMatch(/previous-day spent \$2\.5000/);
+  });
+
   it("rollover triggered by canAfford in the same process when date changes mid-life", () => {
     const day1 = new Date("2026-04-27T23:59:00.000Z");
     vi.useFakeTimers();

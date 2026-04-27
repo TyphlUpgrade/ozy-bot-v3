@@ -310,7 +310,7 @@ export class OutboundResponseGenerator {
         { signal: ac.signal },
       );
     } catch (err) {
-      clearTimeout(timeoutHandle);
+      // `finally` below clears the timeout — single owner of cleanup.
       if (ac.signal.aborted) {
         this.breaker.recordFailure(role);
         this.onEvent?.({ kind: "fallback_timeout", role, eventType: event.type });

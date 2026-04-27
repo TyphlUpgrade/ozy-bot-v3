@@ -73,14 +73,20 @@ export class LlmBudgetTracker {
 
   /** Returns true if a $cost charge would NOT exceed today's cap. */
   canAfford(estimatedCostUsd: number): boolean {
-    this.rolloverIfNeeded();
+    // Snapshot today's date once so that a UTC midnight crossing mid-call
+    // can't make the rollover and the cap-check disagree.
+    const today = todayUtc();
+    this.rolloverIfNeeded(today);
     return this.state.spentUsd + estimatedCostUsd <= this.state.dailyCapUsd;
   }
 
   /** Atomically increments today's spent. Never refunds. */
   charge(actualCostUsd: number): void {
     if (actualCostUsd <= 0) return;
-    this.rolloverIfNeeded();
+    // Same date snapshot as canAfford so a long-running daemon's spend can't
+    // get applied to the wrong day if it straddles UTC midnight.
+    const today = todayUtc();
+    this.rolloverIfNeeded(today);
     this.state.spentUsd += actualCostUsd;
     this.state.lastUpdatedAt = nowIso();
     this.persist();
@@ -88,7 +94,8 @@ export class LlmBudgetTracker {
 
   /** Current UTC-day spent. */
   todaySpentUsd(): number {
-    this.rolloverIfNeeded();
+    const today = todayUtc();
+    this.rolloverIfNeeded(today);
     return this.state.spentUsd;
   }
 
@@ -146,18 +153,25 @@ export class LlmBudgetTracker {
     };
   }
 
-  private rolloverIfNeeded(): void {
-    const today = todayUtc();
-    if (this.state.currentUtcDate !== today) {
-      this.state = {
-        schemaVersion: SCHEMA_VERSION,
-        currentUtcDate: today,
-        spentUsd: 0,
-        dailyCapUsd: this.dailyCapUsd,
-        lastUpdatedAt: nowIso(),
-      };
-      this.persist();
-    }
+  private rolloverIfNeeded(today: string): void {
+    if (this.state.currentUtcDate === today) return;
+    // Surface the previous-day spend so accounting trails are inspectable —
+    // without this, a long-running daemon's prior-day total disappears
+    // silently when the date advances.
+    const previousDate = this.state.currentUtcDate;
+    const previousSpend = this.state.spentUsd;
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[LlmBudgetTracker] UTC rollover: ${previousDate} → ${today}; previous-day spent $${previousSpend.toFixed(4)}`,
+    );
+    this.state = {
+      schemaVersion: SCHEMA_VERSION,
+      currentUtcDate: today,
+      spentUsd: 0,
+      dailyCapUsd: this.dailyCapUsd,
+      lastUpdatedAt: nowIso(),
+    };
+    this.persist();
   }
 
   /** Atomic temp+rename, mirroring `state.ts:180-188`. */
