@@ -50,6 +50,13 @@ export interface SessionResult {
    * `Model: <name>` trailer on every phase commit for forensic provenance.
    */
   modelName?: string;
+  /**
+   * Stall watchdog (commit 1/2): wall-clock ms (Date.now()) of the last
+   * SDKMessage observed on this stream. Populated unconditionally by
+   * consumeStream. No production-code consumer reads it yet — commit 2
+   * wires the orchestrator-side interval timer + session_stalled emission.
+   */
+  lastActivityAt?: number;
 }
 
 export type MessageHandler = (msg: SDKMessage) => void;
@@ -177,9 +184,12 @@ export class SDKClient {
     let sessionId = "";
     // WA-5: model name from system_init feeds the `Model:` commit trailer.
     let initModel: string | undefined;
+    // Stall watchdog (commit 1/2): track timestamp of latest observed message.
+    let lastActivityAt: number | undefined;
 
     for await (const msg of q) {
       onMessage?.(msg);
+      lastActivityAt = Date.now();
 
       // Track session ID from any message that has it
       if ("session_id" in msg && typeof msg.session_id === "string") {
@@ -205,10 +215,11 @@ export class SDKClient {
         numTurns: 0,
         usage: { input_tokens: 0, output_tokens: 0 },
         modelName: initModel,
+        lastActivityAt,
       };
     }
 
-    return { ...result, modelName: result.modelName ?? initModel };
+    return { ...result, modelName: result.modelName ?? initModel, lastActivityAt };
   }
 
   /** Register an abort controller for a session (for external abort) */

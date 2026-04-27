@@ -80,12 +80,34 @@ export interface ArchitectFileConfig {
   prompt_path?: string;                   // path to architect-prompt.md (relative to project.root if not absolute)
 }
 
+/**
+ * Stall watchdog — opt-in interval timer (commit 2 wires the orchestrator side).
+ * Commit 1 ships only the config block + `lastActivityAt` tap on SessionResult.
+ * Per-tier thresholds reflect typical session shapes: Reviewer < Executor < Architect.
+ */
+export interface StallWatchdogConfig {
+  enabled?: boolean;                  // default false (opt-in)
+  check_interval_ms?: number;         // default 30_000
+  executor_threshold_ms?: number;     // default 300_000 (5 min)
+  architect_threshold_ms?: number;    // default 600_000 (10 min)
+  reviewer_threshold_ms?: number;     // default 240_000 (4 min)
+}
+
+export const STALL_WATCHDOG_DEFAULTS = {
+  enabled: false,
+  check_interval_ms: 30_000,
+  executor_threshold_ms: 300_000,
+  architect_threshold_ms: 600_000,
+  reviewer_threshold_ms: 240_000,
+} as const;
+
 export interface HarnessConfig {
   project: ProjectConfig;
   pipeline: PipelineConfig;
   discord: DiscordConfig;
   reviewer?: ReviewerConfig;       // optional — ReviewGate defaults apply when omitted
   architect?: ArchitectFileConfig; // optional — ArchitectManager defaults apply when omitted
+  stall_watchdog?: StallWatchdogConfig; // optional — orchestrator interval timer (commit 2)
   systemPrompt?: string;           // loaded from prompt file at startup, cached
 }
 
@@ -281,6 +303,7 @@ export function loadConfig(configPath: string): HarnessConfig {
 
   const reviewerRaw = parsed.reviewer;
   const architectRaw = parsed.architect;
+  const stallWatchdogRaw = parsed.stall_watchdog;
   const cfg: HarnessConfig = {
     project: parseProject(projectRaw as Record<string, unknown>),
     pipeline: parsePipeline(pipelineRaw as Record<string, unknown>),
@@ -291,6 +314,9 @@ export function loadConfig(configPath: string): HarnessConfig {
   }
   if (architectRaw && typeof architectRaw === "object") {
     cfg.architect = parseArchitect(architectRaw as Record<string, unknown>);
+  }
+  if (stallWatchdogRaw && typeof stallWatchdogRaw === "object") {
+    cfg.stall_watchdog = parseStallWatchdog(stallWatchdogRaw as Record<string, unknown>);
   }
   return cfg;
 }
@@ -312,6 +338,16 @@ function parseArchitect(raw: Record<string, unknown>): ArchitectFileConfig {
   if (typeof raw.compaction_threshold_pct === "number") out.compaction_threshold_pct = raw.compaction_threshold_pct;
   if (typeof raw.arbitration_timeout_ms === "number") out.arbitration_timeout_ms = raw.arbitration_timeout_ms;
   if (typeof raw.prompt_path === "string") out.prompt_path = raw.prompt_path;
+  return out;
+}
+
+function parseStallWatchdog(raw: Record<string, unknown>): StallWatchdogConfig {
+  const out: StallWatchdogConfig = {};
+  if (typeof raw.enabled === "boolean") out.enabled = raw.enabled;
+  if (typeof raw.check_interval_ms === "number") out.check_interval_ms = raw.check_interval_ms;
+  if (typeof raw.executor_threshold_ms === "number") out.executor_threshold_ms = raw.executor_threshold_ms;
+  if (typeof raw.architect_threshold_ms === "number") out.architect_threshold_ms = raw.architect_threshold_ms;
+  if (typeof raw.reviewer_threshold_ms === "number") out.reviewer_threshold_ms = raw.reviewer_threshold_ms;
   return out;
 }
 
