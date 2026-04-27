@@ -1,40 +1,45 @@
 /**
  * Wave E-γ — outbound LLM voice generator.
  *
- * Mirrors `LlmResponseGenerator` (`src/discord/response-generator.ts:192`) but
- * for the outbound notifier path: per-role first-person prose rewrites of
- * deterministic event bodies. Differences:
+ * Per-role first-person prose rewrites of deterministic event bodies.
+ * Calls the Anthropic Messages API directly via `@anthropic-ai/sdk` — a
+ * stateless one-shot operation, no Claude Agent SDK session, no
+ * harness-ts/CLAUDE.md / settings.json / MCP / plugins overhead.
+ *
+ * Differences vs `LlmResponseGenerator` (`src/discord/response-generator.ts`):
  *   - Per-role system prompts (Architect / Reviewer / Executor / Orchestrator)
  *     loaded eagerly at construction; throws on missing or empty file (D9).
  *   - Whitelist guard: non-eligible (event.type, role) tuples short-circuit
- *     to the deterministic body without spawning the SDK (D5).
+ *     to the deterministic body without calling the API (D5).
  *   - Daily budget tracker + per-role circuit breaker as runtime guards (D3, D4).
  *   - Replacement-with-fallback semantic: on ANY failure path, returns
  *     `deterministicBody` verbatim. NEVER throws.
+ *   - Optional per-call instrumentation via `onEvent` callback (silent by
+ *     default; bootstraps wire to console for visibility).
  *
- * Security posture mirrors `LlmResponseGenerator`:
+ * Security posture:
  *   - Deterministic body fenced inside `<operator_input>` tags. Event payload
  *     fenced inside `<event_payload>` tags. The system prompt classifies fenced
  *     content as DATA, not instruction.
- *   - `allowedTools: []` and explicit `disallowedTools` block any tool use.
- *   - `maxTurns: 1` keeps the call single-shot.
- *   - Budget + wall-clock bounded. SDK / parse / timeout failures fall back.
+ *   - No tools available — Messages API has no tool concept on this call.
+ *   - Bounded `max_tokens` cap on output (default 800 ≈ 1500 chars).
+ *   - Wall-clock bounded via AbortController.
  *
  * Failure semantics inside `generate()`:
- *   - whitelist miss → return deterministicBody (no spawn, no log, no breaker)
- *   - circuit breaker open → return deterministicBody; log ONCE per process
- *     per role
- *   - budget rejects → return deterministicBody; log ONCE per UTC day to
- *     console.warn
- *   - SDK throws / abort / non-text → increment breaker; return deterministicBody
+ *   - whitelist miss → return deterministicBody (no API call, no log, no breaker)
+ *   - circuit breaker open → return deterministicBody; log ONCE per process per role
+ *   - budget rejects → return deterministicBody; log ONCE per UTC day to console.warn
+ *   - API throws / abort / non-text → increment breaker; return deterministicBody
  *   - schema validation fail → increment breaker; return deterministicBody
+ *   - actual cost > maxBudgetUsd → charge actual + increment breaker; return deterministicBody
  *   - any uncaught throw → swallow, return deterministicBody
  */
 
 import { readFileSync } from "node:fs";
 
+import type Anthropic from "@anthropic-ai/sdk";
+
 import type { OrchestratorEvent } from "../orchestrator.js";
-import type { SDKClient } from "../session/sdk.js";
 
 import { LlmBudgetTracker, PerRoleCircuitBreaker } from "./llm-budget.js";
 
@@ -42,16 +47,44 @@ import { LlmBudgetTracker, PerRoleCircuitBreaker } from "./llm-budget.js";
 
 export type OutboundRole = "architect" | "reviewer" | "executor" | "orchestrator";
 
+/**
+ * Per-call instrumentation event. Emitted exactly once per `generate()` call
+ * (after guards short-circuit OR after the API call resolves). `undefined`
+ * `onEvent` opt → silent (preserves prior behavior). Bootstraps wire to
+ * `console.log` so operators can grep for `fallback_*` variants to understand
+ * why the LLM didn't fire.
+ */
+export type OutboundGenEvent =
+  | { kind: "spawned"; role: OutboundRole; eventType: string }
+  | { kind: "fallback_whitelist"; role: OutboundRole; eventType: string }
+  | { kind: "fallback_breaker"; role: OutboundRole }
+  | { kind: "fallback_budget"; spentUsd: number }
+  | { kind: "fallback_timeout"; role: OutboundRole; eventType: string }
+  | { kind: "fallback_api_error"; role: OutboundRole; eventType: string; err: string }
+  | { kind: "fallback_validation"; role: OutboundRole; eventType: string }
+  | { kind: "fallback_overspend"; role: OutboundRole; costUsd: number }
+  | { kind: "success"; role: OutboundRole; eventType: string; costUsd: number; outputChars: number };
+
 export interface OutboundResponseGeneratorOpts {
-  sdk: SDKClient;
-  cwd: string;
+  anthropic: Anthropic;
   promptPaths: Record<OutboundRole, string>;
   whitelist: ReadonlySet<string>;
   budget: LlmBudgetTracker;
   circuitBreaker: PerRoleCircuitBreaker;
+  /** Default "claude-haiku-4-5-20251001". */
   model?: string;
+  /** Default 0.02 USD per call — strict ceiling, breach falls back. */
   maxBudgetUsd?: number;
+  /** Default 8000ms wall-clock timeout. */
   timeoutMs?: number;
+  /**
+   * Default 800 tokens (~1500 chars). Bounds cost; truncated server-side if
+   * the model would generate more. Output is further truncated client-side
+   * to Discord's 1900-char headroom cap.
+   */
+  maxOutputTokens?: number;
+  /** Optional per-call instrumentation. Default `undefined` = silent. */
+  onEvent?: (e: OutboundGenEvent) => void;
 }
 
 export interface OutboundGenerateInput {
@@ -65,6 +98,7 @@ export interface OutboundGenerateInput {
 export const DEFAULT_OUTBOUND_MODEL = "claude-haiku-4-5-20251001";
 export const DEFAULT_OUTBOUND_MAX_BUDGET_USD = 0.02;
 export const DEFAULT_OUTBOUND_TIMEOUT_MS = 8_000;
+export const DEFAULT_OUTBOUND_MAX_OUTPUT_TOKENS = 800;
 
 const ALL_ROLES: readonly OutboundRole[] = [
   "architect",
@@ -74,6 +108,20 @@ const ALL_ROLES: readonly OutboundRole[] = [
 ];
 
 const DISCORD_BODY_MAX_CHARS = 1900;
+
+/**
+ * Per-model token pricing in USD per 1M tokens. Fall through to
+ * `FALLBACK_PRICING` (Haiku rates) if the model isn't listed — keeps cost
+ * accounting conservative-ish without crashing on a new/unknown model.
+ *
+ * To add a model: add one row here.
+ */
+const MODEL_PRICING_PER_MTOK: Record<string, { input: number; output: number }> = {
+  "claude-haiku-4-5-20251001": { input: 1.0, output: 5.0 },
+  "claude-sonnet-4-6": { input: 3.0, output: 15.0 },
+  "claude-opus-4-7": { input: 15.0, output: 75.0 },
+};
+const FALLBACK_PRICING = { input: 1.0, output: 5.0 };
 
 // --- Helpers ---
 
@@ -133,11 +181,23 @@ function validateOutput(out: string, event: OrchestratorEvent): boolean {
   return true;
 }
 
+/**
+ * Compute USD cost from token usage and model. Pulls from
+ * `MODEL_PRICING_PER_MTOK`; falls through to Haiku rates for unknown models
+ * so accounting never crashes on a config typo.
+ */
+export function computeCostUsd(
+  model: string,
+  usage: { input_tokens: number; output_tokens: number },
+): number {
+  const rates = MODEL_PRICING_PER_MTOK[model] ?? FALLBACK_PRICING;
+  return (usage.input_tokens * rates.input + usage.output_tokens * rates.output) / 1_000_000;
+}
+
 // --- Generator ---
 
 export class OutboundResponseGenerator {
-  private readonly sdk: SDKClient;
-  private readonly cwd: string;
+  private readonly anthropic: Anthropic;
   private readonly prompts: Record<OutboundRole, string>;
   private readonly whitelist: ReadonlySet<string>;
   private readonly budget: LlmBudgetTracker;
@@ -145,6 +205,8 @@ export class OutboundResponseGenerator {
   private readonly model: string;
   private readonly maxBudgetUsd: number;
   private readonly timeoutMs: number;
+  private readonly maxOutputTokens: number;
+  private readonly onEvent: ((e: OutboundGenEvent) => void) | undefined;
 
   // One-shot logging guards.
   private readonly breakerWarnedRoles: Set<OutboundRole> = new Set();
@@ -168,14 +230,15 @@ export class OutboundResponseGenerator {
       prompts[role] = text;
     }
     this.prompts = prompts as Record<OutboundRole, string>;
-    this.sdk = opts.sdk;
-    this.cwd = opts.cwd;
+    this.anthropic = opts.anthropic;
     this.whitelist = opts.whitelist;
     this.budget = opts.budget;
     this.breaker = opts.circuitBreaker;
     this.model = opts.model ?? DEFAULT_OUTBOUND_MODEL;
     this.maxBudgetUsd = opts.maxBudgetUsd ?? DEFAULT_OUTBOUND_MAX_BUDGET_USD;
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_OUTBOUND_TIMEOUT_MS;
+    this.maxOutputTokens = opts.maxOutputTokens ?? DEFAULT_OUTBOUND_MAX_OUTPUT_TOKENS;
+    this.onEvent = opts.onEvent;
   }
 
   /**
@@ -197,21 +260,24 @@ export class OutboundResponseGenerator {
   private generateInner(input: OutboundGenerateInput): Promise<string> {
     const { event, role, deterministicBody } = input;
 
-    // 1. Whitelist guard — silent short-circuit, no log, no breaker, no spawn.
+    // 1. Whitelist guard — silent short-circuit, no log, no breaker, no API call.
     const key = `${event.type}::${role}`;
     if (!this.whitelist.has(key)) {
+      this.onEvent?.({ kind: "fallback_whitelist", role, eventType: event.type });
       return Promise.resolve(deterministicBody);
     }
 
     // 2. Circuit breaker guard — log once per process per role.
     if (!this.breaker.isClosed(role)) {
       this.warnBreakerOnce(role);
+      this.onEvent?.({ kind: "fallback_breaker", role });
       return Promise.resolve(deterministicBody);
     }
 
     // 3. Budget guard — log once per UTC day.
     if (!this.budget.canAfford(this.maxBudgetUsd)) {
       this.warnBudgetOnce();
+      this.onEvent?.({ kind: "fallback_budget", spentUsd: this.budget.todaySpentUsd() });
       return Promise.resolve(deterministicBody);
     }
 
@@ -224,78 +290,81 @@ export class OutboundResponseGenerator {
     const ac = new AbortController();
     const timeoutHandle = setTimeout(() => ac.abort(), this.timeoutMs);
 
-    type TimeoutResolver = (v: "timeout" | "settled") => void;
-    const timeoutResolverHolder: { resolve: TimeoutResolver | null } = { resolve: null };
-    const onAbort = (): void => {
-      timeoutResolverHolder.resolve?.("timeout");
-    };
-    ac.signal.addEventListener("abort", onAbort, { once: true });
+    this.onEvent?.({ kind: "spawned", role, eventType: event.type });
 
-    let sessionResult: Awaited<ReturnType<SDKClient["consumeStream"]>> | null = null;
+    let response: Awaited<ReturnType<Anthropic["messages"]["create"]>>;
     try {
-      const { query } = this.sdk.spawnSession({
-        prompt: userPrompt,
-        cwd: this.cwd,
-        systemPrompt: this.prompts[role],
-        model: this.model,
-        maxBudgetUsd: this.maxBudgetUsd,
-        maxTurns: 1,
-        allowedTools: [],
-        disallowedTools: [
-          "Bash",
-          "Edit",
-          "Read",
-          "Write",
-          "Grep",
-          "Glob",
-          "WebFetch",
-          "WebSearch",
-        ],
-        permissionMode: "default",
-        abortController: ac,
-      });
-
-      const timeoutPromise = new Promise<"timeout" | "settled">((resolve) => {
-        timeoutResolverHolder.resolve = resolve;
-      });
-      const consumePromise = this.sdk.consumeStream(query);
-      const raced = await Promise.race([consumePromise, timeoutPromise]);
-      if (raced === "timeout") {
+      response = await this.anthropic.messages.create(
+        {
+          model: this.model,
+          max_tokens: this.maxOutputTokens,
+          system: this.prompts[role],
+          messages: [{ role: "user", content: userPrompt }],
+        },
+        { signal: ac.signal },
+      );
+    } catch (err) {
+      clearTimeout(timeoutHandle);
+      if (ac.signal.aborted) {
         this.breaker.recordFailure(role);
+        this.onEvent?.({ kind: "fallback_timeout", role, eventType: event.type });
         return deterministicBody;
       }
-      sessionResult = raced as Awaited<ReturnType<SDKClient["consumeStream"]>>;
-    } catch {
       this.breaker.recordFailure(role);
+      this.onEvent?.({
+        kind: "fallback_api_error",
+        role,
+        eventType: event.type,
+        err: err instanceof Error ? err.message : String(err),
+      });
       return deterministicBody;
     } finally {
       clearTimeout(timeoutHandle);
-      ac.signal.removeEventListener("abort", onAbort);
-      timeoutResolverHolder.resolve?.("settled");
     }
 
-    if (!sessionResult || !sessionResult.success) {
-      this.breaker.recordFailure(role);
-      return deterministicBody;
-    }
-    if (sessionResult.totalCostUsd > this.maxBudgetUsd) {
+    // The streaming variant returns a stream; the non-streaming `create()` we
+    // use here returns a `Message` whose `content` is `ContentBlock[]`.
+    // Concatenate any text blocks. Cast through `unknown` because the SDK's
+    // create() return is a generic union of streaming/non-streaming.
+    const message = response as unknown as {
+      content: Array<{ type: string; text?: string }>;
+      usage: { input_tokens: number; output_tokens: number };
+    };
+    const text = message.content
+      .filter((b): b is { type: "text"; text: string } => b.type === "text" && typeof b.text === "string")
+      .map((b) => b.text)
+      .join("")
+      .trim();
+
+    const costUsd = computeCostUsd(this.model, message.usage);
+
+    if (costUsd > this.maxBudgetUsd) {
       // Breach; charge the actual cost (never refund) and treat as failure.
-      this.budget.charge(sessionResult.totalCostUsd);
+      this.budget.charge(costUsd);
       this.breaker.recordFailure(role);
+      this.onEvent?.({ kind: "fallback_overspend", role, costUsd });
       return deterministicBody;
     }
 
-    const out = (sessionResult.result ?? "").trim();
-    if (!validateOutput(out, event)) {
-      this.budget.charge(sessionResult.totalCostUsd);
+    if (!validateOutput(text, event)) {
+      this.budget.charge(costUsd);
       this.breaker.recordFailure(role);
+      this.onEvent?.({ kind: "fallback_validation", role, eventType: event.type });
       return deterministicBody;
     }
 
     // Success path: charge actual cost, reset breaker counter, return truncated.
-    this.budget.charge(sessionResult.totalCostUsd);
+    this.budget.charge(costUsd);
     this.breaker.recordSuccess(role);
-    return truncateBody(out);
+    const finalBody = truncateBody(text);
+    this.onEvent?.({
+      kind: "success",
+      role,
+      eventType: event.type,
+      costUsd,
+      outputChars: finalBody.length,
+    });
+    return finalBody;
   }
 
   private warnBreakerOnce(role: OutboundRole): void {

@@ -46,7 +46,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import Anthropic from "@anthropic-ai/sdk";
 import { DiscordNotifier } from "../src/discord/notifier.js";
 import { buildSendersForChannels } from "../src/discord/sender-factory.js";
 import type { DiscordConfig } from "../src/lib/config.js";
@@ -54,7 +54,6 @@ import { OutboundResponseGenerator } from "../src/discord/outbound-response-gene
 import { OUTBOUND_LLM_WHITELIST } from "../src/discord/outbound-whitelist.js";
 import { LlmBudgetTracker, PerRoleCircuitBreaker } from "../src/discord/llm-budget.js";
 import { OUTBOUND_EPISTLE_DEFAULTS } from "../src/lib/config.js";
-import { SDKClient } from "../src/session/sdk.js";
 import { InMemoryMessageContext } from "../src/discord/message-context.js";
 import { StateManager } from "../src/lib/state.js";
 
@@ -222,18 +221,19 @@ async function main(): Promise<void> {
   // budget tracker instantiation). When on, all 9 whitelisted tuples go
   // through OutboundResponseGenerator. Project-scoped fixtures only
   // activate the LLM path (notifier projectId guard).
-  const sdk = new SDKClient(query);
   const messageContext = new InMemoryMessageContext({ maxEntries: 1000 });
   const stateManager = new StateManager(join(harnessRoot, ".harness", "smoke-state.json"));
   const outboundGenerator = llmMode
     ? new OutboundResponseGenerator({
-        sdk,
-        cwd: harnessRoot,
+        // ANTHROPIC_API_KEY is read from env automatically by the SDK constructor.
+        anthropic: new Anthropic(),
         promptPaths: {
-          architect:    resolve(harnessRoot, "config/prompts/outbound-response/v1-architect.md"),
-          reviewer:     resolve(harnessRoot, "config/prompts/outbound-response/v1-reviewer.md"),
-          executor:     resolve(harnessRoot, "config/prompts/outbound-response/v1-executor.md"),
-          orchestrator: resolve(harnessRoot, "config/prompts/outbound-response/v1-orchestrator.md"),
+          // Wave E-γ R1 mitigation — smoke validates v2 voice quality before
+          // production bootstrap (live-bot-listen.ts) flips from v1 to v2.
+          architect:    resolve(harnessRoot, "config/prompts/outbound-response/v2-architect.md"),
+          reviewer:     resolve(harnessRoot, "config/prompts/outbound-response/v2-reviewer.md"),
+          executor:     resolve(harnessRoot, "config/prompts/outbound-response/v2-executor.md"),
+          orchestrator: resolve(harnessRoot, "config/prompts/outbound-response/v2-orchestrator.md"),
         },
         whitelist: OUTBOUND_LLM_WHITELIST,
         budget: new LlmBudgetTracker({
@@ -241,6 +241,13 @@ async function main(): Promise<void> {
           dailyCapUsd: OUTBOUND_EPISTLE_DEFAULTS.llm_daily_cap_usd,
         }),
         circuitBreaker: new PerRoleCircuitBreaker(),
+        // Per-call instrumentation surfaces immediately during live smoke so
+        // operator can see why the LLM didn't fire on each fixture (whitelist
+        // miss / breaker / budget / api error / validation / overspend).
+        onEvent: (e) => {
+          // eslint-disable-next-line no-console
+          console.error(`[outbound] ${JSON.stringify(e)}`);
+        },
       })
     : undefined;
 

@@ -25,6 +25,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import Anthropic from "@anthropic-ai/sdk";
 
 import { Orchestrator } from "../src/orchestrator.js";
 import { SDKClient } from "../src/session/sdk.js";
@@ -190,9 +191,12 @@ async function main(): Promise<void> {
   // byte-equal to E-α/β behavior.
   const outboundGenerator = config.discord.outbound_epistle_enabled === true
     ? new OutboundResponseGenerator({
-        sdk,
-        cwd: harnessRepoRoot,
+        // ANTHROPIC_API_KEY is read from env automatically by the SDK constructor.
+        anthropic: new Anthropic(),
         promptPaths: {
+          // v2 prompts authored 2026-04-27 (E-γ R1 mitigation) ship alongside v1;
+          // live-discord-smoke.ts validates them. Flip live-bot-listen to v2 once
+          // operator visual sign-off completes after a smoke run with --llm.
           architect:    resolve(harnessRepoRoot, "config/prompts/outbound-response/v1-architect.md"),
           reviewer:     resolve(harnessRepoRoot, "config/prompts/outbound-response/v1-reviewer.md"),
           executor:     resolve(harnessRepoRoot, "config/prompts/outbound-response/v1-executor.md"),
@@ -204,6 +208,13 @@ async function main(): Promise<void> {
           dailyCapUsd: config.discord.llm_daily_cap_usd ?? OUTBOUND_EPISTLE_DEFAULTS.llm_daily_cap_usd,
         }),
         circuitBreaker: new PerRoleCircuitBreaker(),
+        // Per-call instrumentation — operator visibility into why LLM did or
+        // did not fire. Without this, only one-shot warns surface; per-call
+        // failures stay silent until the breaker reaches 3 strikes.
+        onEvent: (e) => {
+          // eslint-disable-next-line no-console
+          console.log(`[outbound] ${JSON.stringify(e)}`);
+        },
       })
     : undefined;
 
