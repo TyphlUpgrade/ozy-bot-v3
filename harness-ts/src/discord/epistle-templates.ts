@@ -172,20 +172,14 @@ export function renderEpistle(
     case "review_mandatory": {
       const id = shortTaskId(event.taskId);
       const projId = shortProjectId(event.projectId);
-      // reviewSummary and reviewFindings are added in commit 2 (D1 R-IT5-5).
-      // Cast to access optional fields that will be present post-commit-2.
-      const ev = event as typeof event & {
-        reviewSummary?: string;
-        reviewFindings?: import("../gates/review.js").ReviewFinding[];
-      };
       const lines = [`${emoji} **Review Required** — \`${ts}\``, ""];
       lines.push(`Mandatory review firing for \`${id}\` in project \`${projId}\`.`);
-      if (ev.reviewSummary) {
-        lines.push("", `- **Summary:** ${sanitize(ev.reviewSummary, 400)}`);
+      if (event.reviewSummary) {
+        lines.push("", `- **Summary:** ${sanitize(event.reviewSummary, 400)}`);
       }
-      if (ev.reviewFindings && ev.reviewFindings.length > 0) {
+      if (event.reviewFindings && event.reviewFindings.length > 0) {
         lines.push("", "**Findings:**");
-        for (const f of ev.reviewFindings) {
+        for (const f of event.reviewFindings) {
           lines.push(`- ${formatFindingForOps(f)}`);
         }
       }

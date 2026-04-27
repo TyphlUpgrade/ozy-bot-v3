@@ -131,7 +131,7 @@ export type OrchestratorEvent =
   | { type: "architect_arbitration_fired"; taskId: string; projectId: string; cause: ArbitrationCause }
   | { type: "arbitration_verdict"; taskId: string; projectId: string; verdict: ArbitrationVerdict; rationale: string }
   | { type: "review_arbitration_entered"; taskId: string; projectId: string; reviewerRejectionCount: number }
-  | { type: "review_mandatory"; taskId: string; projectId: string }
+  | { type: "review_mandatory"; taskId: string; projectId: string; reviewSummary?: string; reviewFindings?: import("./gates/review.js").ReviewFinding[] }
   | { type: "budget_ceiling_reached"; projectId: string; currentCostUsd: number; ceilingUsd: number }
   | { type: "compaction_fired"; projectId: string; generation: number };
 
