@@ -109,6 +109,15 @@ export interface DiscordConfig {
    * Tracked in `<project.root>/.harness/llm-budget.json` (atomic temp+rename).
    */
   llm_daily_cap_usd?: number;
+  /**
+   * Discord user ID (snowflake) for operator. When set, escalation-class
+   * events prepend a mention `<@operator_user_id>` to the body and use
+   * allowedMentions: { users: [operator_user_id] } so the ping fires.
+   * Without this set, escalation events still emit but without ping.
+   * Wave channel-collapse (2026-04-27) — ops wants single channel with
+   * operator ping for attention rather than separate escalation_channel.
+   */
+  operator_user_id?: string;
 }
 
 export interface ReviewerConfig {
@@ -335,6 +344,11 @@ function parseDiscord(raw: Record<string, unknown>): DiscordConfig {
   if (typeof raw.llm_daily_cap_usd === "number") {
     cfg.llm_daily_cap_usd = raw.llm_daily_cap_usd;
   }
+  // Channel-collapse plumbing (2026-04-27) — optional snowflake string. Block
+  // absent → undefined (notifier default: no operator ping). When set, commit 2
+  // wires the per-event mention prepend + allowedMentions override.
+  const operatorUserId = optionalString(raw, "operator_user_id");
+  if (operatorUserId) cfg.operator_user_id = operatorUserId;
   return cfg;
 }
 

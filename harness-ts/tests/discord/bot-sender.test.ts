@@ -7,7 +7,12 @@ function mockFetchOK(): ReturnType<typeof vi.fn> {
 
 function readBody(call: unknown): {
   content: string;
-  allowed_mentions?: { parse: string[] };
+  allowed_mentions?: {
+    parse?: string[];
+    users?: string[];
+    roles?: string[];
+    replied_user?: boolean;
+  };
   message_reference?: { message_id: string; fail_if_not_exists: boolean };
 } {
   const arg = (call as unknown[])[1] as { body: string };
@@ -57,6 +62,49 @@ describe("BotSender", () => {
     const body = readBody(fetch.mock.calls[0]);
     expect(body.allowed_mentions).toEqual({ parse: [] });
   });
+
+  // Channel-collapse plumbing (2026-04-27) — per-call allowedMentions override.
+  it("channel-collapse: sendToChannel without allowedMentions arg uses default { parse: [] }", async () => {
+    const fetch = mockFetchOK();
+    const sender = new BotSender("t", { fetch, minSpacingMs: 0 });
+    await sender.sendToChannel("123", "default-mentions", undefined, undefined);
+    await vi.runAllTimersAsync();
+    const body = readBody(fetch.mock.calls[0]);
+    expect(body.allowed_mentions).toEqual({ parse: [] });
+  });
+
+  it("channel-collapse: sendToChannel with allowedMentions: { users: [...] } emits snake_case allowed_mentions.users", async () => {
+    const fetch = mockFetchOK();
+    const sender = new BotSender("t", { fetch, minSpacingMs: 0 });
+    await sender.sendToChannel("123", "ping op", undefined, undefined, { users: ["123"] });
+    await vi.runAllTimersAsync();
+    const body = readBody(fetch.mock.calls[0]);
+    expect(body.allowed_mentions).toEqual({ users: ["123"] });
+  });
+
+  it("channel-collapse: sendToChannelAndReturnId forwards allowedMentions override into POST body", async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => ({ id: "msg-3333" }),
+    });
+    const sender = new BotSender("t", { fetch, minSpacingMs: 0 });
+    const p = sender.sendToChannelAndReturnId(
+      "123",
+      "ping op",
+      undefined,
+      undefined,
+      { users: ["249"] },
+    );
+    await vi.runAllTimersAsync();
+    const result = await p;
+    expect(result.messageId).toBe("msg-3333");
+    const body = readBody(fetch.mock.calls[0]);
+    expect(body.allowed_mentions).toEqual({ users: ["249"] });
+  });
+
+  it.todo("notifier wires per-event allowedMentions for escalation events — commit 2");
 
   it("logs (does not throw) on non-2xx responses", async () => {
     // Use 500 here — 429 is exercised by the dedicated retry-after tests below.

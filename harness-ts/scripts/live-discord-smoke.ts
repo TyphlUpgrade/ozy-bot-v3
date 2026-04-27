@@ -57,6 +57,17 @@ import { OUTBOUND_EPISTLE_DEFAULTS } from "../src/lib/config.js";
 import { InMemoryMessageContext } from "../src/discord/message-context.js";
 import { StateManager } from "../src/lib/state.js";
 
+/**
+ * Channel-collapse plumbing (2026-04-27) — extract the bare snowflake from
+ * a Discord-style mention `<@123>` or `<@!123>`. Returns undefined for
+ * unrecognized shapes so the caller falls back to defaults / undefined.
+ */
+function parseOperatorUserId(mention: string | undefined): string | undefined {
+  if (!mention) return undefined;
+  const match = mention.match(/^<@!?(\d+)>$/);
+  return match ? match[1] : undefined;
+}
+
 function loadDotEnv(path: string): void {
   if (!existsSync(path)) return;
   for (const line of readFileSync(path, "utf-8").split("\n")) {
@@ -191,6 +202,10 @@ async function main(): Promise<void> {
     // Wave E-γ — `--llm` flag flips the feature flag for the smoke run.
     // Default off so non-LLM smoke matches Wave E-α/β behavior byte-equal.
     outbound_epistle_enabled: llmMode,
+    // Channel-collapse plumbing (2026-04-27) — accept either OPERATOR_USER_ID
+    // (bare snowflake) or OPERATOR_MENTION (`<@123>` shape from .env).
+    operator_user_id:
+      process.env.OPERATOR_USER_ID ?? parseOperatorUserId(process.env.OPERATOR_MENTION),
   };
   // CW-1 — per-channel sender map. Channels with webhook URL get WebhookSender
   // (native per-agent avatar); others fall back to BotSender.

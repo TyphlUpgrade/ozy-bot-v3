@@ -35,6 +35,8 @@ interface QueuedMessage {
   identity?: AgentIdentity;
   /** Wave E-β — when set, sent as Discord `message_reference` for reply threading. */
   replyToMessageId?: string;
+  /** Channel-collapse plumbing (2026-04-27) — per-call override; default { parse: [] }. */
+  allowedMentions?: AllowedMentions;
   /** CW-1 — settle with `{messageId}`; senders that ignore id pass () => undefined. */
   resolve: (messageId: string | null) => void;
 }
@@ -67,6 +69,7 @@ export class WebhookSender implements DiscordSender {
     content: string,
     identity?: AgentIdentity,
     replyToMessageId?: string,
+    allowedMentions?: AllowedMentions,
   ): Promise<void> {
     // Queue overflow: drop oldest (FIFO cap). The dropped caller's promise
     // resolves, matching the DiscordSender contract — callers are fire-and-
@@ -78,7 +81,14 @@ export class WebhookSender implements DiscordSender {
     }
 
     return new Promise<void>((resolve) => {
-      this.queue.push({ channel, content, identity, replyToMessageId, resolve: () => resolve() });
+      this.queue.push({
+        channel,
+        content,
+        identity,
+        replyToMessageId,
+        allowedMentions,
+        resolve: () => resolve(),
+      });
       void this.drain();
     });
   }
@@ -97,6 +107,7 @@ export class WebhookSender implements DiscordSender {
     content: string,
     identity?: AgentIdentity,
     replyToMessageId?: string,
+    allowedMentions?: AllowedMentions,
   ): Promise<{ messageId: string | null }> {
     if (this.queue.length >= this.maxQueueSize) {
       const dropped = this.queue.shift();
@@ -109,6 +120,7 @@ export class WebhookSender implements DiscordSender {
         content,
         identity,
         replyToMessageId,
+        allowedMentions,
         resolve: (messageId) => resolve({ messageId }),
       });
       void this.drain();
@@ -140,7 +152,9 @@ export class WebhookSender implements DiscordSender {
             content: next.content,
             username: next.identity?.username,
             avatarURL: next.identity?.avatarURL,
-            allowedMentions: NO_MENTIONS,
+            // Channel-collapse plumbing (2026-04-27) — per-call override; default
+            // remains { parse: [] } when caller passes nothing.
+            allowedMentions: next.allowedMentions ?? NO_MENTIONS,
             wait: true,
             // Wave E-β — `failIfNotExists: false` is mandatory: Discord
             // renders without a quote-card if head was deleted instead of

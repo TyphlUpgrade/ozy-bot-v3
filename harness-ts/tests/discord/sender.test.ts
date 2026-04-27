@@ -53,6 +53,39 @@ describe("WebhookSender", () => {
     expect(calls[0].allowedMentions).toEqual({ parse: [] });
   });
 
+  // Channel-collapse plumbing (2026-04-27) — per-call allowedMentions override.
+  it("channel-collapse: sendToChannel without allowedMentions arg uses default { parse: [] }", async () => {
+    const { client, calls } = makeWebhook();
+    const s = new WebhookSender(client, { minSpacingMs: 0 });
+    await s.sendToChannel("dev", "default-mentions", undefined, undefined);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].allowedMentions).toEqual({ parse: [] });
+  });
+
+  it("channel-collapse: sendToChannel with allowedMentions: { users: [...] } forwards override into webhook payload", async () => {
+    const { client, calls } = makeWebhook();
+    const s = new WebhookSender(client, { minSpacingMs: 0 });
+    await s.sendToChannel("dev", "ping op", undefined, undefined, { users: ["123"] });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].allowedMentions).toEqual({ users: ["123"] });
+  });
+
+  it("channel-collapse: sendToChannelAndReturnId forwards allowedMentions override into webhook payload", async () => {
+    const { client, calls } = makeWebhook({ returnId: "wm-77" });
+    const s = new WebhookSender(client, { minSpacingMs: 0 });
+    const result = await s.sendToChannelAndReturnId(
+      "dev",
+      "ping op",
+      undefined,
+      undefined,
+      { users: ["249"] },
+    );
+    expect(result.messageId).toBe("wm-77");
+    expect(calls[0].allowedMentions).toEqual({ users: ["249"] });
+  });
+
+  it.todo("notifier wires per-event allowedMentions for escalation events — commit 2");
+
   it("webhook errors are swallowed (promise still resolves) and log .message only", async () => {
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const { client } = makeWebhook({ fail: true });

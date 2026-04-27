@@ -261,6 +261,44 @@ avatar_url = "https://example.com/avatar.png"
     expect(OUTBOUND_EPISTLE_DEFAULTS.llm_daily_cap_usd).toBe(5.0);
   });
 
+  // Channel-collapse plumbing (2026-04-27).
+  it("channel-collapse: parses [discord] operator_user_id snowflake string", () => {
+    const toml = `
+[project]
+name = "test-project"
+root = "."
+task_dir = "state/tasks"
+state_file = "state/pipeline.json"
+worktree_base = "/tmp/worktrees"
+session_dir = "/tmp/sessions"
+
+[pipeline]
+test_command = "npm test"
+
+[discord]
+bot_token_env = "DISCORD_TOKEN"
+dev_channel = "dev"
+ops_channel = "ops"
+escalation_channel = "escalations"
+operator_user_id = "249313669337317379"
+
+[discord.agents.executor]
+name = "test-bot"
+avatar_url = "https://example.com/avatar.png"
+`;
+    const path = writeTempToml(toml);
+    const config = loadConfig(path);
+    expect(config.discord.operator_user_id).toBe("249313669337317379");
+  });
+
+  it("channel-collapse: leaves operator_user_id undefined when absent", () => {
+    const path = writeTempToml(VALID_TOML);
+    const config = loadConfig(path);
+    expect(config.discord.operator_user_id).toBeUndefined();
+  });
+
+  it.todo("notifier prepends operator mention for escalation events when operator_user_id set — commit 2");
+
   it("Wave E-β notifier consults config flag — commit 2: reply_threading.enabled=false skips lookupRoleHead and never sets replyToMessageId", async () => {
     const { DiscordNotifier } = await import("../../src/discord/notifier.js");
     const { InMemoryMessageContext } = await import("../../src/discord/message-context.js");

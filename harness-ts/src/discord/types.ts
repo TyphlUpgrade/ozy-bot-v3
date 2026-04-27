@@ -12,9 +12,18 @@ export interface AgentIdentity {
  * Allowed-mentions discord.js payload shape. `parse: []` blocks all auto-pings
  * (@everyone, @here, role, user). Wave 2 always sends with `parse: []` as
  * defense-in-depth against Discord message-ping injection from untrusted input.
+ *
+ * Channel-collapse plumbing (2026-04-27) — additive optional fields `users`,
+ * `roles`, `repliedUser` allow per-call escalation pings while keeping the
+ * default `{ parse: [] }` for non-escalation traffic. WebhookSender accepts
+ * the camelCase shape as-is (discord.js shape); BotSender translates each
+ * field to its snake_case Discord API equivalent (`replied_user`).
  */
 export interface AllowedMentions {
   parse?: Array<"everyone" | "roles" | "users">;
+  users?: string[];
+  roles?: string[];
+  repliedUser?: boolean;
 }
 
 /**
@@ -49,18 +58,25 @@ export interface DiscordSender {
    * so the post renders as an in-channel reply. `fail_if_not_exists: false` is
    * mandatory: if the head message was deleted, Discord renders without the
    * quote-card instead of 4xx-rejecting the send.
+   *
+   * Channel-collapse plumbing (2026-04-27) — `allowedMentions` is optional.
+   * When omitted, senders default to `{ parse: [] }` (CW-3 mention-injection
+   * defense). Commit 2 sets this for escalation-class events so the operator
+   * mention `<@operator_user_id>` actually pings.
    */
   sendToChannel(
     channel: string,
     content: string,
     identity?: AgentIdentity,
     replyToMessageId?: string,
+    allowedMentions?: AllowedMentions,
   ): Promise<void>;
   sendToChannelAndReturnId(
     channel: string,
     content: string,
     identity?: AgentIdentity,
     replyToMessageId?: string,
+    allowedMentions?: AllowedMentions,
   ): Promise<{ messageId: string | null }>;
   addReaction(channelId: string, messageId: string, emoji: string): Promise<void>;
 }
@@ -72,6 +88,8 @@ export interface DiscordSender {
  * natively to capture the Discord-assigned message id.
  *
  * Wave E-β — forwards optional `replyToMessageId` to inner `sendToChannel`.
+ * Channel-collapse plumbing (2026-04-27) — forwards optional `allowedMentions`
+ * to inner `sendToChannel`.
  */
 export async function sendToChannelAndReturnIdDefault(
   sender: {
@@ -80,14 +98,16 @@ export async function sendToChannelAndReturnIdDefault(
       content: string,
       identity?: AgentIdentity,
       replyToMessageId?: string,
+      allowedMentions?: AllowedMentions,
     ) => Promise<void>;
   },
   channel: string,
   content: string,
   identity?: AgentIdentity,
   replyToMessageId?: string,
+  allowedMentions?: AllowedMentions,
 ): Promise<{ messageId: string | null }> {
-  await sender.sendToChannel(channel, content, identity, replyToMessageId);
+  await sender.sendToChannel(channel, content, identity, replyToMessageId, allowedMentions);
   return { messageId: null };
 }
 

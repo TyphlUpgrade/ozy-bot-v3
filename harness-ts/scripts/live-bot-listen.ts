@@ -87,6 +87,17 @@ function fatal(msg: string, exitCode = 2): never {
 }
 
 /**
+ * Channel-collapse plumbing (2026-04-27) — extract the bare snowflake from
+ * a Discord-style mention `<@123>` or `<@!123>`. Returns undefined for
+ * unrecognized shapes so the caller falls back to defaults / undefined.
+ */
+function parseOperatorUserId(mention: string | undefined): string | undefined {
+  if (!mention) return undefined;
+  const match = mention.match(/^<@!?(\d+)>$/);
+  return match ? match[1] : undefined;
+}
+
+/**
  * CW-4.5 — compute the optional `projectIdHint` for a buffer append. Hint
  * fires only on operator messages that REPLY to a recorded agent message
  * (conservative). The dispatcher consumes this in `resolveProjectForChannel`
@@ -112,6 +123,13 @@ async function main(): Promise<void> {
     );
   }
   const config = loadConfig(configPath);
+  // Channel-collapse plumbing (2026-04-27) — env override of TOML-set
+  // operator_user_id. OPERATOR_USER_ID is the simple direct path; OPERATOR_MENTION
+  // accepts the `<@123>` mention shape from .env files. TOML value (if any) is
+  // overridden when either env is set.
+  const envOperatorId =
+    process.env.OPERATOR_USER_ID ?? parseOperatorUserId(process.env.OPERATOR_MENTION);
+  if (envOperatorId) config.discord.operator_user_id = envOperatorId;
   const token = process.env[config.discord.bot_token_env] ?? process.env.DISCORD_BOT_TOKEN;
   if (!token) {
     fatal(

@@ -19,7 +19,7 @@
  * with one webhook URL per channel.
  */
 
-import type { AgentIdentity, DiscordSender } from "./types.js";
+import type { AgentIdentity, AllowedMentions, DiscordSender } from "./types.js";
 
 const DEFAULT_MIN_SPACING_MS = 2000;
 const DEFAULT_MAX_QUEUE_SIZE = 50;
@@ -31,6 +31,8 @@ interface QueuedMessage {
   identity?: AgentIdentity;
   /** Wave E-β — when set, sent as Discord `message_reference` for reply threading. */
   replyToMessageId?: string;
+  /** Channel-collapse plumbing (2026-04-27) — per-call override; default { parse: [] }. */
+  allowedMentions?: AllowedMentions;
   /** CW-1 — settle with `{messageId}` for `sendToChannelAndReturnId`; senders that ignore id pass () => undefined. */
   resolve: (messageId: string | null) => void;
 }
@@ -44,6 +46,28 @@ export interface BotSenderOptions {
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Channel-collapse plumbing (2026-04-27) — translate the TypeScript-side
+ * camelCase `AllowedMentions` shape to the snake_case shape Discord's REST
+ * API expects. Default (caller passed nothing) preserves the existing
+ * `{ parse: [] }` defense-in-depth.
+ *
+ * Field mapping:
+ *   parse        -> parse        (no rename)
+ *   users        -> users        (no rename)
+ *   roles        -> roles        (no rename)
+ *   repliedUser  -> replied_user (camelCase -> snake_case)
+ */
+function toDiscordAllowedMentions(am?: AllowedMentions): Record<string, unknown> {
+  if (!am) return { parse: [] };
+  const out: Record<string, unknown> = {};
+  if (am.parse !== undefined) out.parse = am.parse;
+  if (am.users !== undefined) out.users = am.users;
+  if (am.roles !== undefined) out.roles = am.roles;
+  if (am.repliedUser !== undefined) out.replied_user = am.repliedUser;
+  return out;
 }
 
 /**
@@ -87,6 +111,7 @@ export class BotSender implements DiscordSender {
     content: string,
     identity?: AgentIdentity,
     replyToMessageId?: string,
+    allowedMentions?: AllowedMentions,
   ): Promise<void> {
     if (this.queue.length >= this.maxQueueSize) {
       const dropped = this.queue.shift();
@@ -94,7 +119,14 @@ export class BotSender implements DiscordSender {
       console.warn(`[BotSender] queue full, dropping oldest message (queue=${this.queue.length})`);
     }
     return new Promise<void>((resolve) => {
-      this.queue.push({ channelId, content, identity, replyToMessageId, resolve: () => resolve() });
+      this.queue.push({
+        channelId,
+        content,
+        identity,
+        replyToMessageId,
+        allowedMentions,
+        resolve: () => resolve(),
+      });
       void this.drain();
     });
   }
@@ -113,6 +145,7 @@ export class BotSender implements DiscordSender {
     content: string,
     identity?: AgentIdentity,
     replyToMessageId?: string,
+    allowedMentions?: AllowedMentions,
   ): Promise<{ messageId: string | null }> {
     if (this.queue.length >= this.maxQueueSize) {
       const dropped = this.queue.shift();
@@ -125,6 +158,7 @@ export class BotSender implements DiscordSender {
         content,
         identity,
         replyToMessageId,
+        allowedMentions,
         resolve: (messageId) => resolve({ messageId }),
       });
       void this.drain();
@@ -180,7 +214,11 @@ export class BotSender implements DiscordSender {
               headers: this.authHeaders(),
               body: JSON.stringify({
                 content: this.renderBody(next.content, next.identity),
-                allowed_mentions: { parse: [] },
+                // Channel-collapse plumbing (2026-04-27) — per-call override;
+                // default { parse: [] } when caller passes nothing. Translate
+                // camelCase TS shape (AllowedMentions) to snake_case Discord
+                // API shape (replied_user only field that needs renaming).
+                allowed_mentions: toDiscordAllowedMentions(next.allowedMentions),
                 // Wave E-β — `fail_if_not_exists: false` is mandatory: Discord
                 // renders without a quote-card if head was deleted instead of
                 // 4xx-rejecting the entire send.
