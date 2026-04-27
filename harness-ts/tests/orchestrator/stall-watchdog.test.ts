@@ -332,6 +332,73 @@ describe("Orchestrator stall watchdog (commit 2/2)", () => {
     }
   });
 
+  it("does not re-emit session_stalled on subsequent ticks while the same session is still active", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = setupHarness({
+        watchdog: {
+          enabled: true,
+          check_interval_ms: 1_000,
+          executor_threshold_ms: 10_000,
+        },
+      });
+      const session = makeSession<ActiveSessionInfo>("task-stuck", 11_000, h.abortSpies, "executor");
+      h.setExecutorSessions([session]);
+      h.orch.start();
+
+      // First tick — emit + abort.
+      vi.advanceTimersByTime(1_000);
+      expect(h.events.filter((e) => e.type === "session_stalled").length).toBe(1);
+
+      // Second + third ticks while the session is still active (e.g. abort
+      // hasn't taken effect yet) — must NOT re-emit.
+      vi.advanceTimersByTime(1_000);
+      vi.advanceTimersByTime(1_000);
+      expect(h.events.filter((e) => e.type === "session_stalled").length).toBe(1);
+
+      await h.orch.shutdown();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("re-emits session_stalled on a fresh stall after the session leaves and re-enters getActiveSessions()", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = setupHarness({
+        watchdog: {
+          enabled: true,
+          check_interval_ms: 1_000,
+          executor_threshold_ms: 10_000,
+        },
+      });
+      h.setExecutorSessions([
+        makeSession<ActiveSessionInfo>("task-recover", 11_000, h.abortSpies, "executor"),
+      ]);
+      h.orch.start();
+
+      // First stall → 1 emit.
+      vi.advanceTimersByTime(1_000);
+      expect(h.events.filter((e) => e.type === "session_stalled").length).toBe(1);
+
+      // Session leaves active set (recovered or aborted).
+      h.setExecutorSessions([]);
+      vi.advanceTimersByTime(1_000);
+      expect(h.events.filter((e) => e.type === "session_stalled").length).toBe(1);
+
+      // Re-enters with a fresh stall → must emit again.
+      h.setExecutorSessions([
+        makeSession<ActiveSessionInfo>("task-recover", 11_000, h.abortSpies, "executor"),
+      ]);
+      vi.advanceTimersByTime(1_000);
+      expect(h.events.filter((e) => e.type === "session_stalled").length).toBe(2);
+
+      await h.orch.shutdown();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("aborted=false when abort callback throws", async () => {
     vi.useFakeTimers();
     try {

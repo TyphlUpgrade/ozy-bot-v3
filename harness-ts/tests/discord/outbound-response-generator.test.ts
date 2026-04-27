@@ -479,7 +479,7 @@ describe("OutboundResponseGenerator.generate success path", () => {
     const breaker = new PerRoleCircuitBreaker();
     breaker.recordFailure("executor"); // pre-existing 1 strike
     const budget = new LlmBudgetTracker({ rootDir: workDir, dailyCapUsd: 5.0 });
-    const llmOutput = "I built the change across 3 files; handing off to the reviewer.";
+    const llmOutput = "I built task-A across 3 files; handing off to the reviewer.";
     // 1000 input + 500 output Haiku → (1000*1 + 500*5) / 1e6 = 0.0035 USD
     const { anthropic, trace } = makeMockAnthropic([
       { text: llmOutput, usage: { input_tokens: 1000, output_tokens: 500 } },
@@ -546,7 +546,9 @@ describe("OutboundResponseGenerator.generate success path", () => {
   });
 
   it("truncates LLM output above Discord 1900-char cap", async () => {
-    const long = "x".repeat(2500);
+    // Prefix carries the required taskId substring so validation passes;
+    // the rest is filler to exceed the cap.
+    const long = "task-A " + "x".repeat(2500);
     const { anthropic } = makeMockAnthropic([
       { text: long, usage: { input_tokens: 100, output_tokens: 100 } },
     ]);
@@ -564,7 +566,7 @@ describe("OutboundResponseGenerator.generate success path", () => {
     const { anthropic } = makeMockAnthropic([
       {
         contentBlocks: [
-          { type: "text", text: "first chunk " },
+          { type: "text", text: "first chunk for task-A " },
           { type: "text", text: "second chunk." },
         ],
         usage: { input_tokens: 10, output_tokens: 10 },
@@ -576,12 +578,203 @@ describe("OutboundResponseGenerator.generate success path", () => {
       role: "executor",
       deterministicBody: DETERMINISTIC,
     });
-    expect(out).toBe("first chunk second chunk.");
+    expect(out).toBe("first chunk for task-A second chunk.");
+  });
+
+  // --- Per-event validation rules (MEDIUM-1 tightening) ---
+
+  it("task_done validation: LLM omits taskId → fallback + fallback_validation event", async () => {
+    const breaker = new PerRoleCircuitBreaker();
+    const event: OrchestratorEvent = { type: "task_done", taskId: "task-OMIT" };
+    const { anthropic } = makeMockAnthropic([
+      { text: "I finished the work but forgot to name the id.", usage: { input_tokens: 50, output_tokens: 20 } },
+    ]);
+    const { onEvent, events } = captureEvents();
+    const gen = makeFreshGen({ anthropic, breaker, onEvent });
+    const out = await gen.generate({ event, role: "executor", deterministicBody: DETERMINISTIC });
+    expect(out).toBe(DETERMINISTIC);
+    expect(events.some((e) => e.kind === "fallback_validation")).toBe(true);
+  });
+
+  it("session_complete validation: LLM omits taskId → fallback + fallback_validation event", async () => {
+    const breaker = new PerRoleCircuitBreaker();
+    const event: OrchestratorEvent = {
+      type: "session_complete",
+      taskId: "task-SESS",
+      success: true,
+      errors: [],
+    };
+    const { anthropic } = makeMockAnthropic([
+      { text: "Session is complete; ready for review.", usage: { input_tokens: 50, output_tokens: 20 } },
+    ]);
+    const { onEvent, events } = captureEvents();
+    const gen = makeFreshGen({ anthropic, breaker, onEvent });
+    const out = await gen.generate({ event, role: "executor", deterministicBody: DETERMINISTIC });
+    expect(out).toBe(DETERMINISTIC);
+    expect(events.some((e) => e.kind === "fallback_validation")).toBe(true);
+  });
+
+  it("review_mandatory validation: LLM omits taskId → fallback + fallback_validation event", async () => {
+    const breaker = new PerRoleCircuitBreaker();
+    const event: OrchestratorEvent = {
+      type: "review_mandatory",
+      taskId: "task-REV",
+      projectId: "P-rev",
+    } as unknown as OrchestratorEvent;
+    const { anthropic } = makeMockAnthropic([
+      { text: "Review pending without an id.", usage: { input_tokens: 50, output_tokens: 20 } },
+    ]);
+    const { onEvent, events } = captureEvents();
+    const gen = makeFreshGen({ anthropic, breaker, onEvent });
+    const out = await gen.generate({ event, role: "reviewer", deterministicBody: DETERMINISTIC });
+    expect(out).toBe(DETERMINISTIC);
+    expect(events.some((e) => e.kind === "fallback_validation")).toBe(true);
+  });
+
+  it("review_arbitration_entered validation: LLM omits taskId → fallback", async () => {
+    const breaker = new PerRoleCircuitBreaker();
+    const event = {
+      type: "review_arbitration_entered",
+      taskId: "task-ARB",
+      projectId: "P-arb",
+      reviewerRejectionCount: 2,
+    } as unknown as OrchestratorEvent;
+    const { anthropic } = makeMockAnthropic([
+      { text: "Arbitration entered without naming the task id.", usage: { input_tokens: 50, output_tokens: 20 } },
+    ]);
+    const { onEvent, events } = captureEvents();
+    const gen = makeFreshGen({ anthropic, breaker, onEvent });
+    const out = await gen.generate({ event, role: "reviewer", deterministicBody: DETERMINISTIC });
+    expect(out).toBe(DETERMINISTIC);
+    expect(events.some((e) => e.kind === "fallback_validation")).toBe(true);
+  });
+
+  it("architect_arbitration_fired validation: LLM omits taskId → fallback", async () => {
+    const breaker = new PerRoleCircuitBreaker();
+    const event = {
+      type: "architect_arbitration_fired",
+      taskId: "task-AAF",
+      projectId: "P-aaf",
+      cause: "no-progress",
+    } as unknown as OrchestratorEvent;
+    const { anthropic } = makeMockAnthropic([
+      { text: "Architect arbitration without an id reference.", usage: { input_tokens: 50, output_tokens: 20 } },
+    ]);
+    const { onEvent, events } = captureEvents();
+    const gen = makeFreshGen({ anthropic, breaker, onEvent });
+    const out = await gen.generate({ event, role: "architect", deterministicBody: DETERMINISTIC });
+    expect(out).toBe(DETERMINISTIC);
+    expect(events.some((e) => e.kind === "fallback_validation")).toBe(true);
+  });
+
+  it("escalation_needed validation: LLM omits taskId → fallback", async () => {
+    const breaker = new PerRoleCircuitBreaker();
+    const event = {
+      type: "escalation_needed",
+      taskId: "task-ESC",
+      escalationType: "scope_unclear",
+      reason: "missing context",
+    } as unknown as OrchestratorEvent;
+    const { anthropic } = makeMockAnthropic([
+      { text: "Escalation needed but I withhold the id.", usage: { input_tokens: 50, output_tokens: 20 } },
+    ]);
+    const { onEvent, events } = captureEvents();
+    const gen = makeFreshGen({ anthropic, breaker, onEvent });
+    const out = await gen.generate({ event, role: "orchestrator", deterministicBody: DETERMINISTIC });
+    expect(out).toBe(DETERMINISTIC);
+    expect(events.some((e) => e.kind === "fallback_validation")).toBe(true);
+  });
+
+  it("arbitration_verdict validation: LLM omits taskId → fallback", async () => {
+    const breaker = new PerRoleCircuitBreaker();
+    const event = {
+      type: "arbitration_verdict",
+      taskId: "task-AV",
+      projectId: "P-av",
+      verdict: "approve",
+      rationale: "looks good",
+    } as unknown as OrchestratorEvent;
+    const { anthropic } = makeMockAnthropic([
+      { text: "Verdict approve but no id mention.", usage: { input_tokens: 50, output_tokens: 20 } },
+    ]);
+    const { onEvent, events } = captureEvents();
+    const gen = makeFreshGen({ anthropic, breaker, onEvent });
+    const out = await gen.generate({ event, role: "architect", deterministicBody: DETERMINISTIC });
+    expect(out).toBe(DETERMINISTIC);
+    expect(events.some((e) => e.kind === "fallback_validation")).toBe(true);
+  });
+
+  it("arbitration_verdict validation: LLM has taskId but omits verdict literal → fallback", async () => {
+    const breaker = new PerRoleCircuitBreaker();
+    const event = {
+      type: "arbitration_verdict",
+      taskId: "task-AV2",
+      projectId: "P-av2",
+      verdict: "reject",
+      rationale: "issues found",
+    } as unknown as OrchestratorEvent;
+    const { anthropic } = makeMockAnthropic([
+      { text: "Decision on task-AV2 has been recorded.", usage: { input_tokens: 50, output_tokens: 20 } },
+    ]);
+    const { onEvent, events } = captureEvents();
+    const gen = makeFreshGen({ anthropic, breaker, onEvent });
+    const out = await gen.generate({ event, role: "architect", deterministicBody: DETERMINISTIC });
+    expect(out).toBe(DETERMINISTIC);
+    expect(events.some((e) => e.kind === "fallback_validation")).toBe(true);
+  });
+
+  it("project_decomposed validation: LLM omits projectId → fallback", async () => {
+    const breaker = new PerRoleCircuitBreaker();
+    const event = {
+      type: "project_decomposed",
+      projectId: "P-DEC",
+      phaseCount: 4,
+    } as unknown as OrchestratorEvent;
+    const { anthropic } = makeMockAnthropic([
+      { text: "Decomposed the project into 4 phases.", usage: { input_tokens: 50, output_tokens: 20 } },
+    ]);
+    const { onEvent, events } = captureEvents();
+    const gen = makeFreshGen({ anthropic, breaker, onEvent });
+    const out = await gen.generate({ event, role: "architect", deterministicBody: DETERMINISTIC });
+    expect(out).toBe(DETERMINISTIC);
+    expect(events.some((e) => e.kind === "fallback_validation")).toBe(true);
+  });
+
+  it("arbitration_verdict success: LLM includes both taskId and verdict literal", async () => {
+    const event = {
+      type: "arbitration_verdict",
+      taskId: "task-OK",
+      projectId: "P-ok",
+      verdict: "approve",
+      rationale: "ok",
+    } as unknown as OrchestratorEvent;
+    const llmOutput = "On task-OK my verdict is approve — moving on.";
+    const { anthropic } = makeMockAnthropic([
+      { text: llmOutput, usage: { input_tokens: 100, output_tokens: 50 } },
+    ]);
+    const gen = makeFreshGen({ anthropic });
+    const out = await gen.generate({ event, role: "architect", deterministicBody: DETERMINISTIC });
+    expect(out).toBe(llmOutput);
+  });
+
+  it("project_decomposed success: LLM includes projectId verbatim", async () => {
+    const event = {
+      type: "project_decomposed",
+      projectId: "P-OK-DEC",
+      phaseCount: 2,
+    } as unknown as OrchestratorEvent;
+    const llmOutput = "I have decomposed P-OK-DEC into two phases.";
+    const { anthropic } = makeMockAnthropic([
+      { text: llmOutput, usage: { input_tokens: 100, output_tokens: 50 } },
+    ]);
+    const gen = makeFreshGen({ anthropic });
+    const out = await gen.generate({ event, role: "architect", deterministicBody: DETERMINISTIC });
+    expect(out).toBe(llmOutput);
   });
 
   it("injects a `Current UTC time: HH:MM UTC` line into the user prompt", async () => {
     const { anthropic, trace } = makeMockAnthropic([
-      { text: "ok", usage: { input_tokens: 10, output_tokens: 5 } },
+      { text: "ok task-A", usage: { input_tokens: 10, output_tokens: 5 } },
     ]);
     const gen = makeFreshGen({ anthropic });
     await gen.generate({

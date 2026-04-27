@@ -163,28 +163,73 @@ function buildUserPrompt(input: OutboundGenerateInput): string {
 }
 
 /**
- * Validate LLM output. For events with an obvious structured field
- * (e.g. `merge_result.result.commitSha` if present), the output must contain
- * the verbatim hex string. For other events, validation = "non-empty assistant
- * text after trim".
+ * Validate LLM output against per-event structured-field requirements. The
+ * outbound prompts include a "verbatim structured-field rule" telling the
+ * model to reproduce ids / verdicts / shas exactly; checks here enforce that
+ * contract so a hallucination falls back to the deterministic body instead
+ * of going out as gibberish.
+ *
+ * Rules per event type:
+ *   - merge_result          → sha7 prefix (when commitSha is hex and ≥7 chars)
+ *   - task_done             → taskId
+ *   - session_complete      → taskId
+ *   - review_mandatory      → taskId
+ *   - review_arbitration_entered  → taskId
+ *   - architect_arbitration_fired → taskId
+ *   - arbitration_verdict   → taskId + verdict literal
+ *   - project_decomposed    → projectId
+ *   - escalation_needed     → taskId
+ *   - everything else       → only the non-empty check
+ *
+ * To add a new whitelisted event with a structured requirement: add one case
+ * below.
  */
 function validateOutput(out: string, event: OrchestratorEvent): boolean {
   const trimmed = out.trim();
   if (trimmed.length === 0) return false;
+  const lower = trimmed.toLowerCase();
 
-  // Structured-field check: merge_result with a hex commitSha must contain it.
-  if (event.type === "merge_result") {
-    const result = event.result as { commitSha?: unknown } | undefined;
-    const sha = result?.commitSha;
-    if (typeof sha === "string" && sha.length > 0 && /^[0-9a-f]+$/i.test(sha)) {
-      // Accept either the full sha or a short prefix (>=7 chars) — many
-      // deterministic bodies render only sha7. Be lenient: require any 7+
-      // hex prefix substring of the full sha to appear in the output.
-      const prefix = sha.slice(0, 7);
-      if (!trimmed.toLowerCase().includes(prefix.toLowerCase())) return false;
+  switch (event.type) {
+    case "merge_result": {
+      const sha = (event as { result?: { commitSha?: unknown } }).result?.commitSha;
+      if (typeof sha === "string" && /^[0-9a-f]+$/i.test(sha) && sha.length >= 7) {
+        if (!lower.includes(sha.slice(0, 7).toLowerCase())) return false;
+      }
+      return true;
     }
+    case "task_done":
+    case "session_complete":
+    case "review_mandatory":
+    case "review_arbitration_entered":
+    case "architect_arbitration_fired":
+    case "escalation_needed": {
+      const taskId = (event as { taskId?: string }).taskId;
+      if (typeof taskId === "string" && taskId.length > 0) {
+        if (!lower.includes(taskId.toLowerCase())) return false;
+      }
+      return true;
+    }
+    case "arbitration_verdict": {
+      const taskId = (event as { taskId?: string }).taskId;
+      const verdict = (event as { verdict?: string }).verdict;
+      if (typeof taskId === "string" && taskId.length > 0 && !lower.includes(taskId.toLowerCase())) {
+        return false;
+      }
+      if (typeof verdict === "string" && verdict.length > 0 && !lower.includes(verdict.toLowerCase())) {
+        return false;
+      }
+      return true;
+    }
+    case "project_decomposed": {
+      const projectId = (event as { projectId?: string }).projectId;
+      if (typeof projectId === "string" && projectId.length > 0) {
+        if (!lower.includes(projectId.toLowerCase())) return false;
+      }
+      return true;
+    }
+    default:
+      return true;
   }
-  return true;
 }
 
 /**

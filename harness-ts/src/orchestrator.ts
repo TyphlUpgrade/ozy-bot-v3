@@ -147,6 +147,11 @@ export class Orchestrator {
   private running = false;
   private pollTimer?: ReturnType<typeof setTimeout>;
   private stallWatchdogTimer?: ReturnType<typeof setInterval>;
+  /** Set of `${tier}::${taskId}` for sessions already emitted as stalled this active-window.
+   *  Cleared per-entry as sessions leave `getActiveSessions()` so a re-stall AFTER recovery
+   *  fires fresh. Without this, the watchdog re-emits `session_stalled` every interval until
+   *  abort() takes effect — Discord noise + escalation churn. */
+  private readonly stalledEmitted: Set<string> = new Set();
   private readonly eventListeners: ((event: OrchestratorEvent) => void)[] = [];
   /** Tracks task ids that have already emitted the interim Wave A→C "listener not wired" warning,
    *  so the log fires exactly once per task per Section C.6. */
@@ -262,10 +267,22 @@ export class Orchestrator {
         : []),
     ];
 
+    // Compute the live `${tier}::${taskId}` keyset across all tiers in this
+    // tick — used to evict stalledEmitted entries for sessions that have
+    // since dropped out of getActiveSessions(). Without eviction, a recovered-
+    // then-stalled-again session would never re-emit.
+    const liveKeys: Set<string> = new Set();
+
     for (const { tier, threshold, sessions } of tiers) {
       for (const session of sessions) {
+        const key = `${tier}::${session.taskId}`;
+        liveKeys.add(key);
         const stalledForMs = now - session.lastActivityAt;
         if (stalledForMs < threshold) continue;
+        // Suppress re-emission for the same active-window stall — the abort
+        // is already in flight; spamming session_stalled every tick floods
+        // Discord and downstream escalation.
+        if (this.stalledEmitted.has(key)) continue;
         let aborted = false;
         try {
           session.abort();
@@ -277,6 +294,7 @@ export class Orchestrator {
           `[orchestrator] stall watchdog: ${tier} session ${session.taskId} stalled for ${stalledForMs}ms ` +
             `(threshold ${threshold}ms); aborted=${aborted}`,
         );
+        this.stalledEmitted.add(key);
         this.emit({
           type: "session_stalled",
           taskId: session.taskId,
@@ -286,6 +304,12 @@ export class Orchestrator {
           aborted,
         });
       }
+    }
+
+    // Evict any stalledEmitted entries whose session is no longer active.
+    // A future re-stall on the same taskId/tier (after recovery) will re-emit.
+    for (const key of this.stalledEmitted) {
+      if (!liveKeys.has(key)) this.stalledEmitted.delete(key);
     }
   }
 
