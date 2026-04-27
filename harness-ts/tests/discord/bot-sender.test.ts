@@ -221,7 +221,38 @@ describe("BotSender", () => {
     expect(body.message_reference).toEqual({ message_id: "head-x", fail_if_not_exists: false });
   });
 
-  it.todo("notifier replyToMessageId routing — commit 2");
+  it("Wave E-β notifier replyToMessageId routing — commit 2: chained event passes message_reference into BotSender POST body", async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => ({ id: "bot-msg-2" }),
+    });
+    const sender = new BotSender("t", { fetch, minSpacingMs: 0 });
+    const { DiscordNotifier } = await import("../../src/discord/notifier.js");
+    const { InMemoryMessageContext } = await import("../../src/discord/message-context.js");
+    const ctx = new InMemoryMessageContext();
+    ctx.recordRoleMessage("P1", "executor", "exec-head-9", "dev");
+    const fakeState = {
+      getTask(taskId: string) {
+        if (taskId === "task-B") return { id: "task-B", projectId: "P1" };
+        return undefined;
+      },
+    } as unknown as import("../../src/lib/state.js").StateManager;
+    const config = {
+      bot_token_env: "T",
+      dev_channel: "dev",
+      ops_channel: "ops",
+      escalation_channel: "esc",
+      agents: {},
+    };
+    const notifier = new DiscordNotifier(sender, config, { messageContext: ctx, stateManager: fakeState });
+    notifier.handleEvent({ type: "task_done", taskId: "task-B" });
+    await vi.runAllTimersAsync();
+    expect(fetch).toHaveBeenCalledOnce();
+    const body = readBody(fetch.mock.calls[0]);
+    expect(body.message_reference).toEqual({ message_id: "exec-head-9", fail_if_not_exists: false });
+  });
 
   it("addReaction PUTs to the reactions endpoint with url-encoded emoji", async () => {
     const fetch = mockFetchOK();

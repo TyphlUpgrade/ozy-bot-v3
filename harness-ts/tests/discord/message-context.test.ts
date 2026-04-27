@@ -114,5 +114,7 @@ describe("InMemoryMessageContext — Wave E-β role-head", () => {
     expect(ctx.lookupRoleHead("p1", "reviewer", "ops")).toBe("r3");
   });
 
-  it.todo("notifier chain decisions integration — commit 2");
+  // Wave E-β commit 2 — notifier chain decisions integration coverage moved
+  // to `tests/discord/notifier-chain-fixtures.test.ts` (notifier-level concern,
+  // not message-context unit). Kept this comment so future readers can find it.
 });

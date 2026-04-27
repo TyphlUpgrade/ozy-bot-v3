@@ -518,6 +518,14 @@ describe("DiscordNotifier — CW-3 messageContext recording", () => {
         resolveProjectIdForMessage() {
           return null;
         },
+        // Wave E-β commit 2 — role-head methods stubbed for CW-3 tests; chain
+        // behavior is exercised in tests/discord/notifier-chain-fixtures.test.ts.
+        recordRoleMessage() {
+          /* no-op */
+        },
+        lookupRoleHead() {
+          return null;
+        },
       },
       records,
     };

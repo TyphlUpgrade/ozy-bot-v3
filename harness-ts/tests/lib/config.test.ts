@@ -216,7 +216,69 @@ stale_chain_ms = 90000
     expect(DISCORD_REPLY_THREADING_DEFAULTS.stale_chain_ms).toBe(600_000);
   });
 
-  it.todo("notifier consults config flag — commit 2");
+  it("Wave E-β notifier consults config flag — commit 2: reply_threading.enabled=false skips lookupRoleHead and never sets replyToMessageId", async () => {
+    const { DiscordNotifier } = await import("../../src/discord/notifier.js");
+    const { InMemoryMessageContext } = await import("../../src/discord/message-context.js");
+    const { sendToChannelAndReturnIdDefault } = await import("../../src/discord/types.js");
+
+    // Spy MessageContext: tracks lookupRoleHead invocations.
+    let lookups = 0;
+    const ctx = new InMemoryMessageContext();
+    const wrappedCtx = {
+      recordAgentMessage: ctx.recordAgentMessage.bind(ctx),
+      resolveProjectIdForMessage: ctx.resolveProjectIdForMessage.bind(ctx),
+      recordRoleMessage: ctx.recordRoleMessage.bind(ctx),
+      lookupRoleHead: (projectId: string, role: import("../../src/discord/message-context.js").AgentRole, channel: string): string | null => {
+        lookups += 1;
+        return ctx.lookupRoleHead(projectId, role, channel);
+      },
+    };
+    // Pre-seed an architect head so a chain rule WOULD trigger if enabled.
+    ctx.recordRoleMessage("P1", "architect", "head-x", "dev");
+
+    // Sender that records replyToMessageId on the actual outbound call. The
+    // notifier dispatches via `sendToChannelAndReturnId` whenever
+    // messageContext is wired (CW-3 path), so only that branch records here.
+    const sentReplyTos: Array<string | undefined> = [];
+    const sender: import("../../src/discord/types.js").DiscordSender = {
+      async sendToChannel(_c, _b, _i, replyToMessageId) {
+        sentReplyTos.push(replyToMessageId);
+      },
+      async sendToChannelAndReturnId(_c, _b, _i, replyToMessageId) {
+        sentReplyTos.push(replyToMessageId);
+        return { messageId: null };
+      },
+      async addReaction() {
+        /* no-op */
+      },
+    };
+    // sendToChannelAndReturnIdDefault is intentionally unused below — kept the
+    // import shape for clarity; the local fake returns directly.
+    void sendToChannelAndReturnIdDefault;
+
+    const fakeState = {
+      getTask(taskId: string) {
+        if (taskId === "task-X") return { id: "task-X", projectId: "P1" };
+        return undefined;
+      },
+    } as unknown as import("../../src/lib/state.js").StateManager;
+
+    const config = {
+      bot_token_env: "T",
+      dev_channel: "dev",
+      ops_channel: "ops",
+      escalation_channel: "esc",
+      agents: {},
+      reply_threading: { enabled: false },
+    };
+    const notifier = new DiscordNotifier(sender, config, { messageContext: wrappedCtx, stateManager: fakeState });
+    notifier.handleEvent({ type: "session_complete", taskId: "task-X", success: true, errors: [] });
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(lookups).toBe(0);
+    expect(sentReplyTos).toEqual([undefined]);
+  });
 });
 
 describe("loadSystemPrompt", () => {

@@ -20,11 +20,11 @@
  */
 
 import type { OrchestratorEvent } from "../orchestrator.js";
-import { DISCORD_AGENT_DEFAULTS, type DiscordConfig, type DiscordAgentIdentity } from "../lib/config.js";
+import { DISCORD_AGENT_DEFAULTS, DISCORD_REPLY_THREADING_DEFAULTS, type DiscordConfig, type DiscordAgentIdentity } from "../lib/config.js";
 import { sanitize, redactSecrets, truncateRationale } from "../lib/text.js";
 import type { AgentIdentity, DiscordSender } from "./types.js";
 import type { StateManager } from "../lib/state.js";
-import type { MessageContext } from "./message-context.js";
+import type { MessageContext, AgentRole } from "./message-context.js";
 import { renderEpistle, defaultCtx, type EpistleContext } from "./epistle-templates.js";
 import { resolveIdentity as resolveIdentityRole } from "./identity.js";
 
@@ -212,7 +212,70 @@ const NOTIFIER_MAP: NotifierMap = {
     identity: "architect",
     format: (e) => `Compaction fired for project \`${shortProjectId(e.projectId)}\` (generation ${e.generation})`,
   },
+
+  // --- Wave watchdog (commit `2ae53c9`) ---
+  // session_stalled is ops-visible: orchestrator detected a stalled session and
+  // aborted it. Wave E-β chain rules also reply this under the matching tier
+  // role-head when one is registered (see CHAIN_RULES + handleEvent below).
+  session_stalled: {
+    channel: "ops_channel",
+    identity: "orchestrator",
+    format: (e) =>
+      `Session stalled (${e.tier}) on \`${shortTaskId(e.taskId)}\` after ${Math.round(e.stalledForMs / 1000)}s — ${e.aborted ? "aborted" : "still running"}`,
+  },
 };
+
+// --- Wave E-β chain rules ---
+//
+// Per-event reply / register rules. Encodes the chain-decision table from
+// `.omc/plans/2026-04-27-discord-wave-e-beta.md` § B5. Lookups always use the
+// channel the message is being sent to; cross-channel chains are NOT supported
+// (Discord reply-API requires head + reply in same channel).
+//
+// IMPORTANT: keys MUST be verbatim strings from the OrchestratorEvent union
+// (`src/orchestrator.ts:107-137`). Per harness-ts I-4: do not paraphrase or
+// invent names. To add a new event chain, add one row here.
+//
+// `session_stalled` is NOT in this table — its reply target depends on
+// `event.tier`, which is field-conditional. Handled inline in handleEvent.
+interface ChainRule {
+  /** Role-head to look up for reply target. null = standalone (no reply). */
+  replyToRole: AgentRole | null;
+  /** Role-head to register with the returned messageId. null = no registration. */
+  registerRole: AgentRole | null;
+}
+
+const CHAIN_RULES: Partial<Record<EventType, ChainRule>> = {
+  // Architect lifecycle — chain heads.
+  // (`project_decomposed` is the verbatim source-of-truth name; the planning
+  // doc references "architect_decomposed" but no such event exists.)
+  project_decomposed: { replyToRole: null, registerRole: "architect" },
+  architect_arbitration_fired: { replyToRole: null, registerRole: "architect" },
+
+  // Architect mid-chain — reply under prior architect head, re-register.
+  arbitration_verdict: { replyToRole: "architect", registerRole: "architect" },
+
+  // Executor chain under architect head.
+  session_complete: { replyToRole: "architect", registerRole: "executor" },
+  merge_result: { replyToRole: "executor", registerRole: "executor" },
+  task_done: { replyToRole: "executor", registerRole: "executor" },
+
+  // Reviewer chain under executor head.
+  review_mandatory: { replyToRole: "executor", registerRole: "reviewer" },
+  review_arbitration_entered: { replyToRole: "executor", registerRole: "reviewer" },
+};
+
+// --- Wave E-β restart-warn ---
+// Module-private flag so the orchestrator emits exactly one console.warn on
+// the first chain-head miss after process start. Reset only on process
+// restart, which is also the trigger condition. Tests use `vi.resetModules()`
+// to clear between cases.
+let restartWarned = false;
+function warnRestartOnce(): void {
+  if (restartWarned) return;
+  restartWarned = true;
+  console.warn("[notifier] reply-chain head missing — orchestrator likely restarted; chains will rebuild from next event");
+}
 
 // --- Runtime ---
 
@@ -317,21 +380,35 @@ export class DiscordNotifier {
     // projectId for this event, capture the Discord-assigned message id so
     // operator replies route back. Without messageContext, use the legacy
     // fire-and-forget path (no recording, no API change).
+    //
+    // Wave E-β — chain decisions (reply target lookup + role-head register)
+    // also live on this path. They consult `CHAIN_RULES[event.type]` and the
+    // role-head map keyed `(projectId, role, channel)` to synthesize Discord
+    // `message_reference` reply chains. Disabled when
+    // `config.discord.reply_threading.enabled === false`.
     if (this.messageContext) {
       const projectId = this.resolveProjectId(event);
       if (projectId !== null) {
         const ctx = this.messageContext;
+        const replyToMessageId = this.computeReplyTarget(event, projectId, channel);
+        const chainRule = CHAIN_RULES[event.type];
+        const registerRole = this.threadingEnabled() ? (chainRule?.registerRole ?? null) : null;
         void sender
-          .sendToChannelAndReturnId(channel, body, identity)
+          .sendToChannelAndReturnId(channel, body, identity, replyToMessageId ?? undefined)
           .then(({ messageId }) => {
-            if (messageId !== null) ctx.recordAgentMessage(messageId, projectId);
+            if (messageId !== null) {
+              ctx.recordAgentMessage(messageId, projectId);
+              if (registerRole !== null) {
+                ctx.recordRoleMessage(projectId, registerRole, messageId, channel);
+              }
+            }
           })
           .catch((err) => {
             console.error(`[DiscordNotifier] sender failed for ${event.type} -> ${entry.channel}: ${errMessage(err)}`);
           });
         return;
       }
-      // projectId null → fall through to plain sendToChannel (no recording).
+      // projectId null → fall through to plain sendToChannel (no recording, no chain).
     }
 
     // Swallow sender failures — Discord hiccups never crash the pipeline.
@@ -339,6 +416,48 @@ export class DiscordNotifier {
     void sender.sendToChannel(channel, body, identity).catch((err) => {
       console.error(`[DiscordNotifier] sender failed for ${event.type} -> ${entry.channel}: ${errMessage(err)}`);
     });
+  }
+
+  /**
+   * Wave E-β — true when reply-threading is enabled (default). Honors the
+   * `[discord.reply_threading].enabled` config flag; absent block applies the
+   * `DISCORD_REPLY_THREADING_DEFAULTS.enabled` (true) fallback.
+   */
+  private threadingEnabled(): boolean {
+    return this.config.reply_threading?.enabled ?? DISCORD_REPLY_THREADING_DEFAULTS.enabled;
+  }
+
+  /**
+   * Wave E-β — compute reply-target messageId for an outbound event. Returns
+   * null when threading disabled, no chain rule applies, no projectId, or the
+   * lookup misses (stale or absent). On the first miss for an event with an
+   * actual reply expectation, fires `warnRestartOnce()` (likely orchestrator
+   * restart wiped the in-memory map).
+   */
+  private computeReplyTarget(
+    event: OrchestratorEvent,
+    projectId: string,
+    channel: string,
+  ): string | null {
+    if (!this.threadingEnabled()) return null;
+    if (!this.messageContext) return null;
+
+    // session_stalled — tier-aware lookup. The event carries `tier` directly;
+    // reply target is the head matching that tier in the same channel. Per
+    // plan B5: session_stalled does NOT register a new head (the stalled
+    // session is being aborted; no continuity to thread).
+    if (event.type === "session_stalled") {
+      const tierRole = event.tier as AgentRole;
+      const head = this.messageContext.lookupRoleHead(projectId, tierRole, channel);
+      if (head === null) warnRestartOnce();
+      return head;
+    }
+
+    const rule = CHAIN_RULES[event.type];
+    if (!rule || rule.replyToRole === null) return null;
+    const head = this.messageContext.lookupRoleHead(projectId, rule.replyToRole, channel);
+    if (head === null) warnRestartOnce();
+    return head;
   }
 
   /**

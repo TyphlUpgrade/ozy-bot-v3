@@ -127,7 +127,37 @@ describe("WebhookSender", () => {
     expect(calls[0].messageReference).toEqual({ messageId: "head-1", failIfNotExists: false });
   });
 
-  it.todo("notifier replyToMessageId routing — commit 2");
+  it("Wave E-β notifier replyToMessageId routing — commit 2: chained event passes replyToMessageId into WebhookSender", async () => {
+    const { client, calls } = makeWebhook({ returnId: "ws-msg-2" });
+    const sender = new WebhookSender(client, { minSpacingMs: 0 });
+    // Per-channel sender map so the same WebhookSender services dev_channel.
+    const { DiscordNotifier } = await import("../../src/discord/notifier.js");
+    const { InMemoryMessageContext } = await import("../../src/discord/message-context.js");
+    const ctx = new InMemoryMessageContext();
+    // Seed an architect head in dev_channel for project P1 so session_complete
+    // (chains under architect) finds a target.
+    ctx.recordRoleMessage("P1", "architect", "head-msg-1", "dev");
+    const fakeState = {
+      getTask(taskId: string) {
+        if (taskId === "task-A") return { id: "task-A", projectId: "P1" };
+        return undefined;
+      },
+    } as unknown as import("../../src/lib/state.js").StateManager;
+    const config = {
+      bot_token_env: "T",
+      dev_channel: "dev",
+      ops_channel: "ops",
+      escalation_channel: "esc",
+      agents: {},
+    };
+    const notifier = new DiscordNotifier(sender, config, { messageContext: ctx, stateManager: fakeState });
+    notifier.handleEvent({ type: "session_complete", taskId: "task-A", success: true, errors: [] });
+    // Allow the async sendToChannelAndReturnId to resolve.
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(calls).toHaveLength(1);
+    expect(calls[0].messageReference).toEqual({ messageId: "head-msg-1", failIfNotExists: false });
+  });
 
   it("queue overflow drops OLDEST (not newest) when maxQueueSize exceeded", async () => {
     const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
