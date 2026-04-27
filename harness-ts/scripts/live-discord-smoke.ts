@@ -148,18 +148,22 @@ async function main(): Promise<void> {
   // reference target). Live Discord delivery requires DISCORD_BOT_TOKEN +
   // DEV_CHANNEL; without those the script log-only's the intent and exits.
   const llmMode = process.argv.includes("--llm");
+  // `--dry-run` forces log-only path regardless of env. Use when verifying
+  // fixture wiring without burning LLM cost or posting to a live channel.
+  const dryRunFlag = process.argv.includes("--dry-run");
 
   const token = process.env.DISCORD_BOT_TOKEN;
   const dev = process.env.DEV_CHANNEL;
   const ops = process.env.AGENT_CHANNEL ?? dev;
   const escalation = process.env.ALERTS_CHANNEL ?? dev;
 
-  if (!token || !dev) {
-    // Dry-run: log intent for each fixture and exit 0. Lets `--llm` be
-    // verified in CI / lint without provisioning a live Discord channel.
+  if (dryRunFlag || !token || !dev) {
+    const reason = dryRunFlag
+      ? "--dry-run flag set"
+      : "DISCORD_BOT_TOKEN or DEV_CHANNEL missing";
     console.error(
-      `[discord-smoke] dry-run (DISCORD_BOT_TOKEN or DEV_CHANNEL missing) — ` +
-        `would dispatch ${SMOKE_FIXTURES.length} fixtures (llmMode=${llmMode})`,
+      `[discord-smoke] dry-run (${reason}) — would dispatch ` +
+        `${SMOKE_FIXTURES.length} fixtures (llmMode=${llmMode})`,
     );
     for (const fx of SMOKE_FIXTURES) {
       const projectKey =
