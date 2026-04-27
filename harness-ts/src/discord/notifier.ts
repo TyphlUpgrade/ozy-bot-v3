@@ -22,7 +22,7 @@
 import type { OrchestratorEvent } from "../orchestrator.js";
 import { DISCORD_AGENT_DEFAULTS, DISCORD_REPLY_THREADING_DEFAULTS, type DiscordConfig, type DiscordAgentIdentity } from "../lib/config.js";
 import { sanitize, redactSecrets, truncateRationale } from "../lib/text.js";
-import type { AgentIdentity, DiscordSender } from "./types.js";
+import type { AgentIdentity, AllowedMentions, DiscordSender } from "./types.js";
 import type { StateManager } from "../lib/state.js";
 import type { MessageContext, AgentRole } from "./message-context.js";
 import { renderEpistle, defaultCtx, type EpistleContext } from "./epistle-templates.js";
@@ -80,14 +80,13 @@ type NotifierMap = { [K in EventType]?: NotifierEntry<K> };
 
 const NOTIFIER_MAP: NotifierMap = {
   // --- Phase 2A / standalone task lifecycle ---
+  // Channel-collapse (2026-04-27): all events route to dev_channel. Noise
+  // events use `format: () => null` so handleEvent short-circuits emission;
+  // they remain on the OrchestratorEvent bus for audit/log inspection.
   task_picked_up: {
     channel: "dev_channel",
     identity: "orchestrator",
-    format: (e) => {
-      const redacted = redactSecrets(e.prompt);
-      const sanitized = sanitize(redacted, 80);
-      return `Task \`${shortTaskId(e.taskId)}\` picked up: ${sanitized}`;
-    },
+    format: () => null, // suppressed (noise — Architect picks up dozens per project)
   },
   session_complete: {
     channel: "dev_channel",
@@ -107,20 +106,20 @@ const NOTIFIER_MAP: NotifierMap = {
   task_shelved: {
     channel: "dev_channel",
     identity: "orchestrator",
-    format: (e) => `Task \`${shortTaskId(e.taskId)}\` shelved: ${sanitize(e.reason)}`,
+    format: () => null, // suppressed (cooldown noise; auto-retried by orchestrator)
   },
   task_failed: {
-    channel: "ops_channel",
+    channel: "dev_channel",
     identity: "orchestrator",
     format: (e, ctx?) => renderEpistle(e, resolveIdentityRole(e), ctx ?? defaultCtx()),
   },
   escalation_needed: {
-    channel: "escalation_channel",
+    channel: "dev_channel",
     identity: "orchestrator",
     format: (e, ctx?) => renderEpistle(e, resolveIdentityRole(e), ctx ?? defaultCtx()),
   },
   budget_exhausted: {
-    channel: "ops_channel",
+    channel: "dev_channel",
     identity: "orchestrator",
     format: (e) =>
       `Budget exhausted for \`${shortTaskId(e.taskId)}\`: $${e.totalCostUsd.toFixed(2)}`,
@@ -128,23 +127,19 @@ const NOTIFIER_MAP: NotifierMap = {
   retry_scheduled: {
     channel: "dev_channel",
     identity: "orchestrator",
-    format: (e) => `Retry ${e.attempt}/${e.maxRetries} for \`${shortTaskId(e.taskId)}\``,
+    format: () => null, // suppressed (retry cadence noise; followed by terminal task_failed)
   },
   response_level: {
     channel: "dev_channel",
     identity: "orchestrator",
-    format: (e) => {
-      if (e.level < 2) return null; // level 0-1 are default; only escalated levels notify
-      const reasons = e.reasons.map((r) => sanitize(r, 200)).join("; ");
-      return `Response level **${e.level}** (${sanitize(e.name, 40)}) for \`${shortTaskId(e.taskId)}\`: ${reasons}`;
-    },
+    format: () => null, // suppressed (debug-level signal; not actionable for operator)
   },
 
   // --- Wave 2 three-tier project lifecycle ---
   project_declared: {
     channel: "dev_channel",
     identity: "architect",
-    format: (e) => `Project \`${shortProjectId(e.projectId)}\` declared: **${sanitize(e.name, 80)}**`,
+    format: () => null, // suppressed (project_decomposed is the operator-relevant signal)
   },
   project_decomposed: {
     channel: "dev_channel",
@@ -158,42 +153,41 @@ const NOTIFIER_MAP: NotifierMap = {
       `Project \`${shortProjectId(e.projectId)}\` completed (${e.phaseCount} phases, $${e.totalCostUsd.toFixed(2)})`,
   },
   project_failed: {
-    channel: "ops_channel",
+    channel: "dev_channel",
     identity: "architect",
     format: (e, ctx?) => renderEpistle(e, resolveIdentityRole(e), ctx ?? defaultCtx()),
   },
   project_aborted: {
     // Architect owns project lifecycle narrative, including operator-abort (Architect review finding LOW-2).
-    channel: "ops_channel",
+    channel: "dev_channel",
     identity: "architect",
     format: (e) => `Project \`${shortProjectId(e.projectId)}\` aborted by operator ${sanitize(e.operatorId, 64)}`,
   },
   architect_spawned: {
     channel: "dev_channel",
     identity: "architect",
-    format: (e) => `Architect spawned for project \`${shortProjectId(e.projectId)}\` (session ${e.sessionId.slice(0, 8)})`,
+    format: () => null, // suppressed (lifecycle noise; project_decomposed is what operator cares about)
   },
   architect_respawned: {
-    channel: "ops_channel",
+    channel: "dev_channel",
     identity: "architect",
-    format: (e) =>
-      `Architect **respawned** for project \`${shortProjectId(e.projectId)}\` (reason: ${e.reason}, session ${e.sessionId.slice(0, 8)})`,
+    format: () => null, // suppressed (lifecycle noise; ops sees this in logs)
   },
   architect_arbitration_fired: {
-    channel: "ops_channel",
+    channel: "dev_channel",
     identity: "architect",
     format: (e) =>
       `Architect arbitration fired on \`${shortTaskId(e.taskId)}\` in project \`${shortProjectId(e.projectId)}\` (cause: ${e.cause})`,
   },
   arbitration_verdict: {
-    channel: "ops_channel",
+    channel: "dev_channel",
     identity: "architect",
     format: (e) =>
       truncateBody(
         `Arbitration verdict for \`${shortTaskId(e.taskId)}\` in \`${shortProjectId(e.projectId)}\`: **${e.verdict}** — ${sanitize(truncateRationale(e.rationale, 1024))}`,      ),
   },
   review_arbitration_entered: {
-    channel: "escalation_channel",
+    channel: "dev_channel",
     identity: "reviewer",
     format: (e) =>
       `**review_arbitration** entered for \`${shortTaskId(e.taskId)}\` in \`${shortProjectId(e.projectId)}\` (rejection #${e.reviewerRejectionCount})`,
@@ -204,7 +198,7 @@ const NOTIFIER_MAP: NotifierMap = {
     format: (e, ctx?) => renderEpistle(e, resolveIdentityRole(e), ctx ?? defaultCtx()),
   },
   budget_ceiling_reached: {
-    channel: "escalation_channel",
+    channel: "dev_channel",
     identity: "orchestrator",
     format: (e) =>
       `**Budget ceiling** reached for project \`${shortProjectId(e.projectId)}\`: $${e.currentCostUsd.toFixed(2)} / $${e.ceilingUsd.toFixed(2)}`,
@@ -212,15 +206,15 @@ const NOTIFIER_MAP: NotifierMap = {
   compaction_fired: {
     channel: "dev_channel",
     identity: "architect",
-    format: (e) => `Compaction fired for project \`${shortProjectId(e.projectId)}\` (generation ${e.generation})`,
+    format: () => null, // suppressed (internal context-management; not operator-relevant)
   },
 
   // --- Wave watchdog (commit `2ae53c9`) ---
-  // session_stalled is ops-visible: orchestrator detected a stalled session and
-  // aborted it. Wave E-β chain rules also reply this under the matching tier
-  // role-head when one is registered (see CHAIN_RULES + handleEvent below).
+  // session_stalled is operator-attention: orchestrator detected a stalled
+  // session and aborted it. Wave E-β chain rules reply this under the matching
+  // tier role-head when one is registered (see CHAIN_RULES + handleEvent below).
   session_stalled: {
-    channel: "ops_channel",
+    channel: "dev_channel",
     identity: "orchestrator",
     format: (e) =>
       `Session stalled (${e.tier}) on \`${shortTaskId(e.taskId)}\` after ${Math.round(e.stalledForMs / 1000)}s — ${e.aborted ? "aborted" : "still running"}`,
@@ -266,6 +260,38 @@ const CHAIN_RULES: Partial<Record<EventType, ChainRule>> = {
   review_mandatory: { replyToRole: "executor", registerRole: "reviewer" },
   review_arbitration_entered: { replyToRole: "executor", registerRole: "reviewer" },
 };
+
+// --- Channel-collapse — operator-attention routing ---
+//
+// Channel-collapse (2026-04-27) — events where the operator must take action
+// or be aware of a state requiring attention. These prepend
+// `<@operator_user_id>` to the body and override allowedMentions to actually
+// ping. Without `operator_user_id` configured on DiscordConfig, behavior
+// degrades silently (no prepend, no ping; body unchanged).
+//
+// `task_failed` is conditionally included based on `attempt` — see
+// `needsOperatorMention` helper. Earlier attempts are followed by
+// `retry_scheduled` (suppressed) — operator doesn't need to act until the
+// terminal attempt fires.
+const ALWAYS_OPERATOR_ATTENTION: ReadonlySet<OrchestratorEvent["type"]> = new Set([
+  "escalation_needed",
+  "review_arbitration_entered",
+  "budget_ceiling_reached",
+  "project_failed",
+  "project_aborted",
+  "session_stalled",
+]);
+
+function needsOperatorMention(event: OrchestratorEvent): boolean {
+  if (ALWAYS_OPERATOR_ATTENTION.has(event.type)) return true;
+  // task_failed with attempt >= 3 (terminal) gets ping; earlier attempts are
+  // followed by retry_scheduled (now suppressed) — operator doesn't need to act.
+  if (event.type === "task_failed") {
+    const attempt = (event as { attempt?: number }).attempt;
+    return typeof attempt === "number" && attempt >= 3;
+  }
+  return false;
+}
 
 // --- Wave E-β restart-warn ---
 // Module-private flag so the orchestrator emits exactly one console.warn on
@@ -456,9 +482,21 @@ export class DiscordNotifier {
       // projectId null → fall through to plain sendToChannel (no recording, no chain, no LLM).
     }
 
+    // Channel-collapse (2026-04-27) — apply operator-mention prepend +
+    // allowedMentions override for escalation-class events. Without
+    // `operator_user_id` configured, behavior degrades silently (no prepend,
+    // no ping). Truncation happens AFTER prepend so the mention itself never
+    // gets cut; mention adds ~22 chars, effective body cap drops 1900 → ~1878.
+    let finalBody = body;
+    let allowedMentions: AllowedMentions | undefined = undefined;
+    if (this.config.operator_user_id && needsOperatorMention(event)) {
+      finalBody = truncateBody(`<@${this.config.operator_user_id}> ${body}`);
+      allowedMentions = { users: [this.config.operator_user_id] };
+    }
+
     // Swallow sender failures — Discord hiccups never crash the pipeline.
     // Log only .message to avoid echoing request bodies back into logs.
-    void sender.sendToChannel(channel, body, identity).catch((err) => {
+    void sender.sendToChannel(channel, finalBody, identity, undefined, allowedMentions).catch((err) => {
       console.error(`[DiscordNotifier] sender failed for ${event.type} -> ${entry.channel}: ${errMessage(err)}`);
     });
   }
@@ -503,12 +541,22 @@ export class DiscordNotifier {
         });
       }
     }
+    // Channel-collapse (2026-04-27) — apply operator-mention prepend +
+    // allowedMentions override AFTER the (optional) LLM transform but BEFORE
+    // truncation, so the mention itself never gets cut. Mention adds ~22
+    // chars; effective body cap drops 1900 → ~1878 — acceptable.
+    let allowedMentions: AllowedMentions | undefined = undefined;
+    if (this.config.operator_user_id && needsOperatorMention(args.event)) {
+      body = truncateBody(`<@${this.config.operator_user_id}> ${body}`);
+      allowedMentions = { users: [this.config.operator_user_id] };
+    }
     try {
       const { messageId } = await args.sender.sendToChannelAndReturnId(
         args.channel,
         body,
         args.identity,
         args.replyToMessageId ?? undefined,
+        allowedMentions,
       );
       if (messageId !== null) {
         args.ctx.recordAgentMessage(messageId, args.projectId);

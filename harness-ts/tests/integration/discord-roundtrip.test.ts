@@ -254,13 +254,13 @@ describe("Discord roundtrip — Wave 2 + Wave 3 end-to-end", () => {
     expect(h.events.some((e) => e.type === "task_picked_up")).toBe(true);
     expect(h.events.some((e) => e.type === "task_done")).toBe(true);
 
-    // Notifier routed the lifecycle to dev
-    expect(h.sent.some((s) => s.channel === "dev" && /picked up/.test(s.content))).toBe(true);
+    // Channel-collapse: task_picked_up is suppressed at the notifier; the
+    // surviving narrative events (merge_result, task_done) all land in dev.
     expect(h.sent.some((s) => s.channel === "dev" && /merged/.test(s.content))).toBe(true);
     expect(h.sent.some((s) => s.channel === "dev" && /complete/.test(s.content))).toBe(true);
   });
 
-  it("!project declare emits project_declared → notifier routes to dev with architect identity", async () => {
+  it("!project declare emits project_declared → suppressed at notifier (channel-collapse)", async () => {
     const h = setup();
     const args =
       "auth-rewrite\nReplace legacy auth with JWT\nNON-GOALS:\n- no UI changes\n- no DB migration";
@@ -268,13 +268,14 @@ describe("Discord roundtrip — Wave 2 + Wave 3 end-to-end", () => {
     await flushMicrotasks();
 
     expect(h.projectStore.getAllProjects()).toHaveLength(1);
-    const declared = h.sent.find((s) => /declared/.test(s.content));
-    expect(declared).toBeTruthy();
-    expect(declared!.channel).toBe("dev");
-    expect(declared!.identity?.username).toBe("Architect");
+    // Channel-collapse: project_declared is suppressed (project_decomposed is
+    // the operator-relevant signal). The event still fires on the orchestrator
+    // bus for audit; only Discord emission is suppressed.
+    expect(h.events.some((e) => e.type === "project_declared")).toBe(true);
+    expect(h.sent.some((s) => /declared/.test(s.content))).toBe(false);
   });
 
-  it("!project <id> abort confirm → project_aborted → notifier routes to ops", async () => {
+  it("!project <id> abort confirm → project_aborted → notifier routes to dev (channel-collapse)", async () => {
     const h = setup();
     const p = h.projectStore.createProject("short-lived", "desc", ["nothing"]);
     const msg = await h.router.handleCommand("project", `${p.id} abort confirm`, "dev");
@@ -284,7 +285,7 @@ describe("Discord roundtrip — Wave 2 + Wave 3 end-to-end", () => {
     expect(h.projectStore.getProject(p.id)!.state).toBe("aborted");
     const aborted = h.sent.find((s) => /aborted/.test(s.content));
     expect(aborted).toBeTruthy();
-    expect(aborted!.channel).toBe("ops");
+    expect(aborted!.channel).toBe("dev");
   });
 
   it("!status lists projects + tasks (inbound only, no outbound triggered)", async () => {

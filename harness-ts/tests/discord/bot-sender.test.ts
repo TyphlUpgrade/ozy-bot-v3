@@ -104,7 +104,41 @@ describe("BotSender", () => {
     expect(body.allowed_mentions).toEqual({ users: ["249"] });
   });
 
-  it.todo("notifier wires per-event allowedMentions for escalation events — commit 2");
+  it("channel-collapse commit 2: notifier wires per-event allowedMentions for escalation events", async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => ({ id: "bot-msg-esc" }),
+    });
+    const sender = new BotSender("t", { fetch, minSpacingMs: 0 });
+    const { DiscordNotifier } = await import("../../src/discord/notifier.js");
+    const config = {
+      bot_token_env: "T",
+      dev_channel: "dev",
+      ops_channel: "ops",
+      escalation_channel: "esc",
+      agents: {},
+      operator_user_id: "249313669337317379",
+    };
+    const notifier = new DiscordNotifier(sender, config);
+    notifier.handleEvent({
+      type: "escalation_needed",
+      taskId: "task-A",
+      escalation: { type: "clarification_needed", question: "what scope?" },
+    });
+    await vi.runAllTimersAsync();
+    expect(fetch).toHaveBeenCalledOnce();
+    const body = readBody(fetch.mock.calls[0]);
+    expect(body.allowed_mentions).toEqual({ users: ["249313669337317379"] });
+    // BotSender prepends `**[<identity>]**` BEFORE the notifier-built body,
+    // so the mention sits between the identity prefix and the rest of the
+    // body. Assert the mention IS present, immediately following the prefix.
+    expect(body.content).toContain("<@249313669337317379> ");
+    expect(body.content.indexOf("<@249313669337317379> ")).toBeLessThan(
+      body.content.indexOf("ESCALATION"),
+    );
+  });
 
   it("logs (does not throw) on non-2xx responses", async () => {
     // Use 500 here — 429 is exercised by the dedicated retry-after tests below.

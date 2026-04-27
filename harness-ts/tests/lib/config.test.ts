@@ -297,7 +297,40 @@ avatar_url = "https://example.com/avatar.png"
     expect(config.discord.operator_user_id).toBeUndefined();
   });
 
-  it.todo("notifier prepends operator mention for escalation events when operator_user_id set — commit 2");
+  it("channel-collapse commit 2: notifier prepends operator mention for escalation events when operator_user_id set", async () => {
+    const { DiscordNotifier } = await import("../../src/discord/notifier.js");
+    const sent: Array<{ channel: string; content: string }> = [];
+    const sender: import("../../src/discord/types.js").DiscordSender = {
+      async sendToChannel(channel, content) {
+        sent.push({ channel, content });
+      },
+      async sendToChannelAndReturnId(channel, content) {
+        sent.push({ channel, content });
+        return { messageId: null };
+      },
+      async addReaction() {
+        /* no-op */
+      },
+    };
+    const config = {
+      bot_token_env: "T",
+      dev_channel: "dev",
+      ops_channel: "ops",
+      escalation_channel: "esc",
+      agents: {},
+      operator_user_id: "249313669337317379",
+    };
+    const notifier = new DiscordNotifier(sender, config);
+    notifier.handleEvent({
+      type: "escalation_needed",
+      taskId: "task-1",
+      escalation: { type: "clarification_needed", question: "what scope?" },
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sent).toHaveLength(1);
+    expect(sent[0].content.startsWith("<@249313669337317379> ")).toBe(true);
+  });
 
   it("Wave E-β notifier consults config flag — commit 2: reply_threading.enabled=false skips lookupRoleHead and never sets replyToMessageId", async () => {
     const { DiscordNotifier } = await import("../../src/discord/notifier.js");

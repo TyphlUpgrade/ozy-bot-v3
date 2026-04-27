@@ -60,15 +60,13 @@ describe("DiscordNotifier", () => {
 
   // --- Phase 2A / standalone events (baseline) ---
 
-  it("task_picked_up → dev_channel with orchestrator identity", async () => {
+  it("task_picked_up → suppressed (channel-collapse: noise event, no emission)", async () => {
     notifier.handleEvent({ type: "task_picked_up", taskId: "task-long-id-xyz-123456", prompt: "fix the auth bug" });
     await flush();
-    expect(sent).toHaveLength(1);
-    expect(sent[0].channel).toBe("dev");
-    expect(sent[0].identity?.username).toBe("Harness");
-    // shortTaskId truncates ids > 12 chars to "<first8>…<last3>"
-    expect(sent[0].content).toContain("task-lon…456");
-    expect(sent[0].content).toContain("fix the auth bug");
+    // Channel-collapse (2026-04-27): task_picked_up has format: () => null.
+    // The event remains on the OrchestratorEvent bus for audit trail; only
+    // Discord emission is suppressed.
+    expect(sent).toHaveLength(0);
   });
 
   it("session_complete → dev_channel (success + failure)", async () => {
@@ -101,55 +99,54 @@ describe("DiscordNotifier", () => {
     expect(sent[0].identity?.username).toBe("Executor");
   });
 
-  it("task_failed → ops_channel", async () => {
-    notifier.handleEvent({ type: "task_failed", taskId: "t1", reason: "boom" });
+  it("task_failed → dev_channel (channel-collapse: all events single channel)", async () => {
+    notifier.handleEvent({ type: "task_failed", taskId: "t1", reason: "boom", attempt: 1 });
     await flush();
-    expect(sent[0].channel).toBe("ops");
+    expect(sent[0].channel).toBe("dev");
     expect(sent[0].content).toMatch(/FAILED/);
     expect(sent[0].content).toMatch(/boom/);
   });
 
-  it("escalation_needed → escalation_channel", async () => {
+  it("escalation_needed → dev_channel (channel-collapse: all events single channel)", async () => {
     notifier.handleEvent({
       type: "escalation_needed",
       taskId: "t1",
       escalation: { type: "clarification_needed", question: "what scope?" },
     });
     await flush();
-    expect(sent[0].channel).toBe("esc");
+    expect(sent[0].channel).toBe("dev");
     expect(sent[0].content).toMatch(/ESCALATION/);
     expect(sent[0].content).toMatch(/what scope/);
   });
 
-  it("budget_exhausted → ops_channel", async () => {
+  it("budget_exhausted → dev_channel (channel-collapse: all events single channel)", async () => {
     notifier.handleEvent({ type: "budget_exhausted", taskId: "t1", totalCostUsd: 4.2 });
     await flush();
-    expect(sent[0].channel).toBe("ops");
+    expect(sent[0].channel).toBe("dev");
     expect(sent[0].content).toMatch(/\$4\.20/);
   });
 
-  it("retry_scheduled → dev_channel", async () => {
+  it("retry_scheduled → suppressed (channel-collapse: retry cadence noise)", async () => {
     notifier.handleEvent({ type: "retry_scheduled", taskId: "t1", attempt: 2, maxRetries: 3 });
     await flush();
-    expect(sent[0].channel).toBe("dev");
-    expect(sent[0].content).toMatch(/2\/3/);
+    // Channel-collapse: retry_scheduled is suppressed (followed by terminal task_failed).
+    expect(sent).toHaveLength(0);
   });
 
-  it("response_level 2+ → dev_channel; level 0-1 → skipped", async () => {
+  it("response_level → all levels suppressed (channel-collapse: debug-only signal)", async () => {
     notifier.handleEvent({ type: "response_level", taskId: "t1", level: 0, name: "direct", reasons: [] });
     notifier.handleEvent({ type: "response_level", taskId: "t2", level: 1, name: "enriched", reasons: [] });
     notifier.handleEvent({ type: "response_level", taskId: "t3", level: 2, name: "reviewed", reasons: ["guessing"] });
     await flush();
-    expect(sent).toHaveLength(1);
-    expect(sent[0].channel).toBe("dev");
-    expect(sent[0].content).toMatch(/level \*\*2\*\*/);
+    // Channel-collapse: response_level is suppressed at all levels.
+    expect(sent).toHaveLength(0);
   });
 
-  it("task_shelved → dev_channel", async () => {
+  it("task_shelved → suppressed (channel-collapse: cooldown noise)", async () => {
     notifier.handleEvent({ type: "task_shelved", taskId: "t1", reason: "rebase conflict" });
     await flush();
-    expect(sent[0].channel).toBe("dev");
-    expect(sent[0].content).toMatch(/shelved/);
+    // Channel-collapse: task_shelved is suppressed (auto-retried by orchestrator).
+    expect(sent).toHaveLength(0);
   });
 
   it("poll_tick / shutdown / checkpoint_detected / completion_compliance are ignored (no emission)", async () => {
@@ -181,12 +178,11 @@ describe("DiscordNotifier", () => {
 
   // --- Wave 2 three-tier events ---
 
-  it("project_declared → dev_channel with architect identity", async () => {
+  it("project_declared → suppressed (channel-collapse: project_decomposed is the operator-relevant signal)", async () => {
     notifier.handleEvent({ type: "project_declared", projectId: "proj-abc", name: "auth-rewrite" });
     await flush();
-    expect(sent[0].channel).toBe("dev");
-    expect(sent[0].identity?.username).toBe("Architect");
-    expect(sent[0].content).toMatch(/auth-rewrite/);
+    // Channel-collapse: project_declared is suppressed; project_decomposed is the operator-relevant signal.
+    expect(sent).toHaveLength(0);
   });
 
   it("project_decomposed → dev_channel with phase count", async () => {
@@ -203,36 +199,35 @@ describe("DiscordNotifier", () => {
     expect(sent[0].content).toMatch(/\$1\.23/);
   });
 
-  it("project_failed → ops_channel with reason", async () => {
+  it("project_failed → dev_channel (channel-collapse: all events single channel)", async () => {
     notifier.handleEvent({ type: "project_failed", projectId: "p", reason: "budget ceiling" });
     await flush();
-    expect(sent[0].channel).toBe("ops");
+    expect(sent[0].channel).toBe("dev");
     expect(sent[0].content).toMatch(/budget ceiling/);
   });
 
-  it("project_aborted → ops_channel with operator id", async () => {
+  it("project_aborted → dev_channel (channel-collapse: all events single channel)", async () => {
     notifier.handleEvent({ type: "project_aborted", projectId: "p", operatorId: "op-1" });
     await flush();
-    expect(sent[0].channel).toBe("ops");
+    expect(sent[0].channel).toBe("dev");
     expect(sent[0].content).toMatch(/op-1/);
   });
 
-  it("architect_spawned → dev_channel with architect identity", async () => {
+  it("architect_spawned → suppressed (channel-collapse: lifecycle noise)", async () => {
     notifier.handleEvent({ type: "architect_spawned", projectId: "p", sessionId: "session-uuid-1234" });
     await flush();
-    expect(sent[0].channel).toBe("dev");
-    expect(sent[0].identity?.username).toBe("Architect");
+    // Channel-collapse: architect_spawned is suppressed (lifecycle noise).
+    expect(sent).toHaveLength(0);
   });
 
-  it("architect_respawned → ops_channel with reason", async () => {
+  it("architect_respawned → suppressed (channel-collapse: lifecycle noise)", async () => {
     notifier.handleEvent({ type: "architect_respawned", projectId: "p", sessionId: "s", reason: "compaction" });
     await flush();
-    expect(sent[0].channel).toBe("ops");
-    expect(sent[0].identity?.username).toBe("Architect");
-    expect(sent[0].content).toMatch(/compaction/);
+    // Channel-collapse: architect_respawned is suppressed (lifecycle noise; ops sees this in logs).
+    expect(sent).toHaveLength(0);
   });
 
-  it("architect_arbitration_fired → ops_channel with cause", async () => {
+  it("architect_arbitration_fired → dev_channel (channel-collapse: all events single channel)", async () => {
     notifier.handleEvent({
       type: "architect_arbitration_fired",
       taskId: "t1",
@@ -240,11 +235,11 @@ describe("DiscordNotifier", () => {
       cause: "review_disagreement",
     });
     await flush();
-    expect(sent[0].channel).toBe("ops");
+    expect(sent[0].channel).toBe("dev");
     expect(sent[0].content).toMatch(/review_disagreement/);
   });
 
-  it("arbitration_verdict → ops_channel with verdict + rationale", async () => {
+  it("arbitration_verdict → dev_channel with verdict + rationale (channel-collapse)", async () => {
     notifier.handleEvent({
       type: "arbitration_verdict",
       taskId: "t1",
@@ -253,12 +248,12 @@ describe("DiscordNotifier", () => {
       rationale: "add integration test",
     });
     await flush();
-    expect(sent[0].channel).toBe("ops");
+    expect(sent[0].channel).toBe("dev");
     expect(sent[0].content).toMatch(/retry_with_directive/);
     expect(sent[0].content).toMatch(/integration test/);
   });
 
-  it("review_arbitration_entered → escalation_channel with reviewer identity", async () => {
+  it("review_arbitration_entered → dev_channel with reviewer identity (channel-collapse)", async () => {
     notifier.handleEvent({
       type: "review_arbitration_entered",
       taskId: "t1",
@@ -266,7 +261,7 @@ describe("DiscordNotifier", () => {
       reviewerRejectionCount: 2,
     });
     await flush();
-    expect(sent[0].channel).toBe("esc");
+    expect(sent[0].channel).toBe("dev");
     expect(sent[0].identity?.username).toBe("Reviewer");
     expect(sent[0].content).toMatch(/rejection #2/);
   });
@@ -278,7 +273,7 @@ describe("DiscordNotifier", () => {
     expect(sent[0].identity?.username).toBe("Reviewer");
   });
 
-  it("budget_ceiling_reached → escalation_channel with cost + ceiling", async () => {
+  it("budget_ceiling_reached → dev_channel with cost + ceiling (channel-collapse)", async () => {
     notifier.handleEvent({
       type: "budget_ceiling_reached",
       projectId: "p",
@@ -286,16 +281,16 @@ describe("DiscordNotifier", () => {
       ceilingUsd: 10,
     });
     await flush();
-    expect(sent[0].channel).toBe("esc");
+    expect(sent[0].channel).toBe("dev");
     expect(sent[0].content).toMatch(/\$9\.80/);
     expect(sent[0].content).toMatch(/\$10\.00/);
   });
 
-  it("compaction_fired → dev_channel with generation", async () => {
+  it("compaction_fired → suppressed (channel-collapse: internal context-management)", async () => {
     notifier.handleEvent({ type: "compaction_fired", projectId: "p", generation: 3 });
     await flush();
-    expect(sent[0].channel).toBe("dev");
-    expect(sent[0].content).toMatch(/generation 3/);
+    // Channel-collapse: compaction_fired is suppressed (internal context-management).
+    expect(sent).toHaveLength(0);
   });
 
   // --- Phase B rich rendering (skipped until Commit 2 lands renderer) ---
@@ -388,7 +383,9 @@ describe("DiscordNotifier", () => {
     const cfg: DiscordConfig = { ...baseConfig(), agents: {} };
     const f = makeFakeSender();
     const n = new DiscordNotifier(f.sender, cfg);
-    n.handleEvent({ type: "project_declared", projectId: "p", name: "x" });
+    // Channel-collapse: project_declared is suppressed; use project_decomposed
+    // (also architect identity) to exercise the agent identity fallback path.
+    n.handleEvent({ type: "project_decomposed", projectId: "p", phaseCount: 1 });
     await flush();
     expect(f.sent[0].identity?.username).toBe("Architect"); // DISCORD_AGENT_DEFAULTS fallback
   });
@@ -414,15 +411,18 @@ describe("DiscordNotifier", () => {
     }
   });
 
-  it("redacts common secret patterns from task prompts before preview", async () => {
+  it("task_picked_up suppression: secret-bearing prompts never reach Discord (channel-collapse)", async () => {
     notifier.handleEvent({
       type: "task_picked_up",
       taskId: "t1",
       prompt: "debug why request with key sk-live-abcdefghijklmnop1234567890 fails auth",
     });
     await flush();
-    expect(sent[0].content).toContain("[REDACTED]");
-    expect(sent[0].content).not.toContain("sk-live-abcdefghijklmnop1234567890");
+    // Channel-collapse: task_picked_up is suppressed entirely. Defense in depth:
+    // even if the upstream redactor missed something, no Discord emission means
+    // no leak from this path. The redactSecrets unit tests below cover the
+    // function's contract in isolation.
+    expect(sent).toHaveLength(0);
   });
 
   it("escapes backticks in event content (no code-block breakout)", async () => {
@@ -437,14 +437,15 @@ describe("DiscordNotifier", () => {
   });
 
   it("project-related event carries projectId in formatted content", async () => {
-    const allProjectEvents: OrchestratorEvent[] = [
-      { type: "project_declared", projectId: "proj-xyz-1", name: "x" },
+    // Channel-collapse (2026-04-27): project_declared, architect_spawned,
+    // architect_respawned, compaction_fired are suppressed (format: () => null).
+    // Only the operator-relevant project events emit; each must still carry the
+    // shortened projectId prefix in its rendered body.
+    const emittingProjectEvents: OrchestratorEvent[] = [
       { type: "project_decomposed", projectId: "proj-xyz-2", phaseCount: 1 },
       { type: "project_completed", projectId: "proj-xyz-3", phaseCount: 1, totalCostUsd: 0 },
       { type: "project_failed", projectId: "proj-xyz-4", reason: "r" },
       { type: "project_aborted", projectId: "proj-xyz-5", operatorId: "op" },
-      { type: "architect_spawned", projectId: "proj-xyz-6", sessionId: "s" },
-      { type: "architect_respawned", projectId: "proj-xyz-7", sessionId: "s", reason: "crash_recovery" },
       { type: "architect_arbitration_fired", taskId: "t", projectId: "proj-xyz-8", cause: "escalation" },
       {
         type: "arbitration_verdict",
@@ -456,11 +457,10 @@ describe("DiscordNotifier", () => {
       { type: "review_arbitration_entered", taskId: "t", projectId: "proj-xyza", reviewerRejectionCount: 1 },
       { type: "review_mandatory", taskId: "t", projectId: "proj-xyzb" },
       { type: "budget_ceiling_reached", projectId: "proj-xyzc", currentCostUsd: 1, ceilingUsd: 2 },
-      { type: "compaction_fired", projectId: "proj-xyzd", generation: 1 },
     ];
-    for (const ev of allProjectEvents) notifier.handleEvent(ev);
+    for (const ev of emittingProjectEvents) notifier.handleEvent(ev);
     await flush();
-    expect(sent).toHaveLength(allProjectEvents.length);
+    expect(sent).toHaveLength(emittingProjectEvents.length);
     // Every emission references the shortened projectId prefix "proj-xyz"
     for (const s of sent) expect(s.content).toMatch(/proj-xyz/);
   });

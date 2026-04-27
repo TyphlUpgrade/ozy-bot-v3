@@ -223,8 +223,11 @@ describe("DiscordNotifier × OutboundResponseGenerator (Wave E-γ commit 2)", ()
   });
 
   it("flag true + NON-eligible event → generator NOT called", async () => {
-    // `compaction_fired` resolves projectId from event.projectId (architect role)
-    // but is NOT in OUTBOUND_LLM_WHITELIST. Generator must NOT be invoked.
+    // `project_completed` resolves projectId from event.projectId (architect
+    // role) but is NOT in OUTBOUND_LLM_WHITELIST. Generator must NOT be
+    // invoked. (Channel-collapse: previous `compaction_fired` example is now
+    // suppressed at the notifier — sender never called — so it cannot drive
+    // this assertion. project_completed still emits with the same role.)
     const { sender, sent: recorded } = makeRecordingSender();
     sent = recorded;
     const ctx = new InMemoryMessageContext();
@@ -235,7 +238,12 @@ describe("DiscordNotifier × OutboundResponseGenerator (Wave E-γ commit 2)", ()
       outboundGenerator: generator,
     });
 
-    notifier.handleEvent({ type: "compaction_fired", projectId: "proj-1", generation: 1 });
+    notifier.handleEvent({
+      type: "project_completed",
+      projectId: "proj-1",
+      phaseCount: 1,
+      totalCostUsd: 1.0,
+    });
     await flush();
 
     expect(generate).not.toHaveBeenCalled();

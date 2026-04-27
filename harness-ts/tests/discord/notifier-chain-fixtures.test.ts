@@ -108,16 +108,10 @@ describe("DiscordNotifier — Wave E-β chain fixtures (commit 2)", () => {
     // Architect head registered in dev_channel.
     expect(ctx.lookupRoleHead("P1", "architect", "dev")).toBe("msg-1");
 
-    // arbitration_verdict routes to ops_channel — different channel, no chain.
-    // Use architect_arbitration_fired (ops_channel) to register the architect
-    // head in ops_channel first, then arbitration_verdict (also ops_channel)
-    // can chain under it.
-    notifier.handleEvent({ type: "architect_arbitration_fired", taskId: "task-arb", projectId: "P1", cause: "escalation" });
-    await flush();
-    expect(sent[1].channel).toBe("ops");
-    expect(sent[1].replyToMessageId).toBeUndefined(); // standalone (chain head)
-    expect(ctx.lookupRoleHead("P1", "architect", "ops")).toBe("msg-2");
-
+    // Channel-collapse: arbitration_verdict and architect_arbitration_fired
+    // both route to dev_channel now. The architect head from project_decomposed
+    // is in dev_channel, so the verdict can chain under it directly without
+    // needing architect_arbitration_fired to bootstrap a separate ops head.
     notifier.handleEvent({
       type: "arbitration_verdict",
       taskId: "task-arb",
@@ -126,10 +120,10 @@ describe("DiscordNotifier — Wave E-β chain fixtures (commit 2)", () => {
       rationale: "tighten",
     });
     await flush();
-    expect(sent[2].channel).toBe("ops");
-    expect(sent[2].replyToMessageId).toBe("msg-2");
+    expect(sent[1].channel).toBe("dev");
+    expect(sent[1].replyToMessageId).toBe("msg-1"); // chains under project_decomposed head
     // Re-registers architect head with the verdict's id.
-    expect(ctx.lookupRoleHead("P1", "architect", "ops")).toBe("msg-3");
+    expect(ctx.lookupRoleHead("P1", "architect", "dev")).toBe("msg-2");
   });
 
   it("executor chain under architect: project_decomposed → session_complete → merge_result → task_done", async () => {
@@ -168,11 +162,13 @@ describe("DiscordNotifier — Wave E-β chain fixtures (commit 2)", () => {
     const state = makeFakeStateManager({ "task-arb": "P1" });
     const notifier = new DiscordNotifier(sender, baseConfig(), { messageContext: ctx, stateManager: state });
 
-    // Register architect head in ops_channel (so arbitration_verdict can attempt chain).
+    // Channel-collapse: architect_arbitration_fired now routes to dev_channel
+    // (single channel for all events). Register architect head in dev so
+    // arbitration_verdict can attempt chain.
     notifier.handleEvent({ type: "architect_arbitration_fired", taskId: "task-arb", projectId: "P1", cause: "escalation" });
     await flush();
     expect(sent[0].replyToMessageId).toBeUndefined();
-    expect(ctx.lookupRoleHead("P1", "architect", "ops")).toBe("msg-1");
+    expect(ctx.lookupRoleHead("P1", "architect", "dev")).toBe("msg-1");
 
     // Advance well past the TTL.
     now = 1_000_000 + 1100;
@@ -190,24 +186,25 @@ describe("DiscordNotifier — Wave E-β chain fixtures (commit 2)", () => {
     expect(String(consoleSpy.mock.calls[0][0])).toMatch(/reply-chain head missing/);
   });
 
-  it("cross-channel guard: head in ops_channel; event in escalation_channel → standalone (separate head)", async () => {
+  it("cross-channel guard: pre-seeded head in different channel → standalone (heads are per-channel)", async () => {
     const { DiscordNotifier } = await import("../../src/discord/notifier.js");
     const { InMemoryMessageContext } = await import("../../src/discord/message-context.js");
     const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     const ctx = new InMemoryMessageContext();
     const { sender, sent } = makeRecordingSender();
-    const state = makeFakeStateManager({ "task-arb": "P1", "task-rev": "P1" });
+    const state = makeFakeStateManager({ "task-rev": "P1" });
     const notifier = new DiscordNotifier(sender, baseConfig(), { messageContext: ctx, stateManager: state });
 
-    // architect_arbitration_fired registers architect head in ops_channel.
-    notifier.handleEvent({ type: "architect_arbitration_fired", taskId: "task-arb", projectId: "P1", cause: "escalation" });
-    await flush();
-    expect(ctx.lookupRoleHead("P1", "architect", "ops")).toBe("msg-1");
+    // Channel-collapse: post-collapse the notifier only sends to dev_channel
+    // so cross-channel routing is no longer triggered organically. Pre-seed an
+    // executor head in a foreign channel ("ops") to exercise the per-channel
+    // discipline of the role-head map directly.
+    ctx.recordRoleMessage("P1", "executor", "stale-foreign-head", "ops");
 
-    // review_arbitration_entered routes to escalation_channel and CHAIN_RULES
-    // says it replies to executor head — but no executor head exists in
-    // escalation_channel either, so it becomes standalone. Heads are per-channel.
+    // review_arbitration_entered (channel-collapsed → dev) chains under
+    // executor head. With nothing in dev_channel, the lookup misses despite
+    // the pre-seeded head sitting in ops — heads are per-channel.
     notifier.handleEvent({
       type: "review_arbitration_entered",
       taskId: "task-rev",
@@ -215,10 +212,10 @@ describe("DiscordNotifier — Wave E-β chain fixtures (commit 2)", () => {
       reviewerRejectionCount: 1,
     });
     await flush();
-    expect(sent[1].channel).toBe("esc");
-    expect(sent[1].replyToMessageId).toBeUndefined();
-    // Reviewer head registered in the SEND channel (esc), not ops.
-    expect(ctx.lookupRoleHead("P1", "reviewer", "esc")).toBe("msg-2");
+    expect(sent[0].channel).toBe("dev");
+    expect(sent[0].replyToMessageId).toBeUndefined();
+    // Reviewer head registered in the SEND channel (dev), not ops.
+    expect(ctx.lookupRoleHead("P1", "reviewer", "dev")).toBe("msg-1");
     expect(ctx.lookupRoleHead("P1", "reviewer", "ops")).toBeNull();
     consoleSpy.mockRestore();
   });
@@ -259,12 +256,12 @@ describe("DiscordNotifier — Wave E-β chain fixtures (commit 2)", () => {
     const state = makeFakeStateManager({ "task-stall": "P1" });
     const notifier = new DiscordNotifier(sender, baseConfig(), { messageContext: ctx, stateManager: state });
 
-    // Register architect head in ops_channel via architect_arbitration_fired
-    // (session_stalled also routes to ops_channel per NOTIFIER_MAP, so the
-    // tier-keyed lookup must hit the same channel).
+    // Channel-collapse: architect_arbitration_fired and session_stalled both
+    // route to dev_channel. Register architect head in dev so the tier-keyed
+    // lookup on session_stalled hits the same channel.
     notifier.handleEvent({ type: "architect_arbitration_fired", taskId: "task-stall", projectId: "P1", cause: "escalation" });
     await flush();
-    expect(ctx.lookupRoleHead("P1", "architect", "ops")).toBe("msg-1");
+    expect(ctx.lookupRoleHead("P1", "architect", "dev")).toBe("msg-1");
 
     notifier.handleEvent({
       type: "session_stalled",
@@ -275,11 +272,11 @@ describe("DiscordNotifier — Wave E-β chain fixtures (commit 2)", () => {
       aborted: true,
     });
     await flush();
-    expect(sent[1].channel).toBe("ops");
+    expect(sent[1].channel).toBe("dev");
     expect(sent[1].replyToMessageId).toBe("msg-1");
     // session_stalled does NOT register a new head (per plan B5).
     // Architect head still points at msg-1, not msg-2.
-    expect(ctx.lookupRoleHead("P1", "architect", "ops")).toBe("msg-1");
+    expect(ctx.lookupRoleHead("P1", "architect", "dev")).toBe("msg-1");
   });
 
   it("no projectId: standalone events (poll_tick, shutdown) bypass chain logic and use plain sendToChannel", async () => {
@@ -320,6 +317,7 @@ describe("DiscordNotifier — Wave E-β chain fixtures (commit 2)", () => {
     const notifier = new DiscordNotifier(sender, baseConfig(), { messageContext: ctx, stateManager: state });
 
     // arbitration_verdict expects an architect head; none exists post-restart.
+    // Channel-collapse: arbitration_verdict now routes to dev_channel.
     notifier.handleEvent({
       type: "arbitration_verdict",
       taskId: "task-orphan",
@@ -329,20 +327,22 @@ describe("DiscordNotifier — Wave E-β chain fixtures (commit 2)", () => {
     });
     await flush();
     expect(sent[0].replyToMessageId).toBeUndefined();
-    // Re-registers architect head from this verdict (so subsequent events can chain).
-    expect(ctx.lookupRoleHead("P1", "architect", "ops")).toBe("msg-1");
+    // Re-registers architect head from this verdict in the SEND channel (dev).
+    expect(ctx.lookupRoleHead("P1", "architect", "dev")).toBe("msg-1");
     // Warn fired exactly once.
     expect(consoleSpy).toHaveBeenCalledTimes(1);
 
-    // A second missing-head event must NOT log again.
+    // A second missing-head event must NOT log again. session_complete chains
+    // under executor head — none exists, but verdict already re-registered the
+    // architect head so the chain rule lookup misses on executor specifically.
+    // Use a different task to avoid re-using the same chain.
     notifier.handleEvent({
-      type: "session_complete",
+      type: "merge_result",
       taskId: "task-orphan",
-      success: true,
-      errors: [],
+      result: { status: "merged", commitSha: "abc" },
     });
     await flush();
-    // session_complete looks up architect head in dev_channel — none there.
+    // merge_result chains under executor head — none exists in dev.
     expect(sent[1].replyToMessageId).toBeUndefined();
     expect(consoleSpy).toHaveBeenCalledTimes(1); // still 1 (warn-once)
   });

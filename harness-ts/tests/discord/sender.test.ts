@@ -84,7 +84,30 @@ describe("WebhookSender", () => {
     expect(calls[0].allowedMentions).toEqual({ users: ["249"] });
   });
 
-  it.todo("notifier wires per-event allowedMentions for escalation events — commit 2");
+  it("channel-collapse commit 2: notifier wires per-event allowedMentions for escalation events", async () => {
+    const { client, calls } = makeWebhook({ returnId: "ws-msg-esc" });
+    const sender = new WebhookSender(client, { minSpacingMs: 0 });
+    const { DiscordNotifier } = await import("../../src/discord/notifier.js");
+    const config = {
+      bot_token_env: "T",
+      dev_channel: "dev",
+      ops_channel: "ops",
+      escalation_channel: "esc",
+      agents: {},
+      operator_user_id: "249313669337317379",
+    };
+    const notifier = new DiscordNotifier(sender, config);
+    notifier.handleEvent({
+      type: "escalation_needed",
+      taskId: "task-A",
+      escalation: { type: "clarification_needed", question: "what scope?" },
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(calls).toHaveLength(1);
+    expect(calls[0].allowedMentions).toEqual({ users: ["249313669337317379"] });
+    expect(calls[0].content?.startsWith("<@249313669337317379> ")).toBe(true);
+  });
 
   it("webhook errors are swallowed (promise still resolves) and log .message only", async () => {
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);

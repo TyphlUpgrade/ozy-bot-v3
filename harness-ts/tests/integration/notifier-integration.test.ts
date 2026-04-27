@@ -217,10 +217,11 @@ describe("DiscordNotifier ↔ Orchestrator integration", () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("successful task: notifier routes picked_up/session_complete/merge_result/task_done all to dev", async () => {
+  it("successful task: notifier routes session_complete/merge_result/task_done all to dev (channel-collapse)", async () => {
     const { orch, sent } = setupHarness({ completionStatus: "success" });
-    // Ingest via scanForTasks path so task_picked_up fires (that event is only
-    // emitted by the file-ingest lane, not by processTask directly).
+    // Ingest via scanForTasks path so task_picked_up fires (that event is
+    // suppressed at the notifier under channel-collapse, but still emitted on
+    // the orchestrator bus).
     writeFileSync(join(tmpDir, "tasks", "happy-1.json"), JSON.stringify({ prompt: "test" }));
     orch.scanForTasks();
     // processTask is fire-and-forget in scanForTasks; wait for the lifecycle
@@ -232,20 +233,21 @@ describe("DiscordNotifier ↔ Orchestrator integration", () => {
     const channels = sent.map((s) => s.channel);
     const contents = sent.map((s) => s.content);
 
+    // Channel-collapse: task_picked_up is suppressed; surviving narrative
+    // events (session_complete, merge_result, task_done) all land in dev.
     expect(channels.filter((c) => c === "dev").length).toBeGreaterThanOrEqual(3);
-    expect(contents.some((c) => /picked up/i.test(c))).toBe(true);
     expect(contents.some((c) => /Session complete.*success/i.test(c))).toBe(true);
     expect(contents.some((c) => /merged/i.test(c))).toBe(true);
     expect(contents.some((c) => /complete/i.test(c))).toBe(true);
-    // No ops or escalation traffic on happy path
+    // Channel-collapse: no traffic to ops or escalation channels (collapsed into dev).
     expect(channels).not.toContain("ops");
     expect(channels).not.toContain("esc");
   });
 
-  it("failed-task lifecycle (circuit breaker): task_failed routes to ops_channel", async () => {
+  it("failed-task lifecycle (circuit breaker): task_failed routes to dev_channel (channel-collapse)", async () => {
     // Disable auto-escalate so a retry-exhausted failure hits the circuit
-    // breaker and fires task_failed (which routes to ops) instead of
-    // escalation_needed (which routes to esc).
+    // breaker and fires task_failed (channel-collapsed: now routes to dev,
+    // not ops, alongside all other events).
     const { orch, state, sent } = setupHarness({
       completionStatus: "failure",
       mergeOverrides: {},
@@ -258,21 +260,24 @@ describe("DiscordNotifier ↔ Orchestrator integration", () => {
     await orch.processTask(task);
     await flushMicrotasks();
 
-    const opsMessages = sent.filter((s) => s.channel === "ops");
-    expect(opsMessages.length).toBeGreaterThanOrEqual(1);
-    expect(opsMessages.some((s) => /FAILED/.test(s.content))).toBe(true);
+    const devMessages = sent.filter((s) => s.channel === "dev");
+    expect(devMessages.length).toBeGreaterThanOrEqual(1);
+    expect(devMessages.some((s) => /FAILED/.test(s.content))).toBe(true);
+    expect(sent.some((s) => s.channel === "ops")).toBe(false);
   });
 
-  it("escalation signal routes to escalation_channel", async () => {
+  it("escalation signal routes to dev_channel (channel-collapse)", async () => {
     const { orch, state, sent } = setupHarness({ escalationTrigger: true });
     const task = state.createTask("ambiguous", "esc-1");
     await orch.processTask(task);
     await flushMicrotasks();
 
-    const escMessages = sent.filter((s) => s.channel === "esc");
-    expect(escMessages.length).toBeGreaterThanOrEqual(1);
-    expect(escMessages.some((s) => /ESCALATION/.test(s.content))).toBe(true);
-    expect(escMessages.some((s) => /what scope/.test(s.content))).toBe(true);
+    const devMessages = sent.filter((s) => s.channel === "dev");
+    expect(devMessages.length).toBeGreaterThanOrEqual(1);
+    expect(devMessages.some((s) => /ESCALATION/.test(s.content))).toBe(true);
+    expect(devMessages.some((s) => /what scope/.test(s.content))).toBe(true);
+    // Channel-collapse: escalation_channel routing collapsed into dev_channel.
+    expect(sent.some((s) => s.channel === "esc")).toBe(false);
   });
 
   it("every event received by orchestrator listener is offered to notifier", async () => {
