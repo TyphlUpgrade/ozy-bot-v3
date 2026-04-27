@@ -175,7 +175,7 @@ describe("wrapWithRecording", () => {
     const p = tmpPaths();
     const w = new TranscriptWriter({ jsonlPath: p.jsonl, mdPath: p.md });
     const { sender, sent } = makeFakeSender();
-    const wrapped = wrapWithRecording(sender, "dev", w);
+    const wrapped = wrapWithRecording(sender, w);
     await wrapped.sendToChannel("dev", "hello", { username: "Architect", avatarURL: "https://a" });
     expect(sent).toHaveLength(1);
     expect(sent[0].content).toBe("hello");
@@ -191,7 +191,7 @@ describe("wrapWithRecording", () => {
     const p = tmpPaths();
     const w = new TranscriptWriter({ jsonlPath: p.jsonl, mdPath: p.md });
     const { sender } = makeFakeSender({ returnId: "msg-42" });
-    const wrapped = wrapWithRecording(sender, "dev", w);
+    const wrapped = wrapWithRecording(sender, w);
     const result = await wrapped.sendToChannelAndReturnId("dev", "yo");
     expect(result.messageId).toBe("msg-42");
     const lines = readFileSync(p.jsonl, "utf-8").split("\n").filter((l) => l.length > 0);
@@ -204,7 +204,7 @@ describe("wrapWithRecording", () => {
     const p = tmpPaths();
     const w = new TranscriptWriter({ jsonlPath: p.jsonl, mdPath: p.md });
     const { sender } = makeFakeSender({ failSend: true });
-    const wrapped = wrapWithRecording(sender, "dev", w);
+    const wrapped = wrapWithRecording(sender, w);
     await expect(wrapped.sendToChannel("dev", "boom")).rejects.toThrow("discord down");
     const lines = readFileSync(p.jsonl, "utf-8").split("\n").filter((l) => l.length > 0);
     expect(lines).toHaveLength(1);
@@ -217,7 +217,7 @@ describe("wrapWithRecording", () => {
     const p = tmpPaths();
     const w = new TranscriptWriter({ jsonlPath: p.jsonl, mdPath: p.md });
     const { sender } = makeFakeSender({ failSend: true });
-    const wrapped = wrapWithRecording(sender, "dev", w);
+    const wrapped = wrapWithRecording(sender, w);
     await expect(wrapped.sendToChannelAndReturnId("dev", "boom")).rejects.toThrow("discord down");
     const lines = readFileSync(p.jsonl, "utf-8").split("\n").filter((l) => l.length > 0);
     expect(lines).toHaveLength(1);
@@ -229,7 +229,7 @@ describe("wrapWithRecording", () => {
     const p = tmpPaths();
     const w = new TranscriptWriter({ jsonlPath: p.jsonl, mdPath: p.md });
     const { sender } = makeFakeSender();
-    const wrapped = wrapWithRecording(sender, "dev", w);
+    const wrapped = wrapWithRecording(sender, w);
     await wrapped.addReaction("dev", "msg-1", "👀");
     const jsonl = readFileSync(p.jsonl, "utf-8");
     expect(jsonl).toBe("");
@@ -239,7 +239,7 @@ describe("wrapWithRecording", () => {
     const p = tmpPaths();
     const w = new TranscriptWriter({ jsonlPath: p.jsonl, mdPath: p.md });
     const { sender, sent } = makeFakeSender();
-    const wrapped = wrapWithRecording(sender, "dev", w);
+    const wrapped = wrapWithRecording(sender, w);
     await wrapped.sendToChannel(
       "dev",
       "ping",

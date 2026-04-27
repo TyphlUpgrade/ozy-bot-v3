@@ -180,51 +180,65 @@ export class TranscriptWriter {
 }
 
 /**
+ * Build the OutboundRecord and forward to the writer. Shared between the
+ * `sendToChannel` and `sendToChannelAndReturnId` wrapping paths so the record
+ * shape stays in lock-step. `outcome` carries either the Discord-assigned
+ * messageId (success path) or the error message (catch path).
+ */
+function recordOutbound(
+  writer: TranscriptWriter,
+  args: {
+    ts: string;
+    channel: string;
+    content: string;
+    identity?: AgentIdentity;
+    replyToMessageId?: string;
+    allowedMentions?: AllowedMentions;
+  },
+  outcome:
+    | { kind: "success"; messageId: string | null | undefined }
+    | { kind: "error"; error: string },
+): void {
+  writer.record({
+    direction: "out",
+    ts: args.ts,
+    channelId: args.channel,
+    identity: args.identity,
+    content: args.content,
+    allowedMentions: args.allowedMentions,
+    replyToMessageId: args.replyToMessageId,
+    ...(outcome.kind === "success"
+      ? { resultMessageId: outcome.messageId ?? undefined }
+      : { error: outcome.error }),
+  });
+}
+
+/**
  * Wrap a `DiscordSender` so every send is recorded to the supplied writer.
  * Records on completion (success path with resultMessageId) AND on catch
  * (error path with error message). A crash mid-await is the only case where
  * info is lost; at that point the process is dying anyway.
  *
- * `channelId` arg is captured for record-keeping; the actual channel passed
- * to the inner sender at call time is used for the record's `channelId`
- * field so per-channel routing remains observable.
+ * The actual channel passed to the inner sender at call time becomes the
+ * record's `channelId` field so per-channel routing remains observable.
  */
 export function wrapWithRecording(
   inner: DiscordSender,
-  _channelId: string,
   writer: TranscriptWriter,
 ): DiscordSender {
   return {
     async sendToChannel(channel, content, identity, replyToMessageId, allowedMentions) {
-      const ts = new Date().toISOString();
+      const args = { ts: new Date().toISOString(), channel, content, identity, replyToMessageId, allowedMentions };
       try {
         await inner.sendToChannel(channel, content, identity, replyToMessageId, allowedMentions);
-        writer.record({
-          direction: "out",
-          ts,
-          channelId: channel,
-          identity,
-          content,
-          allowedMentions,
-          replyToMessageId,
-          resultMessageId: undefined,
-        });
+        recordOutbound(writer, args, { kind: "success", messageId: undefined });
       } catch (err) {
-        writer.record({
-          direction: "out",
-          ts,
-          channelId: channel,
-          identity,
-          content,
-          allowedMentions,
-          replyToMessageId,
-          error: errMsg(err),
-        });
+        recordOutbound(writer, args, { kind: "error", error: errMsg(err) });
         throw err;
       }
     },
     async sendToChannelAndReturnId(channel, content, identity, replyToMessageId, allowedMentions) {
-      const ts = new Date().toISOString();
+      const args = { ts: new Date().toISOString(), channel, content, identity, replyToMessageId, allowedMentions };
       try {
         const result = await inner.sendToChannelAndReturnId(
           channel,
@@ -233,28 +247,10 @@ export function wrapWithRecording(
           replyToMessageId,
           allowedMentions,
         );
-        writer.record({
-          direction: "out",
-          ts,
-          channelId: channel,
-          identity,
-          content,
-          allowedMentions,
-          replyToMessageId,
-          resultMessageId: result.messageId,
-        });
+        recordOutbound(writer, args, { kind: "success", messageId: result.messageId });
         return result;
       } catch (err) {
-        writer.record({
-          direction: "out",
-          ts,
-          channelId: channel,
-          identity,
-          content,
-          allowedMentions,
-          replyToMessageId,
-          error: errMsg(err),
-        });
+        recordOutbound(writer, args, { kind: "error", error: errMsg(err) });
         throw err;
       }
     },

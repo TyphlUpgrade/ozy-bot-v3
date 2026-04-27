@@ -216,7 +216,7 @@ async function main(): Promise<void> {
   });
   const senders: Record<string, DiscordSender> = {};
   for (const [channelId, inner] of Object.entries(rawSenders)) {
-    senders[channelId] = wrapWithRecording(inner, channelId, transcriptWriter);
+    senders[channelId] = wrapWithRecording(inner, transcriptWriter);
   }
   console.log(`[live-bot-listen] transcript jsonl: ${transcriptJsonl}`);
   console.log(`[live-bot-listen] transcript md:    ${transcriptMd}`);
