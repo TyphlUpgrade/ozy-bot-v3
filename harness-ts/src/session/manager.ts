@@ -215,6 +215,18 @@ export interface ActiveSession {
   branchName: string;
   startedAt: string;
   timeoutHandle?: ReturnType<typeof setTimeout>;
+  /** Stall watchdog (commit 2/2): wall-clock ms (Date.now()) of latest yielded
+   *  SDKMessage. Updated by `consumeStream`'s onMessage callback in spawnTask. */
+  lastActivityAt: number;
+}
+
+/** Per-session activity record exposed to the orchestrator's stall watchdog.
+ *  Plain shape (no orchestrator import) preserves I-10 layer ownership. */
+export interface ActiveSessionInfo {
+  taskId: string;
+  tier: "executor";
+  lastActivityAt: number;
+  abort: () => void;
 }
 
 // --- Session Manager ---
@@ -436,6 +448,7 @@ export class SessionManager {
       worktreePath,
       branchName,
       startedAt: new Date().toISOString(),
+      lastActivityAt: Date.now(),
     };
 
     // Set timeout if configured
@@ -447,8 +460,12 @@ export class SessionManager {
     this.activeSessions.set(task.id, activeSession);
     this.sdk.registerController(task.id, abortController);
 
-    // Consume stream
-    const result = await this.sdk.consumeStream(query, onMessage);
+    // Consume stream — wrap onMessage so the stall watchdog sees per-message activity.
+    const tap = (msg: SDKMessage): void => {
+      activeSession.lastActivityAt = Date.now();
+      onMessage?.(msg);
+    };
+    const result = await this.sdk.consumeStream(query, tap);
 
     // Clear timeout
     if (activeSession.timeoutHandle) {
@@ -533,6 +550,24 @@ export class SessionManager {
   /** Get active session for a task */
   getActiveSession(taskId: string): ActiveSession | undefined {
     return this.activeSessions.get(taskId);
+  }
+
+  /** Stall watchdog (commit 2/2): snapshot of all live Executor sessions
+   *  with their last activity timestamp + abort callback. Returned shape is
+   *  plain (no internal references) so the orchestrator can iterate without
+   *  importing ActiveSession. */
+  getActiveSessions(): ActiveSessionInfo[] {
+    const out: ActiveSessionInfo[] = [];
+    for (const [taskId, s] of this.activeSessions) {
+      const ac = s.abortController;
+      out.push({
+        taskId,
+        tier: "executor",
+        lastActivityAt: s.lastActivityAt,
+        abort: () => ac.abort(),
+      });
+    }
+    return out;
   }
 
   /** Number of active sessions */

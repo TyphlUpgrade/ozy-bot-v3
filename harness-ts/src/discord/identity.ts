@@ -59,6 +59,7 @@ export function resolveIdentity(event: OrchestratorEvent): IdentityRole {
     case "retry_scheduled":
     case "budget_exhausted":
     case "budget_ceiling_reached":
+    case "session_stalled":
       return "orchestrator";
   }
 }

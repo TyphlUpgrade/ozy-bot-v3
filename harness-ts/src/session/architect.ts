@@ -138,8 +138,24 @@ export interface ArchitectSession {
   totalCostUsd: number;
   startedAt: string;
   lastActivityAt: string;
+  /** Stall watchdog (commit 2/2): wall-clock ms (Date.now()) of the most recent
+   *  SDKMessage observed on any consumeStream call for this session. Distinct
+   *  from `lastActivityAt` (ISO string, end-of-call timestamp) — this updates
+   *  per yielded message via the consumeStream onMessage tap. */
+  lastActivityAtMs: number;
   compactionGeneration: number;
   aborted: boolean;
+}
+
+/** Per-architect-session activity record exposed to the orchestrator's stall
+ *  watchdog. Plain shape (no orchestrator import) preserves I-10 layer
+ *  ownership. `taskId` carries the projectId since the watchdog only needs
+ *  an opaque id for the event. */
+export interface ActiveArchitectSessionInfo {
+  taskId: string;
+  tier: "architect";
+  lastActivityAt: number;
+  abort: () => void;
 }
 
 interface ArchitectSpawnResult {
@@ -317,7 +333,9 @@ export class ArchitectManager {
         session.sessionId,
         this.buildResumeConfig(prompt, session, ac),
       );
-      const result = await this.sdk.consumeStream(query);
+      const result = await this.sdk.consumeStream(query, () => {
+        session.lastActivityAtMs = Date.now();
+      });
       session.totalCostUsd += result.totalCostUsd;
       session.lastActivityAt = new Date().toISOString();
       this.projectStore.incrementCost(projectId, result.totalCostUsd);
@@ -403,7 +421,9 @@ export class ArchitectManager {
         session.sessionId,
         this.buildResumeConfig(fenced, session, ac),
       );
-      const result = await this.sdk.consumeStream(query);
+      const result = await this.sdk.consumeStream(query, () => {
+        session.lastActivityAtMs = Date.now();
+      });
       session.totalCostUsd += result.totalCostUsd;
       session.lastActivityAt = new Date().toISOString();
       this.projectStore.incrementCost(projectId, result.totalCostUsd);
@@ -504,7 +524,9 @@ Write your verdict to \`.harness/architect-verdict.json\` per the schema in §5 
         session.sessionId,
         this.buildResumeConfig(prompt, session, ac),
       );
-      const result = await this.sdk.consumeStream(query);
+      const result = await this.sdk.consumeStream(query, () => {
+        session.lastActivityAtMs = Date.now();
+      });
       session.totalCostUsd += result.totalCostUsd;
       session.lastActivityAt = new Date().toISOString();
       this.projectStore.incrementCost(projectId, result.totalCostUsd);
@@ -601,7 +623,9 @@ Write your verdict to \`.harness/architect-verdict.json\` per the schema in §5 
           ac,
         ),
       );
-      const result = await this.sdk.consumeStream(query);
+      const result = await this.sdk.consumeStream(query, () => {
+        session.lastActivityAtMs = Date.now();
+      });
       session.totalCostUsd += result.totalCostUsd;
       this.projectStore.incrementCost(projectId, result.totalCostUsd);
     } catch {
@@ -687,6 +711,28 @@ Write your verdict to \`.harness/architect-verdict.json\` per the schema in §5 
     return this.sessions.get(projectId);
   }
 
+  /** Stall watchdog (commit 2/2): snapshot of all live Architect sessions
+   *  with last-message timestamp + abort callback. Skips aborted sessions —
+   *  the watchdog should not re-abort a session already terminating. The
+   *  abort callback resolves the controller from `abortControllers` at call
+   *  time rather than capturing it, so stale references can't fire. */
+  getActiveSessions(): ActiveArchitectSessionInfo[] {
+    const out: ActiveArchitectSessionInfo[] = [];
+    for (const [projectId, s] of this.sessions) {
+      if (s.aborted) continue;
+      out.push({
+        taskId: projectId,
+        tier: "architect",
+        lastActivityAt: s.lastActivityAtMs,
+        abort: () => {
+          const ac = this.abortControllers.get(projectId);
+          ac?.abort();
+        },
+      });
+    }
+    return out;
+  }
+
   // --- Shutdown ---
 
   async shutdown(projectId: string): Promise<void> {
@@ -758,7 +804,16 @@ Write your verdict to \`.harness/architect-verdict.json\` per the schema in §5 
 
     try {
       const { query } = this.sdk.spawnSession(sessionConfig);
-      const result = await this.sdk.consumeStream(query);
+      // Stall watchdog (commit 2/2): track per-message activity. The session
+      // record may not exist yet during the initial spawn — fall back to a
+      // local mutable holder so the timestamp is preserved into the session.
+      let spawnLastActivityAtMs = Date.now();
+      const tap = (): void => {
+        spawnLastActivityAtMs = Date.now();
+        const live = this.sessions.get(projectId);
+        if (live) live.lastActivityAtMs = spawnLastActivityAtMs;
+      };
+      const result = await this.sdk.consumeStream(query, tap);
       if (!result.success) {
         this.abortControllers.delete(projectId);
         return { status: "failure", error: `Architect session failed: ${result.errors.join("; ")}` };
@@ -772,6 +827,7 @@ Write your verdict to \`.harness/architect-verdict.json\` per the schema in §5 
         totalCostUsd: (existing?.totalCostUsd ?? 0) + result.totalCostUsd,
         startedAt: existing?.startedAt ?? now,
         lastActivityAt: now,
+        lastActivityAtMs: spawnLastActivityAtMs,
         compactionGeneration: existing?.compactionGeneration ?? 0,
         aborted: false,
       };

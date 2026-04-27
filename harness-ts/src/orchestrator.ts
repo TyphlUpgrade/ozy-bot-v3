@@ -10,7 +10,7 @@ import { SessionManager, type CompletionSignal } from "./session/manager.js";
 import { MergeGate, type MergeResult } from "./gates/merge.js";
 import type { SessionResult } from "./session/sdk.js";
 import { StateManager, type TaskRecord } from "./lib/state.js";
-import { MAX_RECOVERY_ATTEMPTS, type HarnessConfig } from "./lib/config.js";
+import { MAX_RECOVERY_ATTEMPTS, STALL_WATCHDOG_DEFAULTS, type HarnessConfig } from "./lib/config.js";
 import { readEscalation, type EscalationSignal } from "./lib/escalation.js";
 import { readCheckpoints, type CheckpointSignal } from "./lib/checkpoint.js";
 import { evaluateResponseLevel, type ResponseLevel } from "./lib/response.js";
@@ -113,6 +113,7 @@ export type OrchestratorEvent =
   | { type: "task_done"; taskId: string; responseLevelName?: string; summary?: string; filesChanged?: string[] }
   | { type: "poll_tick" }
   | { type: "shutdown" }
+  | { type: "session_stalled"; taskId: string; tier: "executor" | "architect" | "reviewer"; lastActivityAt: number; stalledForMs: number; aborted: boolean }
   // Phase 2A events
   | { type: "escalation_needed"; taskId: string; escalation: EscalationSignal }
   | { type: "checkpoint_detected"; taskId: string; checkpoints: CheckpointSignal[] }
@@ -145,6 +146,7 @@ export class Orchestrator {
   private readonly projectStore?: ProjectStore;
   private running = false;
   private pollTimer?: ReturnType<typeof setTimeout>;
+  private stallWatchdogTimer?: ReturnType<typeof setInterval>;
   private readonly eventListeners: ((event: OrchestratorEvent) => void)[] = [];
   /** Tracks task ids that have already emitted the interim Wave A→C "listener not wired" warning,
    *  so the log fires exactly once per task per Section C.6. */
@@ -186,6 +188,9 @@ export class Orchestrator {
 
     // Start polling
     this.poll();
+
+    // Stall watchdog (commit 2): opt-in interval timer.
+    this.startStallWatchdog();
   }
 
   /** Stop the daemon loop gracefully */
@@ -195,10 +200,93 @@ export class Orchestrator {
       clearTimeout(this.pollTimer);
       this.pollTimer = undefined;
     }
+    // Stop watchdog BEFORE abortAll so a final tick cannot race with shutdown teardown.
+    if (this.stallWatchdogTimer) {
+      clearInterval(this.stallWatchdogTimer);
+      this.stallWatchdogTimer = undefined;
+    }
 
     // Abort all active sessions
     this.sessions.abortAll();
     this.emit({ type: "shutdown" });
+  }
+
+  /**
+   * Stall watchdog (commit 2/2). Opt-in via `config.stall_watchdog.enabled = true`.
+   * Schedules a `setInterval(checkStalls, check_interval_ms)` that scans
+   * SessionManager / ArchitectManager / ReviewGate `getActiveSessions()` for
+   * entries whose `lastActivityAt` exceeds the per-tier threshold. On stall
+   * detection the watchdog calls the session's `abort()` callback and emits
+   * `session_stalled`. Existing crash-recovery paths pick up the abort via
+   * the standard `consumeStream` rejection / terminalReason chain.
+   *
+   * No-op (returns silently without scheduling) when:
+   *   - `config.stall_watchdog` block is absent, or
+   *   - `enabled !== true`.
+   */
+  private startStallWatchdog(): void {
+    const cfg = this.config.stall_watchdog;
+    if (!cfg || cfg.enabled !== true) return;
+    const interval = cfg.check_interval_ms ?? STALL_WATCHDOG_DEFAULTS.check_interval_ms;
+    this.stallWatchdogTimer = setInterval(() => {
+      try {
+        this.checkStalls();
+      } catch (err) {
+        // Watchdog must never crash the orchestrator. Swallow + log.
+        console.warn(`[orchestrator] stall watchdog tick threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }, interval);
+  }
+
+  /** Single tick of the stall watchdog. Walks active sessions per tier and
+   * aborts + emits for any whose lastActivityAt exceeds the configured threshold. */
+  private checkStalls(): void {
+    const cfg = this.config.stall_watchdog;
+    if (!cfg || cfg.enabled !== true) return;
+    const now = Date.now();
+    const executorThreshold = cfg.executor_threshold_ms ?? STALL_WATCHDOG_DEFAULTS.executor_threshold_ms;
+    const architectThreshold = cfg.architect_threshold_ms ?? STALL_WATCHDOG_DEFAULTS.architect_threshold_ms;
+    const reviewerThreshold = cfg.reviewer_threshold_ms ?? STALL_WATCHDOG_DEFAULTS.reviewer_threshold_ms;
+
+    const tiers: Array<{
+      tier: "executor" | "architect" | "reviewer";
+      threshold: number;
+      sessions: ReadonlyArray<{ taskId: string; lastActivityAt: number; abort: () => void }>;
+    }> = [
+      { tier: "executor", threshold: executorThreshold, sessions: this.sessions.getActiveSessions() },
+      ...(this.architectManager
+        ? [{ tier: "architect" as const, threshold: architectThreshold, sessions: this.architectManager.getActiveSessions() }]
+        : []),
+      ...(this.reviewGate
+        ? [{ tier: "reviewer" as const, threshold: reviewerThreshold, sessions: this.reviewGate.getActiveSessions() }]
+        : []),
+    ];
+
+    for (const { tier, threshold, sessions } of tiers) {
+      for (const session of sessions) {
+        const stalledForMs = now - session.lastActivityAt;
+        if (stalledForMs < threshold) continue;
+        let aborted = false;
+        try {
+          session.abort();
+          aborted = true;
+        } catch {
+          aborted = false;
+        }
+        console.warn(
+          `[orchestrator] stall watchdog: ${tier} session ${session.taskId} stalled for ${stalledForMs}ms ` +
+            `(threshold ${threshold}ms); aborted=${aborted}`,
+        );
+        this.emit({
+          type: "session_stalled",
+          taskId: session.taskId,
+          tier,
+          lastActivityAt: session.lastActivityAt,
+          stalledForMs,
+          aborted,
+        });
+      }
+    }
   }
 
   /** Single poll iteration — scan for new tasks, check completions */

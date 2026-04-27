@@ -124,5 +124,25 @@ describe("consumeStream — stall watchdog activity tap (commit 1/2)", () => {
     expect(result.lastActivityAt).toBeGreaterThanOrEqual(before);
   });
 
-  it.todo("orchestrator watchdog interval — commit 2");
+  it("invokes onMessage exactly once per yielded SDKMessage (watchdog activity tap)", async () => {
+    const taps: SDKMessage[] = [];
+    const messages: SDKMessage[] = [
+      makeSystemInit(),
+      makeAssistant("session-tap-3"),
+      makeAssistant("session-tap-3"),
+      makeAssistant("session-tap-3"),
+      makeResultSuccess(),
+    ];
+    const client = new SDKClient(() => mockQuery(messages));
+    const { query } = client.spawnSession({ prompt: "test", cwd: "/tmp" });
+    await client.consumeStream(query, (m) => taps.push(m));
+
+    // The orchestrator-side stall watchdog (commit 2) wraps onMessage to stamp
+    // per-message activity into SessionManager's ActiveSession map. Cardinality
+    // matters — one tap per yield, no batching.
+    expect(taps.length).toBe(messages.length);
+    for (let i = 0; i < messages.length; i++) {
+      expect(taps[i]).toBe(messages[i]);
+    }
+  });
 });

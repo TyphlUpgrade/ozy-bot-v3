@@ -54,6 +54,24 @@ export interface ReviewResult {
   summary: string;
 }
 
+// --- Stall watchdog (commit 2/2) types ---
+
+/** Per-reviewer-session activity record exposed to the orchestrator's stall
+ *  watchdog. Plain shape (no orchestrator import) preserves I-10 layer
+ *  ownership. Reviewer is normally single-flight; the map shape is defensive
+ *  in case future code permits concurrent reviews. */
+export interface ActiveReviewerSessionInfo {
+  taskId: string;
+  tier: "reviewer";
+  lastActivityAt: number;
+  abort: () => void;
+}
+
+interface InFlightReview {
+  abortController: AbortController;
+  lastActivityAtMs: number;
+}
+
 // --- Defaults ---
 
 export const REVIEWER_DEFAULTS: Required<Omit<ReviewerConfig, "model">> & { model: string } = {
@@ -150,6 +168,10 @@ export class ReviewGate {
   private readonly reviewer: Required<Omit<ReviewerConfig, "model">> & { model: string };
   private readonly promptPath?: string;
   private readonly getTrunkBranch: () => string;
+  /** Stall watchdog (commit 2/2): in-flight reviewer sessions keyed by taskId.
+   *  Reviewer is normally single-flight per gate, but a Map preserves shape
+   *  if a future change ever permits concurrent reviews. */
+  private readonly inFlightReviews: Map<string, InFlightReview> = new Map();
 
   constructor(deps: ReviewGateDeps) {
     if (typeof deps.getTrunkBranch !== "function") {
@@ -172,6 +194,23 @@ export class ReviewGate {
 
   get arbitrationThreshold(): number {
     return this.reviewer.arbitration_threshold;
+  }
+
+  /** Stall watchdog (commit 2/2): snapshot of all in-flight Reviewer sessions
+   *  with last-message timestamp + abort callback. Plain shape so the
+   *  orchestrator can iterate without importing internal types. */
+  getActiveSessions(): ActiveReviewerSessionInfo[] {
+    const out: ActiveReviewerSessionInfo[] = [];
+    for (const [taskId, s] of this.inFlightReviews) {
+      const ac = s.abortController;
+      out.push({
+        taskId,
+        tier: "reviewer",
+        lastActivityAt: s.lastActivityAtMs,
+        abort: () => ac.abort(),
+      });
+    }
+    return out;
   }
 
   /**
@@ -228,12 +267,21 @@ export class ReviewGate {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const { query, abortController } = this.sdk.spawnSession(sessionConfig);
+      // Stall watchdog (commit 2/2): register the in-flight session so the
+      // orchestrator's interval timer can abort it on stall.
+      const inFlight: InFlightReview = {
+        abortController,
+        lastActivityAtMs: Date.now(),
+      };
+      this.inFlightReviews.set(task.id, inFlight);
       timer = setTimeout(() => {
         timedOut = true;
         abortController.abort();
       }, timeout);
       try {
-        const result = await this.sdk.consumeStream(query);
+        const result = await this.sdk.consumeStream(query, () => {
+          inFlight.lastActivityAtMs = Date.now();
+        });
         if (timedOut) {
           return this.defaultReject("Reviewer session timed out");
         }
@@ -251,6 +299,7 @@ export class ReviewGate {
       return this.defaultReject(`Reviewer spawn failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       if (timer) clearTimeout(timer);
+      this.inFlightReviews.delete(task.id);
     }
 
     // Freshness check: the review file must have been written AFTER the session
