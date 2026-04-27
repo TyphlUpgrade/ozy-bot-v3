@@ -22,7 +22,7 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 
@@ -55,6 +55,10 @@ import {
 import { LlmIntentClassifier } from "../src/discord/intent-classifier.js";
 import { LlmResponseGenerator } from "../src/discord/response-generator.js";
 import { BotSender } from "../src/discord/bot-sender.js";
+import { OutboundResponseGenerator } from "../src/discord/outbound-response-generator.js";
+import { OUTBOUND_LLM_WHITELIST } from "../src/discord/outbound-whitelist.js";
+import { LlmBudgetTracker, PerRoleCircuitBreaker } from "../src/discord/llm-budget.js";
+import { OUTBOUND_EPISTLE_DEFAULTS } from "../src/lib/config.js";
 import { installSigintHandler } from "./lib/scratch-repo.js";
 
 function loadDotEnv(path: string): void {
@@ -177,9 +181,36 @@ async function main(): Promise<void> {
   const senders = buildSendersForChannels(config.discord, token);
   const messageContext = new InMemoryMessageContext({ maxEntries: 1000 });
   const identityMap = buildIdentityMap(config.discord);
+
+  // Wave E-γ — outbound LLM voice generator. Constructed ONLY when the
+  // operator opts in via `[discord] outbound_epistle_enabled = true`. This
+  // gate ensures the prompt-file fail-loud check (D9) only fires under
+  // operator opt-in; default-false deployments never read prompt files or
+  // instantiate the budget tracker. When undefined, the notifier is
+  // byte-equal to E-α/β behavior.
+  const outboundGenerator = config.discord.outbound_epistle_enabled === true
+    ? new OutboundResponseGenerator({
+        sdk,
+        cwd: harnessRepoRoot,
+        promptPaths: {
+          architect:    resolve(harnessRepoRoot, "config/prompts/outbound-response/v1-architect.md"),
+          reviewer:     resolve(harnessRepoRoot, "config/prompts/outbound-response/v1-reviewer.md"),
+          executor:     resolve(harnessRepoRoot, "config/prompts/outbound-response/v1-executor.md"),
+          orchestrator: resolve(harnessRepoRoot, "config/prompts/outbound-response/v1-orchestrator.md"),
+        },
+        whitelist: OUTBOUND_LLM_WHITELIST,
+        budget: new LlmBudgetTracker({
+          rootDir: harnessRepoRoot,
+          dailyCapUsd: config.discord.llm_daily_cap_usd ?? OUTBOUND_EPISTLE_DEFAULTS.llm_daily_cap_usd,
+        }),
+        circuitBreaker: new PerRoleCircuitBreaker(),
+      })
+    : undefined;
+
   const notifier = new DiscordNotifier(senders, config.discord, {
     messageContext,
     stateManager: state,
+    outboundGenerator,
   });
 
   const orch = new Orchestrator({

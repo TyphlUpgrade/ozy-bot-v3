@@ -44,11 +44,19 @@
  */
 
 import { readFileSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { query } from "@anthropic-ai/claude-agent-sdk";
 import { DiscordNotifier } from "../src/discord/notifier.js";
 import { buildSendersForChannels } from "../src/discord/sender-factory.js";
 import type { DiscordConfig } from "../src/lib/config.js";
+import { OutboundResponseGenerator } from "../src/discord/outbound-response-generator.js";
+import { OUTBOUND_LLM_WHITELIST } from "../src/discord/outbound-whitelist.js";
+import { LlmBudgetTracker, PerRoleCircuitBreaker } from "../src/discord/llm-budget.js";
+import { OUTBOUND_EPISTLE_DEFAULTS } from "../src/lib/config.js";
+import { SDKClient } from "../src/session/sdk.js";
+import { InMemoryMessageContext } from "../src/discord/message-context.js";
+import { StateManager } from "../src/lib/state.js";
 
 function loadDotEnv(path: string): void {
   if (!existsSync(path)) return;
@@ -105,24 +113,64 @@ export const SMOKE_FIXTURES: Parameters<typeof DiscordNotifier.prototype.handleE
   { type: "escalation_needed", taskId: "task-smoke-esc2", escalation: { type: "scope_unclear", question: "what scope", options: ["a", "b"], context: "background details" } },
   // Wave E-α audit coverage: task_failed with backtick in reason → sanitize escapes to \` (notifier.test.ts:436)
   { type: "task_failed", taskId: "task-smoke-fail2", reason: "error: `unclosed backtick injection", attempt: 1 },
+  // --- Wave E-γ smoke fixtures (D7) — one per OUTBOUND_LLM_WHITELIST tuple ---
+  // Operator screenshots dev/ops/escalation channels with --llm to compare LLM
+  // voice against the reference target for each (event.type, role) pair.
+  // Project-scoped events only (LLM transform requires resolvable projectId).
+  // project_decomposed::architect
+  { type: "project_decomposed", projectId: "proj-eg-1", phaseCount: 3 },
+  // architect_arbitration_fired::architect
+  { type: "architect_arbitration_fired", taskId: "task-eg-arb", projectId: "proj-eg-2", cause: "review_disagreement" },
+  // arbitration_verdict::architect
+  { type: "arbitration_verdict", taskId: "task-eg-arb", projectId: "proj-eg-3", verdict: "retry_with_directive", rationale: "Reviewer's concern is well-founded; the missing test case must land before merge." },
+  // session_complete::executor
+  { type: "session_complete", taskId: "task-eg-sess", success: true, errors: [] },
+  // task_done::executor
+  { type: "task_done", taskId: "task-eg-done", responseLevelName: "reviewed" },
+  // merge_result::orchestrator
+  { type: "merge_result", taskId: "task-eg-merge", result: { status: "merged", commitSha: "f00ba12cafe34567" } },
+  // review_mandatory::reviewer
+  { type: "review_mandatory", taskId: "task-eg-rev", projectId: "proj-eg-4" },
+  // review_arbitration_entered::reviewer
+  { type: "review_arbitration_entered", taskId: "task-eg-revarb", projectId: "proj-eg-5", reviewerRejectionCount: 2 },
+  // escalation_needed::orchestrator
+  { type: "escalation_needed", taskId: "task-eg-esc", escalation: { type: "scope_unclear", question: "Should this parser handle file:// URLs?", options: ["yes — extend grammar", "no — out of scope"], context: "Found file:// URL in test fixture but spec doesn't mention it." } },
 ];
 
 async function main(): Promise<void> {
   const harnessRoot = dirname(dirname(fileURLToPath(import.meta.url)));
   loadDotEnv(join(harnessRoot, "..", ".env"));
 
+  // Wave E-γ — `--llm` flag opt-in. Without it the smoke runs E-α/β
+  // deterministic only (operator screenshots #ops to baseline). With it,
+  // the 9 whitelisted-tuple fixtures route through OutboundResponseGenerator
+  // for first-person LLM voice (operator screenshots; compares voice to
+  // reference target). Live Discord delivery requires DISCORD_BOT_TOKEN +
+  // DEV_CHANNEL; without those the script log-only's the intent and exits.
+  const llmMode = process.argv.includes("--llm");
+
   const token = process.env.DISCORD_BOT_TOKEN;
   const dev = process.env.DEV_CHANNEL;
   const ops = process.env.AGENT_CHANNEL ?? dev;
   const escalation = process.env.ALERTS_CHANNEL ?? dev;
 
-  if (!token) {
-    console.error("[discord-smoke] DISCORD_BOT_TOKEN missing — populate .env or export it");
-    process.exit(2);
-  }
-  if (!dev) {
-    console.error("[discord-smoke] DEV_CHANNEL missing — populate .env or export it");
-    process.exit(2);
+  if (!token || !dev) {
+    // Dry-run: log intent for each fixture and exit 0. Lets `--llm` be
+    // verified in CI / lint without provisioning a live Discord channel.
+    console.error(
+      `[discord-smoke] dry-run (DISCORD_BOT_TOKEN or DEV_CHANNEL missing) — ` +
+        `would dispatch ${SMOKE_FIXTURES.length} fixtures (llmMode=${llmMode})`,
+    );
+    for (const fx of SMOKE_FIXTURES) {
+      const projectKey =
+        "projectId" in fx && typeof fx.projectId === "string"
+          ? `project=${fx.projectId}`
+          : "taskId" in fx && typeof fx.taskId === "string"
+            ? `task=${fx.taskId}`
+            : "(no project/task)";
+      console.error(`  - ${fx.type} (${projectKey})`);
+    }
+    process.exit(0);
   }
 
   console.log(`[discord-smoke] sending 4 messages to dev channel ${dev}`);
@@ -137,6 +185,9 @@ async function main(): Promise<void> {
       escalation: process.env.DISCORD_WEBHOOK_ESCALATION,
     },
     agents: {},
+    // Wave E-γ — `--llm` flag flips the feature flag for the smoke run.
+    // Default off so non-LLM smoke matches Wave E-α/β behavior byte-equal.
+    outbound_epistle_enabled: llmMode,
   };
   // CW-1 — per-channel sender map. Channels with webhook URL get WebhookSender
   // (native per-agent avatar); others fall back to BotSender.
@@ -162,9 +213,45 @@ async function main(): Promise<void> {
     );
   }
 
-  // Wire DiscordNotifier so we know the routing layer also works end-to-end.
-  const notifier = new DiscordNotifier(senders, config);
+  // Wave E-γ — generator construction is opt-in via --llm flag. When off,
+  // the notifier is byte-equal to E-α/β (no LLM, no prompt-file read, no
+  // budget tracker instantiation). When on, all 9 whitelisted tuples go
+  // through OutboundResponseGenerator. Project-scoped fixtures only
+  // activate the LLM path (notifier projectId guard).
+  const sdk = new SDKClient(query);
+  const messageContext = new InMemoryMessageContext({ maxEntries: 1000 });
+  const stateManager = new StateManager(join(harnessRoot, ".harness", "smoke-state.json"));
+  const outboundGenerator = llmMode
+    ? new OutboundResponseGenerator({
+        sdk,
+        cwd: harnessRoot,
+        promptPaths: {
+          architect:    resolve(harnessRoot, "config/prompts/outbound-response/v1-architect.md"),
+          reviewer:     resolve(harnessRoot, "config/prompts/outbound-response/v1-reviewer.md"),
+          executor:     resolve(harnessRoot, "config/prompts/outbound-response/v1-executor.md"),
+          orchestrator: resolve(harnessRoot, "config/prompts/outbound-response/v1-orchestrator.md"),
+        },
+        whitelist: OUTBOUND_LLM_WHITELIST,
+        budget: new LlmBudgetTracker({
+          rootDir: harnessRoot,
+          dailyCapUsd: OUTBOUND_EPISTLE_DEFAULTS.llm_daily_cap_usd,
+        }),
+        circuitBreaker: new PerRoleCircuitBreaker(),
+      })
+    : undefined;
 
+  // Wire DiscordNotifier so we know the routing layer also works end-to-end.
+  // messageContext + stateManager required so the LLM transform's projectId
+  // guard fires correctly for task-keyed events that look up projectId via state.
+  const notifier = new DiscordNotifier(senders, config, {
+    messageContext,
+    stateManager,
+    outboundGenerator,
+  });
+
+  console.log(
+    `[discord-smoke] dispatching ${SMOKE_FIXTURES.length} fixtures via notifier (llmMode=${llmMode})`,
+  );
   for (const fx of SMOKE_FIXTURES) {
     notifier.handleEvent(fx);
     // Small gap so the rate-limit queue can drain between sends.
@@ -172,10 +259,10 @@ async function main(): Promise<void> {
   }
 
   // Drain queue: wait long enough for the sender's rate limit to flush all
-  // 20 messages (4 direct + 16 from notifier). Default 2 s spacing × 20 = 40 s.
-  await new Promise((r) => setTimeout(r, 40_000));
+  // messages (4 direct + N from notifier). Default 2 s spacing × 30 = 60 s.
+  await new Promise((r) => setTimeout(r, 60_000));
 
-  console.log("[discord-smoke] done — check Discord for 16 notifier messages across #dev / #ops / #esc");
+  console.log(`[discord-smoke] done — check Discord for ${SMOKE_FIXTURES.length} notifier messages across #dev / #ops / #esc`);
   process.exit(0);
 }
 

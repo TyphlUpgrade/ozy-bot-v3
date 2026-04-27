@@ -26,7 +26,9 @@ import type { AgentIdentity, DiscordSender } from "./types.js";
 import type { StateManager } from "../lib/state.js";
 import type { MessageContext, AgentRole } from "./message-context.js";
 import { renderEpistle, defaultCtx, type EpistleContext } from "./epistle-templates.js";
-import { resolveIdentity as resolveIdentityRole } from "./identity.js";
+import { resolveIdentity as resolveIdentityRole, type IdentityRole } from "./identity.js";
+import type { OutboundResponseGenerator, OutboundRole } from "./outbound-response-generator.js";
+import { isOutboundLlmEligible } from "./outbound-whitelist.js";
 
 // Re-export for backward-compat — Wave 3 moved these to src/lib/text.ts.
 export { sanitize, redactSecrets } from "../lib/text.js";
@@ -303,6 +305,39 @@ export interface DiscordNotifierOptions {
    * Without it, task-keyed events skip recording and use the legacy send path.
    */
   stateManager?: StateManager;
+  /**
+   * Wave E-γ — optional outbound LLM voice generator. When provided AND
+   * `config.discord.outbound_epistle_enabled === true` AND the (event.type, role)
+   * tuple is whitelisted AND the event resolves a projectId, the deterministic
+   * body is replaced by a per-role first-person prose rewrite. The generator
+   * handles all failure modes internally (returns deterministicBody on any
+   * miss / error) — never throws, never doubles emissions.
+   *
+   * Defaults to undefined; when undefined OR the flag is unset/false, the
+   * notifier behaves byte-equal to Wave E-α/β.
+   */
+  outboundGenerator?: OutboundResponseGenerator;
+}
+
+/**
+ * Wave E-γ — 1:1 map from `IdentityRole` (deterministic identity resolver) to
+ * `OutboundRole` (LLM-voice generator role). The two enums are co-extensive by
+ * design; this helper exists to keep the type names distinct so tests can
+ * mock either side independently.
+ *
+ * Returns `null` for any unrecognized role (defensive; the exhaustive
+ * `resolveIdentity` switch should prevent this in practice).
+ */
+function identityToOutboundRole(identity: IdentityRole): OutboundRole | null {
+  switch (identity) {
+    case "architect":
+    case "reviewer":
+    case "executor":
+    case "orchestrator":
+      return identity;
+    default:
+      return null;
+  }
 }
 
 function errMessage(err: unknown): string {
@@ -335,6 +370,11 @@ export class DiscordNotifier {
   // CW-3 — optional reply-routing wiring.
   private readonly messageContext: MessageContext | undefined;
   private readonly stateManager: StateManager | undefined;
+  // Wave E-γ — optional outbound LLM voice generator. Activates only when
+  // `config.discord.outbound_epistle_enabled === true` AND the (event, role)
+  // tuple is whitelisted AND the event resolves a projectId. Defaults to
+  // undefined → behavior byte-equal to E-α/β.
+  private readonly outboundGenerator: OutboundResponseGenerator | undefined;
 
   constructor(senders: SenderInput, config: DiscordConfig, options: DiscordNotifierOptions = {}) {
     this.config = config;
@@ -352,6 +392,7 @@ export class DiscordNotifier {
     this.agents = { ...DISCORD_AGENT_DEFAULTS, ...options.agents, ...config.agents };
     this.messageContext = options.messageContext;
     this.stateManager = options.stateManager;
+    this.outboundGenerator = options.outboundGenerator;
   }
 
   /** Register with orchestrator: `orch.on((ev) => notifier.handleEvent(ev));` */
@@ -386,6 +427,11 @@ export class DiscordNotifier {
     // role-head map keyed `(projectId, role, channel)` to synthesize Discord
     // `message_reference` reply chains. Disabled when
     // `config.discord.reply_threading.enabled === false`.
+    //
+    // Wave E-γ — the LLM voice transform is also project-scoped: only events
+    // that resolve a projectId are eligible. System / standalone events
+    // (poll_tick, plain task_picked_up without a project) skip the LLM path
+    // entirely — defense-in-depth on top of the whitelist guard.
     if (this.messageContext) {
       const projectId = this.resolveProjectId(event);
       if (projectId !== null) {
@@ -393,22 +439,21 @@ export class DiscordNotifier {
         const replyToMessageId = this.computeReplyTarget(event, projectId, channel);
         const chainRule = CHAIN_RULES[event.type];
         const registerRole = this.threadingEnabled() ? (chainRule?.registerRole ?? null) : null;
-        void sender
-          .sendToChannelAndReturnId(channel, body, identity, replyToMessageId ?? undefined)
-          .then(({ messageId }) => {
-            if (messageId !== null) {
-              ctx.recordAgentMessage(messageId, projectId);
-              if (registerRole !== null) {
-                ctx.recordRoleMessage(projectId, registerRole, messageId, channel);
-              }
-            }
-          })
-          .catch((err) => {
-            console.error(`[DiscordNotifier] sender failed for ${event.type} -> ${entry.channel}: ${errMessage(err)}`);
-          });
+        void this.sendRecordingPath({
+          event,
+          sender,
+          channel,
+          identity,
+          deterministicBody: body,
+          projectId,
+          ctx,
+          replyToMessageId,
+          registerRole,
+          entryChannel: entry.channel,
+        });
         return;
       }
-      // projectId null → fall through to plain sendToChannel (no recording, no chain).
+      // projectId null → fall through to plain sendToChannel (no recording, no chain, no LLM).
     }
 
     // Swallow sender failures — Discord hiccups never crash the pipeline.
@@ -416,6 +461,66 @@ export class DiscordNotifier {
     void sender.sendToChannel(channel, body, identity).catch((err) => {
       console.error(`[DiscordNotifier] sender failed for ${event.type} -> ${entry.channel}: ${errMessage(err)}`);
     });
+  }
+
+  /**
+   * Wave E-γ — recording-path send with optional LLM voice transform inserted
+   * between deterministic body assembly and the actual sender call. Async
+   * because `OutboundResponseGenerator.generate()` is async; dispatch invokes
+   * via `void` so the public `handleEvent` stays sync (matches E-α/β contract).
+   *
+   * The transform fires only when ALL of:
+   *   - `outboundGenerator` was injected at construction
+   *   - `config.discord.outbound_epistle_enabled === true`
+   *   - the resolved (event.type, role) tuple is in OUTBOUND_LLM_WHITELIST
+   *
+   * Generator handles all internal failure modes (whitelist miss, budget,
+   * circuit breaker, SDK errors, schema validation) and always returns a
+   * string — never throws, so the deterministic body is the worst case.
+   */
+  private async sendRecordingPath(args: {
+    event: OrchestratorEvent;
+    sender: DiscordSender;
+    channel: string;
+    identity: AgentIdentity;
+    deterministicBody: string;
+    projectId: string;
+    ctx: MessageContext;
+    replyToMessageId: string | null;
+    registerRole: AgentRole | null;
+    entryChannel: ChannelKey;
+  }): Promise<void> {
+    let body = args.deterministicBody;
+    if (this.outboundGenerator && this.config.outbound_epistle_enabled === true) {
+      const outboundRole = identityToOutboundRole(resolveIdentityRole(args.event));
+      if (outboundRole !== null && isOutboundLlmEligible(args.event.type, outboundRole)) {
+        // Generator swallows all failures internally and returns
+        // `deterministicBody` on any miss/error — no try/catch needed here.
+        body = await this.outboundGenerator.generate({
+          event: args.event,
+          role: outboundRole,
+          deterministicBody: args.deterministicBody,
+        });
+      }
+    }
+    try {
+      const { messageId } = await args.sender.sendToChannelAndReturnId(
+        args.channel,
+        body,
+        args.identity,
+        args.replyToMessageId ?? undefined,
+      );
+      if (messageId !== null) {
+        args.ctx.recordAgentMessage(messageId, args.projectId);
+        if (args.registerRole !== null) {
+          args.ctx.recordRoleMessage(args.projectId, args.registerRole, messageId, args.channel);
+        }
+      }
+    } catch (err) {
+      console.error(
+        `[DiscordNotifier] sender failed for ${args.event.type} -> ${args.entryChannel}: ${errMessage(err)}`,
+      );
+    }
   }
 
   /**
