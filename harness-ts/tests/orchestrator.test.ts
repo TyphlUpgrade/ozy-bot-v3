@@ -1855,7 +1855,12 @@ describe("Orchestrator — P1-B arbitration verdict routing", () => {
     }
   });
 
-  it("escalate_operator leaves project open when other phases are still active", async () => {
+  it("escalate_operator fails project immediately even when other phases are still pending (R6 fail-fast)", async () => {
+    // Wave R6 — project_failed fires on first phase failure regardless of
+    // other-phase state. Earlier policy waited for hasActivePhases to drain;
+    // the new policy treats a phase failure as a project-level terminal so
+    // dependent pending phases (blocked by priorPhasesTerminal) don't keep
+    // the project in "decomposing" forever.
     const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 1 });
     const architectManager = makeFakeArchitectManager({
       reviewVerdict: { type: "escalate_operator", rationale: "just this one" },
@@ -1872,9 +1877,8 @@ describe("Orchestrator — P1-B arbitration verdict routing", () => {
     state.updateTask("t-multi-fail", { projectId: proj.id, phaseId: "ph-fail" });
     await orch.processTask(state.getTask("t-multi-fail")!);
 
-    expect(projectStore.getProject(proj.id)!.state).toBe("decomposing");
-    expect(events.some((e) => e.type === "project_failed")).toBe(false);
-    // Phase itself marked failed.
+    expect(projectStore.getProject(proj.id)!.state).toBe("failed");
+    expect(events.some((e) => e.type === "project_failed")).toBe(true);
     const ph = projectStore.getProject(proj.id)!.phases.find((p) => p.id === "ph-fail");
     expect(ph?.state).toBe("failed");
   });
@@ -1911,7 +1915,11 @@ describe("Orchestrator — P1-B arbitration verdict routing", () => {
     expect(events.some((e) => e.type === "project_failed")).toBe(false);
   });
 
-  it("escalate_operator with sibling phase in 'active' state leaves project open (hasActivePhases respects active)", async () => {
+  it("escalate_operator with sibling phase in 'active' state still fails project immediately (R6 fail-fast)", async () => {
+    // Wave R6 — even with an in-flight sibling, a phase failure terminates
+    // the project. The sibling's state is not modified by the cascade
+    // (orchestrator-side abort is the operator's responsibility); only the
+    // project record + the failed phase change.
     const gate = makeFakeReviewGate("reject", { arbitrationThreshold: 1 });
     const architectManager = makeFakeArchitectManager({
       reviewVerdict: { type: "escalate_operator", rationale: "active sibling" },
@@ -1928,10 +1936,10 @@ describe("Orchestrator — P1-B arbitration verdict routing", () => {
     state.createTask("x", "t-fail");
     state.updateTask("t-fail", { projectId: proj.id, phaseId: "ph-fail" });
     await orch.processTask(state.getTask("t-fail")!);
-    expect(projectStore.getProject(proj.id)!.state).toBe("decomposing");
-    expect(events.some((e) => e.type === "project_failed")).toBe(false);
+    expect(projectStore.getProject(proj.id)!.state).toBe("failed");
+    expect(events.some((e) => e.type === "project_failed")).toBe(true);
     const activePhase = projectStore.getProject(proj.id)!.phases.find((p) => p.id === "ph-act");
-    expect(activePhase?.state).toBe("active"); // untouched
+    expect(activePhase?.state).toBe("active"); // untouched by cascade
   });
 
   it("escalate_operator: transitions failed, emits task_failed with architect rationale", async () => {

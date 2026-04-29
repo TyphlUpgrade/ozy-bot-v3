@@ -65,11 +65,22 @@ function buildConfig(root: string): HarnessConfig {
       prompt_path: join(root, "config", "harness", "architect-prompt.md"),
     },
     systemPrompt: EXECUTOR_PROMPT,
-    // Wave R3 — project-level smoke gate. Vague-math should produce an
-    // installable Python package; if pip install or pytest fails on trunk we
-    // surface project_failed with the smoke output instead of green-passing.
-    finalTestCommand:
-      "if [ -f pyproject.toml ]; then pip install -q -e . 2>&1 || exit $?; fi; if [ -d tests ] && ls tests/test_*.py >/dev/null 2>&1; then python -m pytest -q --no-header tests 2>&1; fi",
+    // Wave R3+R6 — project-level smoke gate, language-aware. Surfaces
+    // project_failed when trunk-side install or test fails. Python branch
+    // runs `pip install -e . && pytest`; TS branch runs `npm install &&
+    // npm test`. Whichever shape Architect picks, the smoke actually
+    // executes the test runner instead of silently no-op'ing.
+    finalTestCommand: [
+      "if [ -f pyproject.toml ]; then",
+      "  pip install -q -e . 2>&1 || exit $?;",
+      "  if [ -d tests ] && ls tests/test_*.py >/dev/null 2>&1; then",
+      "    python -m pytest -q --no-header tests 2>&1;",
+      "  fi;",
+      "elif [ -f package.json ]; then",
+      "  if [ ! -d node_modules ]; then npm install --silent 2>&1 || exit $?; fi;",
+      "  npm test --silent 2>&1 || exit $?;",
+      "fi",
+    ].join(" "),
   });
 }
 

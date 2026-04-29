@@ -1,7 +1,8 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { existsSync, rmSync } from "node:fs";
-import { execSync } from "node:child_process";
+import { existsSync, rmSync, mkdtempSync, writeFileSync } from "node:fs";
+import { execSync, spawnSync } from "node:child_process";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   initScratchRepo,
   buildBaseConfig,
@@ -45,11 +46,13 @@ describe("scratch-repo helper", () => {
     const cfg = buildBaseConfig({ root: "/tmp/dummy", projectName: "demo" });
     expect(cfg.project.name).toBe("demo");
     expect(cfg.project.root).toBe("/tmp/dummy");
-    // Wave R3 — test_command is a detection-at-eval-time bash snippet that
-    // gates on pyproject.toml [build-system] presence and runs pytest when
-    // tests/ is populated. Non-Python phases short-circuit cleanly.
+    // Wave R3+R6 — detection-at-eval-time bash snippet covering both
+    // languages. Python branch: pyproject.toml [build-system] gate + pytest
+    // run. TS branch: package.json + npm test (auto-install if needed).
     expect(cfg.pipeline.test_command).toContain("pyproject.toml");
     expect(cfg.pipeline.test_command).toContain("pytest");
+    expect(cfg.pipeline.test_command).toContain("package.json");
+    expect(cfg.pipeline.test_command).toContain("npm test");
     expect(cfg.pipeline.max_budget_usd).toBe(1.0);
   });
 
@@ -63,6 +66,7 @@ describe("scratch-repo helper", () => {
     expect(cfg.pipeline.max_budget_usd).toBe(99);
     // Default still present for untouched keys
     expect(cfg.pipeline.test_command).toContain("pyproject.toml");
+    expect(cfg.pipeline.test_command).toContain("package.json");
   });
 
   it("isProjectTerminal recognizes terminal states", () => {
@@ -77,4 +81,45 @@ describe("scratch-repo helper", () => {
     expect(DEFAULT_POLL_LOOP_MS).toBeGreaterThan(0);
     expect(DEFAULT_RUN_TIMEOUT_MS).toBeGreaterThanOrEqual(60_000);
   });
+
+  // Wave R6 — TS-branch test_command actually runs npm test on a fake
+  // package.json worktree. Skip if `npm` is not installed (CI runner sans
+  // Node).
+  it("test_command TS branch executes npm test against a fake worktree", () => {
+    const npmAvailable = spawnSync("which", ["npm"], { stdio: "pipe" }).status === 0;
+    if (!npmAvailable) return; // graceful skip
+    const fake = mkdtempSync(join(tmpdir(), "scratch-ts-test-"));
+    CREATED_DIRS.push(fake);
+    writeFileSync(
+      join(fake, "package.json"),
+      JSON.stringify({ name: "fake", private: true, scripts: { test: "true" } }),
+    );
+
+    const cfg = buildBaseConfig({ root: fake, projectName: "fake" });
+    // Strip the `bash -c '...'` outer wrapper so we can run the inner snippet
+    // directly without nested-quote escaping.
+    const cmdMatch = cfg.pipeline.test_command.match(/^bash -c '(.*)'$/s);
+    expect(cmdMatch).toBeTruthy();
+    const inner = cmdMatch![1];
+
+    const okRun = spawnSync("bash", ["-c", inner], {
+      cwd: fake,
+      encoding: "utf-8",
+      timeout: 60_000,
+    });
+    expect(okRun.status).toBe(0);
+
+    // Failing-test arm — flip the script to `false`. Reuse the same dir;
+    // npm install has populated node_modules already.
+    writeFileSync(
+      join(fake, "package.json"),
+      JSON.stringify({ name: "fake", private: true, scripts: { test: "false" } }),
+    );
+    const failRun = spawnSync("bash", ["-c", inner], {
+      cwd: fake,
+      encoding: "utf-8",
+      timeout: 60_000,
+    });
+    expect(failRun.status).not.toBe(0);
+  }, 90_000);
 });

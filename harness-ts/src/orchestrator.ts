@@ -479,7 +479,12 @@ export class Orchestrator {
     const sameProject = this.state.getAllTasks().filter((t) => t.projectId === projectId && t.phaseId !== undefined);
     for (const prior of sameProject) {
       if (prior.phaseId! >= currentPhaseId) continue;
-      if (prior.state !== "done" && prior.state !== "failed") return false;
+      // Wave R6 — strict gate: if any prior phase failed, abort serialization
+      // so we don't ingest dependent phases that will fail anyway. Cascade
+      // will fire project_failed once the cascade for the failed phase
+      // settles. Earlier behavior accepted "failed" as terminal-and-proceed,
+      // which kept piling phases onto a doomed project.
+      if (prior.state !== "done") return false;
     }
     return true;
   }
@@ -1006,10 +1011,38 @@ export class Orchestrator {
     } else {
       store.markPhaseFailed(task.projectId, task.phaseId, rationale ?? "");
     }
+    // Wave R6 — project-fail propagates immediately on FIRST phase failure.
+    // Don't wait for hasActivePhases to drain: dependent phases are blocked
+    // by priorPhasesTerminal at ingest, so they would stay pending in
+    // projectStore forever and the project would never finalize. The "done"
+    // path still respects hasActivePhases since later phases may still be
+    // running successfully.
+    if (outcome === "failed") {
+      const project = store.getProject(task.projectId);
+      // Skip when project missing OR already failed — the latter guards against
+      // double-emit when a sibling phase's cascade fires after the project's
+      // first failure (failProject is store-idempotent, but emit isn't).
+      if (!project || project.state === "failed") return;
+      const reason = rationale ?? "phase failed";
+      store.failProject(task.projectId, reason);
+      this.emit({
+        type: "project_failed",
+        projectId: task.projectId,
+        reason,
+        failedPhase: task.phaseId,
+      });
+      return;
+    }
     if (store.hasActivePhases(task.projectId)) return;
     const project = store.getProject(task.projectId);
     if (!project) return;
-    if (outcome === "done") {
+    // Wave R6 — aggregate outcome check. If ANY prior phase failed,
+    // treat the project as failed even when the LAST phase done. The
+    // earlier code only branched on the current cascade's `outcome`, so
+    // a sequence (failed, failed, done) erroneously emitted
+    // project_completed.
+    const anyPhaseFailed = project.phases.some((p) => p.state === "failed");
+    if (outcome === "done" && !anyPhaseFailed) {
       // Wave R3 — project-level smoke gate. Catches "every phase merged but
       // trunk doesn't compose" failures (broken pyproject, cross-phase import
       // errors). See runFinalSmoke for null-as-no-config semantics.
@@ -1032,13 +1065,19 @@ export class Orchestrator {
         totalCostUsd: project.totalCostUsd,
       });
     } else {
-      const reason = rationale ?? "";
-      store.failProject(task.projectId, `architect_escalate_operator: ${reason}`);
+      // outcome === "done" && anyPhaseFailed — defense-in-depth. The R6
+      // early-return above handles outcome=failed, and priorPhasesTerminal
+      // blocks dependent phases from ever ingesting after a failure, so this
+      // branch should not normally fire. Kept as a safety net in case a
+      // sibling-phase failure slips through.
+      const failed = project.phases.filter((p) => p.state === "failed").map((p) => p.id);
+      const aggReason = `Project has ${failed.length} failed phase(s): ${failed.join(", ")}`;
+      store.failProject(task.projectId, aggReason);
       this.emit({
         type: "project_failed",
         projectId: task.projectId,
-        reason: `architect escalation: ${reason}`,
-        failedPhase: task.phaseId,
+        reason: aggReason,
+        failedPhase: failed[0],
       });
     }
   }

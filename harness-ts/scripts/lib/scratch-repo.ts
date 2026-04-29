@@ -99,8 +99,15 @@ export function initScratchRepo(opts: InitScratchRepoOpts): string {
       "*.pyc",
       "*.pyo",
       ".pytest_cache/",
+      ".coverage",
+      ".coverage.*",
+      "htmlcov/",
+      "coverage.xml",
+      ".tox/",
       "*.egg-info/",
       "node_modules/",
+      "dist/",
+      ".vitest-cache/",
     ].join("\n") + "\n",
   );
   execFileSync("git", ["add", "-A"], { cwd: root, stdio: "ignore" });
@@ -136,14 +143,33 @@ export function buildBaseConfig(opts: BuildBaseConfigOpts): HarnessConfig {
     },
     pipeline: {
       poll_interval: DEFAULT_POLL_INTERVAL_SEC,
-      // Wave R3 — detection-at-eval-time quality gate. MergeGate runs this in
-      // the per-phase worktree, so detection must happen NOW (a phase may have
-      // just created pyproject.toml or tests/). A literal "true" passed
-      // anything; this snippet (a) fails when pyproject.toml is missing the
-      // [build-system] block (PEP 517 / pip-editable hard requirement), and
-      // (b) runs pytest when test files are present. Non-Python phases short-
-      // circuit cleanly because both checks are guarded by file/dir presence.
-      test_command: "bash -c 'if [ -f pyproject.toml ] && ! grep -q \"^\\[build-system\\]\" pyproject.toml; then echo \"pyproject.toml missing [build-system] section\"; exit 1; fi; if [ -d tests ] && ls tests/test_*.py >/dev/null 2>&1; then PYTHONPATH=. python -m pytest -q --no-header tests 2>&1; fi; exit 0'",
+      // Wave R3+R6 — detection-at-eval-time quality gate. MergeGate runs this
+      // in the per-phase worktree, so detection must happen NOW (a phase may
+      // have just created pyproject.toml or package.json). A literal "true"
+      // passed anything; this snippet now covers both languages:
+      //   (a) Python — fail when pyproject.toml is missing [build-system]
+      //       (PEP 517 / pip-editable hard requirement); run pytest when
+      //       tests/test_*.py present.
+      //   (b) TypeScript / JS — when package.json declares a "test" script,
+      //       run `npm test`. Auto-install when node_modules is missing
+      //       (per-phase install adds ~10-30s but ensures the gate actually
+      //       executes; refusing to install would silently no-op the gate).
+      // Non-Python AND non-TS phases short-circuit cleanly via final exit 0.
+      test_command:
+        "bash -c '" +
+        // Python branch
+        "if [ -f pyproject.toml ] && ! grep -q \"^\\[build-system\\]\" pyproject.toml; then " +
+        "echo \"pyproject.toml missing [build-system] section\"; exit 1; fi; " +
+        "if [ -d tests ] && ls tests/test_*.py >/dev/null 2>&1; then " +
+        "PYTHONPATH=. python -m pytest -q --no-header tests 2>&1; fi; " +
+        // TypeScript / JavaScript branch
+        "if [ -f package.json ] && grep -q \"\\\"test\\\"\" package.json; then " +
+        "if [ ! -d node_modules ]; then " +
+        "npm install --silent 2>&1 || exit $?; " +
+        "fi; " +
+        "npm test --silent 2>&1 || exit $?; " +
+        "fi; " +
+        "exit 0'",
       max_retries: 1,
       test_timeout: 120,
       escalation_timeout: 600,
