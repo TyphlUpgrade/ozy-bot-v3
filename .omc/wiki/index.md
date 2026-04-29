@@ -8,6 +8,7 @@
 - [Harness-TS Architecture Snapshot — 2026-04-27 (As-Built)](harness-ts-architecture-snapshot-2026-04-27-as-built.md) — # Harness-TS Architecture Snapshot — 2026-04-27 (As-Built)
 - [Harness-TS Architecture](harness-ts-architecture.md) — # Harness-TS Architecture
 - [Harness-TS Core Invariants](harness-ts-core-invariants.md) — # Harness-TS Core Invariants
+- [Harness-TS Pipeline Quality Backlog (cycle 5+)](harness-ts-pipeline-quality-backlog.md) — Quality-lift items from ralph cycles 2-4 e2e runs; 5 ranked entries with design surface
 - [Harness-TS Wave C Backlog + P1/P2 Follow-ups](harness-ts-wave-c-backlog.md) — # Wave C Backlog — Status + Remaining Action List
 - [Ozymandias Documentation Index](ozy-doc-index.md) — # Ozymandias Documentation Index
 - [Phase E — Agent Perspective Discord Rendering (Intended Features)](phase-e-agent-perspective-discord-rendering-intended-features.md) — # Phase E — Agent Perspective Discord Rendering (Intended Features)
