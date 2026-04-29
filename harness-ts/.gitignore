@@ -13,3 +13,7 @@ node_modules/
 spikes/*/sandbox/
 spikes/*/results/
 spikes/*/iterations/
+
+# Live e2e + smoke scratch repos (Wave R5). Nuke with `npm run scratch:clean`.
+.scratch/
+.harness/

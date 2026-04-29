@@ -562,6 +562,10 @@ export class Orchestrator {
         // State transition may also fail if task is in incompatible state
       }
       this.emit({ type: "task_failed", taskId: task.id, reason, attempt: this.state.getTask(task.id)?.retryCount ?? 0, terminal: true });
+      // Wave R4 — cascade unexpected-failure to project so a stuck phase
+      // doesn't leave the project pending forever. Cascade is a no-op for
+      // standalone tasks (no projectId) so this is additive.
+      this.cascadePhaseOutcome(task, "failed", reason);
     }
   }
 
@@ -634,10 +638,12 @@ export class Orchestrator {
 
     // Budget exhaustion — permanent failure, never retry (would burn more money)
     if (result.terminalReason === "error_max_budget_usd") {
+      const budgetReason = `Budget exhausted ($${result.totalCostUsd.toFixed(2)})`;
       this.state.transition(task.id, "failed");
-      this.state.updateTask(task.id, { lastError: `Budget exhausted ($${result.totalCostUsd.toFixed(2)})` });
+      this.state.updateTask(task.id, { lastError: budgetReason });
       this.emit({ type: "budget_exhausted", taskId: task.id, totalCostUsd: result.totalCostUsd });
       this.emit({ type: "task_failed", taskId: task.id, reason: "Budget exhausted", attempt: this.state.getTask(task.id)?.retryCount ?? 0, terminal: true });
+      this.cascadePhaseOutcome(task, "failed", budgetReason);
       return;
     }
 
@@ -682,13 +688,13 @@ export class Orchestrator {
     }
 
     // Circuit breaker: permanent failure
+    const breakerReason = autoEscalate
+      ? `Circuit breaker: exhausted ${maxSessionRetries} retries × ${maxEscalations} escalation cycles`
+      : reason;
     this.state.transition(task.id, "failed");
-    this.state.updateTask(task.id, {
-      lastError: autoEscalate
-        ? `Circuit breaker: exhausted ${maxSessionRetries} retries × ${maxEscalations} escalation cycles`
-        : reason,
-    });
+    this.state.updateTask(task.id, { lastError: breakerReason });
     this.emit({ type: "task_failed", taskId: task.id, reason, attempt: this.state.getTask(task.id)?.retryCount ?? 0, terminal: true });
+    this.cascadePhaseOutcome(task, "failed", breakerReason);
   }
 
   /**
@@ -1068,10 +1074,9 @@ export class Orchestrator {
         const attempts = this.state.incrementRebaseAttempts(task.id);
         this.sessions.cleanupWorktree(task.id);
         if (attempts >= this.config.pipeline.max_retries) {
+          const rebaseReason = `Rebase conflict after ${attempts} attempts`;
           this.state.transition(task.id, "failed");
-          this.state.updateTask(task.id, {
-            lastError: `Rebase conflict after ${attempts} attempts`,
-          });
+          this.state.updateTask(task.id, { lastError: rebaseReason });
           this.emit({
             type: "task_failed",
             taskId: task.id,
@@ -1079,6 +1084,7 @@ export class Orchestrator {
             attempt: this.state.getTask(task.id)?.retryCount ?? 0,
             terminal: true,
           });
+          this.cascadePhaseOutcome(task, "failed", rebaseReason);
         } else {
           this.state.transition(task.id, "shelved");
           this.emit({
@@ -1091,20 +1097,22 @@ export class Orchestrator {
         break;
       }
 
-      case "test_failed":
+      case "test_failed": {
+        const reason = `Tests failed: ${mergeResult.error}`;
         this.state.transition(task.id, "failed");
-        this.state.updateTask(task.id, {
-          lastError: `Tests failed: ${mergeResult.error}`,
-        });
+        this.state.updateTask(task.id, { lastError: reason });
         this.emit({ type: "task_failed", taskId: task.id, reason: `Tests failed`, attempt: this.state.getTask(task.id)?.retryCount ?? 0, terminal: true });
         this.sessions.cleanupWorktree(task.id);
+        this.cascadePhaseOutcome(task, "failed", reason);
         break;
+      }
 
       case "test_timeout":
         this.state.transition(task.id, "failed");
         this.state.updateTask(task.id, { lastError: "Test timeout" });
         this.emit({ type: "task_failed", taskId: task.id, reason: "Test timeout", attempt: this.state.getTask(task.id)?.retryCount ?? 0, terminal: true });
         this.sessions.cleanupWorktree(task.id);
+        this.cascadePhaseOutcome(task, "failed", "Test timeout");
         break;
 
       case "error":
@@ -1112,6 +1120,7 @@ export class Orchestrator {
         this.state.updateTask(task.id, { lastError: mergeResult.error });
         this.emit({ type: "task_failed", taskId: task.id, reason: mergeResult.error, attempt: this.state.getTask(task.id)?.retryCount ?? 0, terminal: true });
         this.sessions.cleanupWorktree(task.id);
+        this.cascadePhaseOutcome(task, "failed", mergeResult.error);
         break;
     }
   }
@@ -1127,7 +1136,7 @@ export class Orchestrator {
     name: string,
     description: string,
     nonGoals: string[],
-  ): Promise<{ projectId: string; sessionId: string } | { error: string }> {
+  ): Promise<{ projectId: string; sessionId: string; awaiting_operator?: boolean } | { error: string }> {
     if (!this.architectManager || !this.projectStore) {
       return { error: "ArchitectManager/ProjectStore not configured" };
     }
@@ -1144,6 +1153,29 @@ export class Orchestrator {
     this.emit({ type: "architect_spawned", projectId: project.id, sessionId: spawn.sessionId });
 
     const decomp = await this.architectManager.decompose(project.id);
+
+    // Wave R4 — Architect chose to escalate before decomposing (architect-prompt
+    // §2 "Decide by default; escalate only on genuine forks"). Surface
+    // escalation_needed and KEEP project state=decomposing so the operator's
+    // !reply (architectManager.relayOperatorInput) resumes the same Architect
+    // session and re-runs decompose. Synthetic taskId encodes the projectId so
+    // the operator dialogue handler can route the reply without needing a
+    // pre-seeded mapping.
+    if (decomp.status === "escalation_required") {
+      const escalation: EscalationSignal = {
+        type: "scope_unclear",
+        question: decomp.rationale ?? "Architect requires clarification before decomposition",
+        options: [],
+        context: "Architect requires clarification before decomposition",
+      };
+      this.emit({
+        type: "escalation_needed",
+        taskId: `project-${project.id}-decomposition`,
+        escalation,
+      });
+      return { projectId: project.id, sessionId: spawn.sessionId, awaiting_operator: true };
+    }
+
     if (decomp.status !== "success" || !decomp.phases) {
       this.projectStore.failProject(project.id, decomp.error ?? "decompose failed");
       this.emit({ type: "project_failed", projectId: project.id, reason: decomp.error ?? "decompose failed" });

@@ -13,7 +13,8 @@
     "test:watch": "vitest",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "lint": "tsc --noEmit",
-    "audit:epistle-pins": "npx tsx scripts/audit-epistle-pins.ts"
+    "audit:epistle-pins": "npx tsx scripts/audit-epistle-pins.ts",
+    "scratch:clean": "rm -rf .scratch && echo 'cleaned harness-ts/.scratch (e2e + smoke run dirs)'"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.123",

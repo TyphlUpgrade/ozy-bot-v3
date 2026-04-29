@@ -293,6 +293,55 @@ describe("ArchitectManager", () => {
     expect(result.error).toMatch(/no phase files/i);
   });
 
+  // Wave R4 — decomposition-time escalation channel.
+  it("decompose returns escalation_required when Architect drops escalate_operator verdict + zero phases", async () => {
+    const h = setupManager();
+    const p = h.projectStore.createProject("proj-r4", "d", []);
+    await h.manager.spawn(p.id, p.name, p.description, p.nonGoals);
+    // Simulate Architect writing the verdict instead of phase files.
+    const session = h.manager.getSession(p.id)!;
+    mkdirSync(join(session.worktreePath, ".harness"), { recursive: true });
+    writeFileSync(
+      join(session.worktreePath, ".harness", "architect-verdict.json"),
+      JSON.stringify({
+        type: "escalate_operator",
+        rationale: "language not specified, no codebase anchor",
+      }),
+    );
+    const result = await h.manager.decompose(p.id);
+    expect(result.status).toBe("escalation_required");
+    expect(result.rationale).toContain("language not specified");
+  });
+
+  // Wave R4 — resume flow. After operator answers via relayOperatorInput,
+  // Architect's resumed session writes phase files; re-running decompose now
+  // returns success (the phases-present path skips the verdict-read branch
+  // even when a stale verdict file is still on disk).
+  it("decompose succeeds on retry after Architect writes phase files (verdict file irrelevant once phases present)", async () => {
+    const h = setupManager();
+    const p = h.projectStore.createProject("proj-r4-resume", "d", []);
+    await h.manager.spawn(p.id, p.name, p.description, p.nonGoals);
+    const session = h.manager.getSession(p.id)!;
+
+    // First decompose: escalation.
+    mkdirSync(join(session.worktreePath, ".harness"), { recursive: true });
+    writeFileSync(
+      join(session.worktreePath, ".harness", "architect-verdict.json"),
+      JSON.stringify({ type: "escalate_operator", rationale: "language fork" }),
+    );
+    const first = await h.manager.decompose(p.id);
+    expect(first.status).toBe("escalation_required");
+
+    // Operator replies → Architect's resumed session writes phase files
+    // (we leave the stale verdict on disk to verify the phases-present path
+    // does not consult it).
+    writePhaseFile(h.config.project.task_dir, p.id, "01", "phase 1 (post-resume)");
+
+    const second = await h.manager.decompose(p.id);
+    expect(second.status).toBe("success");
+    expect(second.phases).toHaveLength(1);
+  });
+
   it("decompose ignores phase files from OTHER projects", async () => {
     const h = setupManager();
     const p1 = h.projectStore.createProject("proj-a", "d", []);

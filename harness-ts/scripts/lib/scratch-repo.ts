@@ -13,9 +13,8 @@
  *   - SIGINT cleanup wiring so Ctrl-C during a long run still aborts sessions.
  */
 
-import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import type { HarnessConfig } from "../../src/lib/config.js";
@@ -39,11 +38,20 @@ export interface InitScratchRepoOpts {
 }
 
 /**
- * Create an isolated scratch git repo under tmpdir. Returns the root path.
- * Uses `mkdtempSync` so collisions + symlink-race attacks are impossible.
+ * Create an isolated scratch git repo. Returns the root path.
+ *
+ * Wave R5 — scratch dirs now live under `harness-ts/.scratch/` (gitignored)
+ * instead of `/tmp/`, so `npm run scratch:clean` can nuke them in one go and
+ * leftovers from prior e2e/smoke runs don't clutter `/tmp` between sessions.
+ * Override via `HARNESS_SCRATCH_BASE=/path/to/dir` (e.g. honor `/tmp` for CI
+ * runs that need cross-mount isolation).
+ *
+ * `mkdtempSync` keeps collisions + symlink-race attacks impossible.
  */
 export function initScratchRepo(opts: InitScratchRepoOpts): string {
-  const root = mkdtempSync(join(tmpdir(), `${opts.prefix}-`));
+  const baseDir = process.env.HARNESS_SCRATCH_BASE ?? join(HARNESS_ROOT, ".scratch");
+  if (!existsSync(baseDir)) mkdirSync(baseDir, { recursive: true });
+  const root = mkdtempSync(join(baseDir, `${opts.prefix}-`));
   mkdirSync(join(root, "tasks"), { recursive: true });
   mkdirSync(join(root, "worktrees"), { recursive: true });
   mkdirSync(join(root, "sessions"), { recursive: true });
@@ -72,7 +80,28 @@ export function initScratchRepo(opts: InitScratchRepoOpts): string {
   // be gitignored — without it both rebase-conflict across phases on trunk.
   writeFileSync(
     join(root, ".gitignore"),
-    "tasks/\nworktrees/\nsessions/\nstate.json\nprojects.json\nstate.log.jsonl\n.harness/\n.omc/\n",
+    [
+      "tasks/",
+      "worktrees/",
+      "sessions/",
+      "state.json",
+      "projects.json",
+      "state.log.jsonl",
+      ".harness/",
+      ".omc/",
+      // Wave R5 — Python build/test artifacts. The new pytest-driven
+      // test_command (cycle 2 US-A) writes `__pycache__/` + `*.pyc` into
+      // the per-phase worktree; those untracked files then collide with
+      // git merge --no-ff on the next phase's land. Same logic for
+      // `.pytest_cache/`, eggs, and node_modules so JS-shaped projects
+      // are also covered.
+      "__pycache__/",
+      "*.pyc",
+      "*.pyo",
+      ".pytest_cache/",
+      "*.egg-info/",
+      "node_modules/",
+    ].join("\n") + "\n",
   );
   execFileSync("git", ["add", "-A"], { cwd: root, stdio: "ignore" });
   execFileSync("git", ["commit", "-m", "init"], { cwd: root, stdio: "ignore" });

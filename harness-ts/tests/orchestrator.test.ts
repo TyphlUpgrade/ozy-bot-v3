@@ -1707,7 +1707,8 @@ describe("Orchestrator — Wave A review gate + arbitration wiring", () => {
 
 function makeFakeArchitectManager(opts: {
   spawnStatus?: "success" | "failure";
-  decomposeStatus?: "success" | "failure";
+  decomposeStatus?: "success" | "failure" | "escalation_required";
+  decomposeRationale?: string;
   alive?: boolean;
   respawnStatus?: "success" | "failure";
   reviewVerdict?: ArchitectVerdict;
@@ -1718,6 +1719,15 @@ function makeFakeArchitectManager(opts: {
     opts.reviewVerdict ?? { type: "escalate_operator", rationale: "fake_default" };
   const escalationVerdict: ArchitectVerdict =
     opts.escalationVerdict ?? { type: "escalate_operator", rationale: "fake_default" };
+  const decomposeReturn =
+    opts.decomposeStatus === "failure"
+      ? { status: "failure", error: "no phase files" }
+      : opts.decomposeStatus === "escalation_required"
+        ? { status: "escalation_required", rationale: opts.decomposeRationale ?? "language fork — no anchor" }
+        : {
+            status: "success",
+            phases: [{ phaseId: "01", taskFilePath: "/tmp/x.json" }, { phaseId: "02", taskFilePath: "/tmp/y.json" }],
+          };
   return {
     spawn: vi.fn().mockResolvedValue(
       opts.spawnStatus === "failure"
@@ -1729,14 +1739,7 @@ function makeFakeArchitectManager(opts: {
         ? { status: "failure", error: "respawn failed" }
         : { status: "success", sessionId: "arch-sess-2" },
     ),
-    decompose: vi.fn().mockResolvedValue(
-      opts.decomposeStatus === "failure"
-        ? { status: "failure", error: "no phase files" }
-        : {
-            status: "success",
-            phases: [{ phaseId: "01", taskFilePath: "/tmp/x.json" }, { phaseId: "02", taskFilePath: "/tmp/y.json" }],
-          },
-    ),
+    decompose: vi.fn().mockResolvedValue(decomposeReturn),
     isAlive: vi.fn().mockReturnValue(opts.alive ?? true),
     getSession: vi.fn().mockReturnValue(undefined),
     shutdown: vi.fn().mockResolvedValue(undefined),
@@ -2121,6 +2124,44 @@ describe("Orchestrator — Wave B declareProject + Architect crash recovery", ()
     const failed = events.find((e) => e.type === "project_failed");
     expect(failed).toBeTruthy();
     if (failed && failed.type === "project_failed") expect(failed.reason).toMatch(/no phase files|decompose/i);
+  });
+
+  // Wave R4 — decomposition-time escalation channel.
+  it("declareProject emits escalation_needed (not project_failed) when decompose returns escalation_required", async () => {
+    const config = makeConfig();
+    mkdirSync(join(tmpDir, "tasks"), { recursive: true });
+    const state = new StateManager(join(tmpDir, "state.json"));
+    const projectStore = new ProjectStore(join(tmpDir, "projects.json"), join(tmpDir, "wt"));
+    const sessionMgr = new SessionManager(new SDKClient(vi.fn()), state, config, mockGitOps());
+    const mergeGate = new MergeGate(config.pipeline, tmpDir, mockMergeGitOps());
+    const architectManager = makeFakeArchitectManager({
+      decomposeStatus: "escalation_required",
+      decomposeRationale: "runtime fork: no language anchor",
+    });
+    const orch = new Orchestrator({
+      sessionManager: sessionMgr, mergeGate, stateManager: state, config, architectManager, projectStore,
+    });
+    const events: OrchestratorEvent[] = [];
+    orch.on((e) => events.push(e));
+    const result = await orch.declareProject("proj-vague", "d", []);
+    // Success-shape with awaiting_operator flag.
+    expect("projectId" in result).toBe(true);
+    if ("projectId" in result) {
+      expect(result.awaiting_operator).toBe(true);
+    }
+    // escalation_needed fired with synthetic taskId encoding projectId.
+    const esc = events.find((e) => e.type === "escalation_needed");
+    expect(esc).toBeTruthy();
+    if (esc && esc.type === "escalation_needed") {
+      expect(esc.taskId).toMatch(/-decomposition$/);
+      expect(esc.escalation.type).toBe("scope_unclear");
+      expect(esc.escalation.question).toContain("runtime fork");
+    }
+    // Project NOT marked failed; state still decomposing.
+    expect(events.some((e) => e.type === "project_failed")).toBe(false);
+    if ("projectId" in result) {
+      expect(projectStore.getProject(result.projectId)?.state).toBe("decomposing");
+    }
   });
 
   it("checkArchitectHealth respawns dead Architect + emits architect_respawned", async () => {

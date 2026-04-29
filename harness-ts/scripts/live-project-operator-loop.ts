@@ -145,8 +145,15 @@ async function main(): Promise<void> {
   orch.on((ev) => notifier.handleEvent(ev));
   orch.on(async (ev: OrchestratorEvent) => {
     if (ev.type !== "escalation_needed") return;
-    if (!pendingProjectId) {
-      console.warn(`[op-loop] escalation_needed received but no projectId pinned; skipping`);
+    // Wave R4 — decomposition-time escalation arrives BEFORE declareProject
+    // returns, so pendingProjectId is still null. The synthetic taskId
+    // encodes the projectId as `project-{projectId}-decomposition`; extract
+    // it. For task-time escalations the existing pendingProjectId still
+    // applies.
+    const decompMatch = ev.taskId.match(/^project-(.+)-decomposition$/);
+    const projectId = decompMatch ? decompMatch[1] : pendingProjectId;
+    if (!projectId) {
+      console.warn(`[op-loop] escalation_needed received but no projectId resolvable; skipping`);
       return;
     }
     const inputPath = `/tmp/operator-input-${ev.taskId}.txt`;
@@ -170,7 +177,7 @@ async function main(): Promise<void> {
         try { unlinkSync(inputPath); } catch { /* best-effort */ }
         console.log(`[op-loop] operator replied (${reply.length} chars): ${reply.slice(0, 120)}`);
         try {
-          await architectManager.relayOperatorInput(pendingProjectId, reply);
+          await architectManager.relayOperatorInput(projectId, reply);
           escalationsHandled += 1;
           console.log(`[op-loop] relayed to architect (handled=${escalationsHandled})`);
         } catch (err) {

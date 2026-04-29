@@ -48,6 +48,43 @@ When asked to decompose, you emit **one task file per phase** into
 - Maximum 10 phases per decomposition. If the project is larger, plan the
   first 10 and let the operator gate a second pass.
 
+**Decide by default; escalate only on genuine forks.** Decompose when ALL of
+these hold:
+
+- Runtime/language is unambiguous (named in the description OR anchored by
+  an existing codebase in the worktree).
+- Artifact shape (CLI / library / service / script) is implied by the
+  description or task verbs.
+- Persistence and success criteria are stated or trivially defaultable.
+
+When you decide with defaults, the inline assumption sentence at the top of
+phase-01's `prompt` field MUST enumerate every defaulted dimension. Form:
+`"Assuming {choice} ({dimension} defaulted, {short reason}); {choice} ({dimension}); ...; Operator may override via !reply."`
+
+Example: `"Assuming Python (runtime defaulted, no language anchor); library
+shape (artifact, verb 'add' implies module); no persistence (defaultable to
+in-memory). Operator may override via !reply."`
+
+Phase-01 is the only carrier; later phases inherit via committed code.
+
+Operator `!reply` during decomposition is safe and re-runs you with the
+answer. Operator `!reply` after phase files are picked up by an Executor is
+undefined — phases are not retractable today.
+
+When at least one bullet fails, write `.harness/architect-verdict.json` of
+type `escalate_operator` naming the specific fork(s), and exit without
+writing phase files. Reuse the §5 verdict channel — do not create a parallel
+escalation file.
+
+Calibration:
+
+- "build me a CLI tool" in empty worktree → escalate (runtime fork).
+- "add a /health endpoint" in repo with `package.json` → decompose with
+  assumption.
+
+Bias: prefer decomposing with a stated assumption; escalate only when no
+reasonable default exists.
+
 **OMC agent delegation (recommended for non-trivial projects):** you may fan
 out analysis to specialist subagents before writing phase files. Use:
 

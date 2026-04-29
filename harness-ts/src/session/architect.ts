@@ -164,10 +164,20 @@ interface ArchitectSpawnResult {
   error?: string;
 }
 
-interface DecomposeResult {
-  status: "success" | "failure";
+/**
+ * Wave R4 — decompose() third variant: `escalation_required`. Fires when
+ * Architect's decomposition session writes zero phase files AND drops an
+ * `escalate_operator` verdict in `.harness/architect-verdict.json`. Reuses
+ * the §5 verdict channel (per architect-prompt §2 "Decide by default;
+ * escalate only on genuine forks"). Operator responds via
+ * relayOperatorInput → Architect resumes + re-runs decompose.
+ */
+export interface DecomposeResult {
+  status: "success" | "failure" | "escalation_required";
   phases?: Array<{ phaseId: string; taskFilePath: string }>;
   error?: string;
+  /** When status === "escalation_required" — Architect's reason for asking. */
+  rationale?: string;
 }
 
 interface CompactResult {
@@ -348,6 +358,16 @@ export class ArchitectManager {
 
     const phases = this.persistDecomposedPhases(projectId);
     if (phases.length === 0) {
+      // Wave R4 — Architect may have escalated instead of decomposing
+      // (§2 "Decide by default; escalate only on genuine forks"). Reuse
+      // the existing verdict channel; decompose() does NOT call
+      // unlinkStaleVerdict, so a verdict written during this session is
+      // intact. Only `escalate_operator` is meaningful here — the other
+      // verdict types target arbitration.
+      const verdict = this.readArchitectVerdict(session.worktreePath);
+      if (verdict && verdict.type === "escalate_operator") {
+        return { status: "escalation_required", rationale: verdict.rationale };
+      }
       return { status: "failure", error: "Architect produced no phase files" };
     }
     return { status: "success", phases };
