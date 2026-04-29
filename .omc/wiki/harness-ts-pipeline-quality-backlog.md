@@ -13,23 +13,39 @@ Captured 2026-04-29 after ralph cycles 2 (R3 quality gates), 3 (R4 architect §2
 
 Order: highest-ROI first. Each item has a self-contained design-question section so a future ralph or ralplan run can scope it without re-discovery.
 
-## R7 — Worktree-snapshot-and-diff in MergeGate
+## R7 — Test-artifact pollution in autoCommit (REDESIGN PENDING)
 
-**Problem class:** every new tool Architect introduces (pytest, pytest-cov, vitest, tsc, mypy, ...) generates files in the per-phase worktree that the test_command also exercises. Those untracked files then collide with `git merge --no-ff` ("untracked files would be overwritten by merge"). Cycle 3 patched `__pycache__/` + `*.pyc`; cycle 4 added `.coverage`/`htmlcov/`/`dist/`/`.vitest-cache/`. Each new test runner is a new patch.
+**Problem class:** every new tool Architect introduces (pytest, pytest-cov, vitest, tsc, mypy, ...) generates files in the per-phase worktree. autoCommit's `git add -A` sweeps those untracked files into the phase commit. Trunk's later runTests run regenerates the same artifact (untracked), and the next phase's `git merge --no-ff` collides on "untracked files would be overwritten by merge". Cycle 3 patched `__pycache__/` + `*.pyc`; cycle 4 added `.coverage`/`htmlcov/`/`dist/`/`.vitest-cache/`. Each new test runner is a new patch.
 
-**Fix:** snapshot tracked + untracked file lists at the start of the Executor session, run test_command, on commit only `git add` files that the Executor actually wrote (intersect post-test diff against pre-test snapshot, exclude anything in the post-test set that wasn't there at start). Eliminates the gitignore-extension treadmill.
+**Original "snapshot pre/post Executor + diff" design — REJECTED on closer read.** MergeGate flow (verified 2026-04-29 against `src/gates/merge.ts:315-373`):
 
-**Files:** `src/gates/merge.ts`, possibly `src/session/manager.ts` (snapshot lifecycle).
+1. Worktree starts clean (fresh `git worktree add`).
+2. Executor session writes files. Side effects: Executor may run pytest/vitest via Bash to validate work → test artifacts in worktree.
+3. autoCommit (`git add --all`) in worktree.
+4. Rebase + `merge --no-ff` to trunk.
+5. **runTests in TRUNK**, not worktree.
 
-**Open questions:**
-- Where to take the snapshot? Pre-Executor-spawn (catches Executor's own writes only) vs pre-test-command (catches Executor + test artifacts equally — wrong).
-- Architect-emitted `.harness/completion.json` is a tracked artifact in spirit but written by Executor. Stay opaque to MergeGate (already excluded from commit per existing logic).
-- Symlink + permission edge cases.
-- Submodule edge cases (probably out of scope; harness doesn't use submodules).
+Because worktree starts clean, "snapshot at session start" yields the empty set. Diff at session end = all changes (Executor's intended writes + Bash side effects). Stage = same as `git add --all`. Snapshot adds no signal.
 
-**Estimated size:** ~50 LOC + 3-4 tests.
+**Fix candidates (re-scoped):**
 
-**ROI:** very high. Permanent fix vs perpetual patches.
+a) **Forbid Executor from running tests in its session.** Update `DEFAULT_EXECUTOR_SYSTEM_PROMPT` (config.ts) with "Do not run tests via Bash. The harness runs them after Reviewer approval." Executor stops generating test artifacts. autoCommit stays clean. Risk: Executor commits broken code → caught by Reviewer + harness's runTests. ~5 LOC prompt change. **Cheapest, highest ROI.**
+
+b) **SDK tool-use parsing.** Subscribe to SDK Edit/Write/MultiEdit/NotebookEdit tool_use messages during Executor session. Collect file_path arguments. autoCommit stages exactly those paths via `git add <path>`. Bash side-effect files never enter the snapshot. ~80 LOC SDK message parser + edge cases (Executor using Bash sed/cp/echo to write files would be missed).
+
+c) **`git clean -fd` + pattern deny-list before autoCommit.** Run `git clean -fd <known-test-pattern-paths>` to nuke common artifact dirs before staging. Then `git add -A` as today. ~10 LOC + maintained pattern list.
+
+d) **Status quo + R5+ gitignore extension.** Already in cycle 4. Maintenance overhead.
+
+**Recommend:** (a) first — minimal change, highest ROI, defensive backstop via existing R5+ gitignore. If Executor's "no tests" instruction proves unreliable in practice, escalate to (b).
+
+**Files:** `src/lib/config.ts` (DEFAULT_EXECUTOR_SYSTEM_PROMPT), or for (b) `src/session/manager.ts` (subscribe to SDK messages, capture tool-use paths).
+
+**Estimated size:** (a) ~5 LOC + 1-2 tests verifying prompt content. (b) ~80 LOC + tests.
+
+**ROI:** still high. Permanent fix to the gitignore-extension treadmill class.
+
+**History:** original snapshot-based design captured 2026-04-29 in this backlog entry was rejected after reading the actual MergeGate flow (clean worktree start makes pre-snapshot empty → snapshot equivalent to `git add -A`). Corrected analysis above.
 
 ## Cross-Session Architect Memory
 
