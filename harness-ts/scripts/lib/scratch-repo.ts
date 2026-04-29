@@ -116,10 +116,14 @@ export function buildBaseConfig(opts: BuildBaseConfigOpts): HarnessConfig {
       ...opts.pipelineOverrides,
     },
     discord: {
-      bot_token_env: "UNUSED",
-      dev_channel: "dev",
-      ops_channel: "ops",
-      escalation_channel: "esc",
+      // When a real DISCORD_BOT_TOKEN is exported, env-supplied snowflakes
+      // (DEV_CHANNEL / AGENT_CHANNEL / ALERTS_CHANNEL) replace the placeholder
+      // slugs so BotSender's REST POSTs hit valid channels. Without these
+      // overrides, BotSender would POST /channels/dev/messages and 400.
+      bot_token_env: "DISCORD_BOT_TOKEN",
+      dev_channel: process.env.DEV_CHANNEL ?? "dev",
+      ops_channel: process.env.AGENT_CHANNEL ?? process.env.DEV_CHANNEL ?? "ops",
+      escalation_channel: process.env.ALERTS_CHANNEL ?? process.env.DEV_CHANNEL ?? "esc",
       agents: {
         orchestrator: { name: "Harness", avatar_url: "" },
         architect: { name: "Architect", avatar_url: "" },
