@@ -61,13 +61,34 @@ function validateConfidence(raw: unknown): ConfidenceAssessment | null {
   return obj as unknown as ConfidenceAssessment;
 }
 
-function validateCompletion(raw: unknown): CompletionSignal | null {
-  if (!raw || typeof raw !== "object") return null;
+/** Wave R3 — tagged validation result.
+ *  - `signal` populated → completion file is well-formed
+ *  - `error` populated → completion file rejected; string names the failing field
+ *  - both null is impossible
+ */
+export interface CompletionValidationResult {
+  signal: CompletionSignal | null;
+  error: string | null;
+}
+
+function validateCompletionDetailed(raw: unknown): CompletionValidationResult {
+  if (!raw || typeof raw !== "object") {
+    return { signal: null, error: "completion.json must be a JSON object" };
+  }
   const obj = raw as Record<string, unknown>;
   // Required fields
-  if (typeof obj.status !== "string" || !["success", "failure"].includes(obj.status)) return null;
-  if (typeof obj.summary !== "string") return null;
-  if (!Array.isArray(obj.filesChanged)) return null;
+  if (typeof obj.status !== "string" || !["success", "failure"].includes(obj.status)) {
+    return {
+      signal: null,
+      error: `status must be "success" or "failure" (got ${JSON.stringify(obj.status)})`,
+    };
+  }
+  if (typeof obj.summary !== "string") {
+    return { signal: null, error: "summary missing or not a string" };
+  }
+  if (!Array.isArray(obj.filesChanged)) {
+    return { signal: null, error: "filesChanged missing or not an array" };
+  }
 
   const signal: CompletionSignal = {
     status: obj.status as "success" | "failure",
@@ -76,7 +97,9 @@ function validateCompletion(raw: unknown): CompletionSignal | null {
   };
   // commitSha is optional (WA-1): accept only non-empty strings.
   if (obj.commitSha !== undefined) {
-    if (typeof obj.commitSha !== "string" || obj.commitSha.length === 0) return null;
+    if (typeof obj.commitSha !== "string" || obj.commitSha.length === 0) {
+      return { signal: null, error: "commitSha present but not a non-empty string" };
+    }
     signal.commitSha = obj.commitSha;
   }
 
@@ -96,7 +119,11 @@ function validateCompletion(raw: unknown): CompletionSignal | null {
     // Malformed confidence silently stripped (B7)
   }
 
-  return signal;
+  return { signal, error: null };
+}
+
+function validateCompletion(raw: unknown): CompletionSignal | null {
+  return validateCompletionDetailed(raw).signal;
 }
 
 /** Phase 2A enrichment fields the Executor should populate on success.
@@ -421,7 +448,7 @@ export class SessionManager {
     task: TaskRecord,
     onMessage?: (msg: SDKMessage) => void,
     timeoutMs?: number,
-  ): Promise<{ result: SessionResult; completion: CompletionSignal | null }> {
+  ): Promise<{ result: SessionResult; completion: CompletionSignal | null; completionError: string | null }> {
     // Create worktree
     const { worktreePath, branchName } = this.createWorktree(task.id);
 
@@ -518,14 +545,16 @@ export class SessionManager {
       totalCostUsd: result.totalCostUsd,
     });
 
-    // Check for completion signal
-    const completion = this.readCompletion(worktreePath);
+    // Check for completion signal — Wave R3 surfaces validation error so
+    // the orchestrator can include it in task_failed.reason.
+    const { signal: completion, error: completionError } =
+      this.readCompletionDetailed(worktreePath);
 
     // Clean up tracking
     this.activeSessions.delete(task.id);
     this.sdk.unregisterController(task.id);
 
-    return { result, completion };
+    return { result, completion, completionError };
   }
 
   /** Read completion signal from worktree.
@@ -537,27 +566,44 @@ export class SessionManager {
    * because enrichment is technically optional in the schema.
    */
   readCompletion(worktreePath: string): CompletionSignal | null {
-    const completionPath = join(worktreePath, ".harness", "completion.json");
-    if (!existsSync(completionPath)) return null;
+    return this.readCompletionDetailed(worktreePath).signal;
+  }
 
-    try {
-      const raw = JSON.parse(readFileSync(completionPath, "utf-8"));
-      const signal = validateCompletion(raw);
-      if (signal && signal.status === "success") {
-        const missing = listMissingEnrichment(signal);
-        if (missing.length > 0) {
-          console.warn(
-            `WARN Executor completion at ${completionPath} missing enrichment ` +
-              `fields: ${missing.join(", ")}. ` +
-              `Phase 2A graduated response routing degrades without these. ` +
-              `Check Executor systemPrompt + plugin defaults (caveman drops "filler" fields).`,
-          );
-        }
-      }
-      return signal;
-    } catch {
-      return null;
+  /** Wave R3 — readCompletion with diagnostic context.
+   *  Distinguishes "file missing" (`{signal: null, error: null}`) from
+   *  "file present but invalid" (`{signal: null, error: "<reason>"}`) so
+   *  the orchestrator can surface a precise task_failed.reason instead of
+   *  the opaque "No completion signal" string.
+   */
+  readCompletionDetailed(worktreePath: string): CompletionValidationResult {
+    const completionPath = join(worktreePath, ".harness", "completion.json");
+    if (!existsSync(completionPath)) {
+      return { signal: null, error: null };
     }
+
+    let raw: unknown;
+    try {
+      raw = JSON.parse(readFileSync(completionPath, "utf-8"));
+    } catch (err) {
+      return {
+        signal: null,
+        error: `completion.json malformed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+
+    const result = validateCompletionDetailed(raw);
+    if (result.signal && result.signal.status === "success") {
+      const missing = listMissingEnrichment(result.signal);
+      if (missing.length > 0) {
+        console.warn(
+          `WARN Executor completion at ${completionPath} missing enrichment ` +
+            `fields: ${missing.join(", ")}. ` +
+            `Phase 2A graduated response routing degrades without these. ` +
+            `Check Executor systemPrompt + plugin defaults (caveman drops "filler" fields).`,
+        );
+      }
+    }
+    return result;
   }
 
   /** Abort a specific task's session */

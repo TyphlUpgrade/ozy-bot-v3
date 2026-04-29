@@ -45,7 +45,11 @@ describe("scratch-repo helper", () => {
     const cfg = buildBaseConfig({ root: "/tmp/dummy", projectName: "demo" });
     expect(cfg.project.name).toBe("demo");
     expect(cfg.project.root).toBe("/tmp/dummy");
-    expect(cfg.pipeline.test_command).toBe("true");
+    // Wave R3 — test_command is a detection-at-eval-time bash snippet that
+    // gates on pyproject.toml [build-system] presence and runs pytest when
+    // tests/ is populated. Non-Python phases short-circuit cleanly.
+    expect(cfg.pipeline.test_command).toContain("pyproject.toml");
+    expect(cfg.pipeline.test_command).toContain("pytest");
     expect(cfg.pipeline.max_budget_usd).toBe(1.0);
   });
 
@@ -58,7 +62,7 @@ describe("scratch-repo helper", () => {
     expect(cfg.pipeline.retry_delay_ms).toBe(42);
     expect(cfg.pipeline.max_budget_usd).toBe(99);
     // Default still present for untouched keys
-    expect(cfg.pipeline.test_command).toBe("true");
+    expect(cfg.pipeline.test_command).toContain("pyproject.toml");
   });
 
   it("isProjectTerminal recognizes terminal states", () => {

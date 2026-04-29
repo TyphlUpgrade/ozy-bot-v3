@@ -65,6 +65,11 @@ function buildConfig(root: string): HarnessConfig {
       prompt_path: join(root, "config", "harness", "architect-prompt.md"),
     },
     systemPrompt: EXECUTOR_PROMPT,
+    // Wave R3 — project-level smoke gate. Vague-math should produce an
+    // installable Python package; if pip install or pytest fails on trunk we
+    // surface project_failed with the smoke output instead of green-passing.
+    finalTestCommand:
+      "if [ -f pyproject.toml ]; then pip install -q -e . 2>&1 || exit $?; fi; if [ -d tests ] && ls tests/test_*.py >/dev/null 2>&1; then python -m pytest -q --no-header tests 2>&1; fi",
   });
 }
 

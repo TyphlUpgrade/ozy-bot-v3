@@ -399,6 +399,43 @@ describe("SessionManager", () => {
       rmSync(dir, { recursive: true, force: true });
     });
 
+    // Wave R3 — readCompletionDetailed surfaces field-level validation errors.
+    it("readCompletionDetailed names the failing status field", () => {
+      const dir = makeTmpDir();
+      mkdirSync(join(dir, ".harness"), { recursive: true });
+      writeFileSync(
+        join(dir, ".harness", "completion.json"),
+        JSON.stringify({ status: "done", summary: "x", filesChanged: [] }),
+      );
+      const { mgr } = makeManager();
+      const result = mgr.readCompletionDetailed(dir);
+      expect(result.signal).toBeNull();
+      expect(result.error).toContain("status");
+      expect(result.error).toContain("\"done\"");
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("readCompletionDetailed names a missing summary field", () => {
+      const dir = makeTmpDir();
+      mkdirSync(join(dir, ".harness"), { recursive: true });
+      writeFileSync(
+        join(dir, ".harness", "completion.json"),
+        JSON.stringify({ status: "success", filesChanged: [] }),
+      );
+      const { mgr } = makeManager();
+      const result = mgr.readCompletionDetailed(dir);
+      expect(result.signal).toBeNull();
+      expect(result.error).toContain("summary");
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("readCompletionDetailed returns {signal: null, error: null} when file missing", () => {
+      const { mgr } = makeManager();
+      const result = mgr.readCompletionDetailed("/nonexistent/path");
+      expect(result.signal).toBeNull();
+      expect(result.error).toBeNull();
+    });
+
     it("rejects completion.json with empty commitSha", () => {
       const dir = makeTmpDir();
       mkdirSync(join(dir, ".harness"), { recursive: true });

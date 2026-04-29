@@ -136,8 +136,13 @@ function setupHarness(opts?: {
   mergeGitOverrides?: Partial<MergeGitOps>;
   freshQueryPerCall?: boolean;
   withProjectStore?: boolean;
+  /** Wave R3 — set project.final_test_command for smoke-gate tests. */
+  finalTestCommand?: string;
 }): TestHarness {
   const config = makeConfig();
+  if (opts?.finalTestCommand !== undefined) {
+    config.project.final_test_command = opts.finalTestCommand;
+  }
   mkdirSync(join(tmpDir, "tasks"), { recursive: true });
 
   const gitOps = mockGitOps();
@@ -446,6 +451,50 @@ describe("Orchestrator", () => {
       expect(state.getTask("t-p1")!.state).toBe("done");
       expect(events.some((e) => e.type === "project_completed")).toBe(false);
       expect(projectStore!.getProject(project.id)!.state).toBe("decomposing");
+    });
+
+    // Wave R3 — final_test_command smoke gate.
+    it("emits project_completed when final_test_command exits 0", async () => {
+      const { orch, state, events, projectStore } = setupHarness({
+        withCompletion: true,
+        withProjectStore: true,
+        finalTestCommand: "true",
+      });
+      const project = projectStore!.createProject("p-smoke-pass", "desc", []);
+      projectStore!.addPhase(project.id, "only phase", "phase-a");
+      projectStore!.attachTask(project.id, "phase-a", "t-smoke-pass");
+      const task = state.createTask("only phase", "t-smoke-pass");
+      state.updateTask(task.id, { projectId: project.id, phaseId: "phase-a" });
+
+      await orch.processTask(state.getTask("t-smoke-pass")!);
+
+      expect(events.some((e) => e.type === "project_completed")).toBe(true);
+      expect(events.some((e) => e.type === "project_failed")).toBe(false);
+      expect(projectStore!.getProject(project.id)!.state).toBe("completed");
+    });
+
+    it("emits project_failed when final_test_command exits non-zero", async () => {
+      const { orch, state, events, projectStore } = setupHarness({
+        withCompletion: true,
+        withProjectStore: true,
+        finalTestCommand: "echo broken-build && exit 1",
+      });
+      const project = projectStore!.createProject("p-smoke-fail", "desc", []);
+      projectStore!.addPhase(project.id, "only phase", "phase-a");
+      projectStore!.attachTask(project.id, "phase-a", "t-smoke-fail");
+      const task = state.createTask("only phase", "t-smoke-fail");
+      state.updateTask(task.id, { projectId: project.id, phaseId: "phase-a" });
+
+      await orch.processTask(state.getTask("t-smoke-fail")!);
+
+      expect(events.some((e) => e.type === "project_completed")).toBe(false);
+      const failed = events.find((e) => e.type === "project_failed");
+      expect(failed).toBeTruthy();
+      if (failed && failed.type === "project_failed") {
+        expect(failed.reason).toContain("Project smoke test failed");
+        expect(failed.reason).toContain("broken-build");
+      }
+      expect(projectStore!.getProject(project.id)!.state).toBe("failed");
     });
   });
 

@@ -90,6 +90,8 @@ export interface BuildBaseConfigOpts {
   architect?: HarnessConfig["architect"];
   /** Executor system prompt override. */
   systemPrompt?: string;
+  /** Wave R3 — project-level smoke test run after the last phase merges. */
+  finalTestCommand?: string;
 }
 
 export function buildBaseConfig(opts: BuildBaseConfigOpts): HarnessConfig {
@@ -101,10 +103,18 @@ export function buildBaseConfig(opts: BuildBaseConfigOpts): HarnessConfig {
       state_file: join(opts.root, "state.json"),
       worktree_base: join(opts.root, "worktrees"),
       session_dir: join(opts.root, "sessions"),
+      ...(opts.finalTestCommand ? { final_test_command: opts.finalTestCommand } : {}),
     },
     pipeline: {
       poll_interval: DEFAULT_POLL_INTERVAL_SEC,
-      test_command: "true",
+      // Wave R3 — detection-at-eval-time quality gate. MergeGate runs this in
+      // the per-phase worktree, so detection must happen NOW (a phase may have
+      // just created pyproject.toml or tests/). A literal "true" passed
+      // anything; this snippet (a) fails when pyproject.toml is missing the
+      // [build-system] block (PEP 517 / pip-editable hard requirement), and
+      // (b) runs pytest when test files are present. Non-Python phases short-
+      // circuit cleanly because both checks are guarded by file/dir presence.
+      test_command: "bash -c 'if [ -f pyproject.toml ] && ! grep -q \"^\\[build-system\\]\" pyproject.toml; then echo \"pyproject.toml missing [build-system] section\"; exit 1; fi; if [ -d tests ] && ls tests/test_*.py >/dev/null 2>&1; then PYTHONPATH=. python -m pytest -q --no-header tests 2>&1; fi; exit 0'",
       max_retries: 1,
       test_timeout: 120,
       escalation_timeout: 600,

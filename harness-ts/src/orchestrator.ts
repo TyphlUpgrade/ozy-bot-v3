@@ -6,6 +6,7 @@
 
 import { readdirSync, readFileSync, unlinkSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { SessionManager, type CompletionSignal } from "./session/manager.js";
 import { MergeGate, type MergeResult } from "./gates/merge.js";
 import type { SessionResult } from "./session/sdk.js";
@@ -444,6 +445,36 @@ export class Orchestrator {
    * still missing from state OR mid-flight, returns false so the caller defers
    * ingestion of the current phase to a later scan tick.
    */
+  /**
+   * Wave R3 — run `project.final_test_command` in `project.root` and report
+   * a structured result. Returns null when no smoke command is configured
+   * (caller treats as pass-through). Failure includes the first 500 chars of
+   * combined stderr/stdout so the operator-visible reason is precise.
+   */
+  private runFinalSmoke(projectId: string): { ok: boolean; message: string } | null {
+    const cmd = this.config.project.final_test_command;
+    if (!cmd) return null;
+    const cwd = this.config.project.root;
+    try {
+      const result = spawnSync("bash", ["-c", cmd], {
+        cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+        encoding: "utf-8",
+        timeout: 5 * 60_000,
+      });
+      if (result.status === 0) {
+        return { ok: true, message: "" };
+      }
+      const out = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
+      const snippet = out.length > 500 ? `${out.slice(0, 500)}…` : out;
+      const exitTag = result.signal ? `signal=${result.signal}` : `exit=${result.status}`;
+      return { ok: false, message: `[${exitTag}] ${snippet || "(no output)"}` };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { ok: false, message: `final_test_command threw: ${msg}` };
+    }
+  }
+
   private priorPhasesTerminal(projectId: string, currentPhaseId: string): boolean {
     const sameProject = this.state.getAllTasks().filter((t) => t.projectId === projectId && t.phaseId !== undefined);
     for (const prior of sameProject) {
@@ -481,7 +512,7 @@ export class Orchestrator {
       // Wave B wires cost-ceiling precheck, phase attachment, and Architect routing.
       if (await this.routeByProject(task)) return;
 
-      const { result, completion } = await this.sessions.spawnTask(task);
+      const { result, completion, completionError } = await this.sessions.spawnTask(task);
 
       this.emit({
         type: "session_complete",
@@ -511,7 +542,7 @@ export class Orchestrator {
       }
 
       if (!result.success || !completion || completion.status !== "success") {
-        await this.handleSessionFailure(task, result, completion);
+        await this.handleSessionFailure(task, result, completion, completionError);
         return;
       }
 
@@ -588,11 +619,14 @@ export class Orchestrator {
     task: TaskRecord,
     result: SessionResult,
     completion: CompletionSignal | null,
+    completionError: string | null = null,
   ): Promise<void> {
+    // Wave R3: when the completion file existed but validation rejected it,
+    // surface the validator's reason instead of the opaque "No completion signal".
     const reason = !result.success
       ? result.errors.join("; ")
       : !completion
-        ? "No completion signal"
+        ? (completionError ? `Completion signal invalid: ${completionError}` : "No completion signal")
         : `Agent reported failure: ${completion.summary}`;
 
     // Clean up worktree before any retry/escalation decision
@@ -970,6 +1004,20 @@ export class Orchestrator {
     const project = store.getProject(task.projectId);
     if (!project) return;
     if (outcome === "done") {
+      // Wave R3 — project-level smoke gate. Catches "every phase merged but
+      // trunk doesn't compose" failures (broken pyproject, cross-phase import
+      // errors). See runFinalSmoke for null-as-no-config semantics.
+      const smoke = this.runFinalSmoke(task.projectId);
+      if (smoke && !smoke.ok) {
+        store.failProject(task.projectId, `final_test_command failed: ${smoke.message}`);
+        this.emit({
+          type: "project_failed",
+          projectId: task.projectId,
+          reason: `Project smoke test failed: ${smoke.message}`,
+          failedPhase: task.phaseId,
+        });
+        return;
+      }
       store.completeProject(task.projectId);
       this.emit({
         type: "project_completed",

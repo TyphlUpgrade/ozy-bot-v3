@@ -17,6 +17,15 @@ export interface ProjectConfig {
   worktree_base: string;
   session_dir: string;
   signal_dir?: string;
+  /**
+   * Wave R3 — optional project-level smoke test. When set, the orchestrator
+   * runs this shell command in `root` after the last phase completes; if it
+   * exits non-zero, `project_failed` is emitted instead of `project_completed`.
+   * Catches "all phases green individually but the trunk doesn't actually
+   * compose" failures (e.g. missing build-system block, broken imports across
+   * phase boundaries). Unset = no smoke (default, backward-compatible).
+   */
+  final_test_command?: string;
 }
 
 export interface PipelineConfig {
@@ -239,6 +248,7 @@ function parseProject(raw: Record<string, unknown>): ProjectConfig {
     worktree_base: requireString(raw, "worktree_base", section),
     session_dir: requireString(raw, "session_dir", section),
     signal_dir: optionalString(raw, "signal_dir"),
+    final_test_command: optionalString(raw, "final_test_command"),
   };
 }
 
