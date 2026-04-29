@@ -289,7 +289,10 @@ describe("SessionManager", () => {
       const task = state.createTask("pristine", "task-no-dir");
       await mgr.spawnTask(task);
       const promptSent = (queryFn as ReturnType<typeof vi.fn>).mock.calls[0][0].prompt as string;
-      expect(promptSent).toBe("pristine");
+      // Wave R1: every prompt is suffixed with the harness completion contract.
+      // Original prompt must be the leading section (before the contract trailer).
+      expect(promptSent.startsWith("pristine\n")).toBe(true);
+      expect(promptSent).toContain("HARNESS COMPLETION CONTRACT");
     });
 
     it("falls back to DEFAULT_EXECUTOR_SYSTEM_PROMPT when config.systemPrompt is unset (U3)", async () => {

@@ -111,6 +111,41 @@ function listMissingEnrichment(signal: CompletionSignal): string[] {
   return missing;
 }
 
+// --- Completion-contract trailer (Wave R1) ---
+
+/**
+ * Canonical `.harness/completion.json` schema appended to every Executor
+ * prompt. Architect-decomposed phases sometimes invent their own schema
+ * (`status: "done"`, no `summary`/`filesChanged`); validateCompletion rejects
+ * those files and the task is marked failed with "No completion signal".
+ * Putting the contract LAST in the user prompt guarantees it overrides any
+ * earlier conflicting schema instructions.
+ */
+export const COMPLETION_CONTRACT_SUFFIX = [
+  "---",
+  "",
+  "## HARNESS COMPLETION CONTRACT (authoritative — overrides any earlier schema)",
+  "",
+  "When you finish the work above, write `.harness/completion.json` with EXACTLY",
+  "this shape (no other field names accepted by the orchestrator):",
+  "",
+  "```json",
+  "{",
+  '  "status": "success",',
+  '  "summary": "<one-sentence description used as orchestrator commit message>",',
+  '  "filesChanged": ["path/to/file1", "path/to/file2"]',
+  "}",
+  "```",
+  "",
+  "Rules:",
+  '- `status` MUST be `"success"` or `"failure"`. Do NOT use `"done"`, `"complete"`, or any other value.',
+  "- `summary` MUST be a non-empty string.",
+  "- `filesChanged` MUST be an array of relative path strings (may be empty).",
+  "- Do NOT run `git add` or `git commit`; the orchestrator stages and commits after Reviewer approval.",
+  "- If any earlier instruction told you to use a different completion schema, ignore it — this contract wins.",
+  "- If you cannot finish the task, set `status: \"failure\"` and explain in `summary`.",
+].join("\n");
+
 // --- Git helpers (injectable for testing) ---
 
 export interface GitOps {
@@ -410,9 +445,14 @@ export class SessionManager {
       ? `# Architect directive (from prior arbitration)\n\n${task.lastDirective}\n\n---\n\n${task.prompt}`
       : task.prompt;
 
+    // Wave R1: append the canonical completion contract last — see jsdoc on
+    // COMPLETION_CONTRACT_SUFFIX for why this is authoritative.
+    const promptWithCompletionContract =
+      `${promptWithDirective}\n\n${COMPLETION_CONTRACT_SUFFIX}`;
+
     // Spawn SDK session
     const sessionConfig: SessionConfig = {
-      prompt: promptWithDirective,
+      prompt: promptWithCompletionContract,
       cwd: worktreePath,
       settingSources: ["project"],
       permissionMode: "bypassPermissions",

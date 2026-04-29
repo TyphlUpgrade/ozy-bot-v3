@@ -353,14 +353,27 @@ export class Orchestrator {
     }
   }
 
-  /** Scan task_dir for new .json files and ingest them */
+  /** Scan task_dir for new .json files and ingest them.
+   *
+   * Wave R2 — project-phase serialization. Architect emits all decomposed
+   * phase task files up-front, but they often touch overlapping files
+   * (e.g. phase 2 + 3 both edit a package's __init__.py). Running them
+   * concurrently produced rebase_conflict on merge. Per the architect prompt
+   * §2 contract ("earlier phases must land first; order determines priority")
+   * we now serialize: phase NN ingests only after phase NN-1 has reached a
+   * terminal state (`done` or `failed`). Phase files for not-yet-eligible
+   * phases stay on disk and are picked up in a later scan tick.
+   */
   scanForTasks(): void {
     const taskDir = this.resolveTaskDir();
     if (!existsSync(taskDir)) return;
 
     let files: string[];
     try {
-      files = readdirSync(taskDir).filter((f) => f.endsWith(".json"));
+      // Sort lexicographically so phase-01 ingests before phase-02 when
+      // serialization gates are clear. Architect emits zero-padded phaseIds
+      // so lex order matches numeric order.
+      files = readdirSync(taskDir).filter((f) => f.endsWith(".json")).sort();
     } catch {
       return;
     }
@@ -399,6 +412,13 @@ export class Orchestrator {
         continue;
       }
 
+      // Wave R2 serialization gate — for project-phase tasks, defer ingest
+      // until every prior phase for the same project has reached a terminal
+      // state. Leave the file on disk so a later scan tick re-evaluates.
+      if (taskFile.projectId && taskFile.phaseId && !this.priorPhasesTerminal(taskFile.projectId, taskFile.phaseId)) {
+        continue;
+      }
+
       const task = this.state.createTask(taskFile.prompt, taskId);
       if (taskFile.projectId) {
         this.state.updateTask(task.id, {
@@ -415,6 +435,22 @@ export class Orchestrator {
       // Spawn session (fire and forget — lifecycle handled in processTask)
       this.processTask(task);
     }
+  }
+
+  /**
+   * Wave R2 — phase-serialization helper. Returns true iff every prior phase
+   * for this project (phaseId lex-less than `currentPhaseId`) has been ingested
+   * AND is in a terminal state (`done` or `failed`). When any prior phase is
+   * still missing from state OR mid-flight, returns false so the caller defers
+   * ingestion of the current phase to a later scan tick.
+   */
+  private priorPhasesTerminal(projectId: string, currentPhaseId: string): boolean {
+    const sameProject = this.state.getAllTasks().filter((t) => t.projectId === projectId && t.phaseId !== undefined);
+    for (const prior of sameProject) {
+      if (prior.phaseId! >= currentPhaseId) continue;
+      if (prior.state !== "done" && prior.state !== "failed") return false;
+    }
+    return true;
   }
 
   /**

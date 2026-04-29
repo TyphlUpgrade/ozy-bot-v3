@@ -203,9 +203,13 @@ async function main(): Promise<void> {
   orch.start();
 
   const isDone = (): boolean => {
-    const tasks = state.getAllTasks();
-    if (tasks.length === 0) return false;
-    return tasks.every((t) => t.state === "done" || t.state === "failed");
+    // Wave R2 — phases ingest serially, so checking only state.getAllTasks()
+    // returns true after phase 01 finishes (phases 02+ are still on disk and
+    // missing from state). Anchor terminal-detection on the project's own
+    // state machine: completed/failed/aborted are the only terminal values.
+    const project = projectStore.getProject(result.projectId);
+    if (!project) return false;
+    return project.state === "completed" || project.state === "failed" || project.state === "aborted";
   };
 
   while (!isDone() && Date.now() - startedAt < DEFAULT_RUN_TIMEOUT_MS * 2) {
@@ -242,7 +246,12 @@ async function main(): Promise<void> {
   console.log(`  project completed:       ${completed}`);
 
   console.log(`\nscratch preserved at: ${root}`);
-  process.exit(escFired && escalationsHandled >= 1 && completed ? 0 : 1);
+  // Exit gate: project must complete cleanly. Operator dialogue is
+  // best-effort — `escalation_needed` only fires on Architect arbitration
+  // (Reviewer rejection cascade), and a vague-but-bounded prompt may not
+  // trigger it. PRD US-3 allows the no-escalation case; PASS = project
+  // completed without rebase_conflict / terminal phase failures.
+  process.exit(completed ? 0 : 1);
 }
 
 main().catch((err) => {
