@@ -519,6 +519,10 @@ describe("DiscordNotifier", () => {
     });
     await flush();
     expect(sent[0].content).toMatch(/Stuck — operator must answer scope_unclear/);
+    // nextAction absorbed by opener: must not duplicate as closing line.
+    const matches = sent[0].content.match(/operator must answer scope_unclear/g) ?? [];
+    expect(matches.length).toBe(1);
+    expect(sent[0].content).toContain("I'll check again at the next interval.");
   });
 
   it("nudge_check blocked opener falls back to 'awaiting input' without nextAction", async () => {

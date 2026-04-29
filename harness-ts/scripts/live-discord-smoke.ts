@@ -338,8 +338,9 @@ async function main(): Promise<void> {
   }
 
   // Drain queue: wait long enough for the sender's rate limit to flush all
-  // messages (4 direct + N from notifier). Default 2 s spacing × 30 = 60 s.
-  await new Promise((r) => setTimeout(r, 60_000));
+  // messages (4 direct + N from notifier). At 2 s spacing, 35 events need
+  // ~70 s; budget headroom for jitter + Discord 5xx retries.
+  await new Promise((r) => setTimeout(r, 120_000));
 
   console.log(`[discord-smoke] done — check Discord for ${SMOKE_FIXTURES.length} notifier messages across #dev / #ops / #esc`);
   console.log(`[discord-smoke] transcript jsonl: ${transcriptJsonl}`);

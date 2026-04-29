@@ -233,7 +233,10 @@ export function renderEpistle(
           break;
         }
       }
-      const closing = event.nextAction
+      // For status=blocked, the opener already absorbed `nextAction` ("Stuck — {nextAction}.").
+      // Re-using it as the closing line produces a near-duplicate paragraph; fall back to the
+      // interval default in that case.
+      const closing = event.nextAction && event.status !== "blocked"
         ? sanitize(event.nextAction, 200)
         : "I'll check again at the next interval.";
       const lines = [`${emoji} **Nudge Check** — ${formatTs(ts)}`, ""];
