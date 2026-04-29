@@ -1,0 +1,15 @@
+# Build output
+dist/
+
+# Dependencies
+node_modules/
+
+# OMC state (written relative to CWD, not git root)
+.omc/state/sessions/
+.omc/state/*.json
+!.omc/project-memory.json
+
+# Spike scratch (sandbox + results)
+spikes/*/sandbox/
+spikes/*/results/
+spikes/*/iterations/
