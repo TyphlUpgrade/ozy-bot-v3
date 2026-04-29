@@ -1,7 +1,7 @@
 ---
-title: Harness-TS Wave C Backlog (deferred from 2026-04-24 session)
+title: Harness-TS Wave C Backlog + P1/P2 Follow-ups
 category: architecture
-tags: ["harness-ts", "wave-c", "backlog", "three-tier"]
+tags: ["harness-ts", "wave-c", "backlog", "three-tier", "p1", "p2"]
 updated: 2026-04-24
 ---
 
@@ -73,16 +73,66 @@ SessionManager + ReviewGate + ArchitectManager all hand-assemble `SessionConfig`
 ## Session summary (rolling)
 
 - First-session commits: 32 (Waves 1 / 1.5 / 1.75 item 9 / 2 / 3 / A / B).
-- This session: Wave C hardening + U3 + U4 + spikes 4 + 5.
-- Test count: 280 → 484 (session 1) → **500** (session 2).
-- Live runs: 17 total (6 prior + 5 spike-4 + 6 spike-5), all PASS on compliance.
-- Real bugs found: 2 (both closed).
-- Cumulative live-run API cost across both sessions: ~`$3.17` ($1.95 prior + $1.22 spikes).
+- This session: Wave C hardening + U3 + U4 + spikes 4 + 5 + **P1** (verdict wiring) + **P2** (live arbitration + cascade fix).
+- Test count: 280 → 484 (session 1) → 500 (Wave C core) → **518** (P1+P2).
+- Live runs: 19 total (6 prior + 5 spike-4 + 6 spike-5 + 2 arbitration). All PASS on compliance path.
+- Real bugs found: 4 (2 closed in Wave C core, 1 in P1 gap-fix retry path, 1 in P2 cascade).
+- Cumulative live-run API cost across both sessions: ~`$4.64` ($1.95 prior + $1.22 spikes + $0.75 3-phase + $0.72 arbitration).
 
 ## Spike decisions (Wave C design lock)
 
 - Caveman stays in Executor defaults (100% field preservation).
 - OMC stays in Executor defaults (wall reduction 3.8% — below 20% threshold). Token-cost side signal (~42% cheaper without OMC) logged for possible re-measurement under Wave D budget tuning.
+
+## ✅ P1 — Architect verdict wiring (commits d1aec73 + 21c87a5 + e75fa92)
+
+Wave C core. Wired real Architect verdict parsing end-to-end.
+
+- ArchitectManager: `runArbitration` + context-fenced `buildReviewArbitrationPrompt`/`buildEscalationPrompt` + stale-file unlink + fresh verdict read.
+- Orchestrator: `routeArbitration` + `applyArchitectVerdict` apply the 3 verdict types. retry_with_directive / plan_amendment transition task → `shelved` so `scheduleRetry` unshelves and re-spawns the Executor. escalate_operator → `failed`.
+- SessionManager: prepends `task.lastDirective` to the SDK prompt on retry with an "Architect directive (from prior arbitration)" header.
+- ProjectStore: `updatePhaseSpec` for plan_amendment verdicts.
+- State machine: `review_arbitration` + `escalation_wait` gain `shelved` as valid destination.
+- architect-prompt.md §5: verdict file contract (`.harness/architect-verdict.json`) with exact JSON shape for each type.
+- Tests: 500 → 516 (+16).
+
+Architect review found + fixed: `scheduleRetry` only accepted shelved, not active — first pass dead-ended retry path. Second fix surfaced `lastDirective` to Executor prompt.
+
+## ✅ P2 — Live arbitration E2E (commits a23ef64 + dd6b2b8)
+
+Script `scripts/live-project-arbitration.ts`. Real SDK Architect + Executor, stub Reviewer with reject-then-approve queue.
+
+- First run: stub reviewer claimed a concern not in the task prompt; real Architect **correctly** escalated. Informed test design (stub reviewer concern must be grounded).
+- Second run: trailer requirement added to prompt. Architect issued `retry_with_directive`; Executor retried with directive prepended; reviewer approved; merged. PASS 7/9 tightened checks. Cost $0.725.
+- Cascade bug found by live run: `escalate_operator` transitioned task to failed but never marked phase failed or failed the project. Single-phase projects hung in `decomposing`. Fix: `markPhaseFailed` always; `failProject` + emit `project_failed` when no active phases remain.
+- Tests: 516 → 518 (+2 cascade coverage).
+
+## 🔓 Validator follow-ups — P1/P2 (deferred, non-blocking)
+
+### Medium
+
+- **Cascade symmetry**: `applyArchitectVerdict::escalate_operator` and `handleMergeResult::merged` have ~12 lines of parallel structure (phase.X → maybe-project.X → emit). Extract `finalizePhaseOutcome(task, outcome)` when the 3rd caller lands or the shapes diverge.
+- **Scratch-repo helper duplication**: `scripts/live-project.ts`, `live-project-3phase.ts`, `live-project-arbitration.ts` all duplicate `initScratchRepo` + `buildConfig` (~120 lines × 3). Extract `scripts/lib/scratch-repo.ts` before the 4th script lands.
+- **InjectedReviewGate as shared fixture**: move from inline in `live-project-arbitration.ts` to `scripts/lib/stub-review-gate.ts` with a configurable verdict queue (approve-twice, threshold boundary, multi-rejection). Useful for P3.
+- **Test gaps** on cascade: no-projectStore no-op; multiple phases with sibling in `active` (not just `pending`). Pin `hasActivePhases` contract.
+- **CR M1 from before**: `buildSessionConfig` extraction — still waiting for 4th caller.
+
+### Low
+
+- **Scratch dir TOCTOU**: `/tmp/harness-*-${Date.now()}` + `mkdirSync({recursive:true})` is symlink-raceable. Swap for `mkdtempSync(join(tmpdir(), "harness-*-"))`. Dev-only risk; not urgent.
+- ~~**Rationale length-cap**: `project_failed.reason` embeds `verdict.rationale` unbounded. Add a 1KB cap + ANSI/control-char strip when rendering to Discord/logs.~~ **CLOSED** 2026-04-26 commit `32ce0ea` — `truncateRationale(s, 1024)` from `src/lib/text.ts:66` (existed already; now applied to `project_failed.reason` and `arbitration_verdict.rationale` formatters in `src/discord/notifier.ts`).
+- **Fence-escape parity**: `buildReviewArbitrationPrompt` does not neutralize triple-backticks inside fenced data (unlike `relayOperatorMessage`). Pre-existing; worth aligning.
+- **Script SIGINT cleanup**: `main().catch` catches top-level only. Add `process.on("SIGINT", () => orch.shutdown())` + try/finally around the wait loop in the shared scratch-repo helper.
+- **Magic numbers in live scripts**: `25 * 60 * 1000` timeouts and `2000` poll cadence should move to named consts in the shared helper.
+- **Inconsistent terminal predicate**: 3 scripts have 3 slightly different terminal checks for "project done". Unify in helper.
+
+### Still open from the original list
+
+- **U5 Budget tuning (Wave D)** — graduated caps by Architect-declared phase complexity.
+- **P3 — 7-10 phase mass-phase stress** — state.json contention, poll-loop throughput, worktree branch pileup.
+- **Discord integration live** — RICH RENDERING SHIPPED 2026-04-26 per `.omc/plans/2026-04-26-discord-conversational-output.md`. Three commits: Phase A `e585c3c` (payload extensions: session_complete +errors[]/terminalReason?, task_failed +attempt, project_failed +failedPhase?, task_done +responseLevelName? sourced from new TaskRecord.lastResponseLevelName); Phase B Commit 1 `3fd81a8` (8 it.skip test scaffolds, additions-only); Phase B Commit 2 `32ce0ea` (NOTIFIER_MAP rich rewrite for rows 3/5/7/8/9/10/11/12/14 + truncateBody(1900) helper + 16-fixture live-discord-smoke matrix). 714/714 tests PASS. **Still open**: operator dialogue (`relayOperatorInput`) end-to-end exercise; live-smoke visual operator confirmation pending real Discord run.
+- **Architect crash recovery live** — `respawn("crash_recovery")` unit-tested only; no real abort-mid-decomposition + resume-with-summary round-trip.
+- **OMC-OFF cost re-measurement** — 42% token-cost side signal with N=3. Bigger-N validation before Wave D budget tuning.
 
 ## Plan references
 
