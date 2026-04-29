@@ -64,6 +64,7 @@ import { TranscriptWriter, wrapWithRecording } from "../src/discord/transcript.j
 import type { DiscordSender } from "../src/discord/types.js";
 import { NudgeIntrospector } from "../src/lib/nudge-introspector.js";
 import { installSigintHandler } from "./lib/scratch-repo.js";
+import { readAnthropicApiKey } from "./lib/api-key.js";
 
 function loadDotEnv(path: string): void {
   if (!existsSync(path)) return;
@@ -233,8 +234,11 @@ async function main(): Promise<void> {
   // byte-equal to E-α/β behavior.
   const outboundGenerator = config.discord.outbound_epistle_enabled === true
     ? new OutboundResponseGenerator({
-        // ANTHROPIC_API_KEY is read from env automatically by the SDK constructor.
-        anthropic: new Anthropic(),
+        // Wave R8 — read API key from .env.anthropic explicitly so it never
+        // touches process.env. Keeps the claude-agent-sdk subprocess on
+        // subscription auth (cycle-4 Sonnet leak fix). See
+        // scripts/lib/api-key.ts for the full rationale.
+        anthropic: new Anthropic({ apiKey: readAnthropicApiKey() }),
         promptPaths: {
           // v2 prompts authored 2026-04-27 (E-γ R1 mitigation) ship alongside v1;
           // live-discord-smoke.ts validates them. Flip live-bot-listen to v2 once

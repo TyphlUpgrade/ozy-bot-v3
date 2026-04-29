@@ -58,6 +58,7 @@ import { InMemoryMessageContext } from "../src/discord/message-context.js";
 import { StateManager } from "../src/lib/state.js";
 import { TranscriptWriter, wrapWithRecording } from "../src/discord/transcript.js";
 import type { DiscordSender } from "../src/discord/types.js";
+import { readAnthropicApiKey } from "./lib/api-key.js";
 
 /**
  * Channel-collapse plumbing (2026-04-27) — extract the bare snowflake from
@@ -272,8 +273,12 @@ async function main(): Promise<void> {
   const stateManager = new StateManager(join(harnessRoot, ".harness", "smoke-state.json"));
   const outboundGenerator = llmMode
     ? new OutboundResponseGenerator({
-        // ANTHROPIC_API_KEY is read from env automatically by the SDK constructor.
-        anthropic: new Anthropic(),
+        // Wave R8 — read API key from .env.anthropic explicitly so it never
+        // touches process.env (and therefore can't leak into the
+        // claude-agent-sdk subprocess, which would flip CLI billing from
+        // subscription to API). See scripts/lib/api-key.ts for the full
+        // rationale.
+        anthropic: new Anthropic({ apiKey: readAnthropicApiKey() }),
         promptPaths: {
           // Wave E-γ R1 mitigation — smoke validates v2 voice quality before
           // production bootstrap (live-bot-listen.ts) flips from v1 to v2.

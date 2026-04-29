@@ -14,6 +14,8 @@ updated: 2026-04-27
 
 ## Prerequisites (all live scripts)
 
+**Two-file env split (Wave R8).** `.env` is shell-sourced; it must NOT contain `ANTHROPIC_API_KEY`. The Anthropic API key lives in a SEPARATE file `.env.anthropic` that scripts read explicitly (never sourced into the shell). Why: when `ANTHROPIC_API_KEY` was in `.env`, the shell exported it, the Node process inherited it, the claude-agent-sdk subprocess inherited it, and Claude Code CLI flipped from subscription auth to API billing — which leaked ~$30 of Sonnet during cycles 2-4.
+
 `.env` at repo root (`/home/typhlupgrade/.local/share/ozy-bot-v3/.env`) must define:
 ```
 DISCORD_BOT_TOKEN=...
@@ -23,12 +25,21 @@ ALERTS_CHANNEL=<snowflake>          # optional; defaults to DEV_CHANNEL
 DISCORD_WEBHOOK_DEV=https://...     # required for webhook avatars; live-bot-listen MUST have all 3 webhook URLs
 DISCORD_WEBHOOK_OPS=https://...
 DISCORD_WEBHOOK_ESCALATION=https://...
-ANTHROPIC_API_KEY=sk-ant-...        # required for Claude SDK
+OPERATOR_MENTION=<@123>             # optional; operator user-id mention for @-routing
 ```
+
+`.env.anthropic` at repo root (`/home/typhlupgrade/.local/share/ozy-bot-v3/.env.anthropic`, mode 600, gitignored via `.env.*`) must define:
+```
+ANTHROPIC_API_KEY=sk-ant-...        # ONLY consumed by the Wave E-γ outbound-response-generator (Anthropic Messages API direct).
+                                     # The harness's claude-agent-sdk path never reads this — it uses subscription auth via ~/.claude/.credentials.json.
+```
+
+Subscription auth (`~/.claude/.credentials.json`, set up via `claude /login`) covers Architect/Reviewer/Executor/Dialogue + intent-classifier + inbound-response-generator. Only outbound LLM voice (Wave E-γ) needs the API key file.
 
 Sourcing pattern:
 ```bash
-set -a && source ../.env && set +a   # if not auto-loaded
+set -a && source ../.env && set +a   # if not auto-loaded — sources Discord/operator only
+# Do NOT source .env.anthropic into the shell. Scripts read it explicitly via readAnthropicApiKey().
 ```
 
 ---
