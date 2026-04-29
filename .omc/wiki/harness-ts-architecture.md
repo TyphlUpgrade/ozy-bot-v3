@@ -161,7 +161,7 @@ Quick status snapshot:
 
 ## Cross-References
 
-- [[harness-ts-architecture-snapshot-2026-04-27-as-built]] — comprehensive per-file as-built map (8770 LOC, 5 layers, recent commits, cross-cutting themes)
+- [[harness-ts-architecture-snapshot-2026-04-27-as-built]] — comprehensive per-file as-built map (POINT-IN-TIME 2026-04-27; cycle 2-4 work not reflected)
 - [[harness-ts-phase-roadmap]] — phase-by-phase delivery history (split from this page 2026-04-27)
 - [[harness-ts-types-reference-source-of-truth]] — verbatim type signatures
 - [[harness-ts-core-invariants]] — load-bearing rules (read FIRST)
@@ -169,6 +169,10 @@ Quick status snapshot:
 - [[harness-ts-plan-index]] — index of `.omc/plans/` files
 - [[harness-ts-ambiguity-protections]] — Prior art analysis and TS translation
 - [[harness-ts-graduated-response]] — Signal-driven escalation levels, structured confidence
+- [[harness-ts-wave-c-backlog]] — Wave C scoping (CLOSED 2026-04-29; preserved for spike evidence)
+- [[harness-ts-pipeline-quality-backlog]] — cycle 5+ quality-lift items (R7, cross-session memory, cost ceiling, ...)
+- [[phase-e-agent-perspective-discord-rendering-intended-features]] — Discord agent-perspective intent (Phase E COMPLETE 2026-04-29)
+- [[phase-f-discord-richness-resilience-backlog]] — successor Discord backlog (per-test status, persistent breaker, ...)
 - [[v5-harness-efficiency-proposal]] — Design rationale for the TS rewrite
 - [[v5-harness-supervised-session-architecture]] — Supervised session model design doc
 - [[v5-harness-lessons-learned]] — Institutional knowledge extracted before rewrite

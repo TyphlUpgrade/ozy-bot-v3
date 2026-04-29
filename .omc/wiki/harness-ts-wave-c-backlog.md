@@ -1,11 +1,13 @@
 ---
 title: Harness-TS Wave C Backlog + P1/P2 Follow-ups
 category: architecture
-tags: ["harness-ts", "wave-c", "backlog", "three-tier", "p1", "p2"]
-updated: 2026-04-24
+tags: ["harness-ts", "wave-c", "backlog", "three-tier", "p1", "p2", "closed"]
+updated: 2026-04-29
 ---
 
 # Wave C Backlog — Status + Remaining Action List
+
+> **CLOSED 2026-04-29.** Wave C items (bugs 1/2, SEC M1/M2, CR M2, U3/U4, live stress, spikes 4+5) all landed in cycles 2-4. Cycle 5+ quality-tier follow-ons (R5 scratch hygiene, R6 cascade fail-fast, multi-language test gates, Reviewer rubric, R7 worktree-snapshot, cross-session memory, cost ceiling) tracked in [[harness-ts-pipeline-quality-backlog]]. This page is preserved for the historical record of Wave C scoping + the spike evidence tables below.
 
 **Second-session status (2026-04-24 cont'd):** bugs 1+2, SEC M1/M2, CR M2, U3, U4, and the 3-phase live stress have all landed. Remaining items are live-API spikes (4, 5) + deferred Wave D (U5) + on-arrival CR M1.
 

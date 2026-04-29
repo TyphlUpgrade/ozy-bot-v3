@@ -1,10 +1,10 @@
 ---
 title: "Harness-TS Architecture Snapshot — 2026-04-27 (As-Built)"
-tags: ["harness-ts", "architecture", "snapshot", "as-built", "wave-e-alpha", "post-spike", "comprehensive"]
+tags: ["harness-ts", "architecture", "snapshot", "as-built", "wave-e-alpha", "post-spike", "comprehensive", "point-in-time"]
 created: 2026-04-27T10:44:58.129Z
 updated: 2026-04-27T10:44:58.129Z
 sources: []
-links: ["harness-ts-architecture.md", "harness-ts-phase-roadmap.md", "phase-e-agent-perspective-discord-rendering-intended-features.md", "harness-ts-types-reference-source-of-truth.md", "harness-ts-core-invariants.md", "harness-ts-common-mistakes.md", "harness-ts-live-setup.md", "harness-ts-plan-index.md", "harness-ts-wave-c-backlog.md", "ralplan-procedure-failure-modes-and-recommended-mitigations.md", "session-log-wave-e-completion-2026-04-27.md"]
+links: ["harness-ts-architecture.md", "harness-ts-phase-roadmap.md", "phase-e-agent-perspective-discord-rendering-intended-features.md", "harness-ts-types-reference-source-of-truth.md", "harness-ts-core-invariants.md", "harness-ts-common-mistakes.md", "harness-ts-live-setup.md", "harness-ts-plan-index.md", "harness-ts-wave-c-backlog.md", "ralplan-procedure-failure-modes-and-recommended-mitigations.md", "session-log-wave-e-completion-2026-04-27.md", "harness-ts-pipeline-quality-backlog.md"]
 category: architecture
 confidence: medium
 schemaVersion: 1
@@ -13,6 +13,8 @@ schemaVersion: 1
 # Harness-TS Architecture Snapshot — 2026-04-27 (As-Built)
 
 # Harness-TS Architecture Snapshot — 2026-04-27 (As-Built)
+
+> **POINT-IN-TIME** snapshot frozen at 2026-04-27 (Wave E-α + lead-engineer spike commits). Do NOT edit to add post-2026-04-27 work. For current architecture see [[harness-ts-architecture]] (vision) + [[harness-ts-phase-roadmap]] (history). Cycle 2-4 changes NOT reflected here: R3 quality gates, R4 decompose-or-escalate channel, R5 scratch hygiene, R6 cascade fail-fast + multi-language test gates, Reviewer rubric upgrade. Cycle 5+ work tracked in [[harness-ts-pipeline-quality-backlog]].
 
 **Companion page** to [[harness-ts-architecture]] (vision/high-level) and [[harness-ts-phase-roadmap]] (delivery history). This page is the **comprehensive as-built map** of the codebase as it stands after Wave E-α + lead-engineer spike fixes (commits `25ae1ca` / `4b425d5` / `bc98868` / `dc1bf81`).
 
